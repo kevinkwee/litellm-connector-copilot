@@ -376,7 +376,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // promotes to `litellm_session_id` for per-session spend tracking
             // and cache grouping). Computing it here — before the body is
             // built — lets us inject it into the body in the same pass.
-            sessionFingerprint = computeSessionFingerprint(messages);
+            // Async because the fingerprint uses SHA-256 via Web Crypto.
+            sessionFingerprint = await computeSessionFingerprint(messages);
             const requestBody = await this.buildOpenAIChatRequest(messages, modelToUse, options, modelInfo, caller);
             // Inject the session fingerprint into the request body's metadata
             // so LiteLLM's proxy can group spend logs and cache entries by

@@ -59,9 +59,10 @@ export class CopilotMdWriter {
             // (the chat provider does, so the `.copilotmd` session folder
             // matches the `metadata.session_id` sent to LiteLLM for spend
             // tracking). Fall back to computing from `requestMessages` for
-            // callers that don't care (e.g. unit tests).
+            // callers that don't care (e.g. unit tests). Async because the
+            // fingerprint uses SHA-256 via Web Crypto.
             const sessionFingerprint =
-                entry.sessionFingerprint ?? computeSessionFingerprint(entry.requestMessages);
+                entry.sessionFingerprint ?? (await computeSessionFingerprint(entry.requestMessages));
             const sessionFolder = vscode.Uri.joinPath(
                 this.rootFolder,
                 "copilot-debug",

@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { OpenAIChatCompletionRequest, OpenAIUsagePayload } from "../types";
 import type { TokenSnapshot } from "../adapters/streaming/streamTokenCapture";
+import { sha256HexAsync } from "../utils/discoveryHash";
 
 /**
  * # `.copilotmd` request-log renderer
@@ -86,12 +87,14 @@ export interface CopilotMdEntry {
     /** When `status` is "failure" or "canceled", the human-readable reason. */
     statusReason?: string;
     /**
-     * Pre-computed session fingerprint (8-char hex). When provided, the
-     * writer uses it directly as the session subfolder name instead of
-     * recomputing from `requestMessages`. The chat provider computes this
-     * once at the top of `provideLanguageModelChatResponse` so it can:
+     * Pre-computed session fingerprint (UUID-formatted string). When
+     * provided, the writer uses it directly as the session subfolder name
+     * instead of recomputing from `requestMessages`. The chat provider
+     * computes this once at the top of `provideLanguageModelChatResponse`
+     * so it can:
      *   1. Inject it into `requestBody.metadata.session_id` for LiteLLM
-     *      per-session spend tracking / cache grouping.
+     *      per-session spend tracking / cache grouping (LiteLLM expects a
+     *      UUID-format string for `litellm_session_id`).
      *   2. Pass the same value here so the `.copilotmd` file lands in the
      *      same session folder as the LiteLLM spend-log row.
      * When omitted (e.g. in unit tests that don't care about the folder),
@@ -479,8 +482,12 @@ export function buildCopilotMdFilename(entry: CopilotMdEntry): string {
  * the rationale.
  *
  * Strategy: hash every `User`-role message that appears **after** the last
- * `System` message and **before** the first `Assistant` message, using a
- * fast, dependency-free 32-bit FNV-1a. Returns a hex string like `a1b2c3d4`.
+ * `System` message and **before** the first `Assistant` message, using
+ * SHA-256 (via the existing `sha256HexAsync` Web Crypto helper). Returns a
+ * deterministic UUID-formatted string like `e7074038-e624-485e-bf91-fc179549e3ca`
+ * — the same format LiteLLM expects for `litellm_session_id`, so the
+ * fingerprint can be passed directly to `metadata.session_id` without
+ * any transformation.
  *
  * ## Why this window
  *
@@ -530,9 +537,9 @@ export function buildCopilotMdFilename(entry: CopilotMdEntry): string {
  * - Empty message array: returns a fixed fingerprint (`empty:` → hash) so
  *   the writer always has a folder to write to.
  */
-export function computeSessionFingerprint(messages: readonly vscode.LanguageModelChatRequestMessage[]): string {
+export async function computeSessionFingerprint(messages: readonly vscode.LanguageModelChatRequestMessage[]): Promise<string> {
     const seed = pickFingerprintSeed(messages);
-    return fnv1a32Hex(seed);
+    return uuidFromSeed(seed);
 }
 
 /**
@@ -598,20 +605,23 @@ function extractTextContent(content: readonly (vscode.LanguageModelInputPart | u
 }
 
 /**
- * 32-bit FNV-1a hash, returned as 8-char lowercase hex.
+ * Derives a deterministic UUID-formatted string from a seed string via
+ * SHA-256. Returns a UUID like `e7074038-e624-485e-bf91-fc179549e3ca`.
  *
- * Chosen for: zero dependencies, fast, good distribution for short strings,
- * stable across runs (no randomness). Not cryptographically secure — and
- * doesn't need to be; this is a grouping key, not a security primitive.
+ * The format matches what LiteLLM expects for `litellm_session_id` (a
+ * standard UUID string), so the fingerprint can be passed directly to
+ * `metadata.session_id` without any transformation. SHA-256 gives us a
+ * 256-bit digest; we take the first 128 bits (32 hex chars) and format
+ * them as a UUID (8-4-4-4-12) for display compatibility.
+ *
+ * This is NOT a real UUID v4 (random) or v5 (namespace+name) — it's a
+ * content-addressed UUID derived from the message seed. Same seed → same
+ * UUID, deterministically, with negligible collision probability
+ * (128-bit hash space vs 32-bit FNV-1a's ~4 billion values).
  */
-function fnv1a32Hex(input: string): string {
-    let hash = 0x811c9dc5;
-    for (let i = 0; i < input.length; i++) {
-        hash ^= input.charCodeAt(i);
-        // FNV prime multiplication, kept in 32-bit range with Math.imul.
-        hash = Math.imul(hash, 0x01000193);
-    }
-    // Unsigned 32-bit, then zero-padded 8-char hex.
-    const unsigned = hash >>> 0;
-    return unsigned.toString(16).padStart(8, "0");
+async function uuidFromSeed(seed: string): Promise<string> {
+    const hex = (await sha256HexAsync(seed)).slice(0, 32);
+    // Format as UUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    // (8-4-4-4-12 = 32 hex chars, standard UUID display format)
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }

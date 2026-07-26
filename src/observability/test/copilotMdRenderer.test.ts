@@ -362,7 +362,7 @@ suite("buildCopilotMdFilename", () => {
 });
 
 suite("computeSessionFingerprint", () => {
-    test("returns a stable 8-char hex for the same message set", () => {
+    test("returns a stable UUID for the same message set", async () => {
         const messages = [
             {
                 role: vscode.LanguageModelChatMessageRole.User,
@@ -370,13 +370,14 @@ suite("computeSessionFingerprint", () => {
                 name: undefined,
             },
         ];
-        const a = computeSessionFingerprint(messages);
-        const b = computeSessionFingerprint(messages);
+        const a = await computeSessionFingerprint(messages);
+        const b = await computeSessionFingerprint(messages);
         assert.strictEqual(a, b);
-        assert.match(a, /^[0-9a-f]{8}$/);
+        // UUID format: 8-4-4-4-12 hex chars, lowercase
+        assert.match(a, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     });
 
-    test("returns different fingerprints for different user requests", () => {
+    test("returns different fingerprints for different user requests", async () => {
         const messages1 = [
             {
                 role: vscode.LanguageModelChatMessageRole.User,
@@ -391,10 +392,13 @@ suite("computeSessionFingerprint", () => {
                 name: undefined,
             },
         ];
-        assert.notStrictEqual(computeSessionFingerprint(messages1), computeSessionFingerprint(messages2));
+        assert.notStrictEqual(
+            await computeSessionFingerprint(messages1),
+            await computeSessionFingerprint(messages2)
+        );
     });
 
-    test("skips leading System messages (agent instructions are identical across sessions in a mode)", () => {
+    test("skips leading System messages (agent instructions are identical across sessions in a mode)", async () => {
         // Two sessions with the same system message but different user requests
         // must get different fingerprints. If the system message leaked into
         // the hash, two sessions with the same system prompt (i.e. every
@@ -432,13 +436,13 @@ suite("computeSessionFingerprint", () => {
             },
         ];
         assert.notStrictEqual(
-            computeSessionFingerprint(sessionA),
-            computeSessionFingerprint(sessionB),
+            await computeSessionFingerprint(sessionA),
+            await computeSessionFingerprint(sessionB),
             "same system message + different request must NOT collide"
         );
     });
 
-    test("differentiates sessions with the same workspace context but different first request", () => {
+    test("differentiates sessions with the same workspace context but different first request", async () => {
         // Realistic Copilot Chat structure: system + user-env + user-request.
         // Two sessions in the same workspace share the env-context user message
         // but have different actual requests. They MUST get different fingerprints.
@@ -479,13 +483,13 @@ suite("computeSessionFingerprint", () => {
             },
         ];
         assert.notStrictEqual(
-            computeSessionFingerprint(sessionA),
-            computeSessionFingerprint(sessionB),
+            await computeSessionFingerprint(sessionA),
+            await computeSessionFingerprint(sessionB),
             "same workspace context + different request must NOT collide"
         );
     });
 
-    test("stays stable when later turns append assistant + tool + follow-up messages", () => {
+    test("stays stable when later turns append assistant + tool + follow-up messages", async () => {
         // Within a session, each turn's messages array is a superset of the
         // previous turn's. The "user messages before first assistant" window
         // is therefore stable across all turns: turn 1 has [user-env, user-request]
@@ -516,10 +520,10 @@ suite("computeSessionFingerprint", () => {
                 name: undefined,
             },
         ];
-        assert.strictEqual(computeSessionFingerprint(turn1), computeSessionFingerprint(turn2));
+        assert.strictEqual(await computeSessionFingerprint(turn1), await computeSessionFingerprint(turn2));
     });
 
-    test("window is exclusive of the first assistant message (so turn 1 and turn 2 match)", () => {
+    test("window is exclusive of the first assistant message (so turn 1 and turn 2 match)", async () => {
         // If the first assistant message were INCLUDED in the hash, turn 1
         // (no assistant → hash [user]) and turn 2 (assistant present → hash
         // [user, assistant]) would get different fingerprints, splitting one
@@ -571,10 +575,10 @@ suite("computeSessionFingerprint", () => {
                 name: undefined,
             },
         ];
-        assert.strictEqual(computeSessionFingerprint(turn1), computeSessionFingerprint(turn2));
+        assert.strictEqual(await computeSessionFingerprint(turn1), await computeSessionFingerprint(turn2));
     });
 
-    test("falls back to the first message's role when no user message is present before the first assistant", () => {
+    test("falls back to the first message's role when no user message is present before the first assistant", async () => {
         // Degenerate case: a tool-calling sub-turn seeded only with system +
         // assistant + tool messages. Still needs a deterministic fingerprint.
         const messages = [
@@ -584,15 +588,15 @@ suite("computeSessionFingerprint", () => {
                 name: undefined,
             },
         ];
-        const fp = computeSessionFingerprint(messages);
-        assert.match(fp, /^[0-9a-f]{8}$/);
+        const fp = await computeSessionFingerprint(messages);
+        assert.match(fp, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
         // Same input → same fingerprint (deterministic)
-        assert.strictEqual(fp, computeSessionFingerprint(messages));
+        assert.strictEqual(fp, await computeSessionFingerprint(messages));
     });
 
-    test("returns a stable fingerprint for an empty message array", () => {
-        const fp = computeSessionFingerprint([]);
-        assert.match(fp, /^[0-9a-f]{8}$/);
-        assert.strictEqual(fp, computeSessionFingerprint([]));
+    test("returns a stable fingerprint for an empty message array", async () => {
+        const fp = await computeSessionFingerprint([]);
+        assert.match(fp, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+        assert.strictEqual(fp, await computeSessionFingerprint([]));
     });
 });
