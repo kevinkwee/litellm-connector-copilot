@@ -14,6 +14,8 @@ import { Logger } from "../utils/logger";
 import { LiteLLMTelemetry } from "../utils/telemetry";
 import { LiteLLMProviderBase } from "./liteLLMProviderBase";
 import { StructuredLogger } from "../observability/structuredLogger";
+import { ResponsePartCollector, exportCopilotMdEntry } from "../observability";
+import type { CopilotMdEntry } from "../observability";
 import {
     countOpenAIChatMessagesTokens,
     countTokens,
@@ -31,6 +33,7 @@ import type { StreamingState } from "../adapters/streaming/liteLLMStreamInterpre
 import { emitPartsToVSCode } from "../adapters/streaming/vscodePartEmitter";
 import type { EffortFallbackCache } from "../utils/reasoningEffortFallback";
 import { StreamTokenCapture } from "../adapters/streaming/streamTokenCapture";
+import type { OpenAIChatCompletionRequest } from "../types";
 
 /**
  * Chat provider implementation for VS Code's LanguageModelChatProvider.
@@ -215,7 +218,16 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
     ): Promise<void> {
         this.resetStreamingState();
         const startTime = LiteLLMTelemetry.startTimer();
+        const requestStartDate = new Date();
         const requestId = Math.random().toString(36).substring(7);
+
+        // Hoisted to the outer scope so the failure/cancel paths in the catch
+        // block can still emit a `.copilotmd` entry when the request got far
+        // enough to have a body. Both stay `undefined` until assigned in the
+        // try block, so a failure before `buildOpenAIChatRequest` correctly
+        // produces no export (there's nothing meaningful to render yet).
+        let endpointUrl: string | undefined;
+        let requestBodyBuilt: OpenAIChatCompletionRequest | undefined;
 
         // Check if vscode has thinking part API available.
         // Even if we are not the V2 provider, we can safely report thinking parts if the type exists.
@@ -275,7 +287,12 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         // so we hand it the raw model name instead.
         this._tokenCapture = new StreamTokenCapture(this.getRawModelName(model.id), progress, modelInfo);
         const tokenCapture = this._tokenCapture;
-        const trackingProgress = tokenCapture.progress;
+        const responsePartCollector = new ResponsePartCollector(tokenCapture.progress);
+        // Re-bind `trackingProgress` to the collector's wrapped progress so every
+        // downstream `sendRequestWithRetry` / `processStreamingResponse` call
+        // both reports to VS Code (via tokenCapture) AND records the part for
+        // the `.copilotmd` export. Single source of truth for the response body.
+        const trackingProgress = responsePartCollector.progress;
 
         try {
             const config = await this._configManager.getConfig();
@@ -325,6 +342,16 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 `Chat request: modelToUse.id="${modelToUse.id}" rawModelName="${this.getRawModelName(modelToUse.id)}"`
             );
 
+            // Resolve the backend baseUrl for the `.copilotmd` metadata `url:` line.
+            // The registry is the single source of truth for (namespaced id → backend);
+            // `lookup` returns undefined for raw-name overrides (modelIdOverride rewrote
+            // the id), so we fall back to the vendor id string in that degenerate case.
+            // Assigned to the outer `let` so the catch block can reference it when
+            // rendering a failure entry. Stays undefined if lookup fails before the
+            // body is built, which correctly suppresses a meaningless failure export.
+            const routingEntry = this._registry.lookup(modelToUse.id);
+            endpointUrl = routingEntry?.baseUrl ?? "litellm-connector";
+
             // Capability lookup goes directly to the BackendRegistry. The
             // `modelToUse.id` is either the namespaced id VS Code handed us
             // or, when `modelIdOverride` rewrote it, the raw model name; the
@@ -335,6 +362,11 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // is the same single-source-of-truth read as above.
             const modelInfo = this._registry.getModelInfo(modelToUse.id);
             const requestBody = await this.buildOpenAIChatRequest(messages, modelToUse, options, modelInfo, caller);
+            // Expose the built body to the outer scope so the failure/cancel
+            // paths can still render a `.copilotmd` entry if the stream fails
+            // after the request was shaped. Read-only alias to avoid accidental
+            // mutation downstream.
+            requestBodyBuilt = requestBody;
             // The model id in `modelToUse` is the namespaced `<routing>/<raw>`
             // form VS Code hands us. The tokenizer heuristics (and the
             // `isParameterSupported` / `usageOptOutModels` lookups inside the
@@ -459,6 +491,30 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                                 estimatedTotalCost: snapshot.estimatedTotalCost,
                             });
 
+                            // Fire-and-forget `.copilotmd` export for the retry-success path.
+                            // Mirrors the primary success-path export below; this branch returns
+                            // early so the bottom-of-method export would otherwise be skipped.
+                            void exportCopilotMdEntry({
+                                debugName: caller,
+                                id: requestId.slice(0, 8),
+                                model: modelToUse.id,
+                                url: endpointUrl ?? "litellm-connector",
+                                maxPromptTokens: modelToUse.maxInputTokens,
+                                maxResponseTokens: requestBody.max_tokens,
+                                location: undefined,
+                                body: requestBody,
+                                requestMessages: messages,
+                                startTimeIso: requestStartDate.toISOString(),
+                                endTimeIso: new Date().toISOString(),
+                                durationMs: metric.durationMs,
+                                ourRequestId: requestId,
+                                timeToFirstTokenMs: undefined,
+                                resolvedModel: modelToUse.id,
+                                usage: snapshot,
+                                responseParts: responsePartCollector.parts,
+                                status: "success",
+                            } satisfies CopilotMdEntry);
+
                             // Return early - all processing complete, prevent fall-through
                             // to avoid double-processing the already-consumed stream
                             return;
@@ -575,6 +631,32 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 estimatedTotalCost,
             });
 
+            // Fire-and-forget `.copilotmd` export. Reads the opt-in setting
+            // inside `exportCopilotMdEntry`; when disabled this is a single
+            // config read + early return — negligible on the request hot path.
+            // Never awaited: a failed/slow export must not delay the user's
+            // already-streamed response.
+            void exportCopilotMdEntry({
+                debugName: caller,
+                id: requestId.slice(0, 8),
+                model: modelToUse.id,
+                url: endpointUrl ?? "litellm-connector",
+                maxPromptTokens: modelToUse.maxInputTokens,
+                maxResponseTokens: requestBody.max_tokens,
+                location: undefined,
+                body: requestBody,
+                requestMessages: messages,
+                startTimeIso: requestStartDate.toISOString(),
+                endTimeIso: new Date().toISOString(),
+                durationMs: metric.durationMs,
+                ourRequestId: requestId,
+                timeToFirstTokenMs: undefined,
+                resolvedModel: modelToUse.id,
+                usage: snapshot,
+                responseParts: responsePartCollector.parts,
+                status: "success",
+            } satisfies CopilotMdEntry);
+
             // Usage data is now handled exclusively by StreamTokenCapture
             // which intercepts usage DataParts during streaming and enriches them
             // No need for separate emitExperimentalUsageData call
@@ -659,6 +741,46 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     stack: err instanceof Error ? err.stack : undefined,
                 });
             }
+
+            // Fire-and-forget `.copilotmd` export for the failure case. Only
+            // emits when the request got far enough to have a built body — a
+            // failure before `buildOpenAIChatRequest` (e.g. config error) has
+            // nothing meaningful to render and is skipped.
+            if (requestBodyBuilt && endpointUrl) {
+                void exportCopilotMdEntry({
+                    debugName: caller,
+                    id: requestId.slice(0, 8),
+                    model: model.id,
+                    url: endpointUrl ?? "litellm-connector",
+                    maxPromptTokens: model.maxInputTokens,
+                    maxResponseTokens: requestBodyBuilt.max_tokens,
+                    location: undefined,
+                    body: requestBodyBuilt,
+                    requestMessages: messages,
+                    startTimeIso: requestStartDate.toISOString(),
+                    endTimeIso: new Date().toISOString(),
+                    durationMs: metric.durationMs,
+                    ourRequestId: requestId,
+                    timeToFirstTokenMs: undefined,
+                    resolvedModel: model.id,
+                    usage: this._tokenCapture?.getSnapshot() ?? {
+                        promptTokens: tokensIn ?? 0,
+                        cachedTokens: 0,
+                        cacheCreationInputTokens: 0,
+                        systemPromptTokens: 0,
+                        completionTokens: 0,
+                        reasoningTokens: 0,
+                        toolTokens: 0,
+                        acceptedPredictionTokens: 0,
+                        rejectedPredictionTokens: 0,
+                        sawUpstreamUsage: false,
+                    },
+                    responseParts: responsePartCollector.parts,
+                    status: "failure",
+                    statusReason: errorMessage,
+                } satisfies CopilotMdEntry);
+            }
+
             throw new Error(errorMessage, { cause: err });
         }
     }

@@ -18,3 +18,16 @@ export type {
     AuditSummary,
     TelemetryMetric,
 } from "./types";
+
+// `.copilotmd` request-log export — byte-compatible with VS Code Copilot's
+// Chat Debug View export format. See `copilotMdRenderer.ts` for the format
+// reference and `litellm-connector-copilot-chat-debug-view.md` repo memory
+// for the upstream trace.
+export { renderCopilotMd, buildCopilotMdFilename, computeSessionFingerprint } from "./copilotMdRenderer";
+export type { CopilotMdEntry } from "./copilotMdRenderer";
+export { selectFilesForDeletion } from "./copilotMdCaps";
+export type { CapsConfig, FileMeta } from "./copilotMdCaps";
+export { CopilotMdWriter } from "./copilotMdWriter";
+export { CopilotMdManager, exportCopilotMdEntry } from "./copilotMdManager";
+export type { CopilotMdDestination, CopilotMdSettings } from "./copilotMdManager";
+export { ResponsePartCollector } from "./responsePartCollector";

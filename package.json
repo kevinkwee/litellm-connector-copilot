@@ -92,6 +92,10 @@
       {
         "command": "litellm-connector.setLogLevel",
         "title": "LiteLLM: Set Log Level"
+      },
+      {
+        "command": "litellm-connector.openCopilotMdFolder",
+        "title": "LiteLLM: Open .copilotmd Export Folder"
       }
     ],
     "configuration": {
@@ -235,6 +239,42 @@
             "advanced"
           ],
           "description": "Minimum interval in milliseconds between outward model-discovery change notifications. Set to 0 to disable rate limiting. Default: 2000."
+        },
+        "litellm-connector.debug.copilotMdExport.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Export each chat request as a `.copilotmd` markdown file (byte-compatible with VS Code Copilot's Chat Debug View export). Files contain prompt + response + tool calls + usage; disable before sharing unredacted. Default: off (opt-in)."
+        },
+        "litellm-connector.debug.copilotMdExport.destination": {
+          "type": "string",
+          "enum": [
+            "workspace",
+            "globalStorage"
+          ],
+          "enumItemLabels": [
+            "Extension workspace storage (per-workspace, hidden, wiped when VS Code forgets the workspace)",
+            "Extension global storage (hidden, persists across all workspaces)"
+          ],
+          "default": "workspace",
+          "description": "Where `.copilotmd` files are written. Both destinations are inside VS Code's internal extension storage (never the user's repo folder). `workspace` uses per-workspace extension storage (scoped to the current workspace, cleared when VS Code forgets the workspace); `globalStorage` persists across all workspaces. Falls back to `globalStorage` when no workspace is open. Use the 'LiteLLM: Open .copilotmd Export Folder' command to reveal the folder."
+        },
+        "litellm-connector.debug.copilotMdExport.maxFilesPerSession": {
+          "type": "number",
+          "default": 50,
+          "minimum": 0,
+          "description": "Max `.copilotmd` files per session folder. Oldest files in the session are deleted when exceeded. 0 = unlimited. Default: 50."
+        },
+        "litellm-connector.debug.copilotMdExport.maxSessions": {
+          "type": "number",
+          "default": 100,
+          "minimum": 0,
+          "description": "Max session folders retained. Oldest session folders (by newest-file mtime) are deleted when exceeded. 0 = unlimited. Default: 100."
+        },
+        "litellm-connector.debug.copilotMdExport.maxTotalBytes": {
+          "type": "number",
+          "default": 1073741824,
+          "minimum": 0,
+          "description": "Hard ceiling on total `.copilotmd` bytes across all sessions. Oldest files (globally, by mtime) are deleted when exceeded. 0 = unlimited. Default: 1073741824 (1 GiB)."
         }
       }
     },

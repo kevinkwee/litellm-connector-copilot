@@ -11,13 +11,14 @@ import { registerGenerateCommitMessageCommand } from "./commands/generateCommitM
 import { registerSetLogLevelCommand } from "./commands/setLogLevel";
 import { LiteLLMCommitMessageProvider } from "./providers/liteLLMCommitProvider";
 import { Logger } from "./utils/logger";
-import { StructuredLogger } from "./observability";
+import { StructuredLogger, CopilotMdManager } from "./observability";
 import { PostHogHook } from "./observability/posthogHook";
 import { TelemetryService } from "./telemetry/telemetryService";
 import { LiteLLMTelemetry } from "./utils/telemetry";
 import { setTelemetryService as setTokenUtilsTelemetryService } from "./adapters/tokenUtils";
 import { EffortFallbackCache } from "./utils/reasoningEffortFallback";
 import { LegacyConfigMigration } from "./config/legacyConfigMigration";
+import { registerOpenCopilotMdFolderCommand } from "./commands/openCopilotMdFolder";
 
 // Store the config manager for cleanup on deactivation
 let configManagerInstance: ConfigManager | undefined;
@@ -45,6 +46,11 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // Initialize v2 structured logger
     StructuredLogger.initialize(context);
+
+    // Initialize the .copilotmd export manager. Reads
+    // `litellm-connector.debug.copilotMdExport.*` settings on each export so
+    // users can toggle the feature and adjust caps without reloading.
+    CopilotMdManager.initialize(context);
 
     // Initialize PostHog hook for v2 observability
     const postHogHook = new PostHogHook(telemetryService);
@@ -294,6 +300,7 @@ export function activate(context: vscode.ExtensionContext): void {
         context.subscriptions.push(registerReloadModelsCommand(activeProvider, telemetryService));
         context.subscriptions.push(registerGenerateCommitMessageCommand(commitProvider, telemetryService));
         context.subscriptions.push(registerSetLogLevelCommand());
+        context.subscriptions.push(registerOpenCopilotMdFolderCommand());
         Logger.info("Config command registered.");
     } catch (cmdErr) {
         Logger.error("Failed to register commands", cmdErr);
