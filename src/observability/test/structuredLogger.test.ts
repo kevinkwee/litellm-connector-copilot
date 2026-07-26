@@ -192,4 +192,155 @@ suite("StructuredLogger", () => {
         assert.strictEqual(createOutputChannelStub.firstCall.args[0], "LiteLLM Structured");
         assert.ok((mockChannel.info as sinon.SinonStub).calledOnce);
     });
+
+    /**
+     * Performance regression tests: trace and debug MUST skip all work
+     * (no LogEvent construction, no JSON.stringify, no channel call) when the
+     * channel's log level is above the message level. The streaming hot path
+     * fires dozens of trace calls per SSE event; building then discarding the
+     * payload on every event caused observable CPU spikes and GC pressure
+     * during long chat responses.
+     */
+
+    test("trace skips JSON.stringify and channel.trace when logLevel > Trace", () => {
+        const stringifySpy = sandbox.spy(JSON, "stringify");
+        const mockChannel = {
+            trace: sandbox.stub(),
+            debug: sandbox.stub(),
+            info: sandbox.stub(),
+            warn: sandbox.stub(),
+            error: sandbox.stub(),
+            show: sandbox.stub(),
+            dispose: sandbox.stub(),
+            logLevel: vscode.LogLevel.Info, // above Trace -> trace should be skipped
+        } as unknown as vscode.LogOutputChannel;
+        (StructuredLogger as unknown as { channel: vscode.LogOutputChannel | undefined }).channel = mockChannel;
+
+        StructuredLogger.trace("stream.event_received", { payload: "x".repeat(1000) });
+
+        assert.strictEqual(
+            (mockChannel.trace as sinon.SinonStub).callCount,
+            0,
+            "channel.trace must NOT be called when level > Trace"
+        );
+        // JSON.stringify may have been called by other test infrastructure, so
+        // we assert only that the trace path didn't add a call for the LogEvent.
+        // A more direct check: no call args contain our event name.
+        const traceCalls = stringifySpy
+            .getCalls()
+            .filter((c) => typeof c.args[0] === "object" && (c.args[0] as { event?: string }).event === "stream.event_received");
+        assert.strictEqual(traceCalls.length, 0, "JSON.stringify must not be called for a skipped trace event");
+    });
+
+    test("debug skips JSON.stringify and channel.debug when logLevel > Debug", () => {
+        const stringifySpy = sandbox.spy(JSON, "stringify");
+        const mockChannel = {
+            trace: sandbox.stub(),
+            debug: sandbox.stub(),
+            info: sandbox.stub(),
+            warn: sandbox.stub(),
+            error: sandbox.stub(),
+            show: sandbox.stub(),
+            dispose: sandbox.stub(),
+            logLevel: vscode.LogLevel.Info, // above Debug -> debug should be skipped
+        } as unknown as vscode.LogOutputChannel;
+        (StructuredLogger as unknown as { channel: vscode.LogOutputChannel | undefined }).channel = mockChannel;
+
+        StructuredLogger.debug("param.suppressed", { param: "temperature" });
+
+        assert.strictEqual(
+            (mockChannel.debug as sinon.SinonStub).callCount,
+            0,
+            "channel.debug must NOT be called when level > Debug"
+        );
+        const debugCalls = stringifySpy
+            .getCalls()
+            .filter((c) => typeof c.args[0] === "object" && (c.args[0] as { event?: string }).event === "param.suppressed");
+        assert.strictEqual(debugCalls.length, 0, "JSON.stringify must not be called for a skipped debug event");
+    });
+
+    test("trace still logs when logLevel === Trace (preserves behavior when verbose logging is enabled)", () => {
+        const mockChannel = {
+            trace: sandbox.stub(),
+            debug: sandbox.stub(),
+            info: sandbox.stub(),
+            warn: sandbox.stub(),
+            error: sandbox.stub(),
+            show: sandbox.stub(),
+            dispose: sandbox.stub(),
+            logLevel: vscode.LogLevel.Trace,
+        } as unknown as vscode.LogOutputChannel;
+        (StructuredLogger as unknown as { channel: vscode.LogOutputChannel | undefined }).channel = mockChannel;
+
+        StructuredLogger.trace("stream.event_received", { foo: "bar" });
+
+        assert.ok((mockChannel.trace as sinon.SinonStub).calledOnce, "trace must fire when level === Trace");
+        const logStr = (mockChannel.trace as sinon.SinonStub).firstCall.args[0] as string;
+        const parsed = JSON.parse(logStr) as { event: string; level: string };
+        assert.strictEqual(parsed.event, "stream.event_received");
+        assert.strictEqual(parsed.level, "trace");
+    });
+
+    test("debug still logs when logLevel === Debug (preserves behavior when verbose logging is enabled)", () => {
+        const mockChannel = {
+            trace: sandbox.stub(),
+            debug: sandbox.stub(),
+            info: sandbox.stub(),
+            warn: sandbox.stub(),
+            error: sandbox.stub(),
+            show: sandbox.stub(),
+            dispose: sandbox.stub(),
+            logLevel: vscode.LogLevel.Debug,
+        } as unknown as vscode.LogOutputChannel;
+        (StructuredLogger as unknown as { channel: vscode.LogOutputChannel | undefined }).channel = mockChannel;
+
+        StructuredLogger.debug("param.suppressed", { param: "top_p" });
+
+        assert.ok((mockChannel.debug as sinon.SinonStub).calledOnce, "debug must fire when level === Debug");
+    });
+
+    test("trace logs when channel.logLevel is undefined (no filtering when level unknown)", () => {
+        // Some test stubs and pre-initialize calls may have no logLevel set.
+        // Default to "log everything" so we never silently drop diagnostic output.
+        const mockChannel = {
+            trace: sandbox.stub(),
+            debug: sandbox.stub(),
+            info: sandbox.stub(),
+            warn: sandbox.stub(),
+            error: sandbox.stub(),
+            show: sandbox.stub(),
+            dispose: sandbox.stub(),
+            // logLevel intentionally omitted -> undefined
+        } as unknown as vscode.LogOutputChannel;
+        (StructuredLogger as unknown as { channel: vscode.LogOutputChannel | undefined }).channel = mockChannel;
+
+        StructuredLogger.trace("stream.event_received", { foo: "bar" });
+
+        assert.ok((mockChannel.trace as sinon.SinonStub).calledOnce, "trace must fire when logLevel is undefined");
+    });
+
+    test("info/warn/error always log regardless of trace/debug gating", () => {
+        const mockChannel = {
+            trace: sandbox.stub(),
+            debug: sandbox.stub(),
+            info: sandbox.stub(),
+            warn: sandbox.stub(),
+            error: sandbox.stub(),
+            show: sandbox.stub(),
+            dispose: sandbox.stub(),
+            logLevel: vscode.LogLevel.Off, // even "Off" should still hit info/warn/error
+        } as unknown as vscode.LogOutputChannel;
+        (StructuredLogger as unknown as { channel: vscode.LogOutputChannel | undefined }).channel = mockChannel;
+
+        // info/warn/error are NOT gated by this fix — they always go through log().
+        // VS Code's channel.info/.warn/.error already drop silently when level is Off,
+        // and these paths are not the hot-path source of the CPU spike.
+        StructuredLogger.info("request.ingress", {});
+        StructuredLogger.warn("param.suppressed", {});
+        StructuredLogger.error("request.error", {});
+
+        assert.ok((mockChannel.info as sinon.SinonStub).calledOnce);
+        assert.ok((mockChannel.warn as sinon.SinonStub).calledOnce);
+        assert.ok((mockChannel.error as sinon.SinonStub).calledOnce);
+    });
 });

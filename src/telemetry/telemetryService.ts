@@ -20,7 +20,7 @@ export class TelemetryService implements vscode.Disposable {
 
     private static readonly EXTENSION_VERSION_PROPERTY = "extension_version";
 
-    static readonly POSTHOG_API_KEY = "phc_OJr5j3sxq9AX6YglCd9NMP4HlwchYwBa53n8Jz44jkp";
+    static readonly POSTHOG_API_KEY = "xxx";
     static readonly POSTHOG_HOST = "https://us.i.posthog.com";
 
     constructor() {

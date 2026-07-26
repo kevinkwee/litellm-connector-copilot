@@ -2,6 +2,53 @@ import * as vscode from "vscode";
 import type { LogLevel, LogEvent, EventType } from "./types";
 
 /**
+ * Maps our string `LogLevel` to the numeric `vscode.LogLevel` enum so we can
+ * compare against the channel's runtime `logLevel` property.
+ *
+ * `vscode.LogLevel`: Off=0, Trace=1, Debug=2, Info=3, Warning=4, Error=5.
+ * A message at level L is logged only when `channel.logLevel <= L` (the
+ * channel is configured to show that level or more verbose).
+ */
+const LOG_LEVEL_RANK: Record<LogLevel, number> = {
+    trace: vscode.LogLevel.Trace,
+    debug: vscode.LogLevel.Debug,
+    info: vscode.LogLevel.Info,
+    warn: vscode.LogLevel.Warning,
+    error: vscode.LogLevel.Error,
+};
+
+/**
+ * Returns true if a message at the given `LogLevel` should be skipped
+ * because the channel's configured log level is above it (less verbose).
+ *
+ * Only gates `trace` and `debug` — the streaming hot path fires dozens of
+ * trace calls per SSE event, and building then discarding the LogEvent +
+ * JSON.stringify on every event caused observable CPU spikes and GC
+ * pressure during long chat responses. `info`/`warn`/`error` are NOT gated
+ * here: they are infrequent and important for diagnostics, and VS Code's
+ * own channel methods already silently drop them when the level is too
+ * high, so the wasted work is negligible.
+ *
+ * When `channel.logLevel` is `undefined` (e.g. a test stub that didn't set
+ * it, or a pre-initialize call), we return false — never silently drop
+ * diagnostic output when we can't confirm it should be dropped.
+ */
+function shouldSkipForLevel(channel: vscode.LogOutputChannel, level: LogLevel): boolean {
+    if (level !== "trace" && level !== "debug") {
+        return false;
+    }
+    const channelLevel = channel.logLevel;
+    if (typeof channelLevel !== "number") {
+        return false;
+    }
+    // channelLevel === Off (0) means "log nothing" — skip everything we gate.
+    if (channelLevel === vscode.LogLevel.Off) {
+        return true;
+    }
+    return channelLevel > LOG_LEVEL_RANK[level];
+}
+
+/**
  * Structured JSONL logger for the v2 provider baseline.
  *
  * Outputs one JSON object per line for parseability by standard tools (jq, etc.).
@@ -99,6 +146,17 @@ export class StructuredLogger {
         }
     ): void {
         const channel = this.ensureChannel();
+
+        // Hot-path performance guard: skip all LogEvent construction and
+        // JSON.stringify when the channel is configured above trace/debug.
+        // The streaming pipeline fires dozens of trace calls per SSE event;
+        // building then discarding the payload on every event caused CPU
+        // spikes and GC pressure during long chat responses. See
+        // `shouldSkipForLevel` for the rationale on why only trace/debug are
+        // gated and why an undefined channel.logLevel is treated as "log".
+        if (shouldSkipForLevel(channel, level)) {
+            return;
+        }
 
         const logEvent: LogEvent = {
             timestamp: new Date().toISOString(),
