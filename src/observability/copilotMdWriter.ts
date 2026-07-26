@@ -55,7 +55,13 @@ export class CopilotMdWriter {
      */
     async write(entry: CopilotMdEntry): Promise<vscode.Uri | undefined> {
         try {
-            const sessionFingerprint = computeSessionFingerprint(entry.requestMessages);
+            // Use the pre-computed fingerprint when the caller provides one
+            // (the chat provider does, so the `.copilotmd` session folder
+            // matches the `metadata.session_id` sent to LiteLLM for spend
+            // tracking). Fall back to computing from `requestMessages` for
+            // callers that don't care (e.g. unit tests).
+            const sessionFingerprint =
+                entry.sessionFingerprint ?? computeSessionFingerprint(entry.requestMessages);
             const sessionFolder = vscode.Uri.joinPath(
                 this.rootFolder,
                 "copilot-debug",

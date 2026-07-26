@@ -14,7 +14,7 @@ import { Logger } from "../utils/logger";
 import { LiteLLMTelemetry } from "../utils/telemetry";
 import { LiteLLMProviderBase } from "./liteLLMProviderBase";
 import { StructuredLogger } from "../observability/structuredLogger";
-import { ResponsePartCollector, exportCopilotMdEntry } from "../observability";
+import { ResponsePartCollector, exportCopilotMdEntry, computeSessionFingerprint } from "../observability";
 import type { CopilotMdEntry } from "../observability";
 import {
     countOpenAIChatMessagesTokens,
@@ -228,6 +228,15 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         // produces no export (there's nothing meaningful to render yet).
         let endpointUrl: string | undefined;
         let requestBodyBuilt: OpenAIChatCompletionRequest | undefined;
+        // Session fingerprint — computed once from `messages` (the request
+        // input) at the top of the try block, then reused for two purposes:
+        //   1. Injected into `requestBody.metadata.session_id` so LiteLLM
+        //      promotes it to `litellm_session_id` for per-session spend
+        //      tracking and cache grouping.
+        //   2. Passed to `exportCopilotMdEntry` so the `.copilotmd` file
+        //      lands in the same session folder as the LiteLLM spend-log row.
+        // Hoisted so the catch-block export can reuse the same value.
+        let sessionFingerprint: string | undefined;
 
         // Check if vscode has thinking part API available.
         // Even if we are not the V2 provider, we can safely report thinking parts if the type exists.
@@ -361,7 +370,26 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // request builder will use the override path's defaults. This
             // is the same single-source-of-truth read as above.
             const modelInfo = this._registry.getModelInfo(modelToUse.id);
+            // Compute the session fingerprint once from `messages` (the request
+            // input). This is the same value used for `.copilotmd` folder
+            // grouping AND for LiteLLM's `metadata.session_id` (which LiteLLM
+            // promotes to `litellm_session_id` for per-session spend tracking
+            // and cache grouping). Computing it here — before the body is
+            // built — lets us inject it into the body in the same pass.
+            sessionFingerprint = computeSessionFingerprint(messages);
             const requestBody = await this.buildOpenAIChatRequest(messages, modelToUse, options, modelInfo, caller);
+            // Inject the session fingerprint into the request body's metadata
+            // so LiteLLM's proxy can group spend logs and cache entries by
+            // session. LiteLLM reads `metadata.session_id` and promotes it to
+            // `litellm_session_id` (see `litellm/litellm_core_utils/get_litellm_params.py`).
+            // We always set this — even when `.copilotmd` export is disabled —
+            // because per-session spend tracking is useful independent of the
+            // debug-log export. The fingerprint is deterministic per session,
+            // so all turns of one chat session share one `litellm_session_id`.
+            requestBody.metadata = {
+                ...(requestBody.metadata ?? {}),
+                session_id: sessionFingerprint,
+            };
             // Expose the built body to the outer scope so the failure/cancel
             // paths can still render a `.copilotmd` entry if the stream fails
             // after the request was shaped. Read-only alias to avoid accidental
@@ -513,6 +541,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                                 usage: snapshot,
                                 responseParts: responsePartCollector.parts,
                                 status: "success",
+                                sessionFingerprint,
                             } satisfies CopilotMdEntry);
 
                             // Return early - all processing complete, prevent fall-through
@@ -655,6 +684,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 usage: snapshot,
                 responseParts: responsePartCollector.parts,
                 status: "success",
+                sessionFingerprint,
             } satisfies CopilotMdEntry);
 
             // Usage data is now handled exclusively by StreamTokenCapture
@@ -778,6 +808,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     responseParts: responsePartCollector.parts,
                     status: "failure",
                     statusReason: errorMessage,
+                    sessionFingerprint,
                 } satisfies CopilotMdEntry);
             }
 

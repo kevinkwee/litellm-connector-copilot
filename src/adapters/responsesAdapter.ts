@@ -253,6 +253,11 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
         // and the connector keeps a single canonical request shape.
         reasoning_effort: requestBody.reasoning_effort,
         stream_options: requestBody.stream_options,
+        // Propagate LiteLLM proxy metadata (notably `session_id` →
+        // `litellm_session_id` for per-session spend tracking) so the
+        // `/responses` endpoint gets the same session grouping as
+        // `/chat/completions`. See `OpenAIChatCompletionRequest.metadata`.
+        metadata: requestBody.metadata,
     };
 
     if (requestBody.tools) {

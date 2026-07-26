@@ -85,6 +85,19 @@ export interface CopilotMdEntry {
     status: "success" | "failure" | "canceled";
     /** When `status` is "failure" or "canceled", the human-readable reason. */
     statusReason?: string;
+    /**
+     * Pre-computed session fingerprint (8-char hex). When provided, the
+     * writer uses it directly as the session subfolder name instead of
+     * recomputing from `requestMessages`. The chat provider computes this
+     * once at the top of `provideLanguageModelChatResponse` so it can:
+     *   1. Inject it into `requestBody.metadata.session_id` for LiteLLM
+     *      per-session spend tracking / cache grouping.
+     *   2. Pass the same value here so the `.copilotmd` file lands in the
+     *      same session folder as the LiteLLM spend-log row.
+     * When omitted (e.g. in unit tests that don't care about the folder),
+     * the writer falls back to {@link computeSessionFingerprint}.
+     */
+    sessionFingerprint?: string;
 }
 
 const MARKDOWN_FENCE = "~~~";

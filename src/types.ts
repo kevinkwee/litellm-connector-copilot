@@ -315,6 +315,24 @@ export interface OpenAIChatCompletionRequest {
     tool_choice?: string | object;
     stream_options?: { include_usage?: boolean };
     /**
+     * LiteLLM proxy metadata. The proxy reads `metadata.session_id` and
+     * promotes it to `litellm_session_id` (see
+     * `litellm/litellm_core_utils/get_litellm_params.py`), which drives
+     * per-session spend tracking, cache grouping, and the `session_id`
+     * column in the spend logs / `LiteLLM_SpendLogs` table.
+     *
+     * The connector sets `session_id` to the same fingerprint it uses for
+     * `.copilotmd` session folder grouping, so a request's spend-log row
+     * and its `.copilotmd` file land under the same session key. This is
+     * opt-in via `litellm-connector.debug.copilotMdExport.enabled` — when
+     * the export is off, no `metadata` is attached and LiteLLM falls back
+     * to its default session-id behavior (a per-request UUID).
+     */
+    metadata?: {
+        session_id?: string;
+        [key: string]: unknown;
+    };
+    /**
      * OpenAI-compatible reasoning effort hint accepted by LiteLLM in flat top-level
      * snake_case form on both `/chat/completions` and `/responses`. LiteLLM translates
      * this to the appropriate provider-specific shape internally (e.g. nested
@@ -373,6 +391,15 @@ export interface LiteLLMResponsesRequest {
      */
     reasoning_effort?: string | { effort: string; summary?: string };
     stream_options?: { include_usage?: boolean };
+    /**
+     * LiteLLM proxy metadata — same shape and purpose as
+     * `OpenAIChatCompletionRequest.metadata`. The responses adapter
+     * propagates it from the chat-shaped request body during transformation.
+     */
+    metadata?: {
+        session_id?: string;
+        [key: string]: unknown;
+    };
     /**
      * LiteLLM passthrough body.
      * Used for features like caching controls.
