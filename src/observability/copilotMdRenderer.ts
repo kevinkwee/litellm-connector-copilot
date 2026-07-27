@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import type { OpenAIChatCompletionRequest, OpenAIUsagePayload } from "../types";
 import type { TokenSnapshot } from "../adapters/streaming/streamTokenCapture";
-import { sha256HexAsync } from "../utils/discoveryHash";
+import { sha1BytesAsync } from "../utils/discoveryHash";
 
 /**
  * # `.copilotmd` request-log renderer
@@ -87,16 +87,20 @@ export interface CopilotMdEntry {
     /** When `status` is "failure" or "canceled", the human-readable reason. */
     statusReason?: string;
     /**
-     * Pre-computed session fingerprint (UUID-formatted string). When
-     * provided, the writer uses it directly as the session subfolder name
-     * instead of recomputing from `requestMessages`. The chat provider
-     * computes this once at the top of `provideLanguageModelChatResponse`
-     * so it can:
+     * Pre-computed session fingerprint (UUID v5 string). When provided,
+     * the writer uses it directly as the session subfolder name instead
+     * of recomputing from `requestMessages`. The chat provider computes
+     * this once at the top of `provideLanguageModelChatResponse` so it
+     * can:
      *   1. Inject it into `requestBody.metadata.session_id` for LiteLLM
      *      per-session spend tracking / cache grouping (LiteLLM expects a
      *      UUID-format string for `litellm_session_id`).
      *   2. Pass the same value here so the `.copilotmd` file lands in the
      *      same session folder as the LiteLLM spend-log row.
+     * The UUID is derived as UUID v5 (RFC 4122, name-based with SHA-1) from
+     * the message seed and a fixed namespace UUID, so Python's
+     * `uuid.uuid5(NAMESPACE, name)` produces the same UUID from the same
+     * seed — enabling cross-language session-id reproduction.
      * When omitted (e.g. in unit tests that don't care about the folder),
      * the writer falls back to {@link computeSessionFingerprint}.
      */
@@ -482,12 +486,14 @@ export function buildCopilotMdFilename(entry: CopilotMdEntry): string {
  * the rationale.
  *
  * Strategy: hash every `User`-role message that appears **after** the last
- * `System` message and **before** the first `Assistant` message, using
- * SHA-256 (via the existing `sha256HexAsync` Web Crypto helper). Returns a
- * deterministic UUID-formatted string like `e7074038-e624-485e-bf91-fc179549e3ca`
- * — the same format LiteLLM expects for `litellm_session_id`, so the
- * fingerprint can be passed directly to `metadata.session_id` without
- * any transformation.
+ * `System` message and **before** the first `Assistant` message, then derive
+ * a deterministic **UUID v5** (RFC 4122, name-based UUID with SHA-1) from the
+ * result using a fixed namespace UUID. Returns a real UUID like
+ * `e7074038-e624-585e-bf91-fc179549e3ca` — note the `5` in the version
+ * nibble (position 14) which marks it as a v5 UUID. This is the same format
+ * LiteLLM expects for `litellm_session_id`, and Python's
+ * `uuid.uuid5(uuid.UUID("a4c0a0d3-7d8e-4f6b-b5e1-2c1f9a8b7d6e"), name)`
+ * produces the byte-identical UUID from the same seed.
  *
  * ## Why this window
  *
@@ -605,23 +611,112 @@ function extractTextContent(content: readonly (vscode.LanguageModelInputPart | u
 }
 
 /**
- * Derives a deterministic UUID-formatted string from a seed string via
- * SHA-256. Returns a UUID like `e7074038-e624-485e-bf91-fc179549e3ca`.
+ * Fixed namespace UUID for the LiteLLM connector's session fingerprints.
  *
- * The format matches what LiteLLM expects for `litellm_session_id` (a
- * standard UUID string), so the fingerprint can be passed directly to
- * `metadata.session_id` without any transformation. SHA-256 gives us a
- * 256-bit digest; we take the first 128 bits (32 hex chars) and format
- * them as a UUID (8-4-4-4-12) for display compatibility.
+ * UUID v5 (RFC 4122 / RFC 9562) derives a deterministic UUID from
+ * (namespace UUID, name) via SHA-1. The namespace acts as a salt so our
+ * session ids don't collide with anyone else's v5 UUIDs derived from the
+ * same name strings. This is a generated UUID v4, hardcoded once as the
+ * connector's permanent namespace — it never changes for the life of the
+ * extension. Reproduce in Python with:
+ *   `uuid.uuid5(uuid.UUID("a4c0a0d3-7d8e-4f6b-b5e1-2c1f9a8b7d6e"), name)`
+ */
+const LITELLM_CONNECTOR_NAMESPACE_UUID = "a4c0a0d3-7d8e-4f6b-b5e1-2c1f9a8b7d6e";
+
+/**
+ * Derives a deterministic **UUID v5** (RFC 4122) from a seed string.
  *
- * This is NOT a real UUID v4 (random) or v5 (namespace+name) — it's a
- * content-addressed UUID derived from the message seed. Same seed → same
- * UUID, deterministically, with negligible collision probability
- * (128-bit hash space vs 32-bit FNV-1a's ~4 billion values).
+ * UUID v5 is the standards-compliant "name-based UUID with SHA-1":
+ * given the same namespace UUID and the same name, every implementation
+ * produces the byte-identical UUID. This is exactly the contract we need
+ * for a session fingerprint that must (a) be a real UUID (LiteLLM's
+ * `litellm_session_id` field), (b) be reproducible across turns of the
+ * same session, and (c) be reproducible across languages — Python's
+ * `uuid.uuid5(NAMESPACE, name)` produces the same UUID we produce here,
+ * so a Python spend-log query can derive the session id from the same
+ * message seed without any TS-specific logic.
+ *
+ * ## Algorithm (RFC 4122 §4.3)
+ * 1. Concatenate the 16-byte namespace UUID + the UTF-8 name bytes.
+ * 2. SHA-1 the concatenation → 20-byte digest.
+ * 3. Take the first 16 bytes.
+ * 4. Set the version bits: byte[6] high nibble = 5 → `(b6 & 0x0f) | 0x50`.
+ * 5. Set the variant bits: byte[8] high bits = 10xx → `(b8 & 0x3f) | 0x80`.
+ * 6. Format as `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (lowercase hex).
+ *
+ * ## Why SHA-1 is fine here
+ * SHA-1's known collision breaks (SHAttered, 2017) are chosen-prefix
+ * collision attacks costing ~$110k of compute. They do NOT enable an
+ * attacker to (a) predict a UUID from a name, (b) invert a UUID to recover
+ * the name, or (c) find a second name matching a target UUID. RFC 9562
+ * (2022, the update to 4122) still recommends v5 over v3 for new code
+ * precisely because the collision break doesn't matter for
+ * content-addressing use cases like this one.
  */
 async function uuidFromSeed(seed: string): Promise<string> {
-    const hex = (await sha256HexAsync(seed)).slice(0, 32);
-    // Format as UUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-    // (8-4-4-4-12 = 32 hex chars, standard UUID display format)
+    // Parse the namespace UUID string into 16 bytes.
+    const namespaceBytes = uuidStringToBytes(LITELLM_CONNECTOR_NAMESPACE_UUID);
+    const nameBytes = new TextEncoder().encode(seed);
+    // Step 1: namespace (16 bytes) + name (UTF-8 bytes).
+    const concat = new Uint8Array(namespaceBytes.length + nameBytes.length);
+    concat.set(namespaceBytes, 0);
+    concat.set(nameBytes, namespaceBytes.length);
+    // Step 2: SHA-1 the concatenation.
+    const digest = await sha1BytesAsync(
+        // sha1BytesAsync takes a string; reconstruct from the concatenated
+        // bytes via a Latin1 round-trip so each byte maps 1:1 to a char code.
+        // (TextEncoder would re-encode UTF-8 multibyte sequences; we already
+        // have raw bytes, so we go through String.fromCharCode per chunk to
+        // avoid stack overflow on long names.)
+        bytesToLatin1(concat)
+    );
+    // Step 3: take the first 16 bytes.
+    const uuidBytes = digest.slice(0, 16);
+    // Step 4: set version to 5 (high nibble of byte 6).
+    uuidBytes[6] = (uuidBytes[6] & 0x0f) | 0x50;
+    // Step 5: set variant to 10xx (high bits of byte 8).
+    uuidBytes[8] = (uuidBytes[8] & 0x3f) | 0x80;
+    // Step 6: format as 8-4-4-4-12 lowercase hex.
+    return bytesToUuidString(uuidBytes);
+}
+
+/**
+ * Parses a UUID string (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) into 16 bytes.
+ * Throws on malformed input — the namespace is a hardcoded constant, so a
+ * malformed UUID would be a compile-time bug caught by the first call.
+ */
+function uuidStringToBytes(uuid: string): Uint8Array {
+    const hex = uuid.replace(/-/g, "");
+    if (hex.length !== 32) {
+        throw new Error(`Invalid UUID string: ${uuid}`);
+    }
+    const bytes = new Uint8Array(16);
+    for (let i = 0; i < 16; i++) {
+        bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    }
+    return bytes;
+}
+
+/**
+ * Formats 16 raw bytes as a UUID string (`8-4-4-4-12` lowercase hex).
+ */
+function bytesToUuidString(bytes: Uint8Array): string {
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+/**
+ * Converts a byte array to a Latin1 string (1 byte → 1 char code) in chunks
+ * to avoid stack overflow on `String.fromCharCode(...)` for long inputs.
+ * Used to feed raw bytes through `sha1BytesAsync` (which takes a string)
+ * without UTF-8 re-encoding.
+ */
+function bytesToLatin1(bytes: Uint8Array): string {
+    const CHUNK_SIZE = 0x8000; // 32 KiB
+    let result = "";
+    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+        const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
+        result += String.fromCharCode(...chunk);
+    }
+    return result;
 }

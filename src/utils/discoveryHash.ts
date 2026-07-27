@@ -16,6 +16,22 @@ export async function sha256HexAsync(input: string): Promise<string> {
 }
 
 /**
+ * Web-compatible SHA-1 hash returning raw bytes, using SubtleCrypto.
+ *
+ * SHA-1 is the hash required by RFC 4122 for UUID v5 (name-based UUID with
+ * SHA-1). SHA-1's known collision breaks (SHAttered, 2017) are chosen-prefix
+ * collision attacks and do NOT compromise UUID v5's content-addressing use
+ * case — RFC 9562 (2022) still recommends v5 over v3 for new code. We expose
+ * the raw bytes (not hex) because the UUID v5 algorithm needs to manipulate
+ * individual bytes to set the version and variant bits before formatting.
+ */
+export async function sha1BytesAsync(input: string): Promise<Uint8Array> {
+    const data = new TextEncoder().encode(input);
+    const hashBuffer = await globalThis.crypto.subtle.digest("SHA-1", data);
+    return new Uint8Array(hashBuffer);
+}
+
+/**
  * Synchronous SHA-256 is NOT supported in web environments.
  * Use sha256HexAsync for all hash operations.
  * @throws Error always - sync crypto not available
