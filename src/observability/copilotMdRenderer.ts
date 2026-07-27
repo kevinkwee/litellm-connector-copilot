@@ -239,17 +239,20 @@ export function renderCopilotMd(entry: CopilotMdEntry): string {
  *   with newlines.
  */
 function requestMessageToMarkdown(message: vscode.LanguageModelChatRequestMessage): string {
-    const role = roleToString(message.role);
-    const capitalizedRole = role.charAt(0).toUpperCase() + role.slice(1);
+    const parts = Array.isArray(message.content) ? message.content : [];
+
+    // Detect tool-result-only messages: when every part is a
+    // LanguageModelToolResultPart, render as `### Tool` (matching Copilot's
+    // Raw.ChatRole.Tool rendering) instead of `### User`. VS Code sends tool
+    // results as User-role messages with tool-result parts; the role is
+    // technically User but the semantic role is Tool.
+    const isToolResultMessage =
+        parts.length > 0 && parts.every((p) => p instanceof vscode.LanguageModelToolResultPart);
+
+    const roleLabel = isToolResultMessage ? "Tool" : roleToString(message.role);
+    const capitalizedRole = roleLabel.charAt(0).toUpperCase() + roleLabel.slice(1);
 
     let str = `### ${capitalizedRole}\n${MARKDOWN_FENCE}md\n`;
-
-    // Tool-role messages in Copilot's format prepend `🛠️ {toolCallId}` before
-    // any content. In the LanguageModelChatRequestMessage shape, tool results
-    // are parts inside content (LanguageModelToolResultPart) — we still want
-    // the 🛠️ marker per result, so we emit it inside the content walk below
-    // rather than as a header prefix.
-    const parts = Array.isArray(message.content) ? message.content : [];
 
     const renderedParts: string[] = [];
     for (const part of parts) {
@@ -281,6 +284,20 @@ function requestPartToMarkdown(part: vscode.LanguageModelInputPart | unknown): s
     // LanguageModelTextPart — plain text content.
     if (part instanceof vscode.LanguageModelTextPart) {
         return (part as vscode.LanguageModelTextPart).value;
+    }
+    // LanguageModelThinkingPart — model's internal reasoning/thinking content.
+    // Rendered as `reasoning: {text}` to match Copilot's opaque-content branch
+    // for thinking data (see messageStringify.ts → rawPartAsThinkingData). The
+    // `{"$mid":22,"value":"..."}` garbage in the first export was this part
+    // falling through to the JSON.stringify fallback — the $mid is VS Code's
+    // internal marshalling ID, not meaningful content.
+    const ThinkingPart = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart as
+        | (new (value: string | string[], id?: string, metadata?: Record<string, unknown>) => unknown)
+        | undefined;
+    if (ThinkingPart && part instanceof ThinkingPart) {
+        const thinkingPart = part as { value: string | string[]; id?: string };
+        const text = Array.isArray(thinkingPart.value) ? thinkingPart.value.join("\n") : thinkingPart.value;
+        return `reasoning: ${text}`;
     }
     // LanguageModelDataPart — opaque binary data; serialize as JSON like Copilot
     // does for non-text image content.
@@ -355,11 +372,30 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
             // response body — they're metadata. Skip silently.
             continue;
         } else {
-            // Unknown part type (e.g. LanguageModelThinkingPart from a
-            // proposed API we don't model yet). Skip rather than emitting
-            // a confusing line — thinking content is not part of the
-            // assistant's visible response.
-            continue;
+            // Check for LanguageModelThinkingPart (proposed API). The class
+            // may not be available in all VS Code builds, so we resolve it
+            // lazily via the vscode namespace rather than a static import.
+            const ThinkingPart = (vscode as unknown as Record<string, unknown>)
+                .LanguageModelThinkingPart as
+                | (new (value: string | string[], id?: string, metadata?: Record<string, unknown>) => unknown)
+                | undefined;
+            if (ThinkingPart && part instanceof ThinkingPart) {
+                // Thinking/reasoning content. Flush any pending text first so
+                // the reasoning doesn't run together with the response text,
+                // then emit as `reasoning: {text}` — matching Copilot's
+                // opaque-content rendering for thinking data.
+                flushText();
+                const thinkingPart = part as unknown as { value: string | string[]; id?: string };
+                const text = Array.isArray(thinkingPart.value)
+                    ? thinkingPart.value.join("\n")
+                    : thinkingPart.value;
+                lines.push(`reasoning: ${text}`);
+            } else {
+                // Unknown part type — skip rather than emitting a confusing
+                // JSON.stringify line (which produced the `{"$mid":22,...}`
+                // garbage in the first export).
+                continue;
+            }
         }
     }
     // Flush any trailing text so the response doesn't end mid-buffer.

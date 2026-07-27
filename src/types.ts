@@ -35,6 +35,19 @@ export interface OpenAIChatMessage {
     name?: string;
     tool_calls?: OpenAIToolCall[];
     tool_call_id?: string;
+    /**
+     * Reasoning/thinking content from the model's internal reasoning process.
+     * LiteLLM passes this through to upstream providers that support it
+     * (GLM-5.2, DeepSeek, Qwen, etc.) and also accepts it on assistant
+     * messages sent back as conversation history — so the model can see
+     * its own prior reasoning on subsequent turns. This is separate from
+     * `content` (the model's visible response text) to match the
+     * `reasoning_content` field that LiteLLM and reasoning-native providers
+     * use in both request and response payloads.
+     *
+     * See: https://docs.litellm.ai/docs/reasoning_content
+     */
+    reasoning_content?: string;
 }
 
 /**

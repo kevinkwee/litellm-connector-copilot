@@ -309,6 +309,12 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
         const contentItems: OpenAIChatMessageContentItem[] = [];
         const toolCalls: OpenAIToolCall[] = [];
         const toolResults: { callId: string; content: string }[] = [];
+        // Reasoning/thinking text collected from LanguageModelThinkingPart parts.
+        // Kept separate from `textParts` so it goes into the assistant message's
+        // `reasoning_content` field (not `content`) — matching LiteLLM's
+        // `reasoning_content` convention for reasoning-native providers
+        // (GLM-5.2, DeepSeek, Qwen, etc.).
+        const reasoningParts: string[] = [];
 
         for (const part of m.content ?? []) {
             if (part instanceof vscode.LanguageModelTextPart) {
@@ -365,13 +371,46 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
                 );
                 const content = collectToolResultText(part as { content?: readonly unknown[] });
                 toolResults.push({ callId, content });
+            } else if (isThinkingPart(part)) {
+                // LanguageModelThinkingPart — model's internal reasoning/thinking
+                // content. Collected into `reasoningParts` (separate from
+                // `textParts`) so it goes into the assistant message's
+                // `reasoning_content` field, NOT `content`. This matches LiteLLM's
+                // `reasoning_content` convention for reasoning-native providers
+                // (GLM-5.2, DeepSeek, Qwen, etc.) which accept and return
+                // `reasoning_content` as a distinct field on assistant messages.
+                //
+                // Putting reasoning in `content` would be incorrect — the model
+                // would see its reasoning as regular response text, not as
+                // reasoning, which breaks the reasoning chain semantics and can
+                // confuse the model about what it actually said vs. what it
+                // thought. With `reasoning_content`, the model correctly
+                // distinguishes "this was my internal reasoning before the tool
+                // call" from "this was my visible response."
+                //
+                // See: https://docs.litellm.ai/docs/reasoning_content
+                const thinkingText = getThinkingPartText(part);
+                if (thinkingText) {
+                    reasoningParts.push(thinkingText);
+                    Logger.trace(`[convertMessages] Thinking part: ${thinkingText.length} chars → reasoning_content`);
+                }
             }
         }
 
         let emittedAssistantToolCall = false;
+        // Combine all reasoning parts into one string for the assistant message's
+        // `reasoning_content` field. Only set on assistant-role messages; system
+        // and user messages don't carry reasoning content.
+        const reasoningContent = reasoningParts.length > 0 ? reasoningParts.join("\n") : undefined;
+
         if (toolCalls.length > 0) {
             const messageContent = buildMessageContent(textParts, contentItems);
-            out.push({ role: "assistant", content: messageContent || undefined, tool_calls: toolCalls });
+            out.push({
+                role: "assistant",
+                content: messageContent || undefined,
+                tool_calls: toolCalls,
+                ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+            });
             emittedAssistantToolCall = true;
         }
 
@@ -384,7 +423,11 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
             if (role === "system" || role === "user" || (role === "assistant" && !emittedAssistantToolCall)) {
                 const messageContent = buildMessageContent(textParts, contentItems);
                 if (messageContent) {
-                    out.push({ role: role || "user", content: messageContent });
+                    out.push({
+                        role: role || "user",
+                        content: messageContent,
+                        ...(reasoningContent && role === "assistant" ? { reasoning_content: reasoningContent } : {}),
+                    });
                 }
             }
         }
@@ -827,6 +870,44 @@ export function isToolResultPart(value: unknown): value is { callId: string; con
     const hasCallId = typeof obj.callId === "string";
     const hasContent = "content" in obj;
     return hasCallId && hasContent;
+}
+
+/**
+ * Detects `LanguageModelThinkingPart` (a proposed-API class for model
+ * reasoning/thinking content) without a static `instanceof` check. The class
+ * may not be available in all VS Code builds, so we resolve it lazily from the
+ * `vscode` namespace and fall back to duck-typing on the `value` + `id` shape.
+ */
+export function isThinkingPart(value: unknown): boolean {
+    if (!value || typeof value !== "object") {
+        return false;
+    }
+    // Try instanceof first (most reliable when the class is available).
+    const ThinkingPart = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart as
+        | (new (...args: unknown[]) => unknown)
+        | undefined;
+    if (ThinkingPart && value instanceof ThinkingPart) {
+        return true;
+    }
+    // Duck-type fallback: has a `value` property that's string or string[].
+    const obj = value as Record<string, unknown>;
+    return (
+        "value" in obj &&
+        (typeof obj.value === "string" || (Array.isArray(obj.value) && obj.value.every((v) => typeof v === "string")))
+    );
+}
+
+/**
+ * Extracts the text content from a `LanguageModelThinkingPart`. Joins
+ * string arrays with newlines (matching the V2 converter's behavior in
+ * messageConverter.ts line 111).
+ */
+export function getThinkingPartText(part: unknown): string {
+    const obj = part as { value?: string | string[] };
+    if (!obj || !obj.value) {
+        return "";
+    }
+    return Array.isArray(obj.value) ? obj.value.join("\n") : obj.value;
 }
 
 /**

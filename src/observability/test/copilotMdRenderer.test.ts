@@ -259,6 +259,53 @@ suite("renderCopilotMd", () => {
         assert.ok(md.includes("file content here"));
     });
 
+    test("renders tool-result-only messages as ### Tool (not ### User)", () => {
+        // VS Code sends tool results as User-role messages with
+        // LanguageModelToolResultPart parts. Copilot's format renders these
+        // as `### Tool` (Raw.ChatRole.Tool), not `### User`. The renderer
+        // detects the tool-result-only case and relabels the heading.
+        const entry = makeMinimalEntry({
+            requestMessages: [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    content: [
+                        new vscode.LanguageModelToolResultPart("call_1", [
+                            new vscode.LanguageModelTextPart("result text"),
+                        ]),
+                    ],
+                    name: undefined,
+                },
+            ],
+        });
+        const md = renderCopilotMd(entry);
+        assert.ok(md.includes("### Tool"), "tool-result-only message must render as ### Tool");
+        assert.ok(!md.includes("### User\n~~~md\n🛠️ call_1"), "must NOT render as ### User");
+        assert.ok(md.includes("🛠️ call_1"));
+        assert.ok(md.includes("result text"));
+    });
+
+    test("renders mixed User message (text + tool result) as ### User (not ### Tool)", () => {
+        // When a User message has BOTH text and tool-result parts, it's not
+        // a pure tool-result message — keep it as ### User.
+        const entry = makeMinimalEntry({
+            requestMessages: [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    content: [
+                        new vscode.LanguageModelTextPart("here is the file"),
+                        new vscode.LanguageModelToolResultPart("call_1", [
+                            new vscode.LanguageModelTextPart("file content"),
+                        ]),
+                    ],
+                    name: undefined,
+                },
+            ],
+        });
+        const md = renderCopilotMd(entry);
+        assert.ok(md.includes("### User"), "mixed message stays ### User");
+        assert.ok(!md.includes("### Tool"), "mixed message must NOT become ### Tool");
+    });
+
     test("renders the Response section with the assistant text part", () => {
         const entry = makeMinimalEntry({
             responseParts: [new vscode.LanguageModelTextPart("Hello, world!")],
