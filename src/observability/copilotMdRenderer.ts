@@ -371,9 +371,21 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
         }
     };
 
-    /** Flushes both buffers in the correct order (reasoning before text). */
+    /**
+     * Flushes both buffers in the correct order (reasoning before text).
+     * Inserts a blank line between reasoning and text so the boundary is
+     * visually clear in the rendered markdown — without it, the reasoning
+     * line runs directly into the response text with no separation.
+     */
     const flushAll = (): void => {
+        const hadReasoning = reasoningBuffer.length > 0;
+        const hadText = textBuffer.length > 0;
         flushReasoning();
+        // Add a blank line between reasoning and text (or between reasoning
+        // and tool calls) so they don't run together visually.
+        if (hadReasoning && hadText) {
+            lines.push("");
+        }
         flushText();
     };
 
