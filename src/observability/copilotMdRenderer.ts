@@ -254,11 +254,34 @@ function requestMessageToMarkdown(message: vscode.LanguageModelChatRequestMessag
 
     let str = `### ${capitalizedRole}\n${MARKDOWN_FENCE}md\n`;
 
-    const renderedParts: string[] = [];
+    // Separate reasoning from non-reasoning parts so we can insert a visible
+    // separator between them. Each SSE delta creates a separate
+    // LanguageModelThinkingPart, so we buffer and concatenate them into one
+    // `reasoning: {text}` line (same as the response renderer).
+    const ThinkingPart = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart as
+        | (new (value: string | string[], id?: string, metadata?: Record<string, unknown>) => unknown)
+        | undefined;
+
+    const reasoningChunks: string[] = [];
+    const otherParts: string[] = [];
+
     for (const part of parts) {
-        renderedParts.push(requestPartToMarkdown(part));
+        if (ThinkingPart && part instanceof ThinkingPart) {
+            const thinkingPart = part as unknown as { value: string | string[] };
+            const text = Array.isArray(thinkingPart.value) ? thinkingPart.value.join("\n") : thinkingPart.value;
+            reasoningChunks.push(text);
+        } else {
+            otherParts.push(requestPartToMarkdown(part));
+        }
     }
-    str += renderedParts.join("\n");
+
+    if (reasoningChunks.length > 0) {
+        str += `reasoning: ${reasoningChunks.join("")}\n`;
+        if (otherParts.length > 0) {
+            str += `\n---\n\n`;
+        }
+    }
+    str += otherParts.join("\n");
 
     str += `\n${MARKDOWN_FENCE}\n`;
     return str;
@@ -373,17 +396,19 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
 
     /**
      * Flushes both buffers in the correct order (reasoning before text).
-     * Inserts a blank line between reasoning and text so the boundary is
-     * visually clear in the rendered markdown — without it, the reasoning
-     * line runs directly into the response text with no separation.
+     * Inserts a visible `---` separator between reasoning and text/tool-calls
+     * so the boundary between "what the model thought" and "what the model
+     * said/did" is immediately obvious when scanning the rendered markdown.
      */
     const flushAll = (): void => {
         const hadReasoning = reasoningBuffer.length > 0;
         const hadText = textBuffer.length > 0;
         flushReasoning();
-        // Add a blank line between reasoning and text (or between reasoning
-        // and tool calls) so they don't run together visually.
+        // Insert a visible separator between reasoning and the content that
+        // follows (text or tool calls) so they don't run together visually.
         if (hadReasoning && hadText) {
+            lines.push("");
+            lines.push("---");
             lines.push("");
         }
         flushText();
