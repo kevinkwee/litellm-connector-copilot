@@ -64,6 +64,20 @@ export class CopilotMdManager {
     }
 
     /**
+     * Resolves the root folder URI for the configured destination, mirroring
+     * the private {@link resolveRootFolder} logic. Exposed as a public static
+     * so the `openCopilotMdFolder` command can resolve the exact same folder
+     * the manager would write to, without reaching into private state via a
+     * fragile `as unknown as` cast.
+     *
+     * Returns `undefined` when the manager hasn't been initialized (extension
+     * not activated). The command surfaces this as a user-visible warning.
+     */
+    static resolveDestinationRoot(destination: CopilotMdDestination): vscode.Uri | undefined {
+        return this.instance.resolveRootFolder(destination);
+    }
+
+    /**
      * Exports a single request entry to a `.copilotmd` file under the
      * configured destination, then enforces caps.
      *

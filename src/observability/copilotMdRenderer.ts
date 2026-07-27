@@ -300,31 +300,73 @@ function requestPartToMarkdown(part: vscode.LanguageModelInputPart | unknown): s
  * Renders the `## Response` section's `### Assistant\n~~~md\n{...}\n~~~\n` block
  * from the response parts the provider emitted to VS Code's `progress.report()`.
  *
- * Mirrors Copilot's `_renderDeltasToMarkdown` → `processDeltasToMessage`: text
- * parts contribute their text, tool-call parts contribute
- * `🛠️ {name} ({callId}) {args}` lines, thinking parts contribute their text,
- * and data parts (usage) are dropped from the response body (they're already
- * surfaced in the `usage` metadata line).
+ * Mirrors Copilot's `_renderDeltasToMarkdown` → `processDeltasToMessage`:
+ * - **Text parts are concatenated** (not newline-joined), because each SSE
+ *   text chunk is a fragment of one continuous text stream. Joining with
+ *   `\n` would split a single sentence across multiple lines (e.g.
+ *   `"OK"` / `", just"` / `" let me know"` → "OK\n, just\n let me know"
+ *   instead of "OK, just let me know"). The upstream `LanguageModelTextPart`
+ *   instances are emitted one per SSE `delta` event; their `.value` fields
+ *   are already the raw text fragments, so concatenating restores the
+ *   original streamed text.
+ * - **Tool-call parts** render as `🛠️ {name} ({callId}) {args}` lines, each
+ *   on its own line so multiple parallel tool calls stay readable.
+ * - **Thinking parts** would contribute their text (currently dropped —
+ *   the renderer doesn't model `LanguageModelThinkingPart` yet; if the
+ *   proposed API is available, the part falls through to the default
+ *   `JSON.stringify` branch below).
+ * - **Data parts** (usage, cache-control) are dropped from the response
+ *   body — they're metadata, already surfaced in the `usage` metadata line.
+ *
+ * Boundaries between part types get a newline so a text stream followed
+ * by a tool call doesn't run together (`...text🛠️ tool...`).
  */
 function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageModelResponsePart[]): string {
     const capitalizedRole = role.charAt(0).toUpperCase() + role.slice(1);
-    const chunks: string[] = [];
+    const lines: string[] = [];
+    let textBuffer = "";
+
+    /**
+     * Flushes any accumulated text as a single line, then resets the buffer.
+     * Called when we hit a non-text part or at the end of the loop so the
+     * full concatenated text stream becomes one line in the rendered output.
+     */
+    const flushText = (): void => {
+        if (textBuffer) {
+            lines.push(textBuffer);
+            textBuffer = "";
+        }
+    };
+
     for (const part of parts) {
         if (part instanceof vscode.LanguageModelTextPart) {
-            chunks.push((part as vscode.LanguageModelTextPart).value);
+            // Accumulate text fragments into one continuous string. Each SSE
+            // delta is a fragment of the same text stream, so we concatenate
+            // rather than newline-join to preserve the original prose.
+            textBuffer += (part as vscode.LanguageModelTextPart).value;
         } else if (part instanceof vscode.LanguageModelToolCallPart) {
+            // Tool calls go on their own lines. Flush any pending text first
+            // so a text→tool boundary gets a newline.
+            flushText();
             const callPart = part as vscode.LanguageModelToolCallPart;
-            chunks.push(`🛠️ ${callPart.name} (${callPart.callId}) ${prettyToolArgs(callPart.input)}`);
+            lines.push(`🛠️ ${callPart.name} (${callPart.callId}) ${prettyToolArgs(callPart.input)}`);
         } else if (part instanceof vscode.LanguageModelDataPart) {
             // Usage / cache-control data parts don't belong in the rendered
             // response body — they're metadata. Skip silently.
             continue;
+        } else {
+            // Unknown part type (e.g. LanguageModelThinkingPart from a
+            // proposed API we don't model yet). Skip rather than emitting
+            // a confusing line — thinking content is not part of the
+            // assistant's visible response.
+            continue;
         }
-        // LanguageModelToolResultPart is a request-side part; should not appear
-        // in a response stream, but if it does, skip it rather than emitting
-        // a confusing 🛠️ line.
     }
-    return `### ${capitalizedRole}\n${MARKDOWN_FENCE}md\n${chunks.join("\n")}\n${MARKDOWN_FENCE}\n`;
+    // Flush any trailing text so the response doesn't end mid-buffer.
+    flushText();
+
+    const body = lines.length > 0 ? lines.join("\n") : "";
+    return `### ${capitalizedRole}\n${MARKDOWN_FENCE}md\n${body}\n${MARKDOWN_FENCE}\n`;
 }
 
 /**

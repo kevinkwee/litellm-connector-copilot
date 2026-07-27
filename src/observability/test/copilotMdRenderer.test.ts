@@ -270,6 +270,33 @@ suite("renderCopilotMd", () => {
         assert.ok(md.includes("Hello, world!"));
     });
 
+    test("concatenates multiple text parts into one continuous line (SSE chunk merging)", () => {
+        // Each SSE delta event creates a separate LanguageModelTextPart, but
+        // they're fragments of ONE continuous text stream. The renderer must
+        // concatenate them (not newline-join) so a sentence like "OK, just
+        // let me know" stays one line — not "OK\n, just\n let me know".
+        // This is the bug that produced the chunked response in the first
+        // real .copilotmd export.
+        const entry = makeMinimalEntry({
+            responseParts: [
+                new vscode.LanguageModelTextPart("OK"),
+                new vscode.LanguageModelTextPart(", just"),
+                new vscode.LanguageModelTextPart(" let me know"),
+                new vscode.LanguageModelTextPart(" when you need help"),
+                new vscode.LanguageModelTextPart(" with anything"),
+                new vscode.LanguageModelTextPart("."),
+            ],
+        });
+        const md = renderCopilotMd(entry);
+        // The full concatenated sentence should appear on one line.
+        assert.ok(
+            md.includes("OK, just let me know when you need help with anything."),
+            "text parts must be concatenated, not newline-joined"
+        );
+        // And the broken chunked form must NOT appear.
+        assert.ok(!md.includes("OK\n, just"), "text parts must not be newline-joined");
+    });
+
     test("renders tool-call parts in the response as 🛠️ lines", () => {
         const entry = makeMinimalEntry({
             responseParts: [

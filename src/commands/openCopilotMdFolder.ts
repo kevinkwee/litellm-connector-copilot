@@ -90,18 +90,10 @@ export function registerOpenCopilotMdFolderCommand(): vscode.Disposable {
  * Both are inside VS Code's internal storage, never the user's repo folder.
  */
 function resolveDestinationRoot(destination: CopilotMdDestination): vscode.Uri | undefined {
-    // Access the manager's context via the singleton. If the manager hasn't
-    // been initialized yet (extension not activated), we can't resolve either
-    // storage location — return undefined and let the caller warn.
-    const context = (CopilotMdManager as unknown as { context?: vscode.ExtensionContext }).context;
-    if (!context) {
-        return undefined;
-    }
-    if (destination === "workspace") {
-        // `context.storageUri` is undefined when no workspace folder is open;
-        // fall back to global storage so the command still reveals a real
-        // folder in that degenerate case.
-        return context.storageUri ?? context.globalStorageUri;
-    }
-    return context.globalStorageUri;
+    // Delegate to the manager's public static resolver so the command always
+    // agrees with the manager on where files land, without reaching into the
+    // manager's private `context` field via a fragile cast. Returns
+    // `undefined` when the manager hasn't been initialized (extension not
+    // activated) — the caller surfaces that as a user-visible warning.
+    return CopilotMdManager.resolveDestinationRoot(destination);
 }
