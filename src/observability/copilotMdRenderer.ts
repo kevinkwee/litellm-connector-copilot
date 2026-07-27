@@ -342,6 +342,7 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
     const capitalizedRole = role.charAt(0).toUpperCase() + role.slice(1);
     const lines: string[] = [];
     let textBuffer = "";
+    let reasoningBuffer = "";
 
     /**
      * Flushes any accumulated text as a single line, then resets the buffer.
@@ -355,6 +356,27 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
         }
     };
 
+    /**
+     * Flushes any accumulated reasoning as a single `reasoning: {text}` line,
+     * then resets the buffer. Same concatenation logic as `flushText` — each
+     * SSE `delta.reasoning_content` chunk creates a separate
+     * `LanguageModelThinkingPart`, and concatenating them (not newline-joining)
+     * restores the original reasoning prose. Without this, the reasoning
+     * would be split across dozens of `reasoning: {one word}` lines.
+     */
+    const flushReasoning = (): void => {
+        if (reasoningBuffer) {
+            lines.push(`reasoning: ${reasoningBuffer}`);
+            reasoningBuffer = "";
+        }
+    };
+
+    /** Flushes both buffers in the correct order (reasoning before text). */
+    const flushAll = (): void => {
+        flushReasoning();
+        flushText();
+    };
+
     for (const part of parts) {
         if (part instanceof vscode.LanguageModelTextPart) {
             // Accumulate text fragments into one continuous string. Each SSE
@@ -362,9 +384,9 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
             // rather than newline-join to preserve the original prose.
             textBuffer += (part as vscode.LanguageModelTextPart).value;
         } else if (part instanceof vscode.LanguageModelToolCallPart) {
-            // Tool calls go on their own lines. Flush any pending text first
-            // so a text→tool boundary gets a newline.
-            flushText();
+            // Tool calls go on their own lines. Flush any pending
+            // reasoning and text first so boundaries get newlines.
+            flushAll();
             const callPart = part as vscode.LanguageModelToolCallPart;
             lines.push(`🛠️ ${callPart.name} (${callPart.callId}) ${prettyToolArgs(callPart.input)}`);
         } else if (part instanceof vscode.LanguageModelDataPart) {
@@ -380,16 +402,16 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
                 | (new (value: string | string[], id?: string, metadata?: Record<string, unknown>) => unknown)
                 | undefined;
             if (ThinkingPart && part instanceof ThinkingPart) {
-                // Thinking/reasoning content. Flush any pending text first so
-                // the reasoning doesn't run together with the response text,
-                // then emit as `reasoning: {text}` — matching Copilot's
-                // opaque-content rendering for thinking data.
-                flushText();
+                // Accumulate reasoning fragments into one continuous string,
+                // same as text. Each SSE delta.reasoning_content chunk is a
+                // fragment of the same reasoning stream — concatenating
+                // restores the original prose instead of splitting it across
+                // dozens of `reasoning: {one word}` lines.
                 const thinkingPart = part as unknown as { value: string | string[]; id?: string };
                 const text = Array.isArray(thinkingPart.value)
                     ? thinkingPart.value.join("\n")
                     : thinkingPart.value;
-                lines.push(`reasoning: ${text}`);
+                reasoningBuffer += text;
             } else {
                 // Unknown part type — skip rather than emitting a confusing
                 // JSON.stringify line (which produced the `{"$mid":22,...}`
@@ -398,8 +420,9 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
             }
         }
     }
-    // Flush any trailing text so the response doesn't end mid-buffer.
-    flushText();
+    // Flush any trailing reasoning and text so the response doesn't end
+    // mid-buffer.
+    flushAll();
 
     const body = lines.length > 0 ? lines.join("\n") : "";
     return `### ${capitalizedRole}\n${MARKDOWN_FENCE}md\n${body}\n${MARKDOWN_FENCE}\n`;
