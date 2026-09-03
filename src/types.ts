@@ -207,6 +207,17 @@ export interface LiteLLMConfig {
     /** Minimum interval in milliseconds between outward model-discovery change notifications. Default: 2000. */
     discoveryFireMinIntervalMs?: number;
 
+    /**
+     * Maximum transport-level retry attempts for a chat request when the
+     * upstream connection dies mid-response (terminated / fetch failed /
+     * inactivity abort). The retry resumes from already-streamed text so the
+     * chat UI is not duplicated. Default: 3. Set to 0 to disable.
+     */
+    networkRetries?: number;
+
+    /** Base backoff delay in milliseconds for transport retries; doubles per attempt, capped at 30s. Default: 2000. */
+    networkRetryDelayMs?: number;
+
     // sendDefaultParameters was removed in v2.2.0 (deprecated v1.5.0). Use individual modelOptions instead.
 }
 

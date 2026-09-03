@@ -111,6 +111,22 @@ export class StreamTokenCapture {
         return { report: (part) => this._intercept(part) };
     }
 
+    // ── Resume support (populated during streaming, read after a failure) ──
+
+    /**
+     * Drops the token accounting accumulated for a partial response so a
+     * resumed attempt starts from a clean estimator state. The already-emitted
+     * parts stay counted in the request's input-token baseline on the next
+     * round (VS Code rebuilds history), so keeping them here would double-count.
+     */
+    resetAccumulation(): void {
+        this._textBuffer = "";
+        this._reasoningBuffer = "";
+        this._toolCallTokens = 0;
+        this._sawUpstreamUsage = false;
+        this._upstream = undefined;
+    }
+
     // ── Snapshot (call after stream completes) ──
 
     getSnapshot(): TokenSnapshot {

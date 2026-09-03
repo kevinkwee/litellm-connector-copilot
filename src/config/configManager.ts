@@ -21,6 +21,8 @@ export class ConfigManager {
     private static readonly DISCOVERY_CACHE_TTL_MS_KEY = "litellm-connector.discoveryCacheTtlMs";
     private static readonly DISCOVERY_FIRE_DEBOUNCE_MS_KEY = "litellm-connector.discoveryFireDebounceMs";
     private static readonly DISCOVERY_FIRE_MIN_INTERVAL_MS_KEY = "litellm-connector.discoveryFireMinIntervalMs";
+    private static readonly NETWORK_RETRIES_KEY = "litellm-connector.networkRetries";
+    private static readonly NETWORK_RETRY_DELAY_MS_KEY = "litellm-connector.networkRetryDelayMs";
 
     // Discovery config defaults and bounds
     private static readonly DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
@@ -212,6 +214,19 @@ export class ConfigManager {
             ConfigManager.DEFAULT_DISCOVERY_FIRE_MIN_INTERVAL_MS
         );
 
+        const networkRetries = this.clampRange(
+            workspaceConfig.get<number>(ConfigManager.NETWORK_RETRIES_KEY),
+            0,
+            20,
+            3
+        );
+        const networkRetryDelayMs = this.clampRange(
+            workspaceConfig.get<number>(ConfigManager.NETWORK_RETRY_DELAY_MS_KEY),
+            0,
+            30_000,
+            2_000
+        );
+
         return {
             inactivityTimeout,
             disableCaching,
@@ -227,6 +242,8 @@ export class ConfigManager {
             discoveryCacheTtlMs,
             discoveryFireDebounceMs,
             discoveryFireMinIntervalMs,
+            networkRetries,
+            networkRetryDelayMs,
         };
     }
 

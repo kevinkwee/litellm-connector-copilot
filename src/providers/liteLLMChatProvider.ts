@@ -34,6 +34,15 @@ import { emitPartsToVSCode } from "../adapters/streaming/vscodePartEmitter";
 import type { EffortFallbackCache } from "../utils/reasoningEffortFallback";
 import { StreamTokenCapture } from "../adapters/streaming/streamTokenCapture";
 import type { OpenAIChatCompletionRequest } from "../types";
+import {
+    StreamedTextAccumulator,
+    InactivityTimeoutError,
+    isTransportRetriableError,
+    buildResumeMessages,
+    sleepWithCancellation,
+    backoffDelayMs,
+    logTransportRetry,
+} from "../utils/transportRetry";
 
 /**
  * Chat provider implementation for VS Code's LanguageModelChatProvider.
@@ -427,173 +436,130 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // Count the actual transport request after trimming/conversion.
             tokensIn = estimatedTransportInputTokens;
 
+            // ── Transport retry (resume-on-error) ──
+            // A socket death (`terminated` / `fetch failed`) or inactivity abort
+            // kills the upstream request but does NOT undo parts already emitted
+            // to VS Code. Instead of surfacing the transport error (which shows
+            // the bare model chip and kills the turn), retry the request and let
+            // the model continue from the already-streamed text. Text parts
+            // append seamlessly in the chat UI; nothing is duplicated.
+            const retryCfg = await this._configManager.getConfig();
+            const maxTransportRetries = retryCfg.networkRetries ?? 3;
+            const retryBaseDelayMs = retryCfg.networkRetryDelayMs ?? 2000;
+            const accumulator = new StreamedTextAccumulator();
+            const trackedProgress: vscode.Progress<vscode.LanguageModelResponsePart> = {
+                report: (part) => {
+                    accumulator.add(part);
+                    trackingProgress.report(part);
+                },
+            };
+
+            let activeMessages = messages;
             let stream: ReadableStream<Uint8Array>;
-            try {
-                // Note: sendRequestWithRetry may fully handle /responses by emitting directly to progress.
-                // In that case it returns an already-closed stream.
-                stream = await this.sendRequestWithRetry(
-                    requestBody,
-                    messages,
-                    modelToUse,
-                    options,
-                    trackingProgress,
-                    token,
-                    caller,
-                    modelInfo
-                );
-            } catch (err: unknown) {
-                this.logRequestPayloadOnFailure(requestBody, err, {
-                    stage: "provideLanguageModelChatResponse",
-                    modelId: modelToUse.id,
-                    caller,
-                    modelInfoMode: modelInfo?.mode,
-                });
+            let attempt = 0;
+            while (true) {
+                try {
+                    // VS Code may cancel (Stop/steer) during the backoff sleep.
+                    // A post-cancel request is pointless: the ext-host progress
+                    // wrapper drops all subsequently reported parts anyway.
+                    if (token.isCancellationRequested) {
+                        Logger.debug(
+                            `[transportRetry] request=${requestId} cancelled before attempt ${attempt}; aborting`
+                        );
+                        throw Object.assign(new Error("Operation cancelled by user"), { name: "CancellationError" });
+                    }
+                    if (attempt > 0) {
+                        // Resume mid-response: append the already-streamed
+                        // reasoning + text as the trailing assistant message so
+                        // the model continues where the socket died.
+                        activeMessages = buildResumeMessages(messages, accumulator.text, accumulator.thinking);
+                    }
+                    // Note: sendRequestWithRetry may fully handle /responses by emitting directly to progress.
+                    // In that case it returns an already-closed stream.
+                    // Pass a shallow clone per attempt: the inner reasoning-effort
+                    // fallback mutates request.reasoning_effort on failures, and
+                    // reusing the mutated body across attempts would silently
+                    // start a resumed attempt from a lowered effort.
+                    stream = await this.sendRequestWithRetry(
+                        attempt === 0 ? requestBody : { ...requestBody },
+                        activeMessages,
+                        modelToUse,
+                        options,
+                        trackedProgress,
+                        token,
+                        caller,
+                        modelInfo
+                    );
+                    await this.processStreamingResponse(stream, trackedProgress, token);
 
-                if (token.isCancellationRequested) {
-                    throw new Error("Operation cancelled by user", { cause: err });
-                }
-
-                if (err instanceof Error && err.message.includes("LiteLLM API error")) {
-                    const errorText = err.message.split("\n").slice(1).join("\n");
-                    const parsedMessage = this.parseApiError(400, errorText);
+                    // Flush usage data if no upstream usage was seen during streaming
+                    // This ensures usage is always reported to VS Code
+                    const capture = this._tokenCapture;
+                    if (capture) {
+                        capture.flushUsage();
+                    }
+                    break;
+                } catch (err: unknown) {
+                    const isLastAttempt = attempt >= maxTransportRetries;
                     if (
-                        parsedMessage.toLowerCase().includes("unsupported parameter") ||
-                        parsedMessage.toLowerCase().includes("not supported")
+                        token.isCancellationRequested ||
+                        accumulator.sawToolCall ||
+                        !isTransportRetriableError(err) ||
+                        isLastAttempt
                     ) {
-                        Logger.warn(`Retrying request without optional parameters due to: ${parsedMessage}`);
-                        delete requestBody.temperature;
-                        delete requestBody.top_p;
-                        delete requestBody.frequency_penalty;
-                        delete requestBody.presence_penalty;
-                        delete requestBody.stop;
-
-                        if (
-                            parsedMessage.toLowerCase().includes("stream_options") ||
-                            parsedMessage.toLowerCase().includes("include_usage")
-                        ) {
-                            (this as unknown as { _usageOptOutModels: Set<string> })._usageOptOutModels.add(model.id);
-                            delete (requestBody as { stream_options?: { include_usage?: boolean } }).stream_options;
-                        }
-
-                        if (token.isCancellationRequested) {
-                            throw new Error("Operation cancelled by user", { cause: err });
-                        }
-                        try {
-                            stream = await this.sendRequestWithRetry(
-                                requestBody,
-                                messages,
-                                modelToUse,
-                                options,
-                                trackingProgress,
-                                token,
-                                caller,
-                                modelInfo
+                        // A tool call already reached VS Code before the stream
+                        // died: the agent loop may have executed it, so resending
+                        // this request could double-execute the tool. Not
+                        // recoverable here; log it loudly and rethrow.
+                        if (accumulator.sawToolCall && isTransportRetriableError(err) && !isLastAttempt) {
+                            Logger.error(
+                                `[transportRetry] request=${requestId} unrecoverable: tool call was already emitted before the transport error; not retrying to avoid double tool execution`,
+                                err
                             );
-                            await this.processStreamingResponse(stream, trackingProgress, token);
-
-                            // Flush usage after processing the retried stream
-
-                            tokenCapture.flushUsage();
-
-                            const snapshot = tokenCapture.getSnapshot();
-                            const tokensOut = snapshot.completionTokens;
-
-                            const metric = {
+                            StructuredLogger.error("request.transport_retry_blocked_tool_call", {
                                 requestId,
-                                model: modelToUse.id,
-                                durationMs: LiteLLMTelemetry.endTimer(startTime),
-                                tokensIn,
-                                tokensOut,
-                                estimatedInputCost: snapshot.estimatedInputCost,
-                                estimatedOutputCost: snapshot.estimatedOutputCost,
-                                estimatedTotalCost: snapshot.estimatedTotalCost,
-                                status: "success" as const,
-                                caller,
-                            };
-                            LiteLLMTelemetry.reportMetric(metric);
-                            this.logFinalUsageEnvelope(requestId, modelToUse.id, caller, {
-                                tokensIn,
-                                tokensOut,
-                                sawUsageDataPart: snapshot.sawUpstreamUsage,
-                                estimatedInputCost: snapshot.estimatedInputCost,
-                                estimatedOutputCost: snapshot.estimatedOutputCost,
-                                estimatedTotalCost: snapshot.estimatedTotalCost,
+                                attempt,
+                                error: err instanceof Error ? err.message : String(err),
                             });
-
-                            // Fire-and-forget `.copilotmd` export for the retry-success path.
-                            // Mirrors the primary success-path export below; this branch returns
-                            // early so the bottom-of-method export would otherwise be skipped.
-                            void exportCopilotMdEntry({
-                                debugName: caller,
-                                id: requestId.slice(0, 8),
-                                model: modelToUse.id,
-                                url: endpointUrl ?? "litellm-connector",
-                                maxPromptTokens: modelToUse.maxInputTokens,
-                                maxResponseTokens: requestBody.max_tokens,
-                                location: undefined,
-                                body: requestBody,
-                                requestMessages: messages,
-                                startTimeIso: requestStartDate.toISOString(),
-                                endTimeIso: new Date().toISOString(),
-                                durationMs: metric.durationMs,
-                                ourRequestId: requestId,
-                                timeToFirstTokenMs: undefined,
-                                resolvedModel: modelToUse.id,
-                                usage: snapshot,
-                                responseParts: responsePartCollector.parts,
-                                status: "success",
-                                sessionFingerprint,
-                            } satisfies CopilotMdEntry);
-
-                            // Return early - all processing complete, prevent fall-through
-                            // to avoid double-processing the already-consumed stream
-                            return;
-
-                            // Disabling this to reduce noise / unecessary logging
-                            // TODO: look into potentially removing this in the future if don't need it.
-                            /* if (this._telemetryService) {
-                                this._telemetryService.captureChatRequest({
-                                    request_id: requestId,
-                                    caller,
-                                    model: modelToUse.id,
-                                    endpoint: modelInfo?.mode ?? "chat",
-                                    durationMs: metric.durationMs,
-                                    tokensIn: tokensIn ?? 0,
-                                    tokensOut,
-                                    status: "success",
-                                });
-                            } */
-                        } catch (retryErr: unknown) {
-                            // If retry fails, throw a more descriptive error
-                            let retryErrorMessage = retryErr instanceof Error ? retryErr.message : String(retryErr);
-                            if (retryErrorMessage.includes("LiteLLM API error")) {
-                                const statusMatch = retryErrorMessage.match(/error: (\d+)/);
-                                const statusCode = statusMatch ? parseInt(statusMatch[1], 10) : 400;
-                                const errorParts = retryErrorMessage.split("\n");
-                                const errorText = errorParts.length > 1 ? errorParts.slice(1).join("\n") : "";
-                                const parsedMessage = this.parseApiError(statusCode, errorText);
-                                retryErrorMessage = `LiteLLM Error (${model.id}): ${parsedMessage}. This model may not support certain parameters like temperature.`;
-                            }
-                            throw new Error(retryErrorMessage, { cause: retryErr });
                         }
-                    } else {
+                        // Preserve legacy handling for non-transport errors by
+                        // rethrowing into the original catch structure below.
+                        if (attempt === 0) {
+                            this.logRequestPayloadOnFailure(requestBody, err, {
+                                stage: "provideLanguageModelChatResponse",
+                                modelId: modelToUse.id,
+                                caller,
+                                modelInfoMode: modelInfo?.mode,
+                            });
+                        }
                         throw err;
                     }
-                } else {
-                    throw err;
+
+                    attempt += 1;
+                    const delay = backoffDelayMs(attempt, retryBaseDelayMs);
+                    logTransportRetry(
+                        requestId,
+                        attempt,
+                        maxTransportRetries,
+                        err instanceof Error ? err.message : String(err),
+                        accumulator.text.length
+                    );
+                    StructuredLogger.warn("request.transport_retry", {
+                        requestId,
+                        attempt,
+                        maxRetries: maxTransportRetries,
+                        delayMs: delay,
+                        resumedTextChars: accumulator.text.length,
+                        error: err instanceof Error ? err.message : String(err),
+                    });
+                    // Fresh attempt: drop partial-response token accounting so
+                    // the next usage snapshot reflects only the resumed stream.
+                    this._tokenCapture?.resetAccumulation();
+                    await sleepWithCancellation(delay, token);
                 }
             }
 
-            await this.processStreamingResponse(stream, trackingProgress, token);
-
-            // Flush usage data if no upstream usage was seen during streaming
-            // This ensures usage is always reported to VS Code
-            const capture = this._tokenCapture;
-            if (capture) {
-                capture.flushUsage();
-            }
-
-            const snapshot = capture?.getSnapshot() ?? {
+            const snapshot = this._tokenCapture?.getSnapshot() ?? {
                 promptTokens: tokensIn ?? 0,
                 cachedTokens: 0,
                 cacheCreationInputTokens: 0,
@@ -605,6 +571,11 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 rejectedPredictionTokens: 0,
                 sawUpstreamUsage: false,
             };
+
+            // Orphaned legacy param-strip 400 retry and duplicated bottom
+            // stream processing removed; the transport retry loop above now
+            // owns the full send + stream lifecycle.
+
             const tokensOut = Math.max(snapshot.completionTokens, snapshot.toolTokens);
             const tokensInForTelemetry = snapshot.promptTokens ?? tokensIn;
             const reasoningTokens = snapshot.reasoningTokens || undefined;
@@ -849,6 +820,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         const timeoutMs = (config.inactivityTimeout ?? 60) * 1000;
         let watchdog: NodeJS.Timeout | undefined;
         let eventCount = 0;
+        let wasWatchdogAbort = false;
 
         // Create an AbortController to actually cancel the stream on timeout
         const controller = new AbortController();
@@ -865,6 +837,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     timeoutMs,
                     eventCount,
                 });
+                wasWatchdogAbort = true;
                 controller.abort();
             }, timeoutMs);
         };
@@ -984,6 +957,13 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         recoveryError: recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr),
                     });
                 }
+            }
+
+            // A watchdog abort ends the stream without a transport exception.
+            // Re-throw it as the retryable sentinel so the transport-retry loop
+            // in provideLanguageModelChatResponse can resume the response.
+            if (wasWatchdogAbort) {
+                throw new InactivityTimeoutError(timeoutMs, eventCount);
             }
 
             throw error;

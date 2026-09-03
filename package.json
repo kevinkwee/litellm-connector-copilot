@@ -182,6 +182,20 @@
 					"default": 60,
 					"description": "Timeout in seconds of inactivity before the LiteLLM proxy connection is considered idle."
 				},
+				"litellm-connector.networkRetries": {
+					"type": "number",
+					"default": 3,
+					"minimum": 0,
+					"maximum": 20,
+					"description": "Maximum transport-level retry attempts when the upstream connection dies mid-response (terminated / fetch failed / inactivity abort). The retry resumes from already-streamed text so the chat UI is not duplicated. Set to 0 to disable."
+				},
+				"litellm-connector.networkRetryDelayMs": {
+					"type": "number",
+					"default": 2000,
+					"minimum": 0,
+					"maximum": 30000,
+					"description": "Base backoff delay in milliseconds for transport retries; doubles per attempt, capped at 30s."
+				},
 				"litellm-connector.disableCaching": {
 					"type": "boolean",
 					"default": true,
