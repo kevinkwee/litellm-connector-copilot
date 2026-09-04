@@ -196,6 +196,20 @@
 					"maximum": 30000,
 					"description": "Base backoff delay in milliseconds for transport retries; doubles per attempt, capped at 30s."
 				},
+				"litellm-connector.emptyResponseRetries": {
+					"type": "number",
+					"default": 2,
+					"minimum": 0,
+					"maximum": 10,
+					"description": "Maximum retries for a cleanly-completed stream that produced only reasoning (no text, no tool calls). The retry appends the partial reasoning to the request so the model continues its thought. Separate budget from networkRetries because reasoning-only responses cluster in upstream bursts. Set to 0 to disable."
+				},
+				"litellm-connector.emptyResponseRetryDelayMs": {
+					"type": "number",
+					"default": 1000,
+					"minimum": 0,
+					"maximum": 30000,
+					"description": "Base backoff delay in milliseconds for reasoning-only retries; doubles per attempt, capped at 30s."
+				},
 				"litellm-connector.disableCaching": {
 					"type": "boolean",
 					"default": true,

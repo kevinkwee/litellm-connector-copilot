@@ -37,6 +37,7 @@ import type { OpenAIChatCompletionRequest } from "../types";
 import {
     StreamedTextAccumulator,
     InactivityTimeoutError,
+    ReasoningOnlyError,
     isTransportRetriableError,
     buildResumeMessages,
     sleepWithCancellation,
@@ -443,10 +444,18 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // the bare model chip and kills the turn), retry the request and let
             // the model continue from the already-streamed text. Text parts
             // append seamlessly in the chat UI; nothing is duplicated.
+            //
+            // Reasoning-only completions get a SEPARATE, smaller budget
+            // (emptyResponseRetries): they are not transport failures but
+            // upstream content truncations, and they cluster in bursts, so a
+            // bigger budget just delays the same failure.
             const retryCfg = await this._configManager.getConfig();
             const maxTransportRetries = retryCfg.networkRetries ?? 3;
             const retryBaseDelayMs = retryCfg.networkRetryDelayMs ?? 2000;
+            const maxEmptyRetries = retryCfg.emptyResponseRetries ?? 2;
+            const emptyBaseDelayMs = retryCfg.emptyResponseRetryDelayMs ?? 1000;
             const accumulator = new StreamedTextAccumulator();
+            const contentCounters = { sawTextPart: false, sawToolCallPart: false, sawUsagePart: false };
             const trackedProgress: vscode.Progress<vscode.LanguageModelResponsePart> = {
                 report: (part) => {
                     accumulator.add(part);
@@ -457,6 +466,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             let activeMessages = messages;
             let stream: ReadableStream<Uint8Array>;
             let attempt = 0;
+            let emptyAttempt = 0;
             while (true) {
                 try {
                     // VS Code may cancel (Stop/steer) during the backoff sleep.
@@ -490,7 +500,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         caller,
                         modelInfo
                     );
-                    await this.processStreamingResponse(stream, trackedProgress, token);
+                    await this.processStreamingResponse(stream, trackedProgress, token, contentCounters);
 
                     // Flush usage data if no upstream usage was seen during streaming
                     // This ensures usage is always reported to VS Code
@@ -500,6 +510,47 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     }
                     break;
                 } catch (err: unknown) {
+                    // ── Reasoning-only budget (separate from transport) ──
+                    if (err instanceof ReasoningOnlyError) {
+                        if (emptyAttempt < maxEmptyRetries && !token.isCancellationRequested) {
+                            emptyAttempt += 1;
+                            const delay = backoffDelayMs(emptyAttempt, emptyBaseDelayMs);
+                            Logger.warn(
+                                `[transportRetry] request=${requestId} reasoning-only response, retry ${emptyAttempt}/${maxEmptyRetries} ` +
+                                    `(resuming with ${accumulator.thinking.length} reasoning chars)`
+                            );
+                            StructuredLogger.warn("request.reasoning_only_retry", {
+                                requestId,
+                                attempt: emptyAttempt,
+                                maxRetries: maxEmptyRetries,
+                                delayMs: delay,
+                                resumedReasoningChars: accumulator.thinking.length,
+                            });
+                            this._tokenCapture?.resetAccumulation();
+                            await sleepWithCancellation(delay, token);
+                            // Do NOT count this against the transport attempt
+                            // budget; treat the next iteration as a fresh resume.
+                            continue;
+                        }
+                        // Exhausted: throw a distinct error so the chip explains
+                        // the failure instead of "no response was returned".
+                        Logger.error(
+                            `[transportRetry] request=${requestId} reasoning-only response persisted after ${emptyAttempt} resume attempt(s); failing request`
+                        );
+                        StructuredLogger.error("request.reasoning_only_exhausted", {
+                            requestId,
+                            attempts: emptyAttempt,
+                            config: maxEmptyRetries,
+                        });
+                        throw new Error(
+                            `LiteLLM: model returned reasoning-only response (no text or tool calls) ` +
+                                `after ${emptyAttempt} resume attempt(s). The upstream provider is ` +
+                                `truncating generation mid-reasoning; try resending.`,
+                            { cause: err }
+                        );
+                    }
+
+                    // ── Transport budget ──
                     const isLastAttempt = attempt >= maxTransportRetries;
                     if (
                         token.isCancellationRequested ||
@@ -809,7 +860,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
     protected async processStreamingResponse(
         responseBody: ReadableStream<Uint8Array>,
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-        token: vscode.CancellationToken
+        token: vscode.CancellationToken,
+        contentCounters?: { sawTextPart: boolean; sawToolCallPart: boolean; sawUsagePart: boolean }
     ): Promise<void> {
         Logger.info(`[processStreamingResponse] Starting stream processing`);
         StructuredLogger.info("stream.processing_start", {
@@ -821,6 +873,12 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         let watchdog: NodeJS.Timeout | undefined;
         let eventCount = 0;
         let wasWatchdogAbort = false;
+        // Content tracking for the reasoning-only detection: a cleanly-completed
+        // stream whose ONLY emissions were thinking parts is not a success for
+        // the agent loop (VS Code renders "no response was returned").
+        let sawTextPart = false;
+        let sawToolCallPart = false;
+        let sawUsagePart = false;
 
         // Create an AbortController to actually cancel the stream on timeout
         const controller = new AbortController();
@@ -889,6 +947,24 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     eventNumber: eventCount,
                     partCount: parts.length,
                 });
+                for (const part of parts) {
+                    if (part.type === "text") {
+                        sawTextPart = true;
+                        if (contentCounters) {
+                            contentCounters.sawTextPart = true;
+                        }
+                    } else if (part.type === "tool_call") {
+                        sawToolCallPart = true;
+                        if (contentCounters) {
+                            contentCounters.sawToolCallPart = true;
+                        }
+                    } else if (part.type === "data" && part.mimeType === "usage") {
+                        sawUsagePart = true;
+                        if (contentCounters) {
+                            contentCounters.sawUsagePart = true;
+                        }
+                    }
+                }
                 emitPartsToVSCode(parts, progress);
             }
 
@@ -897,6 +973,24 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 eventCount,
                 reason: "stream_ended",
             });
+
+            // Reasoning-only detection: a cleanly-completed stream that emitted
+            // ONLY thinking parts (plus perhaps a usage data part) contains
+            // nothing the agent loop can act on. VS Code renders it as
+            // "no response was returned" and kills the turn. Surface it to the
+            // retry loop as resumable: the partial reasoning is appended to the
+            // request so the model continues its thought.
+            if (eventCount > 0 && !sawTextPart && !sawToolCallPart) {
+                Logger.warn(
+                    `[processStreamingResponse] Reasoning-only stream detected (${eventCount} events, ` +
+                        `no text/tool parts); surfacing as resumable empty-content error`
+                );
+                StructuredLogger.warn("stream.reasoning_only_response", {
+                    eventCount,
+                    sawUsagePart,
+                });
+                throw new ReasoningOnlyError(eventCount, 0);
+            }
         } catch (error: unknown) {
             Logger.error(`[processStreamingResponse] Stream processing failed after ${eventCount} events`, {
                 error: error instanceof Error ? error.message : String(error),

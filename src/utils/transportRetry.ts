@@ -35,15 +35,39 @@ export class InactivityTimeoutError extends Error {
 }
 
 /**
+ * Sentinel for a stream that completed cleanly but produced no text and no
+ * tool calls - only reasoning (or nothing). VS Code's agent loop treats this
+ * as "no response was returned", so it is surfaced as an error the retry loop
+ * can resume: the partial reasoning is appended to the request so the model
+ * continues its thought instead of restarting.
+ */
+export class ReasoningOnlyError extends Error {
+    public constructor(
+        public readonly eventCount: number,
+        public readonly reasoningChars: number
+    ) {
+        super(
+            `Model returned reasoning-only response with no content or tool calls ` +
+                `(${eventCount} events, ${reasoningChars} reasoning chars)`
+        );
+        this.name = "ReasoningOnlyError";
+    }
+}
+
+/**
  * True when the error represents a transport-level failure that a new HTTP
  * request can plausibly recover from. Deliberately narrow: HTTP status errors
  * (LiteLLM API error), cancellations, and upstream API errors are NOT retried
  * because a fresh request would either be rejected identically or produce
- * duplicated content.
+ * duplicated content. ReasoningOnlyError is NOT classified here because it has
+ * its own, separate retry budget (emptyResponseRetries).
  */
 export function isTransportRetriableError(err: unknown): boolean {
     if (err instanceof InactivityTimeoutError) {
         return true;
+    }
+    if (err instanceof ReasoningOnlyError) {
+        return false;
     }
     if (!(err instanceof Error)) {
         return false;
@@ -91,6 +115,15 @@ export interface TransportRetryConfig {
     networkRetries: number;
     /** Base delay in ms; doubles per attempt, capped at 30s. */
     networkRetryDelayMs: number;
+    /**
+     * Maximum retries for a clean-but-contentless (reasoning-only) stream.
+     * Separate budget from networkRetries because the failure domains differ:
+     * transport deaths are per-connection, contentless responses cluster in
+     * upstream bursts.
+     */
+    emptyResponseRetries: number;
+    /** Base delay in ms for reasoning-only retries; doubles per attempt, capped at 30s. */
+    emptyResponseRetryDelayMs: number;
 }
 
 const MAX_BACKOFF_MS = 30_000;
@@ -188,6 +221,8 @@ function extractThinkingValue(part: unknown): string {
  * reasoning_content field on the OpenAI payload (LiteLLM's convention for
  * reasoning-native providers like GLM).
  */
+export const RESUME_TEXT_MARKER = "\u2026";
+
 export function buildResumeMessages(
     originalMessages: readonly vscode.LanguageModelChatRequestMessage[],
     streamedText: string,
@@ -212,6 +247,12 @@ export function buildResumeMessages(
     }
     if (streamedText.trim()) {
         resumeParts.push(new vscode.LanguageModelTextPart(streamedText));
+    } else if (resumeParts.length > 0) {
+        // convertMessages() only emits an assistant message when it has text,
+        // content items, or tool calls - a reasoning-only message would be
+        // silently dropped from the wire. The marker keeps the message (and
+        // its reasoning_content) present with no meaningful added tokens.
+        resumeParts.push(new vscode.LanguageModelTextPart(RESUME_TEXT_MARKER));
     }
 
     // Merge into a trailing assistant message so the wire carries one coherent

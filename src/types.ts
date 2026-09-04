@@ -218,6 +218,18 @@ export interface LiteLLMConfig {
     /** Base backoff delay in milliseconds for transport retries; doubles per attempt, capped at 30s. Default: 2000. */
     networkRetryDelayMs?: number;
 
+    /**
+     * Maximum retries for a cleanly-completed stream that produced only
+     * reasoning (no text, no tool calls). The retry appends the partial
+     * reasoning to the request so the model continues its thought. Separate
+     * budget from networkRetries because reasoning-only responses cluster in
+     * upstream bursts. Default: 2. Set to 0 to disable.
+     */
+    emptyResponseRetries?: number;
+
+    /** Base backoff delay in milliseconds for reasoning-only retries; doubles per attempt, capped at 30s. Default: 1000. */
+    emptyResponseRetryDelayMs?: number;
+
     // sendDefaultParameters was removed in v2.2.0 (deprecated v1.5.0). Use individual modelOptions instead.
 }
 
