@@ -190,6 +190,50 @@ suite("Utility Unit Tests", () => {
         assert.ok(out[0].tool_calls?.[0].id.startsWith("fc_"));
     });
 
+    test("convertMessages emits reasoning-only assistant message (resume support)", () => {
+        // A reasoning-only assistant message has a ThinkingPart (duck-typed:
+        // value property, no role) but no text/tool-call parts. It must be
+        // emitted on the wire with reasoning_content and no content so the
+        // model can continue its cut-off reasoning after a transport death.
+        const thinkingPart = { value: "I was analyzing the bug when the connection dropped" };
+        const messages = [
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [thinkingPart as unknown as vscode.LanguageModelTextPart],
+                name: undefined,
+            },
+        ];
+
+        const out = convertMessages(messages as unknown as vscode.LanguageModelChatRequestMessage[]) as {
+            role: string;
+            content?: unknown;
+            reasoning_content?: string;
+        }[];
+        assert.strictEqual(out.length, 1, "reasoning-only message must not be dropped");
+        assert.strictEqual(out[0].role, "assistant");
+        assert.strictEqual(out[0].reasoning_content, "I was analyzing the bug when the connection dropped");
+    });
+
+    test("convertMessages does not emit reasoning for user/system roles", () => {
+        const thinkingPart = { value: "should not appear" };
+        const messages = [
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [thinkingPart as unknown as vscode.LanguageModelTextPart],
+                name: undefined,
+            },
+        ];
+
+        const out = convertMessages(messages as unknown as vscode.LanguageModelChatRequestMessage[]) as {
+            role: string;
+            content?: unknown;
+            reasoning_content?: string;
+        }[];
+        const serialized = JSON.stringify(out);
+        assert.ok(!serialized.includes("should not appear"), "user-role thinking must not leak to the wire");
+        assert.ok(!serialized.includes("reasoning_content"));
+    });
+
     test("validateRequest throws when tool call is followed by non-user message", () => {
         const callId = "abc";
         const toolCall = new vscode.LanguageModelToolCallPart(callId, "toolA", { q: 1 });

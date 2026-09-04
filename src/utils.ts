@@ -419,10 +419,14 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
         }
 
         const text = textParts.join("");
-        if (text || contentItems.length > 0) {
+        // A message that carries reasoning (reasoning_content) must be emitted
+        // even without visible text: resumed/reasoning-only assistant turns
+        // have no content but the model needs its prior reasoning to continue.
+        const hasReasoning = role === "assistant" && Boolean(reasoningContent);
+        if (text || contentItems.length > 0 || hasReasoning) {
             if (role === "system" || role === "user" || (role === "assistant" && !emittedAssistantToolCall)) {
                 const messageContent = buildMessageContent(textParts, contentItems);
-                if (messageContent) {
+                if (messageContent || hasReasoning) {
                     out.push({
                         role: role || "user",
                         content: messageContent,
@@ -884,8 +888,7 @@ export function isThinkingPart(value: unknown): boolean {
     }
     // Try instanceof first (most reliable when the class is available).
     const ThinkingPart = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart as
-        | (new (...args: unknown[]) => unknown)
-        | undefined;
+        (new (...args: unknown[]) => unknown) | undefined;
     if (ThinkingPart && value instanceof ThinkingPart) {
         return true;
     }
