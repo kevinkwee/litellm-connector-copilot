@@ -974,6 +974,15 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 reason: "stream_ended",
             });
 
+            // A watchdog abort causes decodeSSE to END CLEANLY (the aborted flag
+            // there suppresses its endError), so the abort lands HERE on the
+            // normal path, not in the catch block. Surface it as the retryable
+            // sentinel BEFORE reasoning-only detection: a watchdog abort kills
+            // the stream regardless of whether reasoning was emitted.
+            if (wasWatchdogAbort) {
+                throw new InactivityTimeoutError(timeoutMs, eventCount);
+            }
+
             // Reasoning-only detection: a cleanly-completed stream that emitted
             // ONLY thinking parts (plus perhaps a usage data part) contains
             // nothing the agent loop can act on. VS Code renders it as
@@ -1053,9 +1062,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 }
             }
 
-            // A watchdog abort ends the stream without a transport exception.
-            // Re-throw it as the retryable sentinel so the transport-retry loop
-            // in provideLanguageModelChatResponse can resume the response.
+            // Belt-and-suspenders: if a watchdog abort coincided with an actual
+            // stream error, classify it as the retryable inactivity sentinel.
             if (wasWatchdogAbort) {
                 throw new InactivityTimeoutError(timeoutMs, eventCount);
             }
