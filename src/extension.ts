@@ -135,35 +135,22 @@ export function activate(context: vscode.ExtensionContext): void {
     const commitProvider = new LiteLLMCommitMessageProvider(context.secrets, ua, effortFallbackCache);
     commitProvider.setTelemetryService(telemetryService);
 
-    // Track active provider registration for hot-swap
-    let chatProviderRegistration: vscode.Disposable | undefined;
-
-    const registerProvider = () => {
-        try {
-            if (chatProviderRegistration) {
-                Logger.info("Disposing existing LanguageModelChatProvider registration...");
-                chatProviderRegistration.dispose();
-                chatProviderRegistration = undefined;
-            }
-
-            Logger.info("Registering LanguageModelChatProvider...");
-            chatProviderRegistration = vscode.lm.registerLanguageModelChatProvider(
-                "litellm-connector",
-                activeProvider as unknown as vscode.LanguageModelChatProvider
-            );
-            if (chatProviderRegistration) {
-                context.subscriptions.push(chatProviderRegistration);
-                Logger.info("Provider registered successfully.");
-            } else {
-                Logger.error("registerLanguageModelChatProvider returned undefined/null");
-            }
-        } catch (err) {
-            Logger.error("Failed to register provider", err);
+    // Register provider immediately (do not await config)
+    try {
+        Logger.info("Registering LanguageModelChatProvider...");
+        const chatProviderRegistration = vscode.lm.registerLanguageModelChatProvider(
+            "litellm-connector",
+            activeProvider as unknown as vscode.LanguageModelChatProvider
+        );
+        if (chatProviderRegistration) {
+            context.subscriptions.push(chatProviderRegistration);
+            Logger.info("Provider registered successfully.");
+        } else {
+            Logger.error("registerLanguageModelChatProvider returned undefined/null");
         }
-    };
-
-    // Register provider and commands immediately (do not await config)
-    registerProvider();
+    } catch (err) {
+        Logger.error("Failed to register provider", err);
+    }
 
     // Proactively nudge VS Code to call provideLanguageModelChatInformation immediately after
     // registration.  Without this, model discovery (and reasoning-effort schema population) is
