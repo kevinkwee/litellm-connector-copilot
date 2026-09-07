@@ -47,7 +47,7 @@ suite("ConfigManager Unit Tests", () => {
                     return false;
                 case "litellm-connector.modelOverrides":
                     return [];
-                case "litellm-connector.modelIdOverride":
+                case "litellm-connector.commitModelIdOverride":
                     return "";
                 case "litellm-connector.modelCapabilitiesOverrides":
                     return {};
@@ -77,8 +77,10 @@ suite("ConfigManager Unit Tests", () => {
     test("getConfig returns empty values when nothing is stored", async () => {
         const manager = new ConfigManager(mockSecrets);
         const config = await manager.getConfig();
-        // url and key are no longer part of LiteLLMConfig (VS Code 1.120+ per-group configuration)
-        assert.strictEqual(config.modelIdOverride, undefined);
+        // url and key are not part of LiteLLMConfig; backends are configured
+        // per provider group in VS Code's Language Models settings.
+        assert.strictEqual(config.commitModelIdOverride, "");
+        assert.deepStrictEqual(config.modelCapabilitiesOverrides, {});
     });
 
     test("getConfig reads modelCapabilitiesOverrides", async () => {
@@ -105,11 +107,6 @@ suite("ConfigManager Unit Tests", () => {
         assert.deepStrictEqual(cfg.modelCapabilitiesOverrides, {});
     });
 
-    // getConfig modelOverrides test removed in v2.2.0 (LiteLLMConfig.modelOverrides field removed
-    // — dead plumbing; override system reads workspace setting directly).
-
-    // resolveBackends tests removed - method no longer exists (VS Code 1.120+ per-group configuration)
-
     test("reportFeatureToggles calls telemetry service with correct toggles", async () => {
         const manager = new ConfigManager(mockSecrets);
         const captureStub = sinon.stub();
@@ -131,55 +128,6 @@ suite("ConfigManager Unit Tests", () => {
         assert.ok(captureStub.calledWith("commit-message", true, "test_source"));
         assert.ok(captureStub.calledWith("caching", true, "test_source"));
         assert.ok(captureStub.calledWith("quota-tool-redaction", true, "test_source"));
-    });
-
-    test("getConfig reads modelIdOverride and trims whitespace", async () => {
-        // Override the stubbed config value for this test.
-        configGetStub.callsFake((key: string, defaultValue?: unknown) => {
-            if (key === "litellm-connector.modelIdOverride") {
-                return "  gpt-4o  ";
-            }
-            switch (key) {
-                case "litellm-connector.inactivityTimeout":
-                    return 60;
-                case "litellm-connector.disableCaching":
-                    return true;
-                case "litellm-connector.disableQuotaToolRedaction":
-                    return false;
-                case "litellm-connector.modelOverrides":
-                    return {};
-                default:
-                    return defaultValue;
-            }
-        });
-
-        const manager = new ConfigManager(mockSecrets);
-        const cfg = await manager.getConfig();
-        assert.strictEqual(cfg.modelIdOverride, "gpt-4o");
-    });
-
-    test("getConfig treats whitespace-only modelIdOverride as unset", async () => {
-        configGetStub.callsFake((key: string, defaultValue?: unknown) => {
-            if (key === "litellm-connector.modelIdOverride") {
-                return "   ";
-            }
-            switch (key) {
-                case "litellm-connector.inactivityTimeout":
-                    return 60;
-                case "litellm-connector.disableCaching":
-                    return true;
-                case "litellm-connector.disableQuotaToolRedaction":
-                    return false;
-                case "litellm-connector.modelOverrides":
-                    return {};
-                default:
-                    return defaultValue;
-            }
-        });
-
-        const manager = new ConfigManager(mockSecrets);
-        const cfg = await manager.getConfig();
-        assert.strictEqual(cfg.modelIdOverride, undefined);
     });
 
     test("reportFeatureToggles is a no-op without telemetry service", async () => {
@@ -228,7 +176,6 @@ suite("ConfigManager Unit Tests", () => {
             "disableQuotaToolRedaction",
             "enableModelOverrides",
             "modelCapabilitiesOverrides",
-            "modelIdOverride",
             "commitModelIdOverride",
             "forceResponsesEndpoint",
             "allowChatCompletionsFallback",

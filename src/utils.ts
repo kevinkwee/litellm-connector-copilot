@@ -302,8 +302,7 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
     for (const m of messages) {
         // `lmcr_toString` returns "system" | "user" | "assistant" for the supported
         // VS Code roles, which matches `Exclude<OpenAIChatRole, "tool">` exactly.
-        // Casting keeps the downstream string narrowing in line 315 typed correctly
-        // and replaces the deprecated `mapRole` helper.
+        // Casting keeps the downstream string narrowing in line 315 typed correctly.
         const role = lmcr_toString(m.role as vscode.LanguageModelChatMessageRole) as Exclude<OpenAIChatRole, "tool">;
         const textParts: string[] = [];
         const contentItems: OpenAIChatMessageContentItem[] = [];
@@ -903,7 +902,7 @@ export function isThinkingPart(value: unknown): boolean {
 /**
  * Extracts the text content from a `LanguageModelThinkingPart`. Joins
  * string arrays with newlines (matching the V2 converter's behavior in
- * messageConverter.ts line 111).
+ * `v2OpenAIMessageConverter.ts`).
  */
 export function getThinkingPartText(part: unknown): string {
     const obj = part as { value?: string | string[] };
@@ -911,36 +910,6 @@ export function getThinkingPartText(part: unknown): string {
         return "";
     }
     return Array.isArray(obj.value) ? obj.value.join("\n") : obj.value;
-}
-
-/**
- * Map VS Code message role to OpenAI message role string.
- * @param message The message whose role is mapped.
- * @deprecated use `lmcr_toString` instead
- */
-export function mapRole(
-    message: vscode.LanguageModelChatRequestMessage | vscode.LanguageModelChatMessage2 | vscode.LanguageModelChatMessage
-): Exclude<OpenAIChatRole, "tool"> {
-    const role = message.role;
-
-    // Use string comparison if possible, or fall back to numeric comparison
-    // User = 1, Assistant = 2, System = 3
-    if (role === vscode.LanguageModelChatMessageRole.User || (role as number) === 1) {
-        return "user";
-    }
-    if (role === vscode.LanguageModelChatMessageRole.Assistant || (role as number) === 2) {
-        return "assistant";
-    }
-
-    // Check for System role (Proposed API: languageModelSystem)
-    // We use the numeric value 3 as the primary check to avoid compiler errors
-    // when the proposed enum member is missing from the stable vscode namespace.
-    if ((role as number) === 3) {
-        return "system";
-    }
-
-    // Default to system for everything else
-    return "system";
 }
 
 /**

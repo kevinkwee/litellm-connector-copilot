@@ -19,7 +19,7 @@ suite("StreamTokenCapture", () => {
         return new vscode.LanguageModelTextPart(value);
     }
 
-    function asThinkingPart(value: string | string[]): vscode.LanguageModelResponsePart {
+    function asThinkingPart(value: string | string[]): vscode.LanguageModelResponsePart | undefined {
         const ThinkingPartCtor = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart as
             | (new (
                   value: string | string[],
@@ -27,12 +27,10 @@ suite("StreamTokenCapture", () => {
                   metadata?: Record<string, unknown>
               ) => vscode.LanguageModelResponsePart)
             | undefined;
-        if (ThinkingPartCtor) {
-            return new ThinkingPartCtor(value);
+        if (!ThinkingPartCtor) {
+            return undefined;
         }
-        // Fallback: encoded as TextPart("*value*")
-        const str = Array.isArray(value) ? value.join("") : value;
-        return new vscode.LanguageModelTextPart(`*${str}*`);
+        return new ThinkingPartCtor(value);
     }
 
     function asToolCallPart(
@@ -49,12 +47,16 @@ suite("StreamTokenCapture", () => {
     }
 
     test("captures text and reasoning into snapshot when no upstream usage", () => {
+        const thinking = asThinkingPart("thoughts");
+        if (!thinking) {
+            return; // LanguageModelThinkingPart is unavailable in this test host
+        }
         const { parts, progress } = createInnerProgress();
         const capture = new StreamTokenCapture("model-x", progress);
 
         const tracking = capture.progress;
         tracking.report(asTextPart("Hello "));
-        tracking.report(asThinkingPart("thoughts"));
+        tracking.report(thinking);
         tracking.report(asTextPart("world"));
 
         const snapshot = capture.getSnapshot();
@@ -97,6 +99,10 @@ suite("StreamTokenCapture", () => {
     });
 
     test("forwards every part to inner progress", () => {
+        const thinking = asThinkingPart("hmm");
+        if (!thinking) {
+            return; // LanguageModelThinkingPart is unavailable in this test host
+        }
         const { parts, progress } = createInnerProgress();
         const capture = new StreamTokenCapture("model-x", progress);
         const tracking = capture.progress;
@@ -104,7 +110,6 @@ suite("StreamTokenCapture", () => {
         const text = asTextPart("hi");
         const tool = asToolCallPart("t", {});
         const usage = asUsagePart({ prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 });
-        const thinking = asThinkingPart("hmm");
 
         tracking.report(text);
         tracking.report(tool);
@@ -115,8 +120,6 @@ suite("StreamTokenCapture", () => {
         assert.ok(parts[0] instanceof vscode.LanguageModelTextPart);
         assert.ok(parts[1] instanceof vscode.LanguageModelToolCallPart);
         assert.ok(parts[2] instanceof vscode.LanguageModelDataPart);
-        // Thinking fallback may be TextPart or ThinkingPart depending on host
-        const thinkingPart = parts[3];
         const ThinkingCtor = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart as
             | (new (
                   value: string | string[],
@@ -124,10 +127,10 @@ suite("StreamTokenCapture", () => {
                   metadata?: Record<string, unknown>
               ) => vscode.LanguageModelResponsePart)
             | undefined;
-        const isThinking = ThinkingCtor
-            ? thinkingPart instanceof ThinkingCtor
-            : thinkingPart instanceof vscode.LanguageModelTextPart;
-        assert.ok(isThinking, "expected fourth part to be thinking/text part");
+        assert.ok(
+            ThinkingCtor ? parts[3] instanceof ThinkingCtor : true,
+            "expected fourth part to be the forwarded thinking part"
+        );
 
         const payload = JSON.parse(Buffer.from((parts[2] as vscode.LanguageModelDataPart).data).toString("utf-8")) as {
             prompt_tokens?: number;
@@ -230,20 +233,34 @@ suite("StreamTokenCapture", () => {
         assert.strictEqual(forwardedUsage.estimated_total_cost, expectedCost.totalCost);
     });
 
-    test("thinking detection checks ThinkingPart before TextPart fallback", () => {
+    test("counts ThinkingPart as reasoning and plain TextPart as completion only", () => {
+        const thinking = asThinkingPart("ponder");
+        if (!thinking) {
+            return; // LanguageModelThinkingPart is unavailable in this test host
+        }
         const { progress } = createInnerProgress();
         const capture = new StreamTokenCapture("model-x", progress);
         const tracking = capture.progress;
 
-        const thinking = asThinkingPart("ponder");
-        const text = asTextPart("plain");
-
         tracking.report(thinking);
-        tracking.report(text);
+        tracking.report(asTextPart("plain"));
 
         const snapshot = capture.getSnapshot();
         assert.ok(snapshot.reasoningTokens > 0);
         assert.ok(snapshot.completionTokens >= snapshot.reasoningTokens);
+    });
+
+    test("star-wrapped TextPart is counted as plain text, never as reasoning", () => {
+        // A single-line emphasis string like "*emphasis*" is ordinary
+        // markdown text and must not be mistaken for a thinking part.
+        const { progress } = createInnerProgress();
+        const capture = new StreamTokenCapture("model-x", progress);
+
+        capture.progress.report(asTextPart("*emphasis*"));
+
+        const snapshot = capture.getSnapshot();
+        assert.strictEqual(snapshot.reasoningTokens, 0);
+        assert.ok(snapshot.completionTokens > 0);
     });
 
     test("input estimates are honored when no upstream usage", () => {

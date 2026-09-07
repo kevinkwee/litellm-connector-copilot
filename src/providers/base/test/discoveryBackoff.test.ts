@@ -99,7 +99,6 @@ suite("Discovery backoff", () => {
         const registry = new LiteLLMProviderRegistry({
             configManager: configManager as unknown as ConfigManager,
             userAgent: "test",
-            onModernConfigurationDetected: () => {},
         });
 
         const token = new vscode.CancellationTokenSource().token;
@@ -122,7 +121,6 @@ suite("Discovery backoff", () => {
         const registry = new LiteLLMProviderRegistry({
             configManager: configManager as unknown as ConfigManager,
             userAgent: "test",
-            onModernConfigurationDetected: () => {},
         });
 
         sharedDiscoveryBackoff.recordFailure(0);

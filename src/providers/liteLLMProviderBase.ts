@@ -107,8 +107,6 @@ export abstract class LiteLLMProviderBase {
 
     protected _telemetryService?: TelemetryService;
 
-    private _onModernConfigurationDetected?: () => void;
-
     constructor(
         protected readonly secrets: vscode.SecretStorage,
         protected readonly userAgent: string,
@@ -119,9 +117,6 @@ export abstract class LiteLLMProviderBase {
         this._registry = new LiteLLMProviderRegistry({
             configManager: this._configManager,
             userAgent: this.userAgent,
-            onModernConfigurationDetected: () => {
-                this._onModernConfigurationDetected?.();
-            },
         });
 
         // Forward the registry's `onDidChange` event to VS Code so the
@@ -158,15 +153,6 @@ export abstract class LiteLLMProviderBase {
 
     public setTelemetryService(service: TelemetryService): void {
         this._telemetryService = service;
-    }
-
-    /**
-     * Registers a callback fired when VS Code per-group provider configuration is
-     * present and passes syntactic validation. Extension activation uses this to
-     * persist a one-time "modern config seen" session flag and suppress legacy prompts.
-     */
-    public setModernConfigurationDetectedHandler(handler: () => void): void {
-        this._onModernConfigurationDetected = handler;
     }
 
     /** Exposes the ConfigManager for external access (e.g., commands that need configuration). */
@@ -222,16 +208,13 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Returns an empty array.
-     *
-     * Stateless design: there is no model-list cache. The last-known-models
-     * view is gone because there is no list to be "last known" — every
-     * discovery call is a fresh fetch. This method is retained for
-     * backward compatibility with the public API surface; callers that
-     * need a model list should trigger a discovery and use the result.
+     * Returns the registry's current, deduplicated model list. The
+     * registry is populated by discovery calls; before any discovery
+     * this is empty, and callers such as the model-picker commands
+     * surface a "reload models" prompt in that case.
      */
     public getLastKnownModels(): LanguageModelChatInformation[] {
-        return [];
+        return this._registry.getAllModels();
     }
 
     /**
@@ -809,8 +792,8 @@ export abstract class LiteLLMProviderBase {
         // than the one currently being routed. The wolfram group tends to
         // not include `configuration` at all (so we fall back to the
         // registry); the geth group tends to include an empty object
-        // (which previously short-circuited the registry fallback and
-        // produced a "No baseUrl provided" runtime error).
+        // (an empty object would otherwise short-circuit the registry
+        // fallback and produce a "No baseUrl provided" runtime error).
         //
         // We trust `options.configuration` ONLY when it has both a usable
         // `baseUrl` (string, non-empty) and a usable `apiKey` (string,
@@ -888,9 +871,8 @@ export abstract class LiteLLMProviderBase {
         if (entry) {
             return entry.rawModelName;
         }
-        // No entry in the registry: assume the id is already raw. This
-        // covers the workspace-level `modelIdOverride` path (the override
-        // is a user-typed raw name, not a namespaced id).
+        // No entry in the registry: assume the id is already raw. Vendor ids
+        // handed to VS Code before discovery are not namespaced.
         return this._registry.extractRawName(modelId);
     }
 
@@ -1060,11 +1042,11 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Tools the detector knows how to redact. Kept narrow on purpose — the
-     * legacy detector only knew `insert_edit_into_file` and
-     * `replace_string_in_file`. Adding more here is a deliberate code change
-     * and must come with a test that exercises a real tool result for the new
-     * tool name (not just a substring match in prompt scaffolding).
+     * Tools the detector knows how to redact. Kept narrow on purpose: only
+     * `insert_edit_into_file` and `replace_string_in_file`. Adding more here
+     * is a deliberate code change and must come with a test that exercises a
+     * real tool result for the new tool name (not just a substring match in
+     * prompt scaffolding).
      */
     private static readonly REDACTABLE_TOOL_NAMES: readonly string[] = [
         "insert_edit_into_file",
@@ -1329,8 +1311,8 @@ export abstract class LiteLLMProviderBase {
      * `<reminderInstructions>`, and `<userRequest>` blocks into every user
      * message. The `<reminderInstructions>` block routinely documents the
      * exact tool-error handling rules that contain both the quota phrase
-     * and the `insert_edit_into_file` / `replace_string_in_file` tool names
-     * — a structural false positive for the legacy regex-pair detector.
+     * and the `insert_edit_into_file` / `replace_string_in_file` tool names,
+     * a structural false positive for the regex-pair detector.
      *
      * Invariant: this function is pure (no I/O, no side effects). The
      * original `text` is not mutated.
@@ -1394,9 +1376,6 @@ export abstract class LiteLLMProviderBase {
  * even for extended sessions (100+ turns).
  */
 const tokenCountCache = new LRUCache<string, number>(100);
-// CACHE_TTL_MS retained for potential future use or if cache implementation changes back to timestamp-based TTL
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-const CACHE_TTL_MS = 60000;
 
 /**
  * Tracks pending background token count requests to avoid redundant network calls.

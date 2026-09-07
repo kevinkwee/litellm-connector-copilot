@@ -23,7 +23,6 @@
  *  - `discoverModels(options, token)` — the only way for VS Code (or any
  *    consumer) to fetch a model list and populate the registry.
  *  - `lookup(id)` — resolve a namespaced id to its routing entry.
- *  - `findBackendForRawName(name)` — workspace-override routing lookup.
  *  - `extractRawName(id)` — strip the routing prefix from a namespaced id.
  *  - `getModelInfo(id)` / `getDerivedCapabilities(id)` — read the
  *    capability caches populated during discovery.
@@ -39,17 +38,11 @@
  *  - `getModelsForBackend(baseUrl)` / `getModelIdsForBackend(baseUrl)` —
  *    internal read, used only by `discoverInternal` for change detection.
  *
- * Why merge discovery into the registry?
- * --------------------------------------
- * The previous design kept `ModelDiscovery` as a separate class and the
- * registry as a pure data structure. That meant the base provider had to
- * call `modelDiscovery.discover(...)`, then `registry.setModelsForBackend`,
- * then check `registry.getModelIdsForBackend` for change detection — a
- * three-step orchestration that was easy to get wrong (write-before-compare
- * silently broke change detection). With the merge, `discoverModels` is
- * the only call site that needs to know the write protocol exists, and
- * consumers see a single ingress that returns the model list, updates the
- * registry, and fires the change event as a unit.
+ * Discovery, storage, and change detection live in one class so the
+ * write-before-compare change-detection protocol has a single call site:
+ * `discoverModels` is the only code path that needs to know the write
+ * protocol exists, and consumers see a single ingress that returns the
+ * model list, updates the registry, and fires the change event as a unit.
  *
  * Per-group namespacing
  * ---------------------
@@ -139,7 +132,6 @@ export interface RegistryEntry {
 export interface RegistryDeps {
     readonly configManager: ConfigManager;
     readonly userAgent: string;
-    readonly onModernConfigurationDetected?: () => void;
 }
 
 /**
@@ -173,7 +165,6 @@ function setsEqual(a: Set<string>, b: Set<string>): boolean {
 export class LiteLLMProviderRegistry implements vscode.Disposable {
     private readonly configManager: RegistryDeps["configManager"];
     private readonly _userAgent: string;
-    private readonly _onModernConfigurationDetected?: () => void;
 
     private readonly entries = new Map<string, RegistryEntry>();
     private readonly modelsByBackend = new Map<string, LanguageModelChatInformation[]>();
@@ -216,7 +207,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     constructor(deps: RegistryDeps) {
         this.configManager = deps.configManager;
         this._userAgent = deps.userAgent;
-        this._onModernConfigurationDetected = deps.onModernConfigurationDetected;
     }
 
     /**
@@ -352,21 +342,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             return id;
         }
         return id.slice(slash + 1);
-    }
-
-    /**
-     * Scans every registered entry's `rawModelName` for a match and returns
-     * the routing entry. Used by workspace-level `modelIdOverride` resolution,
-     * where the user enters a raw model name (e.g. `azure_ai/gpt-5.4-mini`)
-     * and we need to find the backend that can serve it.
-     */
-    public findBackendForRawName(rawName: string): RegistryEntry | undefined {
-        for (const entry of this.entries.values()) {
-            if (entry.rawModelName === rawName) {
-                return entry;
-            }
-        }
-        return undefined;
     }
 
     /**
@@ -535,8 +510,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
                         `Open the LiteLLM provider settings and confirm both Server URL and API key are set.`
                 );
             }
-            this._onModernConfigurationDetected?.();
-
             const routingIdentity = (urlHostname.length > 0 ? urlHostname : displayLabel).replace(/\//g, "_");
             const models = await this.discoverFromSession(session, token, displayLabel, routingIdentity);
             Logger.trace(

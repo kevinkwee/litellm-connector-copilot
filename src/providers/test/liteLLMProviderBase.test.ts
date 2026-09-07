@@ -49,9 +49,6 @@ interface BaseTestAccess {
         lookup: (
             id: string
         ) => { baseUrl: string; apiKey: string; rawModelName: string; routingIdentity: string } | undefined;
-        findBackendForRawName: (
-            rawName: string
-        ) => { baseUrl: string; apiKey: string; rawModelName: string; routingIdentity: string } | undefined;
         getModelInfo: (id: string) => LiteLLMModelInfo | undefined;
         clear: () => void;
         clearCaches: () => void;
@@ -670,22 +667,6 @@ suite("LiteLLMProviderBase", () => {
                     ),
                 (err: unknown) => err instanceof vscode.LanguageModelError
             );
-        });
-
-        test("marks modern configuration detection when provider configuration is valid", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const configManager = access(provider)._configManager;
-            const mockSession = makeMockSession();
-            sandbox.stub(configManager, "convertProviderConfiguration").returns(mockSession);
-
-            const detected = sandbox.stub();
-            provider.setModernConfigurationDetectedHandler(detected);
-
-            await provider.discoverModels(
-                { silent: true, configuration: config },
-                new vscode.CancellationTokenSource().token
-            );
-            assert.ok(detected.calledOnce);
         });
 
         test("per-group model lists are isolated — one group refresh does not trample another", async () => {

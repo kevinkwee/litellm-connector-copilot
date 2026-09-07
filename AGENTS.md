@@ -169,7 +169,6 @@ The extension uses a **shared orchestration + specialized protocol handlers** pa
 
 - **Adapters**:
   - `src/adapters/litellmClient.ts` — HTTP client and endpoint routing integration
-  - `src/adapters/multiBackendClient.ts` — Multi-backend orchestrator and model namespacing
   - `src/adapters/responsesAdapter.ts` — LiteLLM `/responses` endpoint payload translation
   - `/responses` stream event handling (`output_item.delta`, `output_item.done`, anonymous tool buffering) lives in `src/adapters/streaming/liteLLMStreamInterpreter.ts`
   - `src/adapters/tokenUtils.ts` — token budgeting, trimming, and related helpers
@@ -178,11 +177,6 @@ The extension uses a **shared orchestration + specialized protocol handlers** pa
   - Handles per-group provider configuration from `options.configuration` (Base URL, API Key, and any group-scoped settings supplied by VS Code 1.120)
   - Also manages workspace settings via `vscode.workspace.getConfiguration()` (model overrides, caching, etc.)
   - `convertProviderConfiguration()` converts the per-group VS Code provider config into the internal `LiteLLMConfig` format
-
-- **Legacy Config Migration**: `src/config/legacyConfigMigration.ts`
-  - Detects leftover `litellm-connector.baseUrl` / `backends` workspace settings and `SecretStorage` keys from pre-2.1.0 installs
-  - Runs once on activation and presents a guided notification to migrate old config into the VS Code provider-group format
-  - Migration state is persisted in `globalState` so the prompt only fires once per install
 
 **Key Design Principle**: There is exactly one chat provider and one completions provider. Both reuse the same message ingress pipeline in the base orchestrator. This eliminates code duplication, ensures consistent behavior, and avoids the version-suffixed provider sprawl that previously existed.
 
@@ -220,7 +214,6 @@ The contract is **public read, internal write**:
     (`{baseUrl, apiKey, rawModelName, routingIdentity}`). The response
     path uses this as the fallback when VS Code does not pass the
     per-group BYOK config on the call.
-  - `findBackendForRawName(name)` — workspace-override routing lookup.
   - `extractRawName(id)` — strip the routing prefix from a namespaced id.
   - `getModelInfo(id)` / `getDerivedCapabilities(id)` — read the
     per-model capability caches populated during discovery. These are
@@ -292,7 +285,7 @@ Keep this pipeline shared unless the change is intentionally protocol-specific a
 #### Completions-Specific Logic (Completions Provider)
 - **Prompt wrapping**: convert simple `string` prompt to `LanguageModelChatRequestMessage` for base pipeline
 - **Stream text extraction**: parse SSE chunks and accumulate completion text
-- **Model selection**: resolve model using `modelIdOverride` config or first available model with `inline-completions` tag
+- **Model selection**: resolve model using the `commitModelIdOverride` setting; commit generation routes through `vscode.lm.selectChatModels()`
 - **Cost tracking**: completions reuse the same pricing/token snapshot pipeline so estimated request costs are reported consistently with chat.
 
 #### Configuration Flow (v1.120+, per-group)

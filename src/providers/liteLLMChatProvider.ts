@@ -60,91 +60,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         super(secrets, userAgent, effortFallbackCache);
     }
 
-    /************************************************
-     * TODO: REMOVE IF UNUSED IN VERSION 2.3
-     * REASON: Saving in the event this code is
-     *       actually necessary.
-     *  REMOVE BY: V2.3
-     *  CONDITION: IF UNUSED/COMMENTED
-     */
-    /*
-    private mergeUsagePayloadWithLastKnown(current: OpenAIUsagePayload): OpenAIUsagePayload {
-        const previous = this._tokenCapture?.getSnapshot();
-        if (!previous) {
-            return current;
-        }
-
-        const pickMonotonicTokenCount = (currentValue?: number, previousValue?: number): number | undefined => {
-            if (typeof currentValue === "number" && typeof previousValue === "number") {
-                return Math.max(currentValue, previousValue);
-            }
-            if (typeof currentValue === "number") {
-                return currentValue;
-            }
-            return previousValue;
-        };
-
-        const normalizedCurrentPromptDetails: OpenAIUsagePromptTokenDetails = {
-            ...(current.prompt_tokens_details ?? {}),
-        };
-        const normalizedCurrentCompletionDetails: OpenAIUsageCompletionTokenDetails = {
-            ...(current.completion_tokens_details ?? {}),
-        };
-
-        const mergedPromptTokens = Math.max(current.prompt_tokens, previous.promptTokens ?? 0);
-        const mergedCompletionTokens = Math.max(current.completion_tokens, previous.completionTokens ?? 0);
-
-        const mergedPromptDetails: OpenAIUsagePromptTokenDetails = {
-            cached_tokens: pickMonotonicTokenCount(
-                normalizedCurrentPromptDetails.cached_tokens ?? (current.prompt_tokens_details ? 0 : undefined),
-                previous.cachedTokens
-            ),
-            cache_creation_input_tokens: pickMonotonicTokenCount(
-                normalizedCurrentPromptDetails.cache_creation_input_tokens,
-                previous.cacheCreationInputTokens
-            ),
-        };
-
-        const mergedCompletionDetails: OpenAIUsageCompletionTokenDetails = {
-            reasoning_tokens: pickMonotonicTokenCount(
-                normalizedCurrentCompletionDetails.reasoning_tokens ??
-                    (current.completion_tokens_details ? 0 : undefined),
-                previous.reasoningTokens
-            ),
-            tool_tokens: pickMonotonicTokenCount(normalizedCurrentCompletionDetails.tool_tokens, previous.toolTokens),
-            accepted_prediction_tokens: pickMonotonicTokenCount(
-                normalizedCurrentCompletionDetails.accepted_prediction_tokens,
-                previous.acceptedPredictionTokens
-            ),
-            rejected_prediction_tokens: pickMonotonicTokenCount(
-                normalizedCurrentCompletionDetails.rejected_prediction_tokens,
-                previous.rejectedPredictionTokens
-            ),
-        };
-
-        const merged: OpenAIUsagePayload = {
-            ...current,
-            prompt_tokens: mergedPromptTokens,
-            completion_tokens: mergedCompletionTokens,
-            total_tokens: mergedPromptTokens + mergedCompletionTokens,
-            system_prompt_tokens: pickMonotonicTokenCount(current.system_prompt_tokens, previous.systemPromptTokens),
-            prompt_tokens_details: Object.values(mergedPromptDetails).some((value) => typeof value === "number")
-                ? mergedPromptDetails
-                : undefined,
-            completion_tokens_details: Object.values(mergedCompletionDetails).some((value) => typeof value === "number")
-                ? mergedCompletionDetails
-                : undefined,
-            reserved_output_tokens: current.reserved_output_tokens,
-            total_token_max: current.total_token_max,
-        };
-
-        return merged;
-    }
-*/
-    /************************************************
-     * End of code block
-     ***********************************************/
-
     private logFinalUsageEnvelope(
         requestId: string,
         modelId: string,
@@ -191,10 +106,9 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         options: vscode.PrepareLanguageModelChatModelOptions,
         token: CancellationToken
     ): Promise<LanguageModelChatInformation[]> {
-        // VS Code 1.120 expands the options shape to include `configuration` (per-group BYOK
-        // values configured by the user). We pass the full options through to the base discovery
-        // path so it can choose between configuration-based discovery (1.120 group system) and
-        // legacy workspace-settings discovery transparently.
+        // VS Code 1.120 supplies the per-group `configuration` on the options.
+        // We pass the full options through to the base discovery path, which
+        // discovers from that per-group configuration.
         const opts = options as vscode.PrepareLanguageModelChatModelOptions & {
             silent?: boolean;
             configuration?: Record<string, unknown>;
@@ -248,27 +162,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         // Hoisted so the catch-block export can reuse the same value.
         let sessionFingerprint: string | undefined;
 
-        // Check if vscode has thinking part API available.
-        // Even if we are not the V2 provider, we can safely report thinking parts if the type exists.
-        /************************************************
-         * TODO: REMOVE IF UNUSED IN VERSION 2.3
-         * REASON: Saving in the event this code is
-         *       actually necessary.
-         *  REMOVE BY: V2.3
-         *  CONDITION: IF UNUSED/COMMENTED
-         */
-        /*
-        const ThinkingPart = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart as
-            | (new (
-                  value: string | string[],
-                  id?: string,
-                  metadata?: Record<string, unknown>
-              ) => vscode.LanguageModelResponsePart)
-            | undefined;
-*/
-        /************************************************
-         * End of code block
-         ***********************************************/
         // Extract caller/justification from options or model tags
         const telemetry = this.getTelemetryOptions(options);
         const modelWithTags = model as vscode.LanguageModelChatInformation & { tags?: string[] };
@@ -276,8 +169,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         const justification = telemetry.justification;
 
         if (this._telemetryService) {
-            // We do not need the excess noise here.  But this block is useful...
-            // this._telemetryService.captureFeatureUsed("chat", "chat");
             this._telemetryService.captureModelUsed(model.id, caller);
         }
 
@@ -291,10 +182,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         Logger.trace(
             `Chat request: received model id="${model.id}" name="${model.name}" hasOptionsConfig=${(options as { configuration?: unknown }).configuration !== undefined}`
         );
-
-        // <Line of Code>; // TODO: Remove by v2.3 if still commented
-        // let reservedOutputTokensForRequest: number | undefined;
-        // let totalTokenMaxForRequest: number | undefined;
 
         // Capability lookups go directly to the BackendRegistry — the single
         // source of truth. There is no per-provider mirror cache, so a stale
@@ -314,72 +201,21 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         const trackingProgress = responsePartCollector.progress;
 
         try {
-            const config = await this._configManager.getConfig();
-
-            // Optional model override (primarily for completions). If set, we try to use it.
-            // If the override isn't registered yet, attempt a best-effort refresh.
-            //
-            // The override is a RAW model name (e.g. `azure_ai/gpt-5.4-mini`),
-            // not the namespaced id. The registry is keyed by namespaced id, so
-            // we use `findBackendForRawName` to resolve the override back to a
-            // backend before adopting it.
-            let modelToUse = model;
-            if (config.modelIdOverride) {
-                const overrideId = config.modelIdOverride;
-                if (this._registry.findBackendForRawName(overrideId)) {
-                    Logger.trace(
-                        `Chat request: applying modelIdOverride overrideId="${overrideId}" originalModelId="${model.id}"`
-                    );
-                    // The override is reachable; we know its baseUrl/apiKey from
-                    // the registry. Synthesize a minimal LanguageModelChatInformation
-                    // that VS Code will accept (it only needs the id and family
-                    // for downstream request building).
-                    modelToUse = {
-                        ...model,
-                        id: overrideId,
-                    };
-                } else {
-                    try {
-                        Logger.info(`modelIdOverride set to '${overrideId}' but not registered; refreshing model list`);
-                        await this.discoverModels({ silent: true }, token);
-                        if (this._registry.findBackendForRawName(overrideId)) {
-                            Logger.trace(
-                                `Chat request: applying modelIdOverride after refresh overrideId="${overrideId}" originalModelId="${model.id}"`
-                            );
-                            modelToUse = { ...model, id: overrideId };
-                        } else {
-                            Logger.warn(
-                                `modelIdOverride '${overrideId}' not found after refresh; using selected model '${model.id}'`
-                            );
-                        }
-                    } catch (refreshErr) {
-                        Logger.warn("Failed to refresh model list for override; using selected model", refreshErr);
-                    }
-                }
-            }
-            Logger.trace(
-                `Chat request: modelToUse.id="${modelToUse.id}" rawModelName="${this.getRawModelName(modelToUse.id)}"`
-            );
-
             // Resolve the backend baseUrl for the `.copilotmd` metadata `url:` line.
             // The registry is the single source of truth for (namespaced id → backend);
-            // `lookup` returns undefined for raw-name overrides (modelIdOverride rewrote
-            // the id), so we fall back to the vendor id string in that degenerate case.
+            // `lookup` returns undefined when the id is not routable, in which case we
+            // fall back to the vendor id string so the export still names the backend.
             // Assigned to the outer `let` so the catch block can reference it when
             // rendering a failure entry. Stays undefined if lookup fails before the
             // body is built, which correctly suppresses a meaningless failure export.
-            const routingEntry = this._registry.lookup(modelToUse.id);
+            const routingEntry = this._registry.lookup(model.id);
             endpointUrl = routingEntry?.baseUrl ?? "litellm-connector";
 
-            // Capability lookup goes directly to the BackendRegistry. The
-            // `modelToUse.id` is either the namespaced id VS Code handed us
-            // or, when `modelIdOverride` rewrote it, the raw model name; the
-            // registry's `lookup` will return `undefined` for the raw-name
-            // case and `getModelInfo` will also return `undefined` for it
-            // (capabilities are stored under the namespaced key), so the
-            // request builder will use the override path's defaults. This
-            // is the same single-source-of-truth read as above.
-            const modelInfo = this._registry.getModelInfo(modelToUse.id);
+            // Capability lookup goes directly to the BackendRegistry: the single
+            // source of truth. There is no per-provider mirror cache, so a stale
+            // entry from a previous backend cannot be served for a different
+            // backend's request.
+            const modelInfo = this._registry.getModelInfo(model.id);
             // Compute the session fingerprint once from `messages` (the request
             // input). This is the same value used for `.copilotmd` folder
             // grouping AND for LiteLLM's `metadata.session_id` (which LiteLLM
@@ -388,7 +224,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // built — lets us inject it into the body in the same pass.
             // Async because the fingerprint uses SHA-256 via Web Crypto.
             sessionFingerprint = await computeSessionFingerprint(messages);
-            const requestBody = await this.buildOpenAIChatRequest(messages, modelToUse, options, modelInfo, caller);
+            const requestBody = await this.buildOpenAIChatRequest(messages, model, options, modelInfo, caller);
             // Inject the session fingerprint into the request body's metadata
             // so LiteLLM's proxy can group spend logs and cache entries by
             // session. LiteLLM reads `metadata.session_id` and promotes it to
@@ -406,24 +242,21 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // after the request was shaped. Read-only alias to avoid accidental
             // mutation downstream.
             requestBodyBuilt = requestBody;
-            // The model id in `modelToUse` is the namespaced `<routing>/<raw>`
+            // The model id in `model` is the namespaced `<routing>/<raw>`
             // form VS Code hands us. The tokenizer heuristics (and the
             // `isParameterSupported` / `usageOptOutModels` lookups inside the
             // request builder) key off the raw model family, not the routing
             // prefix. The request builder extracts the raw name internally
             // before populating `request.model`.
-            const rawModelIdForTokenizers = this.getRawModelName(modelToUse.id);
+            const rawModelIdForTokenizers = this.getRawModelName(model.id);
             const estimatedTransportInputTokens =
                 countOpenAIChatMessagesTokens(requestBody.messages, rawModelIdForTokenizers, modelInfo) +
                 estimateToolTokens(requestBody.tools);
-            const reservedOutputTokens = getReservedOutputTokens(modelToUse, requestBody.max_tokens, {
+            const reservedOutputTokens = getReservedOutputTokens(model, requestBody.max_tokens, {
                 estimatedInputTokens: estimatedTransportInputTokens,
                 modelInfo,
             });
-            const totalTokenMax = getTotalTokenLimit(modelToUse, modelInfo);
-            // <Line of Code>; // TODO: Remove by v2.3 if still commented
-            // reservedOutputTokensForRequest = reservedOutputTokens;
-            // totalTokenMaxForRequest = totalTokenMax;
+            const totalTokenMax = getTotalTokenLimit(model, modelInfo);
             tokenCapture.setEstimatedPromptTokens(estimatedTransportInputTokens);
             const systemPromptContent = requestBody.messages.find((m) => m.role === "system")?.content;
             if (typeof systemPromptContent === "string") {
@@ -493,7 +326,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     stream = await this.sendRequestWithRetry(
                         attempt === 0 ? requestBody : { ...requestBody },
                         activeMessages,
-                        modelToUse,
+                        model,
                         options,
                         trackedProgress,
                         token,
@@ -573,12 +406,12 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                                 error: err instanceof Error ? err.message : String(err),
                             });
                         }
-                        // Preserve legacy handling for non-transport errors by
-                        // rethrowing into the original catch structure below.
+                        // Rethrow so non-transport errors flow through the
+                        // shared catch handling below.
                         if (attempt === 0) {
                             this.logRequestPayloadOnFailure(requestBody, err, {
                                 stage: "provideLanguageModelChatResponse",
-                                modelId: modelToUse.id,
+                                modelId: model.id,
                                 caller,
                                 modelInfoMode: modelInfo?.mode,
                             });
@@ -623,10 +456,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 sawUpstreamUsage: false,
             };
 
-            // Orphaned legacy param-strip 400 retry and duplicated bottom
-            // stream processing removed; the transport retry loop above now
-            // owns the full send + stream lifecycle.
-
             const tokensOut = Math.max(snapshot.completionTokens, snapshot.toolTokens);
             const tokensInForTelemetry = snapshot.promptTokens ?? tokensIn;
             const reasoningTokens = snapshot.reasoningTokens || undefined;
@@ -642,7 +471,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
 
             const metric = {
                 requestId,
-                model: modelToUse.id,
+                model: model.id,
                 durationMs: LiteLLMTelemetry.endTimer(startTime),
                 tokensIn: tokensInForTelemetry,
                 tokensOut,
@@ -665,7 +494,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         : undefined,
             };
             LiteLLMTelemetry.reportMetric(metric);
-            this.logFinalUsageEnvelope(requestId, modelToUse.id, caller, {
+            this.logFinalUsageEnvelope(requestId, model.id, caller, {
                 tokensIn: tokensInForTelemetry,
                 tokensOut,
                 cachedTokens,
@@ -691,9 +520,9 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             void exportCopilotMdEntry({
                 debugName: caller,
                 id: requestId.slice(0, 8),
-                model: modelToUse.id,
+                model: model.id,
                 url: endpointUrl ?? "litellm-connector",
-                maxPromptTokens: modelToUse.maxInputTokens,
+                maxPromptTokens: model.maxInputTokens,
                 maxResponseTokens: requestBody.max_tokens,
                 location: undefined,
                 body: requestBody,
@@ -703,7 +532,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 durationMs: metric.durationMs,
                 ourRequestId: requestId,
                 timeToFirstTokenMs: undefined,
-                resolvedModel: modelToUse.id,
+                resolvedModel: model.id,
                 usage: snapshot,
                 responseParts: responsePartCollector.parts,
                 status: "success",
@@ -711,25 +540,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             } satisfies CopilotMdEntry);
 
             // Usage data is now handled exclusively by StreamTokenCapture
-            // which intercepts usage DataParts during streaming and enriches them
-            // No need for separate emitExperimentalUsageData call
-
-            // Disabling this to reduce noise / unecessary logging
-            // TODO: look into potentially removing this in the future if don't need it.
-            /*
-            if (this._telemetryService) {
-                this._telemetryService.captureChatRequest({
-                    request_id: requestId,
-                    caller,
-                    model: modelToUse.id,
-                    endpoint: modelInfo?.mode ?? "chat",
-                    durationMs: metric.durationMs,
-                    tokensIn: tokensIn ?? 0,
-                    tokensOut,
-                    status: "success",
-                });
-            }
-            */
+            // which intercepts usage DataParts during streaming and enriches them.
         } catch (err: unknown) {
             let errorMessage = err instanceof Error ? err.message : String(err);
             const errorStack = err instanceof Error ? err.stack : undefined;

@@ -1,7 +1,6 @@
 import * as vscode from "vscode";
 import { PostHogAdapter } from "./posthogAdapter";
 import type {
-    LegacyConfigMigrationEvent,
     CostSummary,
     TelemetryEvent,
     TelemetryCaptureExceptionOptions,
@@ -301,15 +300,6 @@ export class TelemetryService implements vscode.Disposable {
         });
     }
 
-    // Model discovery
-    captureModelsDiscovered(modelCount: number, backendCount: number): void {
-        this.capture("models_discovered", { model_count: modelCount, backend_count: backendCount });
-    }
-
-    captureModelsCacheHit(modelCount: number): void {
-        this.capture("models_cache_hit", { model_count: modelCount });
-    }
-
     // Feature usage reporting
     captureFeatureUsageSnapshot(features: Record<string, boolean>): void {
         this.capture("feature_usage_snapshot", features);
@@ -320,18 +310,6 @@ export class TelemetryService implements vscode.Disposable {
             feature_name: featureName,
             enabled,
             source,
-        });
-    }
-
-    captureModernConfigStatus(props: { is_on_modern_config: boolean; source: string }): void {
-        this.capture("modern_config_status", props);
-    }
-
-    public captureLegacyConfigMigration(data: LegacyConfigMigrationEvent): void {
-        this.capture("legacy_config_migrated", {
-            backend_count: data.backend_count,
-            group_name: data.group_name,
-            source: data.source,
         });
     }
 

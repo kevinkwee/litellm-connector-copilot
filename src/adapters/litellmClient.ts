@@ -289,9 +289,9 @@ export class LiteLLMClient {
 
                 // 2. Always strip caching if mentioned or if it was a likely culprit
                 if (errorLower.includes("no-cache") || errorLower.includes("no_cache")) {
-                    // Cast to unknown first for index signature access
+                    // Some proxies put the cache-bypass flags at the top level
+                    // instead of under extra_body.cache. Strip both spellings.
                     const bodyAny = strippedBody as unknown as Record<string, unknown>;
-                    // Legacy (older implementation)
                     delete bodyAny.no_cache;
                     delete bodyAny["no-cache"];
 

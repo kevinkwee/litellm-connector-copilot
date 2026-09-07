@@ -90,10 +90,6 @@
 				"icon": "$(sparkle)"
 			},
 			{
-				"command": "litellm-connector.setLogLevel",
-				"title": "LiteLLM: Set Log Level"
-			},
-			{
 				"command": "litellm-connector.openCopilotMdFolder",
 				"title": "LiteLLM: Open .copilotmd Export Folder"
 			}
@@ -101,11 +97,7 @@
 		"configuration": {
 			"title": "LiteLLM Connector",
 			"properties": {
-				"litellm-connector.modelIdOverride": {
-					"type": "string",
-					"default": "",
-					"description": "(Deprecated) Optional: force a specific LiteLLM model id for legacy workflows."
-				},
+
 				"litellm-connector.commitModelIdOverride": {
 					"type": "string",
 					"default": "",

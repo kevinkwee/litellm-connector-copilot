@@ -88,39 +88,11 @@ export class StructuredLogger {
      */
     public static initialize(context: vscode.ExtensionContext): void {
         // Structured logger gets a dedicated channel to avoid mixing with
-        // the legacy top-level Logger output at "LiteLLM".
+        // the top-level Logger output channel ("LiteLLM").
         this.ensureChannel(context);
         this.info("logger.initialized", {
             note: "Use the log level dropdown in the output panel to change verbosity",
         });
-    }
-
-    /**
-     * Sets the current log level.
-     *
-     * @deprecated Use the log level dropdown in the VS Code output panel instead.
-     * This method is kept for backward compatibility but has no effect since
-     * log filtering is now handled by the output channel UI.
-     *
-     * @param _level - New log level (ignored)
-     */
-    public static setLevel(_level: LogLevel): void {
-        // No-op: log level is now controlled by the output channel UI
-        this.info("logger.setLevel_called", {
-            note: "Log level is now controlled by the output panel dropdown. This call has no effect.",
-        });
-    }
-
-    /**
-     * Checks if a given level would be logged.
-     *
-     * @deprecated Always returns true since filtering is handled by the output channel.
-     * @param _level - Level to check (ignored)
-     * @returns Always true
-     */
-    public static isEnabled(_level: LogLevel): boolean {
-        // Always return true - let the output channel handle filtering
-        return true;
     }
 
     /**

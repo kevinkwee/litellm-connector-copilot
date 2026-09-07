@@ -4,7 +4,6 @@ import * as vscode from "vscode";
 
 import { LiteLLMChatProvider } from "../";
 import { LiteLLMClient } from "../../adapters/litellmClient";
-import { Logger } from "../../utils/logger";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
 import { createMockSecrets } from "../../test/utils/testMocks";
 import { createTelemetryMocks } from "../../test/utils/telemetryMock";
@@ -270,24 +269,17 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         assert.strictEqual(chatStub.callCount, 2);
     });
 
-    test("provideLanguageModelChatResponse refreshes model override and logs when refresh fails", async () => {
+    test("provideLanguageModelChatResponse uses the model VS Code selected without a settings override", async () => {
         const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
 
         interface ProviderWithConfigManager {
             _configManager: {
-                getConfig: () => Promise<{ url: string; modelIdOverride?: string }>;
+                getConfig: () => Promise<{ url: string }>;
             };
-            discoverModels: (options: { silent: boolean }, token: vscode.CancellationToken) => Promise<void>;
         }
         const providerWithConfig = provider as unknown as ProviderWithConfigManager;
-        sandbox
-            .stub(providerWithConfig._configManager, "getConfig")
-            .resolves({ url: "http://localhost:4000", modelIdOverride: "override" });
-        sandbox.stub(providerWithConfig, "discoverModels").rejects(new Error("refresh failed"));
-        // Seed discovered backend so the routing path doesn't reject before we exercise the
-        // override refresh warning behaviour.
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({ url: "http://localhost:4000" });
         seedDiscoveredBackend(sandbox, provider, "model-1");
-        const warnStub = sandbox.stub(Logger, "warn");
 
         const chatStub = sandbox.stub(LiteLLMClient.prototype, "chat");
         const encoder = new TextEncoder();
@@ -335,7 +327,9 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             new vscode.CancellationTokenSource().token
         );
 
-        assert.strictEqual(warnStub.called, true);
+        // The routed model is the one VS Code selected.
+        assert.strictEqual(chatStub.calledOnce, true);
+        assert.strictEqual((chatStub.firstCall.args[0] as { model?: string }).model, "model-1");
     });
 
     test("provideLanguageModelChatResponse throws on cancellation during request", async () => {

@@ -201,14 +201,6 @@ export function registerGenerateCommitMessageCommand(
                         }
 
                         inputBox.value = generatedMessage;
-
-                        /* if (telemetryService) {
-                            telemetryService.captureCommitMessageGenerated({
-                                model: modelId,
-                                durationMs: Date.now() - startTime,
-                                status: "success",
-                            });
-                        } */
                     } catch (err) {
                         Logger.error("Failed to generate commit message", err);
                         vscode.window.showErrorMessage(

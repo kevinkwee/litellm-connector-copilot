@@ -6,7 +6,6 @@ import * as extension from "../../extension";
 import * as providers from "../../providers";
 import { Logger } from "../../utils/logger";
 import { TelemetryService } from "../../telemetry/telemetryService";
-import { LegacyConfigMigration } from "../../config/legacyConfigMigration";
 import { createMockSecrets, createMockOutputChannel, createMockMemento } from "../utils/testMocks";
 
 /**
@@ -29,7 +28,6 @@ function stubActivationEnvironment(
     refreshStub: sinon.SinonStub;
     showInfoStub: sinon.SinonStub;
     configChangeHandler: () => ((e: vscode.ConfigurationChangeEvent) => void) | undefined;
-    onModernConfigDetected: () => (() => void) | undefined;
     telemetry: ReturnType<typeof stubTelemetryService>;
 } {
     sandbox.stub(vscode.window, "createOutputChannel").returns(createMockOutputChannel());
@@ -42,19 +40,11 @@ function stubActivationEnvironment(
     const executeCommandStub = sandbox.stub(vscode.commands, "executeCommand").resolves(undefined);
     const refreshStub = sandbox.stub(providers.LiteLLMChatProvider.prototype, "refreshModelInformation");
     sandbox.stub(providers.LiteLLMChatProvider.prototype, "setTelemetryService");
-    const setModernHandlerStub = sandbox.stub(
-        providers.LiteLLMChatProvider.prototype,
-        "setModernConfigurationDetectedHandler"
-    );
 
     let capturedConfigHandler: ((e: vscode.ConfigurationChangeEvent) => void) | undefined;
     sandbox.stub(vscode.workspace, "onDidChangeConfiguration").callsFake((listener) => {
         capturedConfigHandler = listener as (e: vscode.ConfigurationChangeEvent) => void;
         return { dispose() {} } as vscode.Disposable;
-    });
-    let capturedModernHandler: (() => void) | undefined;
-    setModernHandlerStub.callsFake((handler: () => void) => {
-        capturedModernHandler = handler;
     });
 
     return {
@@ -63,7 +53,6 @@ function stubActivationEnvironment(
         refreshStub,
         showInfoStub,
         configChangeHandler: () => capturedConfigHandler,
-        onModernConfigDetected: () => capturedModernHandler,
         telemetry: stubTelemetryService(sandbox),
     };
 }
@@ -79,21 +68,19 @@ function stubTelemetryService(sandbox: sinon.SinonSandbox): {
     captureExtensionActivated: sinon.SinonStub;
     captureFeatureAdoption: sinon.SinonStub;
     captureFeatureUsageSnapshot: sinon.SinonStub;
-    captureModernConfigStatus: sinon.SinonStub;
 } {
     return {
         captureException: sandbox.stub(TelemetryService.prototype, "captureException"),
         captureExtensionActivated: sandbox.stub(TelemetryService.prototype, "captureExtensionActivated"),
         captureFeatureAdoption: sandbox.stub(TelemetryService.prototype, "captureFeatureAdoption"),
         captureFeatureUsageSnapshot: sandbox.stub(TelemetryService.prototype, "captureFeatureUsageSnapshot"),
-        captureModernConfigStatus: sandbox.stub(TelemetryService.prototype, "captureModernConfigStatus"),
     };
 }
 
 /**
  * Builds a minimal mock context that already includes `globalState` and
- * `workspaceState` so the migration notice / modern config flag paths in
- * `activate` execute their bodies instead of bailing out.
+ * `workspaceState` so activation paths that persist state execute their
+ * bodies instead of bailing out.
  */
 function createContextWithState(
     sandbox: sinon.SinonSandbox,
@@ -280,37 +267,6 @@ suite("Extension Activation Unit Tests", () => {
         // No cleanup should be triggered on deactivate; settings/secrets should persist.
     });
 
-    test("activate persists modern config session flag when provider detects valid config", async () => {
-        const mockSecrets = createMockSecrets();
-        const workspaceState = createMockMemento();
-        const updateSpy = sandbox.spy(workspaceState, "update");
-
-        const context = {
-            subscriptions: [],
-            secrets: mockSecrets,
-            workspaceState,
-        } as unknown as vscode.ExtensionContext;
-
-        let onModernConfigDetected: (() => void) | undefined;
-        sandbox
-            .stub(providers.LiteLLMChatProvider.prototype, "setModernConfigurationDetectedHandler")
-            .callsFake((handler: () => void) => {
-                onModernConfigDetected = handler;
-            });
-
-        sandbox.stub(vscode.window, "createOutputChannel").returns(createMockOutputChannel());
-        sandbox.stub(vscode.extensions, "getExtension").returns({ packageJSON: { version: "1.2.3" } } as never);
-        sandbox.stub(vscode.window, "showInformationMessage");
-        sandbox.stub(vscode.lm, "registerLanguageModelChatProvider").returns({ dispose() {} } as vscode.Disposable);
-        sandbox.stub(vscode.commands, "registerCommand").returns({ dispose() {} } as vscode.Disposable);
-
-        extension.activate(context);
-
-        onModernConfigDetected?.();
-
-        assert.strictEqual(updateSpy.calledWith("litellm-connector.isOnModernConfig", true), true);
-    });
-
     test("deactivate tolerates repeated disposal", async () => {
         const mockSecrets = createMockSecrets();
 
@@ -476,140 +432,6 @@ suite("Extension Activation Unit Tests", () => {
         assert.ok(preDetach, "captured pre-dispose listener list");
     });
 
-    test("activate opens Language Models when user accepts the migration notice", async () => {
-        const ctx = createContextWithState(sandbox);
-        const env = stubActivationEnvironment(sandbox, ctx);
-        env.showInfoStub.resolves("Open Language Models" as unknown as string);
-        activateAndTrack(ctx);
-        await new Promise((resolve) => setImmediate(resolve));
-        await new Promise((resolve) => setImmediate(resolve));
-        assert.strictEqual(
-            env.executeCommandStub.calledWith("workbench.action.chat.manage"),
-            true,
-            "chat.manage should be invoked when user accepts the notice"
-        );
-    });
-
-    test("activate does not run any command when user dismisses the migration notice", async () => {
-        const ctx = createContextWithState(sandbox);
-        const env = stubActivationEnvironment(sandbox, ctx);
-        env.showInfoStub.resolves(undefined);
-        activateAndTrack(ctx);
-        await new Promise((resolve) => setImmediate(resolve));
-        assert.strictEqual(
-            env.executeCommandStub.calledWith("workbench.action.chat.manage"),
-            false,
-            "no command should run when the user dismisses the notice"
-        );
-    });
-
-    test("activate falls back to openSettings when chat.manage rejects", async () => {
-        const ctx = createContextWithState(sandbox);
-        const env = stubActivationEnvironment(sandbox, ctx);
-        env.showInfoStub.resolves("Open Language Models" as unknown as string);
-        env.executeCommandStub.withArgs("workbench.action.chat.manage").rejects(new Error("missing"));
-        activateAndTrack(ctx);
-        await new Promise((resolve) => setImmediate(resolve));
-        await new Promise((resolve) => setImmediate(resolve));
-        assert.strictEqual(
-            env.executeCommandStub.calledWith("workbench.action.openSettings", "@tag:language-model"),
-            true,
-            "fallback to openSettings when chat.manage rejects"
-        );
-    });
-
-    test("activate suppresses the migration notice once it has been shown", async () => {
-        const ctx = createContextWithState(sandbox, {
-            globalState: { "litellm-connector.migrationNotice.v1": true },
-        });
-        const env = stubActivationEnvironment(sandbox, ctx);
-        activateAndTrack(ctx);
-        await new Promise((resolve) => setImmediate(resolve));
-        assert.strictEqual(env.showInfoStub.called, false, "notice must not reappear once shown");
-    });
-
-    test("activate warns when workspaceState is unavailable and the modern config handler is invoked", async () => {
-        const ctx = {
-            subscriptions: [],
-            secrets: createMockSecrets(),
-            globalState: createMockMemento(),
-            // intentionally no workspaceState
-        } as unknown as vscode.ExtensionContext;
-        const env = stubActivationEnvironment(sandbox, ctx);
-        const warnSpy = sandbox.stub(Logger, "warn");
-        activateAndTrack(ctx);
-        const handler = env.onModernConfigDetected();
-        assert.ok(handler, "modern config handler should have been registered");
-        handler();
-        // Allow the fire-and-forget async IIFE inside the handler to settle.
-        await new Promise((resolve) => setImmediate(resolve));
-        await new Promise((resolve) => setImmediate(resolve));
-        assert.strictEqual(
-            warnSpy.calledWith("workspaceState unavailable; cannot persist modern configuration session flag"),
-            true
-        );
-    });
-
-    test("activate emits a telemetry event for the already-marked modern config branch", async () => {
-        const ctx = createContextWithState(sandbox, {
-            workspaceState: { "litellm-connector.isOnModernConfig": true },
-        });
-        const env = stubActivationEnvironment(sandbox, ctx);
-        activateAndTrack(ctx);
-        const handler = env.onModernConfigDetected();
-        assert.ok(handler, "handler should be registered for already-marked case");
-        handler();
-        assert.strictEqual(
-            env.telemetry.captureModernConfigStatus.calledWith({
-                is_on_modern_config: true,
-                source: "provider_configuration_detected",
-            }),
-            true,
-            "already-marked branch should emit a modern-config telemetry event"
-        );
-    });
-
-    test("activate persists and emits a telemetry event for the happy path of modern config detection", async () => {
-        const ctx = createContextWithState(sandbox);
-        const env = stubActivationEnvironment(sandbox, ctx);
-        activateAndTrack(ctx);
-        const handler = env.onModernConfigDetected();
-        assert.ok(handler);
-        handler();
-        // The handler fires a fire-and-forget async IIFE; give it a few
-        // microtask/immediate cycles to settle before asserting.
-        await new Promise((resolve) => setImmediate(resolve));
-        await new Promise((resolve) => setImmediate(resolve));
-        assert.strictEqual(
-            env.telemetry.captureModernConfigStatus.calledWith({
-                is_on_modern_config: true,
-                source: "provider_configuration_detected",
-            }),
-            true,
-            "happy path should capture a modern-config telemetry event"
-        );
-    });
-
-    test("activate logs and swallows persistence errors during modern config detection", async () => {
-        const ctx = createContextWithState(sandbox);
-        const env = stubActivationEnvironment(sandbox, ctx);
-        const ctxState = (ctx as unknown as { workspaceState: vscode.Memento }).workspaceState;
-        sandbox.stub(ctxState, "update").rejects(new Error("store down"));
-        const errorSpy = sandbox.stub(Logger, "error");
-        activateAndTrack(ctx);
-        const handler = env.onModernConfigDetected();
-        assert.ok(handler);
-        handler();
-        // Allow the fire-and-forget async IIFE inside the handler to settle.
-        await new Promise((resolve) => setImmediate(resolve));
-        await new Promise((resolve) => setImmediate(resolve));
-        assert.strictEqual(
-            errorSpy.calledWith("Failed to persist modern configuration session flag", sinon.match.any),
-            true,
-            "persistence failures should be logged, not propagated"
-        );
-    });
-
     test("activate fires the post-registration refresh and tracks the provider registration in subscriptions", async () => {
         const ctx = createContextWithState(sandbox);
         const env = stubActivationEnvironment(sandbox, ctx);
@@ -675,65 +497,5 @@ suite("Extension Activation Unit Tests", () => {
 
         // The "Config command registered." log should have been emitted.
         assert.strictEqual(infoSpy.calledWith("Config command registered."), true);
-    });
-
-    test("activate skips refresh when legacy migration reports no migration", async () => {
-        const ctx = createContextWithState(sandbox);
-        const env = stubActivationEnvironment(sandbox, ctx);
-        sandbox.stub(LegacyConfigMigration.prototype, "runMigrationIfNeeded").resolves({
-            migrated: false,
-            groupsCreated: 0,
-            groupNames: [],
-            cleanupComplete: false,
-            errors: [],
-        });
-        activateAndTrack(ctx);
-        await new Promise((resolve) => setImmediate(resolve));
-        await new Promise((resolve) => setTimeout(resolve, 600));
-        assert.strictEqual(
-            env.refreshStub.callCount <= 1, // may be 1 from setImmediate
-            true,
-            "non-migrated result should not trigger a migration-driven refresh"
-        );
-    });
-
-    test("activate logs and refreshes when legacy migration succeeds", async () => {
-        const ctx = createContextWithState(sandbox);
-        const env = stubActivationEnvironment(sandbox, ctx);
-        const refreshBefore = env.refreshStub.callCount;
-        const infoSpy = sandbox.stub(Logger, "info");
-        sandbox.stub(LegacyConfigMigration.prototype, "runMigrationIfNeeded").resolves({
-            migrated: true,
-            groupsCreated: 2,
-            groupNames: ["g1", "g2"],
-            cleanupComplete: true,
-            errors: [],
-        });
-        activateAndTrack(ctx);
-        await new Promise((resolve) => setTimeout(resolve, 600));
-        assert.strictEqual(
-            infoSpy.calledWith("Migration completed: 2 groups created"),
-            true,
-            "successful migration should log group count"
-        );
-        assert.strictEqual(
-            env.refreshStub.callCount > refreshBefore,
-            true,
-            "successful migration should schedule a refresh"
-        );
-    });
-
-    test("activate logs and swallows legacy migration rejections", async () => {
-        const ctx = createContextWithState(sandbox);
-        stubActivationEnvironment(sandbox, ctx);
-        const errorSpy = sandbox.stub(Logger, "error");
-        sandbox.stub(LegacyConfigMigration.prototype, "runMigrationIfNeeded").rejects(new Error("boom"));
-        activateAndTrack(ctx);
-        await new Promise((resolve) => setImmediate(resolve));
-        assert.strictEqual(
-            errorSpy.calledWith("Migration check failed", sinon.match.any),
-            true,
-            "migration rejections should be logged"
-        );
     });
 });

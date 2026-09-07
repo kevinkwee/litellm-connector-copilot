@@ -58,8 +58,9 @@ suite("ConfigManager", () => {
         const manager = new ConfigManager(secrets);
         const config = await manager.getConfig();
 
-        // url, key, and backends are no longer part of LiteLLMConfig (VS Code 1.120+ per-group configuration)
-        assert.strictEqual(config.modelIdOverride, undefined);
+        // url, key, and backends are not part of LiteLLMConfig; backends are
+        // configured per provider group in VS Code's Language Models settings.
+        assert.strictEqual(config.commitModelIdOverride, "");
     });
 
     // resolveBackends test removed - method no longer exists (VS Code 1.120+ per-group configuration)

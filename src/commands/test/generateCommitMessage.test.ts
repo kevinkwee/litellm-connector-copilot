@@ -126,7 +126,6 @@ suite("GenerateCommitMessage Command Unit Tests", () => {
         await handler();
 
         assert.strictEqual(mockInputBox.value, "feat: from vscode route");
-        assert.strictEqual(mockProvider.provideCommitMessage.called, false);
         assert.strictEqual((model.sendRequest as sinon.SinonStub).calledOnce, true);
     });
 
@@ -159,7 +158,6 @@ suite("GenerateCommitMessage Command Unit Tests", () => {
         await handler();
 
         assert.ok(errorStub.called);
-        assert.ok(mockProvider.provideCommitMessage.notCalled);
     });
 
     test("handler reports error if diff retrieval fails", async () => {
@@ -316,11 +314,11 @@ suite("GenerateCommitMessage Command Unit Tests", () => {
 
         const mockApi = { repositories: [repoA, repoB] } as unknown as never;
         sandbox.stub(GitUtils, "getGitAPI").resolves(mockApi);
-        // getStagedDiff is called with rootUri now — stub to verify it receives the right URI
+        // getStagedDiff receives the SCM context's rootUri; stub to verify the right URI
         const getDiffStub = sandbox.stub(GitUtils, "getStagedDiff").resolves("diff-b-content");
 
         mockProvider.getModelInfo.returns({ max_input_tokens: 1000 } as unknown as LiteLLMModelInfo);
-        // The handler now uses VS Code's `selectChatModels` route. Stream the commit message
+        // The handler uses VS Code's `selectChatModels` route. Stream the commit message
         // through the mock model so the input box is updated.
         const model = {
             sendRequest: sandbox.stub().resolves({

@@ -12,7 +12,6 @@ export class ConfigManager {
     private static readonly DISABLE_QUOTA_TOOL_REDACTION_KEY = "litellm-connector.disableQuotaToolRedaction";
     private static readonly KEY_MODEL_OVERRIDES_ENABLE = "litellm-connector.enableModelOverrides";
     private static readonly MODEL_CAPABILITIES_OVERRIDES_KEY = "litellm-connector.modelCapabilitiesOverrides";
-    private static readonly MODEL_ID_OVERRIDE_KEY = "litellm-connector.modelIdOverride";
     private static readonly SCM_COMMIT_MSG_MODEL_ID_KEY = "litellm-connector.commitModelIdOverride";
     private static readonly FORCE_RESPONSES_ENDPOINT_KEY = "litellm-connector.forceResponsesEndpoint";
     private static readonly ALLOW_CHAT_COMPLETIONS_FALLBACK_KEY = "litellm-connector.allowChatCompletionsFallback";
@@ -145,9 +144,6 @@ export class ConfigManager {
             false
         );
         const enableModelOverrides = workspaceConfig.get<boolean>(ConfigManager.KEY_MODEL_OVERRIDES_ENABLE, true);
-        // modelOverrides are loaded but the LiteLLMConfig.modelOverrides field was
-        // removed in v2.2.0 (dead plumbing — the override system reads the workspace
-        // setting directly via modelOverrides.ts findOverride).
 
         const modelCapabilitiesOverridesRaw = workspaceConfig.get<Record<string, string | string[]>>(
             ConfigManager.MODEL_CAPABILITIES_OVERRIDES_KEY,
@@ -186,7 +182,6 @@ export class ConfigManager {
             }
         }
 
-        const modelIdOverride = workspaceConfig.get<string>(ConfigManager.MODEL_ID_OVERRIDE_KEY, "").trim();
         const scmGitCompletionsModelId = workspaceConfig
             .get<string>(ConfigManager.SCM_COMMIT_MSG_MODEL_ID_KEY, "")
             .trim();
@@ -248,7 +243,6 @@ export class ConfigManager {
             disableQuotaToolRedaction,
             enableModelOverrides,
             modelCapabilitiesOverrides,
-            modelIdOverride: modelIdOverride.length > 0 ? modelIdOverride : undefined,
             commitModelIdOverride: `${scmGitCompletionsModelId}`,
             forceResponsesEndpoint,
             allowChatCompletionsFallback,
@@ -296,8 +290,8 @@ export class ConfigManager {
      * uses `baseUrl` as the cache key regardless of the group name, so a
      * missing or stale groupName has no effect on routing.
      *
-     * `providerName` (if present in the payload) is ignored. It is a legacy
-     * field from the multi-backend era and is no longer part of the schema.
+     * `providerName` (if present in the payload) is not part of the schema
+     * and is ignored.
      */
     convertProviderConfiguration(
         groupName: string,

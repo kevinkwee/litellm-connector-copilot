@@ -2,7 +2,7 @@ import * as assert from "assert";
 import * as sinon from "sinon";
 import * as vscode from "vscode";
 import { StructuredLogger } from "../structuredLogger";
-import type { LogLevel, LogEvent } from "../types";
+import type { LogEvent } from "../types";
 
 suite("StructuredLogger", () => {
     let sandbox: sinon.SinonSandbox;
@@ -13,39 +13,6 @@ suite("StructuredLogger", () => {
 
     teardown(() => {
         sandbox.restore();
-    });
-
-    /**
-     * Log level filtering is now handled by VS Code's LogOutputChannel UI
-     * (the dropdown in the output panel). StructuredLogger.isEnabled() always
-     * returns true because all logs are sent to the channel and the channel
-     * decides what to display based on the user-selected level.
-     */
-
-    test("isEnabled always returns true (filtering handled by output channel UI)", () => {
-        // Regardless of previous state, isEnabled should always return true
-        assert.strictEqual(StructuredLogger.isEnabled("trace" as LogLevel), true);
-        assert.strictEqual(StructuredLogger.isEnabled("debug" as LogLevel), true);
-        assert.strictEqual(StructuredLogger.isEnabled("info" as LogLevel), true);
-        assert.strictEqual(StructuredLogger.isEnabled("warn" as LogLevel), true);
-        assert.strictEqual(StructuredLogger.isEnabled("error" as LogLevel), true);
-    });
-
-    test("isEnabled returns true for all levels when using trace", () => {
-        assert.strictEqual(StructuredLogger.isEnabled("trace" as LogLevel), true);
-        assert.strictEqual(StructuredLogger.isEnabled("debug" as LogLevel), true);
-        assert.strictEqual(StructuredLogger.isEnabled("info" as LogLevel), true);
-        assert.strictEqual(StructuredLogger.isEnabled("warn" as LogLevel), true);
-        assert.strictEqual(StructuredLogger.isEnabled("error" as LogLevel), true);
-    });
-
-    test("isEnabled returns true for all levels when using error", () => {
-        // All levels return true - output channel UI handles filtering
-        assert.strictEqual(StructuredLogger.isEnabled("trace" as LogLevel), true);
-        assert.strictEqual(StructuredLogger.isEnabled("debug" as LogLevel), true);
-        assert.strictEqual(StructuredLogger.isEnabled("info" as LogLevel), true);
-        assert.strictEqual(StructuredLogger.isEnabled("warn" as LogLevel), true);
-        assert.strictEqual(StructuredLogger.isEnabled("error" as LogLevel), true);
     });
 
     test("initialize uses distinct structured logger output channel name", () => {
@@ -228,7 +195,10 @@ suite("StructuredLogger", () => {
         // A more direct check: no call args contain our event name.
         const traceCalls = stringifySpy
             .getCalls()
-            .filter((c) => typeof c.args[0] === "object" && (c.args[0] as { event?: string }).event === "stream.event_received");
+            .filter(
+                (c) =>
+                    typeof c.args[0] === "object" && (c.args[0] as { event?: string }).event === "stream.event_received"
+            );
         assert.strictEqual(traceCalls.length, 0, "JSON.stringify must not be called for a skipped trace event");
     });
 
@@ -255,7 +225,9 @@ suite("StructuredLogger", () => {
         );
         const debugCalls = stringifySpy
             .getCalls()
-            .filter((c) => typeof c.args[0] === "object" && (c.args[0] as { event?: string }).event === "param.suppressed");
+            .filter(
+                (c) => typeof c.args[0] === "object" && (c.args[0] as { event?: string }).event === "param.suppressed"
+            );
         assert.strictEqual(debugCalls.length, 0, "JSON.stringify must not be called for a skipped debug event");
     });
 
@@ -332,9 +304,10 @@ suite("StructuredLogger", () => {
         } as unknown as vscode.LogOutputChannel;
         (StructuredLogger as unknown as { channel: vscode.LogOutputChannel | undefined }).channel = mockChannel;
 
-        // info/warn/error are NOT gated by this fix — they always go through log().
-        // VS Code's channel.info/.warn/.error already drop silently when level is Off,
-        // and these paths are not the hot-path source of the CPU spike.
+        // info/warn/error bypass the shouldSkipForLevel guard and always go
+        // through log(). VS Code's channel.info/.warn/.error already drop
+        // silently when level is Off, and these paths are not the hot-path
+        // source of the CPU spike.
         StructuredLogger.info("request.ingress", {});
         StructuredLogger.warn("param.suppressed", {});
         StructuredLogger.error("request.error", {});

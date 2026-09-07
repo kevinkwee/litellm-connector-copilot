@@ -266,10 +266,6 @@ export class StreamTokenCapture {
     // ── Internal: intercept every part ──
 
     private _intercept(part: vscode.LanguageModelResponsePart): void {
-        // Thinking must be detected BEFORE TextPart because the /responses path
-        // falls back to TextPart("*text*") on older VS Code hosts. If we check
-        // TextPart first, the thinking text (with "*" wrappers) would be
-        // counted as raw completion tokens and never reach reasoning.
         if (this._isThinkingPart(part)) {
             const value = this._extractThinkingValue(part);
             this._reasoningBuffer += value;
@@ -301,8 +297,7 @@ export class StreamTokenCapture {
             this._sawUpstreamUsage = true;
 
             // Monotonic merge: when upstream sends multiple usage frames (e.g. mid-stream
-            // + final), pick Math.max to avoid regressing counts. Mirrors the legacy
-            // mergeUsagePayloadWithLastKnown logic from the chat provider.
+            // + final), pick Math.max to avoid regressing counts.
             this._upstream = this._upstream ? this._mergeMonotonic(this._upstream, parsed) : parsed;
 
             // Enrich with internal estimates for missing fields
@@ -406,33 +401,21 @@ export class StreamTokenCapture {
         };
     }
 
-    // ── ThinkingPart detection (handles both real ThinkingPart and "*text*" fallback) ──
+    // ── ThinkingPart detection ──
 
     private _isThinkingPart(part: vscode.LanguageModelResponsePart): boolean {
-        // Real ThinkingPart (VS Code proposed API)
         const ThinkingPart = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart;
         if (ThinkingPart && part instanceof (ThinkingPart as new (...args: unknown[]) => unknown)) {
             return true;
-        }
-        // The /responses path emits reasoning as TextPart("*text*") on older VS Code — detect that pattern
-        if (part instanceof vscode.LanguageModelTextPart) {
-            const v = part.value;
-            return v.startsWith("*") && v.endsWith("*") && v.length > 2;
         }
         return false;
     }
 
     private _extractThinkingValue(part: vscode.LanguageModelResponsePart): string {
-        // Real ThinkingPart value
         const tp = part as unknown as { value: string | string[] };
         if (Array.isArray(tp.value)) {
             return tp.value.join("");
         }
-        const v = tp.value as string;
-        // Strip the "*" wrapper from /responses path fallback
-        if (v.startsWith("*") && v.endsWith("*")) {
-            return v.slice(1, -1);
-        }
-        return v;
+        return tp.value as string;
     }
 }

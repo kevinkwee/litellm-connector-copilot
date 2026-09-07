@@ -169,11 +169,6 @@ export interface LiteLLMConfig {
      * When set, overrides the auto-derived toolCalling / imageInput capabilities.
      */
     modelCapabilitiesOverrides?: Record<string, ModelCapabilityOverride>;
-    /**
-     * Optional: force a specific model id.
-     * When unset, the provider uses the model selected by Copilot/VS Code.
-     */
-    modelIdOverride?: string;
 
     /** Model id to use for LiteLLM commit message generation. */
     commitModelIdOverride?: string;

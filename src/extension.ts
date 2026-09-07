@@ -8,7 +8,6 @@ import {
     registerShowModelsCommand,
 } from "./commands/manageConfig";
 import { registerGenerateCommitMessageCommand } from "./commands/generateCommitMessage";
-import { registerSetLogLevelCommand } from "./commands/setLogLevel";
 import { LiteLLMCommitMessageProvider } from "./providers/liteLLMCommitProvider";
 import { Logger } from "./utils/logger";
 import { StructuredLogger, CopilotMdManager } from "./observability";
@@ -17,16 +16,11 @@ import { TelemetryService } from "./telemetry/telemetryService";
 import { LiteLLMTelemetry } from "./utils/telemetry";
 import { setTelemetryService as setTokenUtilsTelemetryService } from "./adapters/tokenUtils";
 import { EffortFallbackCache } from "./utils/reasoningEffortFallback";
-import { LegacyConfigMigration } from "./config/legacyConfigMigration";
 import { registerOpenCopilotMdFolderCommand } from "./commands/openCopilotMdFolder";
 
-// Store the config manager for cleanup on deactivation
 let configManagerInstance: ConfigManager | undefined;
 let telemetryServiceInstance: TelemetryService | undefined;
 let activeChatProviderInstance: LiteLLMChatProvider | undefined;
-
-const MODERN_CONFIG_SESSION_KEY = "litellm-connector.isOnModernConfig";
-const MIGRATION_NOTICE_KEY = "litellm-connector.migrationNotice.v1";
 
 export function activate(context: vscode.ExtensionContext): void {
     // Initialize telemetry first so logger can use it
@@ -117,45 +111,6 @@ export function activate(context: vscode.ExtensionContext): void {
     const configManager = configManagerInstance;
     configManager.setTelemetryService(telemetryService);
 
-    const showMigrationNoticeOnce = async (): Promise<void> => {
-        // globalState is always present on a real ExtensionContext, but tests may
-        // provide a partial stub. Bail out silently if it is missing.
-        if (!context.globalState) {
-            return;
-        }
-        const alreadyShown = context.globalState.get<boolean>(MIGRATION_NOTICE_KEY, false);
-        if (alreadyShown) {
-            return;
-        }
-
-        await context.globalState.update(MIGRATION_NOTICE_KEY, true);
-
-        const openLanguageModels = "Open Language Models";
-        const message =
-            "Configuration now lives in VS Code's Language Models view. Use Add Model... to add or edit LiteLLM.";
-        const choice = await vscode.window.showInformationMessage(message, openLanguageModels);
-        if (choice === openLanguageModels) {
-            try {
-                await vscode.commands.executeCommand("workbench.action.chat.manage");
-            } catch {
-                await vscode.commands.executeCommand("workbench.action.openSettings", "@tag:language-model");
-            }
-        }
-    };
-
-    const getModernConfigSessionFlag = (): boolean => {
-        return context.workspaceState?.get<boolean>(MODERN_CONFIG_SESSION_KEY, false) === true;
-    };
-
-    const persistModernConfigSessionFlag = async (): Promise<boolean> => {
-        if (!context.workspaceState) {
-            Logger.warn("workspaceState unavailable; cannot persist modern configuration session flag");
-            return false;
-        }
-        await context.workspaceState.update(MODERN_CONFIG_SESSION_KEY, true);
-        return true;
-    };
-
     const effortFallbackCache = new EffortFallbackCache();
 
     // Track feature adoption
@@ -174,44 +129,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // VS Code 1.120+ uses the unified chat provider with per-group configuration support.
 
-    void showMigrationNoticeOnce();
-
     const activeProvider = new LiteLLMChatProvider(context.secrets, ua, effortFallbackCache);
     activeChatProviderInstance = activeProvider; // Store for cleanup on deactivation
     activeProvider.setTelemetryService(telemetryService);
-
-    const isOnModernConfigAtStartup = getModernConfigSessionFlag();
-    telemetryService.captureModernConfigStatus({
-        is_on_modern_config: isOnModernConfigAtStartup,
-        source: "startup",
-    });
-
-    activeProvider.setModernConfigurationDetectedHandler(() => {
-        const alreadyMarked = getModernConfigSessionFlag();
-        if (alreadyMarked) {
-            telemetryService.captureModernConfigStatus({
-                is_on_modern_config: true,
-                source: "provider_configuration_detected",
-            });
-            return;
-        }
-
-        void (async () => {
-            try {
-                const persisted = await persistModernConfigSessionFlag();
-                if (!persisted) {
-                    return;
-                }
-                Logger.info("Marked session as modern-configured from provider configuration detection");
-                telemetryService.captureModernConfigStatus({
-                    is_on_modern_config: true,
-                    source: "provider_configuration_detected",
-                });
-            } catch (err: unknown) {
-                Logger.error("Failed to persist modern configuration session flag", err);
-            }
-        })();
-    });
 
     // Commit message provider (version-agnostic)
     const commitProvider = new LiteLLMCommitMessageProvider(context.secrets, ua, effortFallbackCache);
@@ -299,30 +219,11 @@ export function activate(context: vscode.ExtensionContext): void {
         context.subscriptions.push(registerShowModelsCommand(activeProvider, telemetryService));
         context.subscriptions.push(registerReloadModelsCommand(activeProvider, telemetryService));
         context.subscriptions.push(registerGenerateCommitMessageCommand(commitProvider, telemetryService));
-        context.subscriptions.push(registerSetLogLevelCommand());
         context.subscriptions.push(registerOpenCopilotMdFolderCommand());
         Logger.info("Config command registered.");
     } catch (cmdErr) {
         Logger.error("Failed to register commands", cmdErr);
     }
-
-    // Legacy configuration migration
-    const legacyMigration = new LegacyConfigMigration(context, configManager, telemetryService);
-    void legacyMigration
-        .runMigrationIfNeeded()
-        .then(async (result) => {
-            if (!result?.migrated) {
-                return;
-            }
-            Logger.info(`Migration completed: ${result.groupsCreated} groups created`);
-            // Give VS Code time to settle before refreshing model list
-            setTimeout(() => {
-                activeProvider.refreshModelInformation();
-            }, 500);
-        })
-        .catch((err) => {
-            Logger.error("Migration check failed", err);
-        });
 }
 
 export async function deactivate(): Promise<void> {
