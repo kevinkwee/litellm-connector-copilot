@@ -5,8 +5,8 @@ import { StructuredLogger } from "../observability/structuredLogger";
  * Maximum allowed length for tool function names in the Bedrock Converse API.
  *
  * AWS Bedrock enforces a 64-character limit on the toolUse.name field.
- * This constant is exposed for use at all outbound boundaries where tool names
- * are emitted: the message converter and the streaming interpreter.
+ * This constant is exposed for use at the outbound boundary where tool names
+ * are emitted: the streaming interpreter.
  */
 export const TOOL_NAME_MAX_LENGTH = 64;
 
@@ -31,9 +31,8 @@ export interface SanitizedToolName {
 /**
  * Sanitizes and truncates a tool function name to comply with AWS Bedrock's 64-character limit.
  *
- * This function is applied at **outbound boundaries** where tool names are emitted:
- * 1. **message converter** (`src/adapters/v2OpenAIMessageConverter.ts`): `toOpenAIToolCall`
- * 2. **streaming interpreter** (`src/adapters/streaming/liteLLMStreamInterpreter.ts`):
+ * This function is applied at the outbound boundary where tool names are emitted:
+ * **streaming interpreter** (`src/adapters/streaming/liteLLMStreamInterpreter.ts`):
  *    - `state.toolCallBuffers` initialization (OpenAI format)
  *    - `state.responseToolCallBuffers` updates (output_item.delta)
  *    - `state.responseToolCallBuffers` updates (output_tool_call.*)

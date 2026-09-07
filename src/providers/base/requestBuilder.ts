@@ -1,15 +1,8 @@
 import type * as vscode from "vscode";
-import {
-    convertMessages,
-    convertTools,
-    validateRequest,
-    validateV2Messages,
-    convertV2MessagesToOpenAI,
-} from "../../utils";
-import { trimMessagesToFitBudget, trimV2MessagesForBudget } from "../../adapters/tokenUtils";
+import { convertMessages, convertTools, validateRequest } from "../../utils";
+import { trimMessagesToFitBudget } from "../../adapters/tokenUtils";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest, OpenAIFunctionToolDef } from "../../types";
 import type { RequestBuilderDeps } from "./types";
-import type { V2ChatMessage } from "../v2Types";
 
 export class RequestBuilder {
     private readonly configManager: RequestBuilderDeps["configManager"];
@@ -74,8 +67,7 @@ export class RequestBuilder {
                 typeof mo.max_tokens === "number"
                     ? Math.min(mo.max_tokens, model.maxOutputTokens)
                     : model.maxOutputTokens,
-            ...(this.isParameterSupported("reasoning_effort", modelInfo, rawModelId) &&
-            reasoningEffort
+            ...(this.isParameterSupported("reasoning_effort", modelInfo, rawModelId) && reasoningEffort
                 ? { reasoning_effort: reasoningEffort }
                 : {}),
         };
@@ -98,85 +90,6 @@ export class RequestBuilder {
         }
         if (this.isParameterSupported("stop", modelInfo, rawModelId) && mo.stop) {
             requestBody.stop = mo.stop as string | string[];
-        }
-        if (this.isParameterSupported("top_p", modelInfo, rawModelId) && typeof mo.top_p === "number") {
-            requestBody.top_p = mo.top_p;
-        }
-
-        if (toolConfig.tools) {
-            requestBody.tools = toolConfig.tools as unknown as OpenAIFunctionToolDef[];
-        }
-
-        // Only include tool_choice when:
-        // 1. Model supports tool_choice (per isParameterSupported), AND
-        // 2. Tools are present, AND
-        //    a. Explicitly required by toolMode (toolConfig.tool_choice is set), OR
-        //    b. Model supports it - default to "auto" for backward compatibility
-        if (toolConfig.tools && toolConfig.tools.length > 0) {
-            if (this.isParameterSupported("tool_choice", modelInfo, rawModelId)) {
-                if (toolConfig.tool_choice) {
-                    // Explicitly required tool (toolMode === Required)
-                    requestBody.tool_choice = toolConfig.tool_choice;
-                } else {
-                    // Model supports tool_choice, tools present, but no explicit required mode
-                    // Default to "auto" for backward compatibility
-                    requestBody.tool_choice = "auto";
-                }
-            }
-            // If model doesn't support tool_choice, omit it entirely
-        }
-
-        this.stripUnsupportedParametersFromRequest(
-            requestBody as unknown as Record<string, unknown>,
-            modelInfo,
-            rawModelId
-        );
-        return requestBody;
-    }
-
-    public async buildV2ChatRequest(
-        messages: readonly V2ChatMessage[],
-        model: vscode.LanguageModelChatInformation,
-        options: vscode.ProvideLanguageModelChatResponseOptions,
-        modelInfo?: LiteLLMModelInfo,
-        _caller?: string
-    ): Promise<OpenAIChatCompletionRequest> {
-        // See `buildOpenAIChatRequest` for the rationale: `model.id` is
-        // namespaced, the body needs the raw model name.
-        const rawModelId = this.extractRawModelName(model.id);
-
-        const toolConfig = convertTools(options);
-        const trimmedMessages = trimV2MessagesForBudget(messages, toolConfig.tools, model, modelInfo);
-        validateV2Messages(trimmedMessages);
-
-        const reasoningEffort = this.getReasoningEffort(options, model, modelInfo);
-        const mo = (options.modelOptions as Record<string, unknown>) ?? {};
-
-        const requestBody: OpenAIChatCompletionRequest = {
-            model: rawModelId,
-            messages: convertV2MessagesToOpenAI(trimmedMessages),
-            stream: true,
-            max_tokens:
-                typeof options.modelOptions?.max_tokens === "number"
-                    ? Math.min(options.modelOptions.max_tokens, model.maxOutputTokens)
-                    : model.maxOutputTokens,
-            ...(this.isParameterSupported("reasoning_effort", modelInfo, rawModelId) &&
-            reasoningEffort
-                ? { reasoning_effort: reasoningEffort }
-                : {}),
-        };
-
-        if (this.isParameterSupported("temperature", modelInfo, rawModelId)) {
-            const temp = mo.temperature as number | undefined;
-            requestBody.temperature = temp;
-        }
-        if (this.isParameterSupported("frequency_penalty", modelInfo, rawModelId)) {
-            const fp = mo.frequency_penalty as number | undefined;
-            requestBody.frequency_penalty = fp;
-        }
-        if (this.isParameterSupported("presence_penalty", modelInfo, rawModelId)) {
-            const pp = mo.presence_penalty as number | undefined;
-            requestBody.presence_penalty = pp;
         }
         if (this.isParameterSupported("top_p", modelInfo, rawModelId) && typeof mo.top_p === "number") {
             requestBody.top_p = mo.top_p;

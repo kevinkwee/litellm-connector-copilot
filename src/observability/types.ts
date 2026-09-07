@@ -2,7 +2,7 @@
  * Type definitions for the observability layer.
  *
  * These types define the structured logging, telemetry, and auditing contracts
- * used throughout the v2 provider baseline.
+ * used throughout the provider request pipeline.
  */
 
 /**

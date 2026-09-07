@@ -3,7 +3,7 @@ import type { HookPoint, HookHandler, HookContext } from "./types";
 import { StructuredLogger } from "./structuredLogger";
 
 /**
- * Lifecycle hook system for the v2 provider baseline.
+ * Lifecycle hook system for the provider request pipeline.
  *
  * Allows observers to inspect or modify requests/responses at defined points
  * in the request lifecycle. Hooks are registered via the registration API

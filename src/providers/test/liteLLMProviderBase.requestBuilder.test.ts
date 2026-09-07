@@ -54,10 +54,10 @@ suite("RequestBuilder", () => {
         sinon.assert.match(req.stream, true);
     });
 
-    test("buildV2ChatRequest preserves tool_choice", async () => {
+    test("buildOpenAIChatRequest preserves tool_choice when ToolMode is Required", async () => {
         configManager.getConfig.resolves({});
-        const model = { id: "gpt-v2", maxInputTokens: 100, maxOutputTokens: 20 } as vscode.LanguageModelChatInformation;
-        const messages = [
+        const model = { id: "gpt-x", maxInputTokens: 100, maxOutputTokens: 50 } as vscode.LanguageModelChatInformation;
+        const messages: vscode.LanguageModelChatRequestMessage[] = [
             {
                 role: vscode.LanguageModelChatMessageRole.User,
                 content: [new vscode.LanguageModelTextPart("hi")],
@@ -66,8 +66,8 @@ suite("RequestBuilder", () => {
         ];
         const modelInfo = { mode: "chat" } as LiteLLMModelInfo;
 
-        const req = await builder.buildV2ChatRequest(
-            messages as never,
+        const req = await builder.buildOpenAIChatRequest(
+            messages,
             model,
             {
                 modelOptions: {},

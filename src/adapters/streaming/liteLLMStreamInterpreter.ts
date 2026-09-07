@@ -1,10 +1,20 @@
-export type { V2EmittedPart as EmittedPart } from "../../providers/v2Types";
-import type { V2EmittedPart as EmittedPart } from "../../providers/v2Types";
 import type { OpenAIUsageCompletionTokenDetails, OpenAIUsagePayload, OpenAIUsagePromptTokenDetails } from "../../types";
 import { isCacheControlMimeType, normalizeToolCallId } from "../../utils";
 import { sanitizeToolName } from "../../utils/toolNameUtils";
 import { Logger } from "../../utils/logger";
 import { StructuredLogger } from "../../observability/structuredLogger";
+
+/**
+ * Discriminated union of response parts the stream interpreter emits toward
+ * VS Code (text, data, thinking, buffered tool calls, finish, and usage).
+ */
+export type EmittedPart =
+    | { type: "text"; value: string }
+    | { type: "data"; mimeType: string; value: unknown }
+    | { type: "thinking"; value: string | string[]; id?: string; metadata?: Record<string, unknown> }
+    | { type: "tool_call"; index: number; id?: string; name?: string; args: string }
+    | { type: "finish"; reason?: string }
+    | { type: "response"; usage?: { inputTokens?: number; outputTokens?: number } };
 
 export interface StreamingState {
     toolCallBuffers: Map<number, { id?: string; name?: string; args: string }>;

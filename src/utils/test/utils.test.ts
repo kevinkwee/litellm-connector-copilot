@@ -10,11 +10,6 @@ import {
     tryParseJSONObject,
     validateRequest,
     validateTools,
-    normalizeMessagesForV2Pipeline,
-    convertV2MessagesToProviderMessages,
-    convertV2MessagesToTransportMessages,
-    convertV2MessagesToOpenAI,
-    validateV2Messages,
 } from "../../utils";
 import type { OpenAIChatMessage } from "../../types";
 
@@ -427,171 +422,6 @@ suite("Utility Unit Tests", () => {
         assert.strictEqual(out[0].tool_calls?.[0].function.arguments, "{}");
     });
 
-    test("V2 pipeline utility functions", () => {
-        const v2Msgs = normalizeMessagesForV2Pipeline([
-            {
-                role: vscode.LanguageModelChatMessageRole.User,
-                content: [
-                    new vscode.LanguageModelTextPart("hi"),
-                    new vscode.LanguageModelDataPart(Buffer.from("data"), "text/plain"),
-                ],
-                name: "user1",
-            } as unknown as vscode.LanguageModelChatMessage,
-        ]);
-
-        assert.strictEqual(v2Msgs.length, 1);
-        assert.strictEqual(v2Msgs[0].role, "user");
-        assert.strictEqual(v2Msgs[0].content.length, 2);
-
-        const providerMsgs = convertV2MessagesToProviderMessages(v2Msgs);
-        assert.strictEqual(providerMsgs.length, 1);
-        assert.ok(providerMsgs[0].content[1] instanceof vscode.LanguageModelDataPart);
-
-        const transportMsgs = convertV2MessagesToTransportMessages(v2Msgs);
-        assert.strictEqual(transportMsgs.length, 1);
-        assert.ok(transportMsgs[0].content[1] instanceof vscode.LanguageModelTextPart);
-
-        assert.doesNotThrow(() => validateV2Messages(v2Msgs));
-    });
-
-    test("V2 pipeline handles tool calls and results", () => {
-        const v2Msgs = normalizeMessagesForV2Pipeline([
-            {
-                role: vscode.LanguageModelChatMessageRole.Assistant,
-                content: [new vscode.LanguageModelToolCallPart("c1", "t1", { a: 1 })],
-                name: "assistant",
-            } as unknown as vscode.LanguageModelChatMessage,
-            {
-                role: vscode.LanguageModelChatMessageRole.User,
-                content: [new vscode.LanguageModelToolResultPart("c1", ["ok"])],
-                name: "user",
-            } as unknown as vscode.LanguageModelChatMessage,
-        ]);
-
-        assert.strictEqual(v2Msgs[0].content[0].type, "tool_call");
-        assert.strictEqual(v2Msgs[1].content[0].type, "tool_result");
-
-        const openai = convertV2MessagesToOpenAI(v2Msgs);
-        assert.strictEqual(openai[0].role, "assistant");
-        assert.ok(openai[0].tool_calls);
-        assert.strictEqual(openai[1].role, "tool");
-    });
-
-    test("V2 validation allows tool results followed by adjacent user text", () => {
-        const v2Msgs = normalizeMessagesForV2Pipeline([
-            {
-                role: vscode.LanguageModelChatMessageRole.Assistant,
-                content: [new vscode.LanguageModelToolCallPart("write-1", "write_file", { path: "src/example.ts" })],
-                name: "assistant",
-            } as unknown as vscode.LanguageModelChatMessage,
-            {
-                role: vscode.LanguageModelChatMessageRole.User,
-                content: [
-                    new vscode.LanguageModelToolResultPart("write-1", ["Wrote src/example.ts"]),
-                    new vscode.LanguageModelTextPart("The file write completed successfully."),
-                ],
-                name: "user",
-            } as unknown as vscode.LanguageModelChatMessage,
-        ]);
-
-        assert.doesNotThrow(() => validateV2Messages(v2Msgs));
-    });
-
-    test("V2 conversion keeps tool result before adjacent trailing text", () => {
-        const v2Msgs = normalizeMessagesForV2Pipeline([
-            {
-                role: vscode.LanguageModelChatMessageRole.Assistant,
-                content: [new vscode.LanguageModelToolCallPart("write-2", "write_file", { path: "src/example.ts" })],
-                name: "assistant",
-            } as unknown as vscode.LanguageModelChatMessage,
-            {
-                role: vscode.LanguageModelChatMessageRole.User,
-                content: [
-                    new vscode.LanguageModelToolResultPart("write-2", ["Wrote src/example.ts"]),
-                    new vscode.LanguageModelTextPart("No follow-up read is required."),
-                ],
-                name: "user",
-            } as unknown as vscode.LanguageModelChatMessage,
-        ]);
-
-        const openai = convertV2MessagesToOpenAI(v2Msgs);
-
-        assert.strictEqual(openai.length, 3);
-        assert.strictEqual(openai[0].role, "assistant");
-        assert.ok(openai[0].tool_calls);
-        assert.strictEqual(openai[1].role, "tool");
-        assert.strictEqual(openai[1].content, "Wrote src/example.ts");
-        assert.strictEqual(openai[2].role, "user");
-        assert.strictEqual(openai[2].content, "No follow-up read is required.");
-    });
-
-    test("V2 conversion serializes structured tool results without flat concatenation", () => {
-        const v2Msgs = normalizeMessagesForV2Pipeline([
-            {
-                role: vscode.LanguageModelChatMessageRole.Assistant,
-                content: [new vscode.LanguageModelToolCallPart("write-3", "write_file", { path: "src/example.ts" })],
-                name: "assistant",
-            } as unknown as vscode.LanguageModelChatMessage,
-            {
-                role: vscode.LanguageModelChatMessageRole.User,
-                content: [
-                    new vscode.LanguageModelToolResultPart("write-3", [
-                        new vscode.LanguageModelTextPart("write result"),
-                        { status: "success", path: "src/example.ts", bytesWritten: 42 },
-                    ]),
-                ],
-                name: "user",
-            } as unknown as vscode.LanguageModelChatMessage,
-        ]);
-
-        const openai = convertV2MessagesToOpenAI(v2Msgs);
-        const toolContent = openai[1].content;
-
-        assert.strictEqual(typeof toolContent, "string");
-        assert.notStrictEqual(
-            toolContent,
-            'write result{"status":"success","path":"src/example.ts","bytesWritten":42}'
-        );
-
-        const parsed = JSON.parse(toolContent as string) as {
-            type: string;
-            content: { type: string; text?: string; value?: unknown }[];
-        };
-        assert.strictEqual(parsed.type, "tool_result");
-        assert.deepStrictEqual(parsed.content[0], { type: "text", text: "write result" });
-        assert.deepStrictEqual(parsed.content[1], {
-            type: "json",
-            value: { status: "success", path: "src/example.ts", bytesWritten: 42 },
-        });
-    });
-
-    test("V2 pipeline handles thinking parts", () => {
-        // `LanguageModelThinkingPart` is part of the proposed VS Code API and may
-        // not be present at runtime in older insiders. We probe for it via a
-        // typed view that surfaces it as an optional constructor.
-        const vscodeWithThinking = vscode as unknown as {
-            LanguageModelThinkingPart?: new (text: string, id?: string) => vscode.LanguageModelTextPart;
-        };
-        const ThinkingPart = vscodeWithThinking.LanguageModelThinkingPart;
-        if (!ThinkingPart) {
-            return;
-        }
-
-        const v2Msgs = normalizeMessagesForV2Pipeline([
-            {
-                role: vscode.LanguageModelChatMessageRole.Assistant,
-                content: [new ThinkingPart("reasoning", "id1")],
-                name: "assistant",
-            } as unknown as vscode.LanguageModelChatMessage,
-        ]);
-
-        assert.strictEqual(v2Msgs[0].content[0].type, "thinking");
-
-        const transport = convertV2MessagesToTransportMessages(v2Msgs);
-        assert.ok(transport[0].content[0] instanceof vscode.LanguageModelTextPart);
-        assert.strictEqual((transport[0].content[0] as vscode.LanguageModelTextPart).value, "reasoning");
-    });
-
     // Regression tests for the "$mid / cache_control / json_cache" bug where
     // Anthropic-style prompt-cache metadata was being decoded and injected as
     // raw text into outbound LLM messages. Once that happens, LLMs fixate on
@@ -599,59 +429,6 @@ suite("Utility Unit Tests", () => {
     // the active task. These tests guard every transport conversion path so
     // the metadata can never reach the wire again.
     suite("cache_control metadata stripping (regression)", () => {
-        test("V2 transport drops bare 'cache_control' parts and keeps adjacent text", () => {
-            const v2Msgs = normalizeMessagesForV2Pipeline([
-                {
-                    role: vscode.LanguageModelChatMessageRole.User,
-                    name: undefined,
-                    content: [
-                        new vscode.LanguageModelDataPart(new Uint8Array(Buffer.from("ephemeral")), "cache_control"),
-                        new vscode.LanguageModelTextPart("keep me"),
-                    ],
-                } as unknown as vscode.LanguageModelChatMessage,
-            ]);
-
-            const openai = convertV2MessagesToOpenAI(v2Msgs);
-            assert.strictEqual(openai.length, 1);
-            assert.strictEqual(openai[0].content, "keep me");
-            assert.ok(
-                typeof openai[0].content !== "string" || !openai[0].content.includes("ephemeral"),
-                "cache_control payload must not appear in transport content"
-            );
-        });
-
-        test("V2 transport drops 'application/vnd.cache-control+json' variants", () => {
-            // Guard the +json suffix variant — previously the mimeType.includes("json")
-            // branch would decode the carrier payload (e.g. a VS Code $mid object)
-            // and inject it as literal text into the LLM message.
-            const carrier = JSON.stringify({
-                $mid: 24,
-                mimeType: "cache_control",
-                data: "ZXBoZW1lcmFs",
-            });
-            const v2Msgs = normalizeMessagesForV2Pipeline([
-                {
-                    role: vscode.LanguageModelChatMessageRole.User,
-                    name: undefined,
-                    content: [
-                        new vscode.LanguageModelDataPart(
-                            new Uint8Array(Buffer.from(carrier)),
-                            "application/vnd.cache-control+json"
-                        ),
-                        new vscode.LanguageModelTextPart("hello"),
-                    ],
-                } as unknown as vscode.LanguageModelChatMessage,
-            ]);
-
-            const openai = convertV2MessagesToOpenAI(v2Msgs);
-            assert.strictEqual(openai.length, 1);
-            assert.strictEqual(openai[0].content, "hello");
-            const serialized = JSON.stringify(openai);
-            assert.ok(!serialized.includes("$mid"), "carrier $mid marker must not leak");
-            assert.ok(!serialized.includes("ZXBoZW1lcmFs"), "carrier base64 must not leak");
-            assert.ok(!serialized.includes("cache_control"), "cache_control marker must not leak");
-        });
-
         suite("deriveGroupNameFromUrl", () => {
             test("returns hostname from https URL", () => {
                 const result = deriveGroupNameFromUrl("https://llm-kit.geth.cc");
@@ -678,10 +455,9 @@ suite("Utility Unit Tests", () => {
                 assert.strictEqual(result, "proxy.example.com");
             });
         });
-        test("V1 convertMessages drops cache_control parts (bare + +json variants)", () => {
-            // V1 path: Copilot Chat can deliver the same poisoned data parts to
-            // providers using the legacy convertMessages path, so it must be
-            // equally strict.
+        test("convertMessages drops cache_control parts (bare + +json variants)", () => {
+            // Copilot Chat can deliver the same poisoned data parts to providers
+            // via convertMessages, so this path must strip them too.
             const msgs: vscode.LanguageModelChatMessage[] = [
                 {
                     role: vscode.LanguageModelChatMessageRole.User,
@@ -702,60 +478,7 @@ suite("Utility Unit Tests", () => {
             assert.strictEqual(out[0].content, "visible");
         });
 
-        test("V2 transport preserves legitimate text/plain and application/json data parts", () => {
-            // Sanity guard: while stripping cache_control, we must NOT accidentally
-            // strip real JSON / text data parts that carry actual model context.
-            const v2Msgs = normalizeMessagesForV2Pipeline([
-                {
-                    role: vscode.LanguageModelChatMessageRole.User,
-                    name: undefined,
-                    content: [
-                        new vscode.LanguageModelDataPart(Buffer.from('{"a":1}'), "application/json"),
-                        new vscode.LanguageModelDataPart(Buffer.from("plain"), "text/plain"),
-                    ],
-                } as unknown as vscode.LanguageModelChatMessage,
-            ]);
-
-            const openai = convertV2MessagesToOpenAI(v2Msgs);
-            assert.strictEqual(openai.length, 1);
-            const content = openai[0].content as string;
-            assert.ok(content.includes('{"a":1}'));
-            assert.ok(content.includes("plain"));
-        });
-
-        test("V2 tool result serialization drops cache_control data parts but keeps text", () => {
-            const v2Msgs = normalizeMessagesForV2Pipeline([
-                {
-                    role: vscode.LanguageModelChatMessageRole.Assistant,
-                    name: undefined,
-                    content: [new vscode.LanguageModelToolCallPart("call-1", "tool", {})],
-                } as unknown as vscode.LanguageModelChatMessage,
-                {
-                    role: vscode.LanguageModelChatMessageRole.User,
-                    name: undefined,
-                    content: [
-                        new vscode.LanguageModelToolResultPart("call-1", [
-                            new vscode.LanguageModelDataPart(Buffer.from("ephemeral"), "cache_control"),
-                            new vscode.LanguageModelDataPart(
-                                Buffer.from('{"$mid":24,"mimeType":"cache_control","data":"ZXBoZW1lcmFs"}'),
-                                "application/vnd.cache-control+json"
-                            ),
-                            new vscode.LanguageModelTextPart("real tool output"),
-                        ]),
-                    ],
-                } as unknown as vscode.LanguageModelChatMessage,
-            ]);
-
-            const out = convertV2MessagesToOpenAI(v2Msgs);
-            const serialized = JSON.stringify(out);
-
-            assert.ok(serialized.includes("real tool output"));
-            assert.ok(!serialized.includes("ephemeral"), "cache_control payload must not leak");
-            assert.ok(!serialized.includes("cache_control"), "cache_control marker must not leak");
-            assert.ok(!serialized.includes("ZXBoZW1lcmFs"), "carrier base64 must not leak");
-        });
-
-        test("V1 tool result serialization drops cache_control data parts but keeps text", () => {
+        test("tool result serialization drops cache_control data parts but keeps text", () => {
             const msgs: vscode.LanguageModelChatMessage[] = [
                 {
                     role: vscode.LanguageModelChatMessageRole.Assistant,

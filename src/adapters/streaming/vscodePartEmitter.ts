@@ -4,7 +4,7 @@ import { isCacheControlMimeType } from "../../utils";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import type { EmittedPart } from "./liteLLMStreamInterpreter";
 
-export function emitV2PartsToVSCode(
+export function emitPartsToVSCode(
     parts: EmittedPart[],
     progress: vscode.Progress<vscode.LanguageModelResponsePart | vscode.LanguageModelDataPart>
 ): void {
@@ -177,5 +177,3 @@ export function emitV2PartsToVSCode(
         partCount: parts.length,
     });
 }
-
-export const emitPartsToVSCode = emitV2PartsToVSCode;

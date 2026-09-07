@@ -4,7 +4,7 @@ import type { TelemetryService } from "../telemetry/telemetryService";
 import type { HookPoint, HookContext } from "./types";
 
 /**
- * Connects the v2 observability HookSystem to PostHog telemetry.
+ * Connects the observability HookSystem to PostHog telemetry.
  */
 export class PostHogHook implements vscode.Disposable {
     private disposables: vscode.Disposable[] = [];

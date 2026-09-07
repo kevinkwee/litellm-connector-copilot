@@ -80,7 +80,7 @@ import { StructuredLogger } from "<relative-path>/observability/structuredLogger
 5. If the event is a **per-element trace**, use `trace`.
 
 **Event name** — dotted, present-tense, namespaced by area:
-`tokenizer.part_counted`, `stream.tool_call_buffered`, `v2.convert.completed`.
+`tokenizer.part_counted`, `stream.tool_call_buffered`.
 Reuse the existing `EventType` enum in `src/observability/types.ts` when
 one fits; otherwise use a new namespaced string.
 

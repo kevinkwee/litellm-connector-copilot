@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as sinon from "sinon";
 import * as assert from "assert";
-import { emitV2PartsToVSCode } from "../vscodePartEmitter";
+import { emitPartsToVSCode } from "../vscodePartEmitter";
 import { Logger } from "../../../utils/logger";
 
 suite("vscodePartEmitter", () => {
@@ -22,10 +22,7 @@ suite("vscodePartEmitter", () => {
             report: (p: unknown) => reported.push(p),
         } as vscode.Progress<vscode.LanguageModelResponsePart>;
 
-        emitV2PartsToVSCode(
-            [{ type: "tool_call", index: 0, id: "call_1", name: "t1", args: "{invalid json" }],
-            progress
-        );
+        emitPartsToVSCode([{ type: "tool_call", index: 0, id: "call_1", name: "t1", args: "{invalid json" }], progress);
 
         sinon.assert.calledOnce(warnStub);
         const callArgs = warnStub.firstCall.args;
@@ -48,7 +45,7 @@ suite("vscodePartEmitter", () => {
             report: (p: unknown) => reported.push(p),
         } as vscode.Progress<vscode.LanguageModelResponsePart>;
 
-        emitV2PartsToVSCode(
+        emitPartsToVSCode(
             [
                 {
                     type: "data",
@@ -74,7 +71,7 @@ suite("vscodePartEmitter", () => {
             report: (p: unknown) => reported.push(p),
         } as vscode.Progress<vscode.LanguageModelResponsePart>;
 
-        emitV2PartsToVSCode(
+        emitPartsToVSCode(
             [
                 {
                     type: "data",
@@ -118,7 +115,7 @@ suite("vscodePartEmitter", () => {
             report: (p: unknown) => reported.push(p),
         } as vscode.Progress<vscode.LanguageModelResponsePart>;
 
-        emitV2PartsToVSCode([{ type: "text", value: 12345 } as unknown as { type: "text"; value: string }], progress);
+        emitPartsToVSCode([{ type: "text", value: 12345 } as unknown as { type: "text"; value: string }], progress);
 
         assert.strictEqual(reported.length, 1);
         assert.ok(reported[0] instanceof vscode.LanguageModelTextPart);
@@ -131,7 +128,7 @@ suite("vscodePartEmitter", () => {
             report: (p: unknown) => reported.push(p),
         } as vscode.Progress<vscode.LanguageModelResponsePart>;
 
-        emitV2PartsToVSCode([{ type: "data", mimeType: "application/octet-stream", value: { raw: "data" } }], progress);
+        emitPartsToVSCode([{ type: "data", mimeType: "application/octet-stream", value: { raw: "data" } }], progress);
 
         assert.strictEqual(reported.length, 1);
         assert.ok(reported[0] instanceof vscode.LanguageModelDataPart);
@@ -143,7 +140,7 @@ suite("vscodePartEmitter", () => {
             report: (p: unknown) => reported.push(p),
         } as vscode.Progress<vscode.LanguageModelResponsePart>;
 
-        emitV2PartsToVSCode(
+        emitPartsToVSCode(
             [
                 { type: "response" } as unknown as { type: "text"; value: string },
                 { type: "finish" } as unknown as { type: "text"; value: string },
@@ -163,7 +160,7 @@ suite("vscodePartEmitter", () => {
             report: (p: unknown) => reported.push(p),
         } as vscode.Progress<vscode.LanguageModelResponsePart>;
 
-        emitV2PartsToVSCode([{ type: "data", mimeType: "usage", value: '{"tokens": 10}' }], progress);
+        emitPartsToVSCode([{ type: "data", mimeType: "usage", value: '{"tokens": 10}' }], progress);
 
         assert.strictEqual(reported.length, 1);
         assert.ok(reported[0] instanceof vscode.LanguageModelDataPart);

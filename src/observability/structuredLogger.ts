@@ -49,7 +49,7 @@ function shouldSkipForLevel(channel: vscode.LogOutputChannel, level: LogLevel): 
 }
 
 /**
- * Structured JSONL logger for the v2 provider baseline.
+ * Structured JSONL logger for the provider request pipeline.
  *
  * Outputs one JSON object per line for parseability by standard tools (jq, etc.).
  * Log level filtering is handled by VS Code's LogOutputChannel UI (the dropdown

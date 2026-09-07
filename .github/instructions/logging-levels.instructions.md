@@ -61,8 +61,8 @@ StructuredLogger.<level>("<area>.<verb>", { ...data }, { requestId?, model?, end
 ```
 
 - **Event name** — dotted, present-tense, namespaced by area
-  (`tokenizer.part_counted`, `stream.tool_call_buffered`,
-  `v2.convert.completed`). Reuse the existing `EventType` enum in
+  (`tokenizer.part_counted`, `stream.tool_call_buffered`).
+  Reuse the existing `EventType` enum in
   `src/observability/types.ts` when one fits; otherwise introduce a
   new namespaced string.
 - **Data** — the **inputs that drove the decision**, e.g.

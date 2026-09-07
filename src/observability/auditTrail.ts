@@ -2,7 +2,7 @@ import type { LogEvent, AuditSummary } from "./types";
 import { StructuredLogger } from "./structuredLogger";
 
 /**
- * Audit trail system for the v2 provider baseline.
+ * Audit trail system for the provider request pipeline.
  *
  * Stores events in memory during the request lifecycle and provides
  * a query API to reconstruct the full flow for a given request ID.

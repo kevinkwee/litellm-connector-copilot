@@ -1,5 +1,5 @@
 /**
- * Observability layer for the v2 provider baseline.
+ * Observability layer for the provider request pipeline.
  *
  * Provides structured JSONL logging, lifecycle hooks, audit trails,
  * and telemetry for end-to-end request visibility.

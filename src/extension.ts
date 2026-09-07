@@ -38,7 +38,6 @@ export function activate(context: vscode.ExtensionContext): void {
     // Bridge to token utils
     setTokenUtilsTelemetryService(telemetryService);
 
-    // Initialize v2 structured logger
     StructuredLogger.initialize(context);
 
     // Initialize the .copilotmd export manager. Reads
@@ -46,7 +45,6 @@ export function activate(context: vscode.ExtensionContext): void {
     // users can toggle the feature and adjust caps without reloading.
     CopilotMdManager.initialize(context);
 
-    // Initialize PostHog hook for v2 observability
     const postHogHook = new PostHogHook(telemetryService);
     postHogHook.initialize();
     context.subscriptions.push(postHogHook);
