@@ -194,10 +194,10 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         this._tokenCapture = new StreamTokenCapture(this.getRawModelName(model.id), progress, modelInfo);
         const tokenCapture = this._tokenCapture;
         const responsePartCollector = new ResponsePartCollector(tokenCapture.progress);
-        // Re-bind `trackingProgress` to the collector's wrapped progress so every
-        // downstream `sendRequestWithRetry` / `processStreamingResponse` call
-        // both reports to VS Code (via tokenCapture) AND records the part for
-        // the `.copilotmd` export. Single source of truth for the response body.
+        // Bind `trackingProgress` to the collector's wrapped progress so every
+        // downstream streaming call both reports to VS Code (via tokenCapture)
+        // AND records the part for the `.copilotmd` export. Single source of
+        // truth for the response body.
         const trackingProgress = responsePartCollector.progress;
 
         try {
@@ -316,14 +316,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         // the model continues where the socket died.
                         activeMessages = buildResumeMessages(messages, accumulator.text, accumulator.thinking);
                     }
-                    // Note: sendRequestWithRetry may fully handle /responses by emitting directly to progress.
-                    // In that case it returns an already-closed stream.
-                    // Pass a shallow clone per attempt: the inner reasoning-effort
-                    // fallback mutates request.reasoning_effort on failures, and
-                    // reusing the mutated body across attempts would silently
-                    // start a resumed attempt from a lowered effort.
                     stream = await this.sendRequestWithRetry(
-                        attempt === 0 ? requestBody : { ...requestBody },
+                        requestBody,
                         activeMessages,
                         model,
                         options,
