@@ -1,7 +1,7 @@
 {
 	"name": "litellm-connector-copilot",
 	"displayName": "LiteLLM Connector for Copilot",
-	"version": "2.1.10-dev5",
+	"version": "2.1.10-dev6",
 	"description": "An extension that integrates LiteLLM proxy into Copilot",
 	"categories": [
 		"AI",
@@ -97,7 +97,6 @@
 		"configuration": {
 			"title": "LiteLLM Connector",
 			"properties": {
-
 				"litellm-connector.commitModelIdOverride": {
 					"type": "string",
 					"default": "",
