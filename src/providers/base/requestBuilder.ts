@@ -84,7 +84,19 @@ export class RequestBuilder {
         }
 
         if (this.isParameterSupported("temperature", modelInfo, rawModelId)) {
-            const temp = mo.temperature as number | undefined;
+            // Per-model config (`chatLanguageModels.json` settings, e.g.
+            // `{"temperature": 0.2}`) is the user's choice for this model.
+            // A caller-provided `modelOptions.temperature` (explicit
+            // per-request value) wins, mirroring Copilot's own BYOK
+            // precedence. Unset means provider default: do not invent a
+            // temperature the user never configured.
+            const configuredTemp = this.getTelemetryOptions(options).modelConfiguration?.temperature;
+            const temp =
+                typeof mo.temperature === "number"
+                    ? mo.temperature
+                    : typeof configuredTemp === "number"
+                      ? configuredTemp
+                      : undefined;
             requestBody.temperature = temp;
         }
         if (this.isParameterSupported("frequency_penalty", modelInfo, rawModelId)) {

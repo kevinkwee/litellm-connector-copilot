@@ -2,6 +2,86 @@ import type * as vscode from "vscode";
 import type { LiteLLMModelInfo, ModelCapabilityOverride, SupportedReasoningEffort } from "../types";
 import { getDefaultEffort, getEffectiveEfforts } from "../config/modelOverrides";
 
+/**
+ * Static parameter limitations for known model families.
+ * Each key is a prefix match: the limitation applies when modelId
+ * includes the key.
+ *
+ * The table is checked before `supported_openai_params`, so a family
+ * listed here is rejected even when its model info claims the parameter
+ * is supported.
+ */
+export const KNOWN_PARAMETER_LIMITATIONS: Record<string, Set<string>> = {
+    "claude-3-5-sonnet": new Set(["temperature"]),
+    "claude-3-5-haiku": new Set(["temperature"]),
+    "claude-3-opus": new Set(["temperature"]),
+    "claude-3-sonnet": new Set(["temperature"]),
+    "claude-3-haiku": new Set(["temperature"]),
+    "claude-haiku-4-5": new Set(["temperature"]),
+    "gpt-5.1-codex": new Set(["temperature", "frequency_penalty", "presence_penalty"]),
+    "gpt-5.1-codex-mini": new Set(["temperature", "frequency_penalty", "presence_penalty"]),
+    "gpt-5.1-codex-max": new Set(["temperature", "frequency_penalty", "presence_penalty"]),
+    "codex-mini-latest": new Set(["temperature", "frequency_penalty", "presence_penalty"]),
+    "o1-": new Set(["temperature", "top_p", "presence_penalty", "frequency_penalty"]),
+    "gpt-5": new Set(["temperature", "top_p", "presence_penalty", "frequency_penalty"]),
+};
+
+/**
+ * Pure gate for whether an OpenAI-compatible parameter may be sent to a model.
+ *
+ * Source of truth: the `supported_openai_params` array on the model's
+ * `LiteLLMModelInfo`. When params are absent the parameter is allowed
+ * (capability data missing is not proof of exclusion). The known
+ * model-family limitation table is applied first as a prefix gate, so it
+ * can reject a parameter even when the info lists it as supported.
+ */
+export function isOpenAIParamSupported(
+    param: string,
+    modelInfo: LiteLLMModelInfo | undefined,
+    modelId?: string
+): boolean {
+    if (modelId) {
+        if (KNOWN_PARAMETER_LIMITATIONS[modelId]?.has(param)) {
+            return false;
+        }
+        for (const [knownModel, limitations] of Object.entries(KNOWN_PARAMETER_LIMITATIONS)) {
+            if (modelId.includes(knownModel) && limitations.has(param)) {
+                return false;
+            }
+        }
+    }
+
+    if (modelInfo?.supported_openai_params) {
+        const supportedParams = modelInfo.supported_openai_params;
+        const normalizedParam = param.toLowerCase();
+        const isSupported = supportedParams.some((p) => p.toLowerCase() === normalizedParam);
+
+        if (supportedParams.length === 0) {
+            return false;
+        }
+
+        if (!isSupported) {
+            return !isOpenAIParamRestrictable(param);
+        }
+        return true;
+    }
+
+    return true;
+}
+
+function isOpenAIParamRestrictable(param: string): boolean {
+    const restrictableParams = new Set([
+        "temperature",
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "stop",
+        "reasoning_effort",
+        "tool_choice",
+    ]);
+    return restrictableParams.has(param.toLowerCase());
+}
+
 export interface DerivedModelCapabilities {
     supportsTools: boolean;
     supportsVision: boolean;
@@ -470,6 +550,70 @@ export function buildReasoningEffortConfigurationSchema(
             },
         },
     };
+}
+
+/**
+ * Configuration property for per-model sampling temperature.
+ *
+ * Exposed in the model's configurationSchema so users can pin a temperature
+ * per model in `chatLanguageModels.json` (same storage channel as the
+ * reasoning effort picker). No `default`: an unset value must mean "use the
+ * provider's default" rather than forcing a sampling behavior the user never
+ * chose.
+ *
+ * The request path allows temperature when capability data is absent (missing
+ * data is not proof of exclusion, and the strip-and-retry path handles an
+ * upstream rejection live). A schema entry is a UI promise, stricter than a
+ * send: the property is only advertised when `supported_openai_params`
+ * explicitly lists temperature. This split prevents the picker from offering
+ * a knob the backend may reject while keeping the send path resilient.
+ */
+export function buildTemperatureConfigurationProperty(
+    modelInfo?: LiteLLMModelInfo,
+    modelId?: string
+):
+    | {
+          type: "number";
+          title: string;
+          description: string;
+          minimum: number;
+          maximum: number;
+      }
+    | undefined {
+    if (!modelInfo?.supported_openai_params?.includes("temperature")) {
+        return undefined;
+    }
+    if (!isOpenAIParamSupported("temperature", modelInfo, modelId)) {
+        return undefined;
+    }
+
+    return {
+        type: "number",
+        title: "Temperature",
+        description: "A sampling temperature to send with every request. Unset uses the model server's default.",
+        minimum: 0,
+        maximum: 2,
+    };
+}
+
+/**
+ * Combines configuration schema fragments (reasoning effort picker and
+ * temperature) into one schema object for `LanguageModelChatInformation`.
+ * Returns undefined when no fragment contributes properties, so the model
+ * carries no schema at all rather than an empty one.
+ */
+export function mergeConfigurationSchemas(
+    reasoningSchema: ReturnType<typeof buildReasoningEffortConfigurationSchema>,
+    temperatureProperty?: ReturnType<typeof buildTemperatureConfigurationProperty>
+): { properties: Record<string, Record<string, unknown>> } | undefined {
+    const properties: Record<string, Record<string, unknown>> = {};
+    if (reasoningSchema) {
+        properties.reasoningEffort = reasoningSchema.properties.reasoningEffort as unknown as Record<string, unknown>;
+    }
+    if (temperatureProperty) {
+        properties.temperature = temperatureProperty as unknown as Record<string, unknown>;
+    }
+    return Object.keys(properties).length > 0 ? { properties } : undefined;
 }
 
 /**

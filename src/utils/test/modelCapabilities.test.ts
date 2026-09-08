@@ -6,6 +6,8 @@ import {
     getSupportedReasoningEfforts,
     getDefaultReasoningEffort,
     buildReasoningEffortConfigurationSchema,
+    buildTemperatureConfigurationProperty,
+    mergeConfigurationSchemas,
     derivePickerCategory,
     type DerivedModelCapabilities,
     type ExtendedModelInformation,
@@ -362,9 +364,25 @@ suite("modelCapabilities", () => {
     });
 
     suite("getSupportedReasoningEfforts", () => {
-        const canonicalGpt5Efforts: SupportedReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+        const canonicalGpt5Efforts: SupportedReasoningEffort[] = [
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        ];
         const claudeEfforts: SupportedReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
-        const canonicalCatchAllEfforts: SupportedReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+        const canonicalCatchAllEfforts: SupportedReasoningEffort[] = [
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        ];
 
         test("returns empty array when supports_reasoning is true but reasoning_effort not in supported_openai_params", () => {
             const modelInfo: LiteLLMModelInfo = {
@@ -559,6 +577,69 @@ suite("modelCapabilities", () => {
 
             assert.strictEqual(defaultEffort, "medium");
             assert.strictEqual(schema?.properties.reasoningEffort.default, "medium");
+        });
+    });
+
+    suite("buildTemperatureConfigurationProperty", () => {
+        test("returns undefined when temperature is not in supported_openai_params", () => {
+            const modelInfo = { supported_openai_params: ["stream", "tools"] } as LiteLLMModelInfo;
+            const prop = buildTemperatureConfigurationProperty(modelInfo, "test-model");
+            assert.strictEqual(prop, undefined);
+        });
+
+        test("returns a number property when the model supports temperature", () => {
+            const modelInfo = {
+                supported_openai_params: ["stream", "temperature", "tools"],
+            } as LiteLLMModelInfo;
+
+            const prop = buildTemperatureConfigurationProperty(modelInfo, "test-model");
+
+            assert.ok(prop, "Expected a temperature property for a supporting model");
+            assert.strictEqual(prop.type, "number");
+            assert.strictEqual(prop.minimum, 0);
+            assert.strictEqual(prop.maximum, 2);
+            // Unset means the provider default applies; the schema must not force one.
+            assert.strictEqual("default" in prop, false);
+        });
+
+        test("returns undefined when known model families reject temperature", () => {
+            // Claude 3.x and o1/gpt-5 reasoning models reject temperature upstream;
+            // the known-limitations gate must hide the config knob for them too.
+            const modelInfo = {
+                supported_openai_params: ["stream", "temperature"],
+            } as LiteLLMModelInfo;
+
+            assert.strictEqual(buildTemperatureConfigurationProperty(modelInfo, "claude-3-5-sonnet-2024"), undefined);
+            assert.strictEqual(buildTemperatureConfigurationProperty(modelInfo, "o1-preview"), undefined);
+        });
+
+        test("returns undefined without model info", () => {
+            assert.strictEqual(buildTemperatureConfigurationProperty(undefined, "test-model"), undefined);
+        });
+    });
+
+    suite("mergeConfigurationSchemas", () => {
+        test("returns the sole schema when only one is present", () => {
+            const reasoning = buildReasoningEffortConfigurationSchema(["low", "medium", "high"]);
+            const merged = mergeConfigurationSchemas(reasoning);
+            assert.deepStrictEqual(merged?.properties, { reasoningEffort: reasoning?.properties.reasoningEffort });
+        });
+
+        test("merges reasoning effort and temperature properties into one schema", () => {
+            const reasoning = buildReasoningEffortConfigurationSchema(["low", "medium", "high"]);
+            const modelInfo = {
+                supported_openai_params: ["stream", "temperature"],
+            } as LiteLLMModelInfo;
+            const temperature = buildTemperatureConfigurationProperty(modelInfo, "test-model");
+
+            const merged = mergeConfigurationSchemas(reasoning, temperature);
+
+            assert.ok(merged?.properties.reasoningEffort, "reasoningEffort must survive the merge");
+            assert.ok(merged?.properties.temperature, "temperature must be added by the merge");
+        });
+
+        test("returns undefined when no schema fragments are present", () => {
+            assert.strictEqual(mergeConfigurationSchemas(undefined, undefined), undefined);
         });
     });
 

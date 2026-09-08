@@ -749,6 +749,81 @@ suite("LiteLLMProviderBase", () => {
             assert.ok(models[0].configurationSchema, "schema should be attached for reasoning models");
         });
 
+        test("surfaces temperature configuration when the model supports the parameter", async () => {
+            const sessionWithTemperature: BackendSession = {
+                ...makeMockSession(),
+                client: {
+                    getModelInfo: sandbox.stub().resolves({
+                        data: [
+                            {
+                                model_name: "glm-5.3-flash",
+                                model_info: {
+                                    litellm_provider: "openai",
+                                    supports_reasoning: true,
+                                    supports_reasoning_effort: true,
+                                    max_input_tokens: 872000,
+                                    max_output_tokens: 128000,
+                                    mode: "chat",
+                                    supported_openai_params: ["stream", "temperature", "reasoning_effort"],
+                                },
+                            },
+                        ],
+                    }),
+                } as unknown as BackendSession["client"],
+            };
+            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const configManager = access(provider)._configManager;
+            sandbox.stub(configManager, "convertProviderConfiguration").returns(sessionWithTemperature);
+
+            const models = await provider.discoverModels(
+                { silent: true, configuration: config },
+                new vscode.CancellationTokenSource().token
+            );
+
+            const schema = models[0].configurationSchema;
+            const temperatureProp = schema?.properties?.temperature;
+            assert.ok(temperatureProp, "temperature property must be advertised for supporting models");
+            assert.strictEqual(temperatureProp.type, "number");
+        });
+
+        test("omits temperature configuration when supported_openai_params excludes it", async () => {
+            const sessionWithoutTemperature: BackendSession = {
+                ...makeMockSession(),
+                client: {
+                    getModelInfo: sandbox.stub().resolves({
+                        data: [
+                            {
+                                model_name: "gpt-4",
+                                model_info: {
+                                    litellm_provider: "openai",
+                                    supports_reasoning: true,
+                                    supports_reasoning_effort: true,
+                                    max_input_tokens: 128000,
+                                    max_output_tokens: 4096,
+                                    mode: "chat",
+                                    supported_openai_params: ["stream", "reasoning_effort"],
+                                },
+                            },
+                        ],
+                    }),
+                } as unknown as BackendSession["client"],
+            };
+            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const configManager = access(provider)._configManager;
+            sandbox.stub(configManager, "convertProviderConfiguration").returns(sessionWithoutTemperature);
+
+            const models = await provider.discoverModels(
+                { silent: true, configuration: config },
+                new vscode.CancellationTokenSource().token
+            );
+
+            assert.strictEqual(
+                models[0].configurationSchema?.properties?.temperature,
+                undefined,
+                "temperature must not be advertised when the model does not support the parameter"
+            );
+        });
+
         test("returns [] when no configuration is provided (vendor-level call)", async () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
             const token = new vscode.CancellationTokenSource().token;

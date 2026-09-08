@@ -60,6 +60,8 @@ import {
     capabilitiesToVSCode,
     getModelTags as getDerivedModelTags,
     buildReasoningEffortConfigurationSchema,
+    buildTemperatureConfigurationProperty,
+    mergeConfigurationSchemas,
     getSupportedReasoningEfforts,
     derivePickerCategory,
 } from "../utils/modelCapabilities";
@@ -697,6 +699,11 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         const tags = getDerivedModelTags(modelId, derived, {}, capabilityOverrides);
         const supportedEfforts = getSupportedReasoningEfforts(modelInfo, modelId);
         const reasoningSchema = buildReasoningEffortConfigurationSchema(supportedEfforts, modelId, modelInfo);
+        // The temperature knob is advertised only for models that accept the
+        // parameter upstream; the request path re-checks the same gate before
+        // sending so a stale config value cannot reach an unsupported model.
+        const temperatureProperty = buildTemperatureConfigurationProperty(modelInfo, modelId);
+        const configurationSchema = mergeConfigurationSchemas(reasoningSchema, temperatureProperty);
 
         const cacheIndicator = modelInfo?.supports_prompt_caching ? "⚡ " : "";
         const detailBase = backendName ?? "LiteLLM";
@@ -760,7 +767,7 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             // therefore does NOT regress per-backend picker sectioning; it
             // only stops the crash on `getCategoryLabel`.
             category,
-            configurationSchema: reasoningSchema,
+            configurationSchema,
         } as unknown as vscode.LanguageModelChatInformation;
 
         // Populate pricing fields only when enabled and data is present.

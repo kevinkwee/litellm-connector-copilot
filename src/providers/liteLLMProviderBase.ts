@@ -18,7 +18,7 @@ import { ConfigManager } from "../config/configManager";
 import { Logger } from "../utils/logger";
 import { LiteLLMTelemetry } from "../utils/telemetry";
 import type { TelemetryService } from "../telemetry/telemetryService";
-import { getSupportedReasoningEfforts } from "../utils/modelCapabilities";
+import { getSupportedReasoningEfforts, isOpenAIParamSupported } from "../utils/modelCapabilities";
 import type { SupportedReasoningEffort } from "../types";
 import {
     EffortFallbackCache,
@@ -33,26 +33,6 @@ import type { RequestBuilderDeps, TransportDeps } from "./base/types";
 import { LiteLLMProviderRegistry } from "./liteLLMProviderRegistry";
 import { LRUCache } from "../utils/lruCache";
 import { AuditTrail } from "../observability/auditTrail";
-
-/**
- * Static fallback parameter limitations for known model families.
- * Used as fallback when model info (supported_openai_params) is unavailable.
- * These are prefix matches - if modelId includes the key, the limitation applies.
- */
-const KNOWN_PARAMETER_LIMITATIONS: Record<string, Set<string>> = {
-    "claude-3-5-sonnet": new Set(["temperature"]),
-    "claude-3-5-haiku": new Set(["temperature"]),
-    "claude-3-opus": new Set(["temperature"]),
-    "claude-3-sonnet": new Set(["temperature"]),
-    "claude-3-haiku": new Set(["temperature"]),
-    "claude-haiku-4-5": new Set(["temperature"]),
-    "gpt-5.1-codex": new Set(["temperature", "frequency_penalty", "presence_penalty"]),
-    "gpt-5.1-codex-mini": new Set(["temperature", "frequency_penalty", "presence_penalty"]),
-    "gpt-5.1-codex-max": new Set(["temperature", "frequency_penalty", "presence_penalty"]),
-    "codex-mini-latest": new Set(["temperature", "frequency_penalty", "presence_penalty"]),
-    "o1-": new Set(["temperature", "top_p", "presence_penalty", "frequency_penalty"]),
-    "gpt-5": new Set(["temperature", "top_p", "presence_penalty", "frequency_penalty"]),
-};
 
 /**
  * Shared orchestration base for all LiteLLM-backed VS Code language model providers.
@@ -879,46 +859,7 @@ export abstract class LiteLLMProviderBase {
      * supports.
      */
     protected isParameterSupported(param: string, modelInfo: LiteLLMModelInfo | undefined, modelId?: string): boolean {
-        if (modelId) {
-            if (KNOWN_PARAMETER_LIMITATIONS[modelId]?.has(param)) {
-                return false;
-            }
-            for (const [knownModel, limitations] of Object.entries(KNOWN_PARAMETER_LIMITATIONS)) {
-                if (modelId.includes(knownModel) && limitations.has(param)) {
-                    return false;
-                }
-            }
-        }
-
-        if (modelInfo?.supported_openai_params) {
-            const supportedParams = modelInfo.supported_openai_params;
-            const normalizedParam = param.toLowerCase();
-            const isSupported = supportedParams.some((p) => p.toLowerCase() === normalizedParam);
-
-            if (supportedParams.length === 0) {
-                return false;
-            }
-
-            if (!isSupported) {
-                return !this.isRestrictableParam(param);
-            }
-            return true;
-        }
-
-        return true;
-    }
-
-    private isRestrictableParam(param: string): boolean {
-        const restrictableParams = new Set([
-            "temperature",
-            "top_p",
-            "presence_penalty",
-            "frequency_penalty",
-            "stop",
-            "reasoning_effort",
-            "tool_choice",
-        ]);
-        return restrictableParams.has(param.toLowerCase());
+        return isOpenAIParamSupported(param, modelInfo, modelId);
     }
 
     protected stripUnsupportedParametersFromRequest(

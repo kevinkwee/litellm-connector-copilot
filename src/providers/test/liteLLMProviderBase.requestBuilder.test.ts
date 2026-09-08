@@ -19,7 +19,14 @@ suite("RequestBuilder", () => {
             detectQuotaToolRedaction: (messages, tools) => ({ tools, confidence: "none" as const }),
             stripUnsupportedParametersFromRequest: () => {},
             isParameterSupported: () => true,
-            getTelemetryOptions: () => ({ caller: "test", justification: undefined, modelConfiguration: {} }),
+            // Mirrors `LiteLLMProviderBase.getTelemetryOptions`: VS Code's
+            // per-model picker selections arrive via `options.modelConfiguration`.
+            getTelemetryOptions: (options: vscode.ProvideLanguageModelChatResponseOptions) => ({
+                caller: "test",
+                justification: undefined,
+                modelConfiguration: ((options as unknown as { modelConfiguration?: Record<string, unknown> })
+                    .modelConfiguration ?? {}) as Record<string, unknown>,
+            }),
             usageOptOutModels: new Set(),
             extractRawModelName: (id: string) => {
                 // Test mirror of `LiteLLMProviderRegistry.extractRawName`:
@@ -52,6 +59,101 @@ suite("RequestBuilder", () => {
         );
         sinon.assert.match(req.max_tokens, 50);
         sinon.assert.match(req.stream, true);
+    });
+
+    suite("temperature from modelConfiguration", () => {
+        const model = { id: "gpt-x", maxInputTokens: 100, maxOutputTokens: 50 } as vscode.LanguageModelChatInformation;
+        const messages: vscode.LanguageModelChatRequestMessage[] = [
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelTextPart("hi")],
+                name: undefined,
+            },
+        ];
+
+        setup(() => {
+            configManager.getConfig.resolves({});
+        });
+
+        test("applies per-model temperature set in the VS Code model configuration", async () => {
+            const req = await builder.buildOpenAIChatRequest(
+                messages,
+                model,
+                {
+                    modelOptions: {},
+                    modelConfiguration: { temperature: 0.2 },
+                } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+                undefined,
+                "caller"
+            );
+
+            assert.strictEqual(req.temperature, 0.2);
+        });
+
+        test("caller-supplied modelOptions.temperature wins over per-model configuration", async () => {
+            const req = await builder.buildOpenAIChatRequest(
+                messages,
+                model,
+                {
+                    modelOptions: { temperature: 0.9 },
+                    modelConfiguration: { temperature: 0.2 },
+                } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+                undefined,
+                "caller"
+            );
+
+            assert.strictEqual(req.temperature, 0.9);
+        });
+
+        test("omits temperature when no explicit value is configured", async () => {
+            const req = await builder.buildOpenAIChatRequest(
+                messages,
+                model,
+                { modelOptions: {} } as vscode.ProvideLanguageModelChatResponseOptions,
+                undefined,
+                "caller"
+            );
+
+            assert.strictEqual(req.temperature, undefined);
+        });
+
+        test("omits per-model temperature when the model does not support the parameter", async () => {
+            // The suite's default builder stubs isParameterSupported to always
+            // allow; this test needs a gate that rejects temperature, so it
+            // builds its own.
+            const gatedBuilder = new RequestBuilder({
+                configManager,
+                getReasoningEffort: () => undefined,
+                detectQuotaToolRedaction: (messages, tools) => ({ tools, confidence: "none" as const }),
+                stripUnsupportedParametersFromRequest: () => {},
+                isParameterSupported: (param: string) => param !== "temperature",
+                getTelemetryOptions: (options: vscode.ProvideLanguageModelChatResponseOptions) => ({
+                    caller: "test",
+                    justification: undefined,
+                    modelConfiguration: ((options as unknown as { modelConfiguration?: Record<string, unknown> })
+                        .modelConfiguration ?? {}) as Record<string, unknown>,
+                }),
+                usageOptOutModels: new Set(),
+                extractRawModelName: (id: string) => {
+                    const slash = id.indexOf("/");
+                    return slash < 0 ? id : id.slice(slash + 1);
+                },
+            });
+            const modelInfo = { supported_openai_params: ["stream", "tools"] } as LiteLLMModelInfo;
+
+            const req = await gatedBuilder.buildOpenAIChatRequest(
+                messages,
+                model,
+                {
+                    modelOptions: {},
+                    modelConfiguration: { temperature: 0.2 },
+                } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+                modelInfo,
+                "caller"
+            );
+
+            assert.strictEqual(req.temperature, undefined);
+        });
     });
 
     test("buildOpenAIChatRequest preserves tool_choice when ToolMode is Required", async () => {
