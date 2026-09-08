@@ -1533,4 +1533,336 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         assert.strictEqual(second.length, 2, "Retry must append a trailing assistant message");
         assert.strictEqual(second[1].reasoning_content, "cut-off thought");
     });
+
+    function runChatRequest(
+        provider: LiteLLMChatProvider,
+        reported: vscode.LanguageModelResponsePart[],
+        token?: vscode.CancellationToken
+    ): Promise<void> {
+        return provider.provideLanguageModelChatResponse(
+            {
+                id: "model-1",
+                name: "model-1",
+                tooltip: "",
+                family: "litellm",
+                version: "1.0.0",
+                maxInputTokens: 1000,
+                maxOutputTokens: 1000,
+                capabilities: { toolCalling: true, imageInput: false },
+            },
+            [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart("hi")],
+                },
+            ],
+            {
+                modelOptions: {},
+                tools: [],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+                requestInitiator: "test",
+                configuration: { baseUrl: "http://localhost:4000", apiKey: "test-api-key" } as unknown as Record<
+                    string,
+                    unknown
+                >,
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            { report: (part) => reported.push(part) },
+            token ?? new vscode.CancellationTokenSource().token
+        );
+    }
+
+    test("tool call already emitted before a transport error blocks the retry", async () => {
+        const encoder = new TextEncoder();
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const localReported: vscode.LanguageModelResponsePart[] = [];
+        const localSent: OpenAIChatCompletionRequest[] = [];
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async (request: OpenAIChatCompletionRequest) => {
+            localSent.push(request);
+            return new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(
+                        encoder.encode(
+                            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_time","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n'
+                        )
+                    );
+                },
+                pull(controller) {
+                    controller.error(new Error("terminated"));
+                },
+            });
+        });
+
+        await assert.rejects(() => runChatRequest(provider, localReported), /terminated/);
+        assert.strictEqual(localSent.length, 1, "A tool call was already emitted, so no second attempt is sent");
+        const toolCall = localReported.find(
+            (p): p is vscode.LanguageModelToolCallPart =>
+                p instanceof vscode.LanguageModelToolCallPart ||
+                typeof (p as unknown as Record<string, unknown>)?.name === "string"
+        );
+        assert.ok(toolCall, "the tool call reached VS Code before the transport death");
+    });
+
+    test("transport retries exhausted after the budget surfaces the transport error", async () => {
+        const encoder = new TextEncoder();
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 2,
+            networkRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const sent: OpenAIChatCompletionRequest[] = [];
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sent.push(request);
+            return new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"par"}}]}\n\n'));
+                },
+                pull(controller) {
+                    controller.error(new Error("terminated"));
+                },
+            });
+        });
+
+        await assert.rejects(() => runChatRequest(provider, reported), /terminated/);
+        // attempt 0 + networkRetries 2 = 3 total requests
+        assert.strictEqual(sent.length, 3, "transport budget must be exhausted");
+    });
+
+    test("reasoning-only retries exhausted after the budget surfaces the descriptive error", async () => {
+        const encoder = new TextEncoder();
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            emptyResponseRetries: 1,
+            emptyResponseRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const sent: OpenAIChatCompletionRequest[] = [];
+        const reasoningOnlyStream = () =>
+            new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(
+                        encoder.encode('data: {"choices":[{"delta":{"reasoning_content":"more thought"}}]}\n\n')
+                    );
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                },
+            });
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sent.push(request);
+            return reasoningOnlyStream();
+        });
+
+        await assert.rejects(
+            () => runChatRequest(provider, reported),
+            /reasoning-only response.*after 1 resume attempt/
+        );
+        // attempt 0 + emptyResponseRetries 1 = 2 total requests, and the
+        // empty budget must not spill into the transport budget
+        assert.strictEqual(sent.length, 2, "reasoning-only budget must be exhausted");
+    });
+
+    test("reasoning-only retries do not consume the transport retry budget", async () => {
+        const encoder = new TextEncoder();
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 2,
+            networkRetryDelayMs: 1,
+            emptyResponseRetries: 2,
+            emptyResponseRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const sent: OpenAIChatCompletionRequest[] = [];
+        const reasoningOnlyStream = () =>
+            new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(
+                        encoder.encode('data: {"choices":[{"delta":{"reasoning_content":"thought"}}]}\n\n')
+                    );
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                },
+            });
+        const dyingStream = () =>
+            new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"a"}}]}\n\n'));
+                },
+                pull(controller) {
+                    controller.error(new Error("terminated"));
+                },
+            });
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sent.push(request);
+            return sent.length === 1 ? reasoningOnlyStream() : dyingStream();
+        });
+
+        // 1 reasoning-only retry from the empty budget, then the full
+        // transport budget must still be available: 2 more requests after the
+        // first transport death (networkRetries 2), 4 in total.
+        await assert.rejects(() => runChatRequest(provider, reported), /terminated/);
+        assert.strictEqual(sent.length, 4, "empty-budget retry must not shrink the transport budget");
+    });
+
+    test("inactivity timeout mid-stream triggers a resume attempt", async () => {
+        const encoder = new TextEncoder();
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            // sub-second watchdog so the test does not wait 60s
+            inactivityTimeout: 0.05,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const sent: OpenAIChatCompletionRequest[] = [];
+        const stalledStream = () =>
+            new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"par"}}]}\n\n'));
+                    // never closes and never enqueues again: the watchdog must abort it
+                },
+            });
+        const doneStream = () =>
+            new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"done."}}]}\n\n'));
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                },
+            });
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sent.push(request);
+            return sent.length === 1 ? stalledStream() : doneStream();
+        });
+
+        await runChatRequest(provider, reported);
+        assert.strictEqual(sent.length, 2, "watchdog abort must trigger one resume attempt");
+        const second = sent[1].messages;
+        assert.strictEqual(second.length, 2, "resume after inactivity timeout must append the partial text");
+        assert.strictEqual(second[1].content, "par");
+    });
+
+    test("transport retry resumes across consecutive attempts without duplicating the assistant turn", async () => {
+        const encoder = new TextEncoder();
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const sent: OpenAIChatCompletionRequest[] = [];
+        const dyingStream = (chunk: string) =>
+            new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode(`data: {"choices":[{"delta":{"content":"${chunk}"}}]}\n\n`));
+                },
+                pull(controller) {
+                    controller.error(new Error("terminated"));
+                },
+            });
+        const doneStream = () =>
+            new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":" done"}}]}\n\n'));
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                },
+            });
+        const chunks = ["Hel", "lo "];
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sent.push(request);
+            const index = sent.length - 1;
+            return index < chunks.length ? dyingStream(chunks[index]) : doneStream();
+        });
+
+        await runChatRequest(provider, reported);
+        assert.strictEqual(sent.length, 3, "two failed attempts then success");
+        const third = sent[2].messages;
+        assert.strictEqual(third.length, 2, "still exactly one appended assistant turn");
+        assert.strictEqual(third[1].content, "Hello ");
+        // the second request appends only the first attempt's chunk, and the
+        // first request is the untouched original
+        assert.strictEqual(sent[0].messages.length, 1);
+        assert.strictEqual(sent[1].messages[1].content, "Hel");
+    });
+
+    test("cancellation between attempts aborts instead of sending another request", async () => {
+        const encoder = new TextEncoder();
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            // The backoff sleep must still be pending when cancellation fires,
+            // so the delay (200ms) strictly exceeds the cancel timer (50ms).
+            networkRetryDelayMs: 200,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const sent: OpenAIChatCompletionRequest[] = [];
+        const tokenSource = new vscode.CancellationTokenSource();
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sent.push(request);
+            return new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"a"}}]}\n\n'));
+                },
+                pull(controller) {
+                    controller.error(new Error("terminated"));
+                },
+            });
+        });
+
+        setTimeout(() => tokenSource.cancel(), 50);
+
+        await assert.rejects(
+            () => runChatRequest(provider, reported, tokenSource.token),
+            /Operation cancelled by user/
+        );
+        assert.strictEqual(sent.length, 1, "no new request after cancellation during backoff");
+    });
 });
