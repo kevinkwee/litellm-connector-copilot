@@ -386,9 +386,10 @@ export interface OpenAIChatCompletionRequest {
      * never has to reason about per-provider request shaping.
      *
      * Two shapes are accepted:
-     *  - string: "minimal" | "low" | "medium" | "high" | "xhigh"
+     *  - string: a `SupportedReasoningEffort` value
+     *    ("none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
      *  - object: { effort: "low" | "medium" | "high"; summary?: "auto" | "concise" | "detailed" }
-     *    — used by `gpt-5.4+` when callers want to control the summary text returned
+     *    used by `gpt-5.4+` when callers want to control the summary text returned
      *    alongside the reasoning text.
      *
      * When omitted, LiteLLM falls back to the upstream model's default. We never
