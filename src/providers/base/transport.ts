@@ -21,6 +21,7 @@ export class Transport {
         url: string;
         key?: string;
         disableCaching?: boolean;
+        rateLimitMaxDelayMs?: number;
     }) => LiteLLMClient;
 
     constructor(deps: TransportDeps) {
@@ -31,7 +32,12 @@ export class Transport {
             deps.liteLLMClientFactory ??
             ((backend) =>
                 new LiteLLMClient(
-                    { url: backend.url, key: backend.key, disableCaching: backend.disableCaching },
+                    {
+                        url: backend.url,
+                        key: backend.key,
+                        disableCaching: backend.disableCaching,
+                        rateLimitMaxDelayMs: backend.rateLimitMaxDelayMs,
+                    },
                     this.userAgent
                 ));
     }
@@ -99,10 +105,18 @@ export class Transport {
         // LiteLLMClient so Cache-Control headers are set on the HTTP connection.
         const disableCaching =
             typeof configuration?.disableCaching === "boolean" ? configuration.disableCaching : undefined;
+        // The configuration merge does not guarantee clamped values, so the
+        // guard below must stay self-contained.
+        const rateLimitMaxDelayMs =
+            typeof configuration?.rateLimitMaxDelayMs === "number" &&
+            Number.isFinite(configuration.rateLimitMaxDelayMs) &&
+            configuration.rateLimitMaxDelayMs >= 0
+                ? configuration.rateLimitMaxDelayMs
+                : undefined;
         this.logger.trace(
             `[transport.sendRequestToLiteLLM] Creating client: baseUrl=${baseUrl}, timeout=${modelInfo?.timeout ?? "default"}ms, disableCaching=${disableCaching}`
         );
-        const client = this.liteLLMClientFactory({ url: baseUrl, key: apiKey, disableCaching });
+        const client = this.liteLLMClientFactory({ url: baseUrl, key: apiKey, disableCaching, rateLimitMaxDelayMs });
 
         this.logger.info(
             `[transport.sendRequestToLiteLLM] Sending request to LiteLLM: model=${request.model} caller=${caller} streaming=true`

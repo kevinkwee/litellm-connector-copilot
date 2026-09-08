@@ -382,6 +382,37 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.strictEqual(fetchStub.callCount, 2);
     });
 
+    test("rateLimitMaxDelayMs=0 disables 429 retries inside fetchWithRateLimit", async () => {
+        const client = new LiteLLMClient({ ...config, rateLimitMaxDelayMs: 0 }, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch");
+
+        const rateLimitResponse = {
+            ok: false,
+            status: 429,
+            statusText: "Too Many Requests",
+            clone: function () {
+                return this;
+            },
+            text: async () => "Rate limit exceeded",
+            headers: {
+                get: (name: string) => {
+                    if (name.toLowerCase() === "retry-after") {
+                        return "0.5";
+                    }
+                    return null;
+                },
+            },
+        } as Response;
+
+        fetchStub.resolves(rateLimitResponse);
+
+        await assert.rejects(() => client.chat({ model: "m", messages: [] }));
+
+        // rateLimitMaxDelayMs=0 means no retry budget: the first 429 must be returned
+        // (and then rejected as a non-ok response) without a second fetch.
+        assert.strictEqual(fetchStub.callCount, 1);
+    });
+
     test("fetchWithRetry retries on 5xx", async () => {
         const client = new LiteLLMClient(config, userAgent);
         const fetchStub = sandbox.stub(global, "fetch");

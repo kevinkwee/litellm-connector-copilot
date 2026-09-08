@@ -225,6 +225,15 @@ export interface LiteLLMConfig {
     /** Base backoff delay in milliseconds for reasoning-only retries; doubles per attempt, capped at 30s. Default: 1000. */
     emptyResponseRetryDelayMs?: number;
 
+    /**
+     * Maximum cumulative delay in milliseconds for 429 rate-limit retries in
+     * the HTTP client. Once the cumulative backoff exceeds this, the 429
+     * response is returned as a hard failure instead of retrying. Populated
+     * from the seconds-based `litellm-connector.rateLimitMaxDelaySeconds`
+     * setting. Default: 120000. Set to 0 to disable rate-limit retries.
+     */
+    rateLimitMaxDelayMs?: number;
+
     // sendDefaultParameters was removed in v2.2.0 (deprecated v1.5.0). Use individual modelOptions instead.
 }
 
@@ -241,6 +250,11 @@ export interface LiteLLMClientConfig {
     disableCaching?: boolean;
     /** Timeout in milliseconds for /model/info discovery requests. Default: 5000. */
     discoveryTimeoutMs?: number;
+    /**
+     * Maximum cumulative delay in milliseconds for 429 rate-limit retries.
+     * Default: 120000. Set to 0 to disable rate-limit retries.
+     */
+    rateLimitMaxDelayMs?: number;
 }
 
 /**

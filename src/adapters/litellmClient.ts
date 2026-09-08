@@ -30,6 +30,7 @@ export class LiteLLMClient {
     private _telemetryService?: TelemetryService;
 
     private static readonly DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
+    private static readonly DEFAULT_RATE_LIMIT_MAX_DELAY_MS = 120_000;
 
     constructor(
         private readonly config: LiteLLMClientConfig,
@@ -451,16 +452,21 @@ export class LiteLLMClient {
     }
 
     /**
-     * Fetch with exponential back-off for rate limiting (429).
-     * Retries with exponential delay up to a maximum cumulative delay of 2 minutes.
-     * For other transient errors, it delegates to {@link fetchWithRetry}.
+     * Fetch with back-off for rate limiting (429), honoring the Retry-After
+     * header when present. Retries until the cumulative delay reaches the
+     * configured maximum (config `rateLimitMaxDelayMs`, default 120000 ms;
+     * 0 disables retries). For other transient errors, it delegates to
+     * {@link fetchWithRetry}.
      */
     async fetchWithRateLimit(
         url: string,
         init: RequestInit,
         options?: { maxTotalDelayMs?: number; initialDelayMs?: number; token?: vscode.CancellationToken }
     ): Promise<Response> {
-        const maxTotalDelayMs = options?.maxTotalDelayMs ?? 120_000;
+        const maxTotalDelayMs =
+            options?.maxTotalDelayMs ??
+            this.config.rateLimitMaxDelayMs ??
+            LiteLLMClient.DEFAULT_RATE_LIMIT_MAX_DELAY_MS;
         const initialDelayMs = options?.initialDelayMs ?? 500;
         let cumulativeDelayMs = 0;
         let attempt = 0;

@@ -24,6 +24,7 @@ export class ConfigManager {
     private static readonly NETWORK_RETRY_DELAY_MS_KEY = "litellm-connector.networkRetryDelayMs";
     private static readonly EMPTY_RESPONSE_RETRIES_KEY = "litellm-connector.emptyResponseRetries";
     private static readonly EMPTY_RESPONSE_RETRY_DELAY_MS_KEY = "litellm-connector.emptyResponseRetryDelayMs";
+    private static readonly RATE_LIMIT_MAX_DELAY_SECONDS_KEY = "litellm-connector.rateLimitMaxDelaySeconds";
 
     // Discovery config defaults and bounds
     private static readonly DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
@@ -36,6 +37,17 @@ export class ConfigManager {
     private static readonly MAX_DISCOVERY_FIRE_DEBOUNCE_MS = 5_000;
     private static readonly DEFAULT_DISCOVERY_FIRE_MIN_INTERVAL_MS = 2_000;
     private static readonly MAX_DISCOVERY_FIRE_MIN_INTERVAL_MS = 30_000;
+
+    // Rate-limit retry ceiling defaults and bounds. The setting is expressed in
+    // seconds because Retry-After is a seconds-based header; the internal
+    // pipeline works in milliseconds, so the clamped value is converted once
+    // below. The upper bound (24h) keeps typo-scale values from effectively
+    // hanging a request; the loop is cancellable at every sleep, so long
+    // legitimate waits are safe.
+    private static readonly DEFAULT_RATE_LIMIT_MAX_DELAY_SECONDS = 120;
+    private static readonly MIN_RATE_LIMIT_MAX_DELAY_SECONDS = 0;
+    private static readonly MAX_RATE_LIMIT_MAX_DELAY_SECONDS = 86_400;
+    private static readonly MS_PER_SECOND = 1_000;
 
     private _telemetryService?: TelemetryService;
 
@@ -237,6 +249,14 @@ export class ConfigManager {
             1_000
         );
 
+        const rateLimitMaxDelaySeconds = this.clampRange(
+            workspaceConfig.get<number>(ConfigManager.RATE_LIMIT_MAX_DELAY_SECONDS_KEY),
+            ConfigManager.MIN_RATE_LIMIT_MAX_DELAY_SECONDS,
+            ConfigManager.MAX_RATE_LIMIT_MAX_DELAY_SECONDS,
+            ConfigManager.DEFAULT_RATE_LIMIT_MAX_DELAY_SECONDS
+        );
+        const rateLimitMaxDelayMs = Math.round(rateLimitMaxDelaySeconds * ConfigManager.MS_PER_SECOND);
+
         return {
             inactivityTimeout,
             disableCaching,
@@ -255,6 +275,7 @@ export class ConfigManager {
             networkRetryDelayMs,
             emptyResponseRetries,
             emptyResponseRetryDelayMs,
+            rateLimitMaxDelayMs,
         };
     }
 

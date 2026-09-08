@@ -53,7 +53,12 @@ export interface TransportDeps {
         debug: (msg: string, err?: unknown) => void;
         trace: (msg: string, err?: unknown) => void;
     };
-    liteLLMClientFactory?: (backend: { url: string; key?: string; disableCaching?: boolean }) => LiteLLMClient;
+    liteLLMClientFactory?: (backend: {
+        url: string;
+        key?: string;
+        disableCaching?: boolean;
+        rateLimitMaxDelayMs?: number;
+    }) => LiteLLMClient;
 }
 
 export interface SendRequestArgs {

@@ -142,7 +142,12 @@ export abstract class LiteLLMProviderBase {
             logger: Logger,
             liteLLMClientFactory: (backend) =>
                 new LiteLLMClient(
-                    { url: backend.url, key: backend.key, disableCaching: backend.disableCaching },
+                    {
+                        url: backend.url,
+                        key: backend.key,
+                        disableCaching: backend.disableCaching,
+                        rateLimitMaxDelayMs: backend.rateLimitMaxDelayMs,
+                    },
                     this.userAgent
                 ),
         };
@@ -781,12 +786,13 @@ export abstract class LiteLLMProviderBase {
                 `getCallTimeConfiguration: HIT via options.configuration modelId="${model.id}" baseUrl="${optBaseUrl}"`
             );
             // Merge workspace-config ergonomic toggles onto the per-group
-            // configuration so the transport can read allowChatCompletionsFallback
-            // and disableCaching without a separate config fetch on the hot path.
+            // configuration so the transport can read them without a separate
+            // config fetch on the hot path.
             return {
                 ...opt.configuration,
                 allowChatCompletionsFallback: cfg.allowChatCompletionsFallback,
                 disableCaching: cfg.disableCaching,
+                rateLimitMaxDelayMs: cfg.rateLimitMaxDelayMs,
             };
         }
         if (opt.configuration) {
@@ -812,14 +818,14 @@ export abstract class LiteLLMProviderBase {
         const entry = this._registry.lookup(model.id);
         if (entry) {
             Logger.trace(`getCallTimeConfiguration: registry HIT modelId="${model.id}" -> baseUrl="${entry.baseUrl}"`);
-            // Same ergonomic-toggle merge as the options.configuration path above,
-            // so /responses fallback + disableCaching work regardless of which
-            // path resolved baseUrl/apiKey.
+            // Same ergonomic-toggle merge as the options.configuration path
+            // above, so both call-time resolution paths behave identically.
             return {
                 baseUrl: entry.baseUrl,
                 apiKey: entry.apiKey,
                 allowChatCompletionsFallback: cfg.allowChatCompletionsFallback,
                 disableCaching: cfg.disableCaching,
+                rateLimitMaxDelayMs: cfg.rateLimitMaxDelayMs,
             };
         }
         Logger.warn(

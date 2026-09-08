@@ -154,6 +154,7 @@ Base URL and API key are configured through **VS Code's Language Models provider
 | `litellm-connector.discoveryCacheTtlMs` | number | `60000` | TTL (ms) for cached discovery responses. Set 0 to disable |
 | `litellm-connector.discoveryFireDebounceMs` | number | `250` | Debounce window (ms) for model-change notifications |
 | `litellm-connector.discoveryFireMinIntervalMs` | number | `2000` | Min interval (ms) between change notifications |
+| `litellm-connector.rateLimitMaxDelaySeconds` | number | `120` | Max cumulative delay (seconds) spent retrying 429 rate-limit responses (honoring `Retry-After`). Set `0` to disable |
 
 > **Tip**: Most users won't need to touch these — the defaults work great!
 

@@ -202,6 +202,13 @@
 					"maximum": 30000,
 					"description": "Base backoff delay in milliseconds for reasoning-only retries; doubles per attempt, capped at 30s."
 				},
+				"litellm-connector.rateLimitMaxDelaySeconds": {
+					"type": "number",
+					"default": 120,
+					"minimum": 0,
+					"maximum": 86400,
+					"description": "Maximum cumulative delay in seconds the client spends retrying 429 rate-limit responses (honoring Retry-After). Once exceeded, the 429 is surfaced as a hard failure. Default: 120 (2 minutes). Set to 0 to disable rate-limit retries."
+				},
 				"litellm-connector.disableCaching": {
 					"type": "boolean",
 					"default": true,

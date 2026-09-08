@@ -160,6 +160,32 @@ suite("ConfigManager Unit Tests", () => {
         assert.strictEqual(config.allowChatCompletionsFallback, false);
     });
 
+    test("should read rateLimitMaxDelaySeconds from workspace settings", async () => {
+        settingsMap.set("litellm-connector.rateLimitMaxDelaySeconds", 30);
+        const config = await configManager.getConfig();
+        assert.strictEqual(config.rateLimitMaxDelayMs, 30000);
+    });
+
+    test("should default rateLimitMaxDelaySeconds to 120 seconds when not set", async () => {
+        settingsMap.delete("litellm-connector.rateLimitMaxDelaySeconds");
+        const config = await configManager.getConfig();
+        assert.strictEqual(config.rateLimitMaxDelayMs, 120000);
+    });
+
+    test("should clamp rateLimitMaxDelaySeconds to its bounds", async () => {
+        settingsMap.set("litellm-connector.rateLimitMaxDelaySeconds", -5);
+        assert.strictEqual((await configManager.getConfig()).rateLimitMaxDelayMs, 0);
+        settingsMap.set("litellm-connector.rateLimitMaxDelaySeconds", 999999999);
+        assert.strictEqual((await configManager.getConfig()).rateLimitMaxDelayMs, 86400000);
+        settingsMap.set("litellm-connector.rateLimitMaxDelaySeconds", Number.NaN);
+        assert.strictEqual((await configManager.getConfig()).rateLimitMaxDelayMs, 120000);
+    });
+
+    test("should convert fractional seconds to whole milliseconds", async () => {
+        settingsMap.set("litellm-connector.rateLimitMaxDelaySeconds", 0.5);
+        assert.strictEqual((await configManager.getConfig()).rateLimitMaxDelayMs, 500);
+    });
+
     test("every LiteLLMConfig field is populated by getConfig() (anti-dead-config guard)", async () => {
         // This test exists because settings were previously declared, read into
         // LiteLLMConfig, and reported to telemetry WITHOUT any runtime behavior.
@@ -179,6 +205,7 @@ suite("ConfigManager Unit Tests", () => {
             "commitModelIdOverride",
             "forceResponsesEndpoint",
             "allowChatCompletionsFallback",
+            "rateLimitMaxDelayMs",
             // NOTE: sendDefaultParameters, inlineCompletions*, v2ApiEnabled,
             // enableResponses, modelOverrides (field) are intentionally absent —
             // removed as dead config. Do NOT re-add them.
