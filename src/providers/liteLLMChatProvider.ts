@@ -147,11 +147,18 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
 
         // Hoisted to the outer scope so the failure/cancel paths in the catch
         // block can still emit a `.copilotmd` entry when the request got far
-        // enough to have a body. Both stay `undefined` until assigned in the
-        // try block, so a failure before `buildOpenAIChatRequest` correctly
-        // produces no export (there's nothing meaningful to render yet).
+        // enough to have a body. `endpointUrl` and `requestBodyBuilt` stay
+        // `undefined` until assigned in the try block, so a failure before
+        // `buildOpenAIChatRequest` produces no export (there's nothing
+        // meaningful to render yet). `requestBodyBuilt` and `activeMessages`
+        // hold the body and message list of the current attempt. The
+        // `activeMessages` initializer covers a failure before the first body
+        // exists, so the (body-gated) failure export still has the original
+        // message list to render; a mid-stream resume can diverge both from
+        // the original request.
         let endpointUrl: string | undefined;
         let requestBodyBuilt: OpenAIChatCompletionRequest | undefined;
+        let activeMessages: readonly LanguageModelChatRequestMessage[] = messages;
         // Session fingerprint, computed once from `messages` (the request
         // input) at the top of the try block, then reused for two purposes:
         //   1. Injected into `requestBody.metadata.session_id` so LiteLLM
@@ -237,10 +244,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 ...(requestBody.metadata ?? {}),
                 session_id: sessionFingerprint,
             };
-            // Expose the built body to the outer scope so the failure/cancel
-            // paths can still render a `.copilotmd` entry if the stream fails
-            // after the request was shaped. Read-only alias to avoid accidental
-            // mutation downstream.
             requestBodyBuilt = requestBody;
             // The model id in `model` is the namespaced `<routing>/<raw>`
             // form VS Code hands us. The tokenizer heuristics (and the
@@ -295,10 +298,10 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 },
             };
 
-            let activeMessages = messages;
             let stream: ReadableStream<Uint8Array>;
             let attempt = 0;
             let emptyAttempt = 0;
+            let resumed = false;
             while (true) {
                 try {
                     // VS Code may cancel (Stop/steer) during the backoff sleep.
@@ -310,14 +313,46 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         );
                         throw Object.assign(new Error("Operation cancelled by user"), { name: "CancellationError" });
                     }
-                    if (attempt > 0) {
-                        // Resume mid-response: append the already-streamed
-                        // reasoning + text as the trailing assistant message so
-                        // the model continues where the socket died.
-                        activeMessages = buildResumeMessages(messages, accumulator.text, accumulator.thinking);
+                    if (resumed) {
+                        // Both retry budgets resume mid-response: the
+                        // already-streamed reasoning + text is appended as
+                        // trailing assistant content so the model continues
+                        // where the previous attempt stopped. The wire body is
+                        // rebuilt because the body built before the loop still
+                        // carries the pre-stream messages. Both state variables
+                        // are committed only after the rebuild succeeds, so a
+                        // failed rebuild leaves the pair consistent.
+                        const resumedMessages = buildResumeMessages(messages, accumulator.text, accumulator.thinking);
+                        const resumedRequestBody = await this.buildOpenAIChatRequest(
+                            resumedMessages,
+                            model,
+                            options,
+                            modelInfo,
+                            caller
+                        );
+                        activeMessages = resumedMessages;
+                        requestBodyBuilt = resumedRequestBody;
+                        // Carry over the request metadata (which holds the
+                        // session fingerprint) so resumed attempts keep
+                        // per-session spend grouping in LiteLLM.
+                        requestBodyBuilt.metadata = { ...(requestBody.metadata ?? {}) };
+                        const resumedInputTokens =
+                            countOpenAIChatMessagesTokens(
+                                requestBodyBuilt.messages,
+                                rawModelIdForTokenizers,
+                                modelInfo
+                            ) + estimateToolTokens(requestBodyBuilt.tools);
+                        tokenCapture.setEstimatedPromptTokens(resumedInputTokens);
+                        tokenCapture.setReservedOutputTokens(
+                            getReservedOutputTokens(model, requestBodyBuilt.max_tokens, {
+                                estimatedInputTokens: resumedInputTokens,
+                                modelInfo,
+                            })
+                        );
+                        tokensIn = resumedInputTokens;
                     }
                     stream = await this.sendRequestWithRetry(
-                        requestBody,
+                        requestBodyBuilt,
                         activeMessages,
                         model,
                         options,
@@ -339,6 +374,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     if (err instanceof ReasoningOnlyError) {
                         if (emptyAttempt < maxEmptyRetries && !token.isCancellationRequested) {
                             emptyAttempt += 1;
+                            resumed = true;
                             const delay = backoffDelayMs(emptyAttempt, emptyBaseDelayMs);
                             Logger.warn(
                                 `[transportRetry] request=${requestId} reasoning-only response, retry ${emptyAttempt}/${maxEmptyRetries} ` +
@@ -400,7 +436,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         // Rethrow so non-transport errors flow through the
                         // shared catch handling below.
                         if (attempt === 0) {
-                            this.logRequestPayloadOnFailure(requestBody, err, {
+                            this.logRequestPayloadOnFailure(requestBodyBuilt, err, {
                                 stage: "provideLanguageModelChatResponse",
                                 modelId: model.id,
                                 caller,
@@ -411,6 +447,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     }
 
                     attempt += 1;
+                    resumed = true;
                     const delay = backoffDelayMs(attempt, retryBaseDelayMs);
                     logTransportRetry(
                         requestId,
@@ -514,10 +551,10 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 model: model.id,
                 url: endpointUrl ?? "litellm-connector",
                 maxPromptTokens: model.maxInputTokens,
-                maxResponseTokens: requestBody.max_tokens,
+                maxResponseTokens: requestBodyBuilt.max_tokens,
                 location: undefined,
-                body: requestBody,
-                requestMessages: messages,
+                body: requestBodyBuilt,
+                requestMessages: activeMessages,
                 startTimeIso: requestStartDate.toISOString(),
                 endTimeIso: new Date().toISOString(),
                 durationMs: metric.durationMs,
@@ -611,7 +648,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     maxResponseTokens: requestBodyBuilt.max_tokens,
                     location: undefined,
                     body: requestBodyBuilt,
-                    requestMessages: messages,
+                    requestMessages: activeMessages,
                     startTimeIso: requestStartDate.toISOString(),
                     endTimeIso: new Date().toISOString(),
                     durationMs: metric.durationMs,

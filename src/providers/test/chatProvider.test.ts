@@ -4,6 +4,7 @@ import * as vscode from "vscode";
 
 import { LiteLLMChatProvider } from "../";
 import { LiteLLMClient } from "../../adapters/litellmClient";
+import type { OpenAIChatCompletionRequest } from "../../types";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
 import { createMockSecrets } from "../../test/utils/testMocks";
 import { createTelemetryMocks } from "../../test/utils/telemetryMock";
@@ -1268,5 +1269,268 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             assert.strictEqual(toolCallParts.length, 1, "Should emit tool call part");
             assert.strictEqual(toolCallParts[0].name, "my_tool", "Tool call should have correct name");
         }
+    });
+
+    /**
+     * Shared harness for the mid-stream resume tests: stubs the transport so
+     * attempt 1 emits a partial response then dies with a retriable error,
+     * attempt 2 completes the response, and records the wire bodies sent.
+     */
+    function runResumeScenario(opts: { firstAttemptEvents: string[]; firstAttemptError: Error }): {
+        sentRequests: OpenAIChatCompletionRequest[];
+        reported: vscode.LanguageModelResponsePart[];
+    } {
+        const encoder = new TextEncoder();
+        const sentRequests: OpenAIChatCompletionRequest[] = [];
+        const reported: vscode.LanguageModelResponsePart[] = [];
+
+        // Erroring a ReadableStream clears its queued chunks, so the error
+        // must be raised from `pull` (which runs only after the queue is
+        // drained), not from `start`: otherwise the streamed events are lost
+        // before the consumer reads them and there is nothing to resume from.
+        const makeDyingStream = () =>
+            new ReadableStream<Uint8Array>({
+                start(controller) {
+                    for (const event of opts.firstAttemptEvents) {
+                        controller.enqueue(encoder.encode(event));
+                    }
+                },
+                pull(controller) {
+                    controller.error(opts.firstAttemptError);
+                },
+            });
+
+        const chatStub = sandbox.stub(LiteLLMClient.prototype, "chat");
+        chatStub.onFirstCall().callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sentRequests.push(request);
+            return makeDyingStream();
+        });
+        chatStub.onSecondCall().callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sentRequests.push(request);
+            return new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":" done."}}]}\n\n'));
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                },
+            });
+        });
+
+        return { sentRequests, reported };
+    }
+
+    test("transport retry sends the streamed text as the trailing assistant message", async () => {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+
+        interface ProviderWithConfigManager {
+            _configManager: {
+                getConfig: () => Promise<{ url: string } & Record<string, unknown>>;
+            };
+        }
+        const providerWithConfig = provider as unknown as ProviderWithConfigManager;
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+
+        const { sentRequests, reported } = runResumeScenario({
+            firstAttemptEvents: [
+                'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n',
+                'data: {"choices":[{"delta":{"content":"lo wor"}}]}\n\n',
+            ],
+            firstAttemptError: new Error("terminated"),
+        });
+
+        await provider.provideLanguageModelChatResponse(
+            {
+                id: "model-1",
+                name: "model-1",
+                tooltip: "",
+                family: "litellm",
+                version: "1.0.0",
+                maxInputTokens: 1000,
+                maxOutputTokens: 1000,
+                capabilities: { toolCalling: true, imageInput: false },
+            },
+            [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart("hi")],
+                },
+            ],
+            {
+                modelOptions: {},
+                tools: [],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+                requestInitiator: "test",
+                configuration: { baseUrl: "http://localhost:4000", apiKey: "test-api-key" } as unknown as Record<
+                    string,
+                    unknown
+                >,
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            { report: (part) => reported.push(part) },
+            new vscode.CancellationTokenSource().token
+        );
+
+        assert.strictEqual(sentRequests.length, 2, "Expected two HTTP attempts");
+        const first = sentRequests[0].messages;
+        const second = sentRequests[1].messages;
+        assert.strictEqual(first.length, 1, "First attempt carries only the user message");
+        assert.strictEqual(second.length, 2, "Second attempt must append a trailing assistant message");
+        assert.strictEqual(second[1].role, "assistant");
+        assert.strictEqual(second[1].content, "Hello wor");
+    });
+
+    test("transport retry sends the streamed reasoning as reasoning_content", async () => {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+
+        interface ProviderWithConfigManager {
+            _configManager: {
+                getConfig: () => Promise<{ url: string } & Record<string, unknown>>;
+            };
+        }
+        const providerWithConfig = provider as unknown as ProviderWithConfigManager;
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+
+        const { sentRequests, reported } = runResumeScenario({
+            firstAttemptEvents: [
+                'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n',
+                'data: {"choices":[{"delta":{"reasoning_content":"thinking hard"}}]}\n\n',
+            ],
+            firstAttemptError: new Error("terminated"),
+        });
+
+        await provider.provideLanguageModelChatResponse(
+            {
+                id: "model-1",
+                name: "model-1",
+                tooltip: "",
+                family: "litellm",
+                version: "1.0.0",
+                maxInputTokens: 1000,
+                maxOutputTokens: 1000,
+                capabilities: { toolCalling: true, imageInput: false },
+            },
+            [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart("hi")],
+                },
+            ],
+            {
+                modelOptions: {},
+                tools: [],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+                requestInitiator: "test",
+                configuration: { baseUrl: "http://localhost:4000", apiKey: "test-api-key" } as unknown as Record<
+                    string,
+                    unknown
+                >,
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            { report: (part) => reported.push(part) },
+            new vscode.CancellationTokenSource().token
+        );
+
+        assert.strictEqual(sentRequests.length, 2, "Expected two HTTP attempts");
+        const second = sentRequests[1].messages;
+        assert.strictEqual(second.length, 2, "Second attempt must append a trailing assistant message");
+        assert.strictEqual(second[1].reasoning_content, "thinking hard");
+        assert.strictEqual(second[1].content, "Hel");
+    });
+
+    test("reasoning-only retry sends the streamed reasoning as reasoning_content", async () => {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+
+        interface ProviderWithConfigManager {
+            _configManager: {
+                getConfig: () => Promise<{ url: string } & Record<string, unknown>>;
+            };
+        }
+        const providerWithConfig = provider as unknown as ProviderWithConfigManager;
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            emptyResponseRetries: 2,
+            emptyResponseRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+
+        const encoder = new TextEncoder();
+        const sentRequests: OpenAIChatCompletionRequest[] = [];
+
+        const chatStub = sandbox.stub(LiteLLMClient.prototype, "chat");
+        chatStub.onFirstCall().callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sentRequests.push(request);
+            return new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(
+                        encoder.encode('data: {"choices":[{"delta":{"reasoning_content":"cut-off thought"}}]}\n\n')
+                    );
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                },
+            });
+        });
+        chatStub.onSecondCall().callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sentRequests.push(request);
+            return new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"Answer."}}]}\n\n'));
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                },
+            });
+        });
+
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        await provider.provideLanguageModelChatResponse(
+            {
+                id: "model-1",
+                name: "model-1",
+                tooltip: "",
+                family: "litellm",
+                version: "1.0.0",
+                maxInputTokens: 1000,
+                maxOutputTokens: 1000,
+                capabilities: { toolCalling: true, imageInput: false },
+            },
+            [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart("hi")],
+                },
+            ],
+            {
+                modelOptions: {},
+                tools: [],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+                requestInitiator: "test",
+                configuration: { baseUrl: "http://localhost:4000", apiKey: "test-api-key" } as unknown as Record<
+                    string,
+                    unknown
+                >,
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            { report: (part) => reported.push(part) },
+            new vscode.CancellationTokenSource().token
+        );
+
+        assert.strictEqual(sentRequests.length, 2, "Expected two HTTP attempts");
+        const second = sentRequests[1].messages;
+        assert.strictEqual(second.length, 2, "Retry must append a trailing assistant message");
+        assert.strictEqual(second[1].reasoning_content, "cut-off thought");
     });
 });

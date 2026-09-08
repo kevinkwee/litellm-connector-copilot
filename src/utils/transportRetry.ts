@@ -36,7 +36,7 @@ export class InactivityTimeoutError extends Error {
 
 /**
  * Sentinel for a stream that completed cleanly but produced no text and no
- * tool calls - only reasoning (or nothing). VS Code's agent loop treats this
+ * tool calls, only reasoning (or nothing). VS Code's agent loop treats this
  * as "no response was returned", so it is surfaced as an error the retry loop
  * can resume: the partial reasoning is appended to the request so the model
  * continues its thought instead of restarting.
@@ -135,7 +135,7 @@ export function backoffDelayMs(attempt: number, baseMs: number): number {
 /**
  * Accumulates the text that has already been delivered to VS Code during the
  * current response. On a mid-stream retry the value is appended to the request
- * as the leading assistant content so the model continues from where the
+ * as the trailing assistant content so the model continues from where the
  * socket died without duplicating anything in the chat UI.
  */
 export class StreamedTextAccumulator {
@@ -220,8 +220,9 @@ function extractThinkingValue(part: unknown): string {
  * is carried as a thinking part, which convertMessages() maps to the
  * reasoning_content field on the OpenAI payload (LiteLLM's convention for
  * reasoning-native providers like GLM). convertMessages() emits a
- * reasoning-only assistant message (no text, no tool calls) since the
- * hasReasoning guard, so no marker text is needed.
+ * reasoning-only assistant message (no text, no tool calls) because its
+ * hasReasoning guard treats reasoning_content as message content, so no
+ * marker text is needed.
  */
 export function buildResumeMessages(
     originalMessages: readonly vscode.LanguageModelChatRequestMessage[],
@@ -240,10 +241,7 @@ export function buildResumeMessages(
 
     const resumeParts: vscode.LanguageModelResponsePart[] = [];
     if (streamedThinking.trim()) {
-        const thinkingPart = createThinkingPart(streamedThinking);
-        if (thinkingPart) {
-            resumeParts.push(thinkingPart);
-        }
+        resumeParts.push(createThinkingPart(streamedThinking));
     }
     if (streamedText.trim()) {
         resumeParts.push(new vscode.LanguageModelTextPart(streamedText));
@@ -272,12 +270,17 @@ export function buildResumeMessages(
     return messages;
 }
 
-/** Constructs a LanguageModelThinkingPart when the proposed API is available. */
-function createThinkingPart(value: string): vscode.LanguageModelResponsePart | undefined {
+/**
+ * Constructs a thinking part for the resume payload. Uses the proposed-API
+ * class when available; otherwise the plain `{ value }` shape that
+ * convertMessages recognizes through its duck-typed thinking-part guard, so a
+ * reasoning-only resume still reaches the wire as reasoning_content.
+ */
+function createThinkingPart(value: string): vscode.LanguageModelResponsePart {
     const ThinkingPart = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart as
         (new (v: string, id?: string) => unknown) | undefined;
     if (!ThinkingPart) {
-        return undefined;
+        return { value } as vscode.LanguageModelResponsePart;
     }
     return new ThinkingPart(value) as vscode.LanguageModelResponsePart;
 }
