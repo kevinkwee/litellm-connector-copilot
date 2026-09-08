@@ -186,6 +186,27 @@ suite("ConfigManager Unit Tests", () => {
         assert.strictEqual((await configManager.getConfig()).rateLimitMaxDelayMs, 500);
     });
 
+    test("should read large networkRetries values without capping", async () => {
+        settingsMap.set("litellm-connector.networkRetries", 1000);
+        assert.strictEqual((await configManager.getConfig()).networkRetries, 1000);
+        settingsMap.set("litellm-connector.networkRetries", 1_000_000);
+        assert.strictEqual((await configManager.getConfig()).networkRetries, 1_000_000);
+    });
+
+    test("should clamp Infinity networkRetries to the sentinel ceiling", async () => {
+        settingsMap.set("litellm-connector.networkRetries", Infinity);
+        assert.strictEqual((await configManager.getConfig()).networkRetries, Number.MAX_SAFE_INTEGER);
+    });
+
+    test("should default networkRetries to 3 and clamp only the floor", async () => {
+        settingsMap.delete("litellm-connector.networkRetries");
+        assert.strictEqual((await configManager.getConfig()).networkRetries, 3);
+        settingsMap.set("litellm-connector.networkRetries", -5);
+        assert.strictEqual((await configManager.getConfig()).networkRetries, 0);
+        settingsMap.set("litellm-connector.networkRetries", Number.NaN);
+        assert.strictEqual((await configManager.getConfig()).networkRetries, 3);
+    });
+
     test("every LiteLLMConfig field is populated by getConfig() (anti-dead-config guard)", async () => {
         // This test exists because settings were previously declared, read into
         // LiteLLMConfig, and reported to telemetry WITHOUT any runtime behavior.

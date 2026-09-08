@@ -226,7 +226,7 @@ export class ConfigManager {
         const networkRetries = this.clampRange(
             workspaceConfig.get<number>(ConfigManager.NETWORK_RETRIES_KEY),
             0,
-            20,
+            Number.MAX_SAFE_INTEGER,
             3
         );
         const networkRetryDelayMs = this.clampRange(
