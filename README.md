@@ -146,6 +146,7 @@ Base URL and API key are configured through **VS Code's Language Models provider
 | `litellm-connector.inactivityTimeout` | number | `60` | Seconds before connection is considered idle |
 | `litellm-connector.disableCaching` | boolean | `true` | Send `no-cache` headers to bypass LiteLLM caching |
 | `litellm-connector.disableQuotaToolRedaction` | boolean | `false` | Disable automatic tool removal on quota errors |
+| `litellm-connector.autoTrimMessages` | boolean | `false` | Trim older messages to fit the model's input token budget. Covers both the proactive per-request trim and the recovery retry after a context-overflow rejection. Off by default. Oversized requests fail with a context-exceeded error instead of being silently trimmed |
 | `litellm-connector.enableModelOverrides` | boolean | `true` | Master toggle for model override system |
 | `litellm-connector.modelOverrides` | array | `[]` | User-supplied regex-based override rules |
 | `litellm-connector.modelCapabilitiesOverrides` | object | `{}` | Override `toolCalling` / `imageInput` capabilities |

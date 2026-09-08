@@ -25,6 +25,7 @@ export class ConfigManager {
     private static readonly EMPTY_RESPONSE_RETRIES_KEY = "litellm-connector.emptyResponseRetries";
     private static readonly EMPTY_RESPONSE_RETRY_DELAY_MS_KEY = "litellm-connector.emptyResponseRetryDelayMs";
     private static readonly RATE_LIMIT_MAX_DELAY_SECONDS_KEY = "litellm-connector.rateLimitMaxDelaySeconds";
+    private static readonly AUTO_TRIM_MESSAGES_KEY = "litellm-connector.autoTrimMessages";
 
     // Discovery config defaults and bounds
     private static readonly DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
@@ -257,6 +258,8 @@ export class ConfigManager {
         );
         const rateLimitMaxDelayMs = Math.round(rateLimitMaxDelaySeconds * ConfigManager.MS_PER_SECOND);
 
+        const autoTrimMessages = workspaceConfig.get<boolean>(ConfigManager.AUTO_TRIM_MESSAGES_KEY, false);
+
         return {
             inactivityTimeout,
             disableCaching,
@@ -276,6 +279,7 @@ export class ConfigManager {
             emptyResponseRetries,
             emptyResponseRetryDelayMs,
             rateLimitMaxDelayMs,
+            autoTrimMessages,
         };
     }
 
@@ -292,6 +296,7 @@ export class ConfigManager {
             ["commit-message", !!(config.commitModelIdOverride && config.commitModelIdOverride.length > 0)],
             ["caching", !config.disableCaching],
             ["quota-tool-redaction", !config.disableQuotaToolRedaction],
+            ["auto-trim-messages", !!config.autoTrimMessages],
         ];
         for (const [name, enabled] of toggles) {
             this._telemetryService.captureFeatureToggled(name, enabled, source);

@@ -704,6 +704,19 @@ export abstract class LiteLLMProviderBase {
                 throw err;
             }
 
+            // Trimming is opt-in (`litellm-connector.autoTrimMessages`). When
+            // disabled, silently dropping history to recover from an overflow
+            // would hide the real failure, so surface the overflow instead of
+            // retrying with a trimmed conversation.
+            const config = await this._configManager.getConfig();
+            if (config.autoTrimMessages !== true) {
+                const contextError = new vscode.LanguageModelError(
+                    "Context window exceeded. The conversation is too long for this model."
+                );
+                (contextError as { code?: string }).code = "ContextExceeded";
+                throw contextError;
+            }
+
             Logger.warn("[sendRequestWithRetry] Context overflow detected, retrying with aggressive trim", err);
 
             const toolConfig = convertTools(options);

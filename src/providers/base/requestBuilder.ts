@@ -52,7 +52,14 @@ export class RequestBuilder {
         // today. It is consumed by the base for logging/telemetry already;
         // this call site only needs the (possibly redacted) tool list.
         const toolConfig = convertTools({ ...options, tools: toolRedaction.tools });
-        const messagesToUse = trimMessagesToFitBudget(messages, toolConfig.tools, model, modelInfo);
+        // Silently dropping older turns is surprising, so trimming
+        // (`litellm-connector.autoTrimMessages`) stays off by default. The
+        // overflow-recovery retry in the provider base is gated on the same
+        // setting.
+        const messagesToUse =
+            config.autoTrimMessages === true
+                ? trimMessagesToFitBudget(messages, toolConfig.tools, model, modelInfo)
+                : messages;
         const openaiMessages = convertMessages(messagesToUse);
         validateRequest(messagesToUse);
 

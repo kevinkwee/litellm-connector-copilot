@@ -164,4 +164,71 @@ suite("RequestBuilder", () => {
         // tool_choice should be "auto" when model supports it and tools are present
         assert.strictEqual(req.tool_choice, "auto");
     });
+
+    test("buildOpenAIChatRequest skips trimming when autoTrimMessages is disabled", async () => {
+        configManager.getConfig.resolves({ autoTrimMessages: false });
+        const model = {
+            id: "gpt-x",
+            maxInputTokens: 10,
+            maxOutputTokens: 5,
+        } as vscode.LanguageModelChatInformation;
+        const longText = "word ".repeat(500);
+        const messages: vscode.LanguageModelChatRequestMessage[] = [
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelTextPart(longText)],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelTextPart("hi")],
+                name: undefined,
+            },
+        ];
+
+        const req = await builder.buildOpenAIChatRequest(
+            messages,
+            model,
+            { modelOptions: {} } as vscode.ProvideLanguageModelChatResponseOptions,
+            undefined,
+            "caller"
+        );
+
+        // The oversized first message is untouched because trimming is skipped.
+        assert.strictEqual(req.messages.length, 2);
+    });
+
+    test("buildOpenAIChatRequest trims when autoTrimMessages is enabled", async () => {
+        configManager.getConfig.resolves({ autoTrimMessages: true });
+        const model = {
+            id: "gpt-x",
+            maxInputTokens: 10,
+            maxOutputTokens: 5,
+        } as vscode.LanguageModelChatInformation;
+        const longText = "word ".repeat(500);
+        const messages: vscode.LanguageModelChatRequestMessage[] = [
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelTextPart(longText)],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelTextPart("hi")],
+                name: undefined,
+            },
+        ];
+
+        const req = await builder.buildOpenAIChatRequest(
+            messages,
+            model,
+            { modelOptions: {} } as vscode.ProvideLanguageModelChatResponseOptions,
+            undefined,
+            "caller"
+        );
+
+        // Only the recent message fits the tiny budget, so the oversized one is dropped.
+        assert.strictEqual(req.messages.length, 1);
+        assert.strictEqual(req.messages[0].content, "hi");
+    });
 });

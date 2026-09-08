@@ -355,6 +355,108 @@ suite("LiteLLMProviderBase", () => {
             assert.ok(sendStub.calledTwice);
         });
 
+        test("overflow retry surfaces ContextExceeded when autoTrimMessages is disabled", async () => {
+            const provider = setupProvider();
+            const baseConfig = { baseUrl: "https://wolfram.example", apiKey: "k" };
+            seedBackendForCall(sandbox, provider, baseConfig, {
+                backendName: "wolfram",
+                baseUrl: "https://wolfram.example",
+                apiKey: "k",
+                client: {} as never,
+            });
+            sandbox.stub(access(provider)._configManager, "getConfig").resolves({ autoTrimMessages: false });
+
+            const sendStub = sandbox
+                .stub(access(provider)._transport, "sendRequestToLiteLLM")
+                .rejects(apiError("LiteLLM API error 400: maximum context length exceeded", 400));
+
+            const longText = "word ".repeat(500);
+            const messages: vscode.LanguageModelChatRequestMessage[] = [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart(longText)],
+                },
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart("hi")],
+                },
+            ];
+            const smallModel = { ...model, maxInputTokens: 10, maxOutputTokens: 5 };
+
+            await assert.rejects(
+                () =>
+                    access(provider).sendRequestWithRetry(
+                        { model: "model-reasoning", messages: [], stream: true, max_tokens: 5 },
+                        messages,
+                        smallModel,
+                        { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+                        { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
+                        new vscode.CancellationTokenSource().token,
+                        "test"
+                    ),
+                (err: unknown) =>
+                    err instanceof vscode.LanguageModelError &&
+                    (err as unknown as { code?: string }).code === "ContextExceeded"
+            );
+            // Trimming is disabled, so the overflow must not trigger a
+            // second, silently trimmed attempt.
+            assert.ok(sendStub.calledOnce);
+        });
+
+        test("overflow recovery trims when autoTrimMessages is enabled", async () => {
+            const provider = setupProvider();
+            const baseConfig = { baseUrl: "https://wolfram.example", apiKey: "k" };
+            seedBackendForCall(sandbox, provider, baseConfig, {
+                backendName: "wolfram",
+                baseUrl: "https://wolfram.example",
+                apiKey: "k",
+                client: {} as never,
+            });
+            sandbox.stub(access(provider)._configManager, "getConfig").resolves({ autoTrimMessages: true });
+
+            const sendStub = sandbox
+                .stub(access(provider)._transport, "sendRequestToLiteLLM")
+                .onCall(0)
+                .rejects(apiError("LiteLLM API error 400: maximum context length exceeded", 400))
+                .onCall(1)
+                .resolves(new ReadableStream());
+
+            const longText = "word ".repeat(500);
+            const messages: vscode.LanguageModelChatRequestMessage[] = [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart(longText)],
+                },
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart("hi")],
+                },
+            ];
+            const smallModel = { ...model, maxInputTokens: 10, maxOutputTokens: 5 };
+
+            const stream = await access(provider).sendRequestWithRetry(
+                { model: "model-reasoning", messages: [], stream: true, max_tokens: 5 },
+                messages,
+                smallModel,
+                { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+                { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
+                new vscode.CancellationTokenSource().token,
+                "test"
+            );
+
+            assert.ok(stream);
+            assert.ok(sendStub.calledTwice);
+            // The retried request must carry the aggressively trimmed history,
+            // not the original oversized message list.
+            const retryMessages = sendStub.secondCall.args[0].messages;
+            assert.strictEqual(retryMessages.length, 1);
+            assert.strictEqual(retryMessages[0].content, "hi");
+        });
+
         test("notifies once per model and original effort", async () => {
             const provider = setupProvider();
             const baseConfig = { baseUrl: "https://wolfram.example", apiKey: "k", reasoningEffort: "high" };

@@ -107,6 +107,17 @@ suite("ConfigManager Unit Tests", () => {
         assert.deepStrictEqual(cfg.modelCapabilitiesOverrides, {});
     });
 
+    test("getConfig reads autoTrimMessages (default false, opt-in)", async () => {
+        const manager = new ConfigManager(mockSecrets);
+
+        const defaultConfig = await manager.getConfig();
+        assert.strictEqual(defaultConfig.autoTrimMessages, false);
+
+        settingsMap.set("litellm-connector.autoTrimMessages", true);
+        const enabledConfig = await manager.getConfig();
+        assert.strictEqual(enabledConfig.autoTrimMessages, true);
+    });
+
     test("reportFeatureToggles calls telemetry service with correct toggles", async () => {
         const manager = new ConfigManager(mockSecrets);
         const captureStub = sinon.stub();
@@ -124,10 +135,11 @@ suite("ConfigManager Unit Tests", () => {
 
         await manager.reportFeatureToggles("test_source");
 
-        assert.strictEqual(captureStub.callCount, 3);
+        assert.strictEqual(captureStub.callCount, 4);
         assert.ok(captureStub.calledWith("commit-message", true, "test_source"));
         assert.ok(captureStub.calledWith("caching", true, "test_source"));
         assert.ok(captureStub.calledWith("quota-tool-redaction", true, "test_source"));
+        assert.ok(captureStub.calledWith("auto-trim-messages", false, "test_source"));
     });
 
     test("reportFeatureToggles is a no-op without telemetry service", async () => {
@@ -227,6 +239,7 @@ suite("ConfigManager Unit Tests", () => {
             "forceResponsesEndpoint",
             "allowChatCompletionsFallback",
             "rateLimitMaxDelayMs",
+            "autoTrimMessages",
             // NOTE: sendDefaultParameters, inlineCompletions*, v2ApiEnabled,
             // enableResponses, modelOverrides (field) are intentionally absent —
             // removed as dead config. Do NOT re-add them.

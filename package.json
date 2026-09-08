@@ -109,6 +109,11 @@
 					"default": false,
 					"description": "Disable per-turn tool redaction when a quota error is detected in chat history. Leave off to keep redaction enabled."
 				},
+				"litellm-connector.autoTrimMessages": {
+					"type": "boolean",
+					"default": false,
+					"description": "Trim older chat messages to fit the model's input token budget, both proactively before each request and as a recovery retry when the upstream rejects a request for exceeding the context window. When off, the full history is sent and context overflow failures surface as errors instead of being silently trimmed."
+				},
 				"litellm-connector.modelOverrides": {
 					"type": "array",
 					"default": [],

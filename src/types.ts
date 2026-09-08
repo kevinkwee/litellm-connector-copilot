@@ -190,6 +190,16 @@ export interface LiteLLMConfig {
     /** When true, show pricing data in the model picker hover (if available from /model/info). Default: true. */
     displayPricingInPicker?: boolean;
 
+    /**
+     * When true, trims chat history to fit the model's input token budget:
+     * proactively before each request and again when the upstream rejects
+     * a request for exceeding the context window.
+     * When false (default), the full history is always sent and context
+     * overflow failures surface as errors. Opt-in because trimming
+     * silently drops older turns, which can surprise users.
+     */
+    autoTrimMessages?: boolean;
+
     /** Timeout in milliseconds for /model/info discovery requests. Default: 5000. */
     discoveryTimeoutMs?: number;
 
