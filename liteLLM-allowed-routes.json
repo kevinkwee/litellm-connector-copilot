@@ -1,36 +1,28 @@
 [
-    // ── Model Discovery & Metadata ──────────────────────────────
     "/model/info",           // Detailed model info (capabilities, pricing, provider)
     "/models/*",             // List models, get specific model details
     "/model_group_info",     // Model group metadata
 
-    // ── Chat & Completions (Core Inference) ─────────────────────
     "/chat/completions",     // OpenAI-compatible chat completions (streaming + non-streaming)
     "/completions",          // OpenAI-compatible legacy text completions
     "/responses",            // LiteLLM native responses endpoint
 
-    // ── Embeddings ──────────────────────────────────────────────
     "/embeddings",           // Text embedding generation
 
-    // ── Images ──────────────────────────────────────────────────
     "/images/generations",   // Image generation (DALL·E, Stable Diffusion, etc.)
     "/images/edits",         // Image editing
     "/images/variations",    // Image variations
 
-    // ── Audio ───────────────────────────────────────────────────
     "/audio/transcriptions", // Speech-to-text (Whisper, etc.)
     "/audio/translations",   // Audio translation to English
     "/audio/speech",         // Text-to-speech (TTS)
 
-    // ── Moderation & Reranking ──────────────────────────────────
     "/moderations",          // Content moderation (OpenAI-compatible)
     "/rerank",               // Reranking models (Cohere, etc.)
 
-    // ── Tokenization & Counting ─────────────────────────────────
     "/tokenize",             // Token counting / tokenization
     "/utils/token_counter",  // LiteLLM token counter utility
 
-    // ── Health & Status (Read-Only) ─────────────────────────────
     "/health",               // Overall health check
     "/health/liveliness",    // Liveness probe
     "/health/readiness",     // Readiness probe
@@ -38,16 +30,13 @@
     "/active_running_jobs",  // Currently running inference jobs
     "/metrics",              // Prometheus-compatible metrics
 
-    // ── Spend / Usage (Read-Only Self-Service) ──────────────────
     "/global/spend/list",    // List spend records (read-only)
     "/global/spend/keys",    // Spend by key (read-only)
     "/global/spend/teams",   // Spend by team (read-only)
     "/global/spend/models",  // Spend by model (read-only)
 
-    // ── Key Info (Read-Only Self-Service) ───────────────────────
     "/key/info"              // View current key info / limits (no generation/update/delete)
 
-    // ── Compact (paste-ready) ──────────────────────────────────────
     // ["/model/info","/models/*","/model_group_info","/chat/completions","/completions","/responses","/embeddings","/images/generations","/images/edits","/images/variations","/audio/transcriptions","/audio/translations","/audio/speech","/moderations","/rerank","/tokenize","/utils/token_counter","/health","/health/liveliness","/health/readiness","/active/callbacks","/active_running_jobs","/metrics","/global/spend/list","/global/spend/keys","/global/spend/teams","/global/spend/models","/key/info"]
 ]
 

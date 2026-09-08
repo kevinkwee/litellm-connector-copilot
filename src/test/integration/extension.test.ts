@@ -236,7 +236,7 @@ suite("Extension Activation Unit Tests", () => {
         extension.activate(context);
         assert.ok(configChangeHandler, "expected onDidChangeConfiguration handler to be registered");
 
-        // Trigger config change WITHOUT affecting litellm-connector config - should not refresh
+        // Trigger config change WITHOUT affecting litellm-connector config, so it should not refresh
         const mockEvent = {
             affectsConfiguration: (section: string): boolean => {
                 return section === "litellm-connector.someOtherSetting";
@@ -327,11 +327,9 @@ suite("Extension Activation Unit Tests", () => {
         assert.ok(context.subscriptions.length > 0);
     });
 
-    // -------------------------------------------------------------------------
     // Bulk coverage tests for the remaining extension.ts lines. Each test in
     // the suite below covers multiple uncovered branches in `activate` to keep
     // the test count small while raising line/branch coverage.
-    // -------------------------------------------------------------------------
 
     test("activate wires process error listeners and removes them on dispose", async () => {
         const context = createContextWithState(sandbox);

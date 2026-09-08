@@ -1,5 +1,5 @@
 /**
- * BackendRegistry — the single source of truth for backends and their
+ * BackendRegistry: the single source of truth for backends and their
  * associated models.
  *
  * This class owns:
@@ -15,27 +15,25 @@
  *     the picker when the set has really changed.
  *  4. **Capability caches**: per-model `LiteLLMModelInfo` and derived
  *     capabilities. These are populated as a side effect of discovery and
- *     feed the request hot path. They are NOT a model-list cache — they
+ *     feed the request hot path. They are NOT a model-list cache: they
  *     cache the capability info for known models.
  *
  * Public surface (read + ingress)
- * --------------------------------
- *  - `discoverModels(options, token)` — the only way for VS Code (or any
+ *  - `discoverModels(options, token)`: the only way for VS Code (or any
  *    consumer) to fetch a model list and populate the registry.
- *  - `lookup(id)` — resolve a namespaced id to its routing entry.
- *  - `extractRawName(id)` — strip the routing prefix from a namespaced id.
- *  - `getModelInfo(id)` / `getDerivedCapabilities(id)` — read the
+ *  - `lookup(id)`: resolve a namespaced id to its routing entry.
+ *  - `extractRawName(id)`: strip the routing prefix from a namespaced id.
+ *  - `getModelInfo(id)` / `getDerivedCapabilities(id)`: read the
  *    capability caches populated during discovery.
- *  - `size()` — number of distinct backends currently registered.
- *  - `clear()` — wipe the routing table (call on user-initiated reload).
- *  - `clearCaches()` — wipe the capability caches + backoff controller.
- *  - `onDidChange` — fires when a backend's model set changes.
+ *  - `size()`: number of distinct backends currently registered.
+ *  - `clear()`: wipe the routing table (call on user-initiated reload).
+ *  - `clearCaches()`: wipe the capability caches + backoff controller.
+ *  - `onDidChange`: fires when a backend's model set changes.
  *
  * Internal surface (write)
- * ------------------------
- *  - `setModelsForBackend(...)` — internal write, called only by
+ *  - `setModelsForBackend(...)`: internal write, called only by
  *    `discoverInternal`. Not part of the public contract.
- *  - `getModelsForBackend(baseUrl)` / `getModelIdsForBackend(baseUrl)` —
+ *  - `getModelsForBackend(baseUrl)` / `getModelIdsForBackend(baseUrl)`:
  *    internal read, used only by `discoverInternal` for change detection.
  *
  * Discovery, storage, and change detection live in one class so the
@@ -45,7 +43,6 @@
  * model list, updates the registry, and fires the change event as a unit.
  *
  * Per-group namespacing
- * ---------------------
  * The namespaced id format `<routingIdentity>/<rawModelName>` is the
  * keystone of multi-backend support: it lets the response path look up
  * routing in O(1) by id, with no per-backend scan and no ambiguity when
@@ -180,7 +177,7 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
      * Per-model capability caches. These are populated as a side effect of
      * discovery and feed the request hot path (`buildOpenAIChatRequest`,
      * token utilities, capability derivation). They are NOT a model list
-     * cache — they cache the capability info for known models.
+     * cache: they cache the capability info for known models.
      */
     private readonly modelInfoCache = new Map<string, LiteLLMModelInfo | undefined>();
     private readonly derivedCapabilitiesCache = new Map<string, ReturnType<typeof deriveCapabilitiesFromModelInfo>>();
@@ -240,9 +237,7 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         return this._debouncedOnDidChange;
     }
 
-    // -------------------------------------------------------------------------
     // Public ingress
-    // -------------------------------------------------------------------------
 
     /**
      * The single public entry point for discovery.
@@ -255,9 +250,8 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
      *   prior delivery.
      *
      * Stateless by design: there is no model-list cache, no in-flight
-     * de-duplication, and no TTL. Every call is a single HTTP round-trip.
-     * The "ghost cache" is gone, and the picker always reflects the live
-     * state of the backend.
+     * de-duplication, and no TTL. Every call is a single HTTP round-trip,
+     * so the picker always reflects the live state of the backend.
      */
     public async discoverModels(
         options: {
@@ -280,9 +274,7 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         return outcome.models;
     }
 
-    // -------------------------------------------------------------------------
     // Public read
-    // -------------------------------------------------------------------------
 
     /**
      * Direct lookup of the routing entry for a given id. The id is the
@@ -420,9 +412,7 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         this._onDidChangeEmitter.dispose();
     }
 
-    // -------------------------------------------------------------------------
     // Internal write (NOT part of the public contract)
-    // -------------------------------------------------------------------------
 
     /**
      * Records the full model list returned by a single backend's discovery
@@ -470,9 +460,7 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         return new Set(models.map((m) => m.id));
     }
 
-    // -------------------------------------------------------------------------
     // Discovery implementation
-    // -------------------------------------------------------------------------
 
     private async discoverInternal(
         options: { silent?: boolean; configuration?: Record<string, unknown>; groupName?: string },
@@ -503,7 +491,7 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
                       ? "API key is empty"
                       : "Configuration is invalid or incomplete";
                 Logger.warn(
-                    `LiteLLMProviderRegistry.discoverModels: ${reason} — surfacing LanguageModelError to the picker`
+                    `LiteLLMProviderRegistry.discoverModels: ${reason}; surfacing LanguageModelError to the picker`
                 );
                 throw vscode.LanguageModelError.Blocked(
                     `Cannot list models: ${reason}. ` +
@@ -691,7 +679,7 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         // The id is the namespaced form `<routingIdentity>/<rawModelName>` so
         // the response path can recover both pieces by splitting on the first
         // `/`. Two backends on different hostnames can advertise the same raw
-        // model name (e.g. `azure_ai/gpt-5.4-mini`) — the routing identity
+        // model name (e.g. `azure_ai/gpt-5.4-mini`): the routing identity
         // disambiguates them. The `name` shown to the user in the model
         // picker stays as the raw model_name (no namespace leak).
         const modelId = routingIdentity.length > 0 ? `${routingIdentity}/${modelName}` : modelName;
@@ -760,14 +748,14 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             // crashes with `TypeError: a.charAt is not a function` when the
             // value is not a string. The picker recognizes the three literals
             // `lightweight` | `versatile` | `powerful` and handles `undefined`
-            // (omit tag). We MUST return one of those or `undefined` — never a
-            // grouping object, never `null`. See `.investigate/vscode-picker-charAt-bug.md`.
+            // (omit tag). We MUST return one of those or `undefined`: never a
+            // grouping object, never `null`.
             //
             // Note on grouping: the picker does NOT read `category` for
             // per-backend sectioning. Per the upstream
             // `ModelPickerWidget.buildModelPickerItems()`, grouping is driven
             // by `(vendor, groupName)` resolved through the workbench
-            // `ILanguageModelsService.getLanguageModelGroups()` lookup — not
+            // `ILanguageModelsService.getLanguageModelGroups()` lookup, not
             // by anything we return in `category`. Returning a string here
             // therefore does NOT regress per-backend picker sectioning; it
             // only stops the crash on `getCategoryLabel`.

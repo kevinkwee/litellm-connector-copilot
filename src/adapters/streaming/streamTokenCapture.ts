@@ -87,8 +87,6 @@ export class StreamTokenCapture {
         this._modelId = modelId;
     }
 
-    // ── Input-side configuration (call before sending the request) ──
-
     setEstimatedPromptTokens(count: number): void {
         this._estimatedPromptTokens = count;
     }
@@ -105,13 +103,9 @@ export class StreamTokenCapture {
         this._totalTokenMax = tokens;
     }
 
-    // ── The wrapped progress (pass this to sendRequest*) ──
-
     get progress(): vscode.Progress<vscode.LanguageModelResponsePart> {
         return { report: (part) => this._intercept(part) };
     }
-
-    // ── Resume support (populated during streaming, read after a failure) ──
 
     /**
      * Drops the token accounting accumulated for a partial response so a
@@ -127,8 +121,6 @@ export class StreamTokenCapture {
         this._upstream = undefined;
     }
 
-    // ── Snapshot (call after stream completes) ──
-
     getSnapshot(): TokenSnapshot {
         const hasUpstream = this._sawUpstreamUsage && this._upstream !== undefined;
         const promptDetails: OpenAIUsagePromptTokenDetails | undefined = this._upstream?.prompt_tokens_details;
@@ -136,13 +128,13 @@ export class StreamTokenCapture {
             this._upstream?.completion_tokens_details;
 
         const snapshot: TokenSnapshot = {
-            // Input — prefer upstream, fall back to pre-computed estimate
+            // Input: prefer upstream, fall back to pre-computed estimate
             promptTokens: this._upstream?.prompt_tokens ?? this._estimatedPromptTokens,
             cachedTokens: promptDetails?.cached_tokens ?? 0,
             cacheCreationInputTokens: promptDetails?.cache_creation_input_tokens ?? 0,
             systemPromptTokens: this._upstream?.system_prompt_tokens ?? this._estimatedSystemPromptTokens,
 
-            // Output — prefer upstream, fall back to internal accumulation
+            // Output: prefer upstream, fall back to internal accumulation
             completionTokens:
                 this._upstream?.completion_tokens ?? countTokens(this._textBuffer, this._modelId, this._modelInfo),
             reasoningTokens:
@@ -170,8 +162,6 @@ export class StreamTokenCapture {
 
         return snapshot;
     }
-
-    // ── Flush usage data (call after stream completes if no upstream usage was seen) ──
 
     /**
      * Emits a usage DataPart to VS Code if no upstream usage was seen during streaming.
@@ -263,8 +253,6 @@ export class StreamTokenCapture {
         this._inner.report(new vscode.LanguageModelDataPart(payloadBytes, "usage"));
     }
 
-    // ── Internal: intercept every part ──
-
     private _intercept(part: vscode.LanguageModelResponsePart): void {
         if (this._isThinkingPart(part)) {
             const value = this._extractThinkingValue(part);
@@ -343,7 +331,7 @@ export class StreamTokenCapture {
             const enrichedBytes = new TextEncoder().encode(JSON.stringify(enriched));
             this._inner.report(new vscode.LanguageModelDataPart(enrichedBytes, "usage"));
         } catch {
-            // Malformed usage — forward as-is
+            // Malformed usage: forward as-is
             this._inner.report(part);
         }
     }
@@ -400,8 +388,6 @@ export class StreamTokenCapture {
             total_token_max: prev.total_token_max ?? next.total_token_max,
         };
     }
-
-    // ── ThinkingPart detection ──
 
     private _isThinkingPart(part: vscode.LanguageModelResponsePart): boolean {
         const ThinkingPart = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart;

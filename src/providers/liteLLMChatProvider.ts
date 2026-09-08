@@ -152,7 +152,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         // produces no export (there's nothing meaningful to render yet).
         let endpointUrl: string | undefined;
         let requestBodyBuilt: OpenAIChatCompletionRequest | undefined;
-        // Session fingerprint — computed once from `messages` (the request
+        // Session fingerprint, computed once from `messages` (the request
         // input) at the top of the try block, then reused for two purposes:
         //   1. Injected into `requestBody.metadata.session_id` so LiteLLM
         //      promotes it to `litellm_session_id` for per-session spend
@@ -183,7 +183,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             `Chat request: received model id="${model.id}" name="${model.name}" hasOptionsConfig=${(options as { configuration?: unknown }).configuration !== undefined}`
         );
 
-        // Capability lookups go directly to the BackendRegistry — the single
+        // Capability lookups go directly to the BackendRegistry: the single
         // source of truth. There is no per-provider mirror cache, so a stale
         // entry from a previous backend cannot be served for a different
         // backend's request.
@@ -220,8 +220,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // input). This is the same value used for `.copilotmd` folder
             // grouping AND for LiteLLM's `metadata.session_id` (which LiteLLM
             // promotes to `litellm_session_id` for per-session spend tracking
-            // and cache grouping). Computing it here — before the body is
-            // built — lets us inject it into the body in the same pass.
+            // and cache grouping). Computing it here (before the body is
+            // built) lets us inject it into the body in the same pass.
             // Async because the fingerprint uses SHA-256 via Web Crypto.
             sessionFingerprint = await computeSessionFingerprint(messages);
             const requestBody = await this.buildOpenAIChatRequest(messages, model, options, modelInfo, caller);
@@ -229,7 +229,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // so LiteLLM's proxy can group spend logs and cache entries by
             // session. LiteLLM reads `metadata.session_id` and promotes it to
             // `litellm_session_id` (see `litellm/litellm_core_utils/get_litellm_params.py`).
-            // We always set this — even when `.copilotmd` export is disabled —
+            // We always set this, even when `.copilotmd` export is disabled,
             // because per-session spend tracking is useful independent of the
             // debug-log export. The fingerprint is deterministic per session,
             // so all turns of one chat session share one `litellm_session_id`.
@@ -270,7 +270,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // Count the actual transport request after trimming/conversion.
             tokensIn = estimatedTransportInputTokens;
 
-            // ── Transport retry (resume-on-error) ──
             // A socket death (`terminated` / `fetch failed`) or inactivity abort
             // kills the upstream request but does NOT undo parts already emitted
             // to VS Code. Instead of surfacing the transport error (which shows
@@ -343,7 +342,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     }
                     break;
                 } catch (err: unknown) {
-                    // ── Reasoning-only budget (separate from transport) ──
                     if (err instanceof ReasoningOnlyError) {
                         if (emptyAttempt < maxEmptyRetries && !token.isCancellationRequested) {
                             emptyAttempt += 1;
@@ -383,7 +381,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         );
                     }
 
-                    // ── Transport budget ──
                     const isLastAttempt = attempt >= maxTransportRetries;
                     if (
                         token.isCancellationRequested ||
@@ -514,7 +511,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
 
             // Fire-and-forget `.copilotmd` export. Reads the opt-in setting
             // inside `exportCopilotMdEntry`; when disabled this is a single
-            // config read + early return — negligible on the request hot path.
+            // config read + early return, negligible on the request hot path.
             // Never awaited: a failed/slow export must not delay the user's
             // already-streamed response.
             void exportCopilotMdEntry({
@@ -539,8 +536,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 sessionFingerprint,
             } satisfies CopilotMdEntry);
 
-            // Usage data is now handled exclusively by StreamTokenCapture
-            // which intercepts usage DataParts during streaming and enriches them.
+            // Usage data flows through StreamTokenCapture, which intercepts
+            // usage DataParts during streaming and enriches them.
         } catch (err: unknown) {
             let errorMessage = err instanceof Error ? err.message : String(err);
             const errorStack = err instanceof Error ? err.stack : undefined;
@@ -607,7 +604,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             }
 
             // Fire-and-forget `.copilotmd` export for the failure case. Only
-            // emits when the request got far enough to have a built body — a
+            // emits when the request got far enough to have a built body. A
             // failure before `buildOpenAIChatRequest` (e.g. config error) has
             // nothing meaningful to render and is skipped.
             if (requestBodyBuilt && endpointUrl) {
@@ -854,7 +851,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         StructuredLogger.info("stream.recovery_success", {
                             toolCallsFlushed: recoveredParts.filter((p) => p.type === "tool_call").length,
                         });
-                        // Don't re-throw after successful recovery - partial response is better than hard failure
+                        // Don't re-throw after successful recovery. Partial response is better than hard failure.
                         return;
                     } else {
                         // No recoverable parts (empty stream), let error through
