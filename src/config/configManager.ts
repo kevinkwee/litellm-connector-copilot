@@ -52,6 +52,12 @@ export class ConfigManager {
 
     private _telemetryService?: TelemetryService;
 
+    // Last config returned by getConfig(). convertProviderConfiguration is
+    // synchronous but must hand the session client a discovery timeout, so it
+    // reads the most recently loaded workspace config, falling back to the
+    // client default when getConfig() has not run yet.
+    private _lastConfig?: LiteLLMConfig;
+
     private readonly secrets: vscode.SecretStorage;
 
     constructor(secrets: vscode.SecretStorage) {
@@ -141,6 +147,9 @@ export class ConfigManager {
 
     /**
      * Retrieves the current LiteLLM workspace-level configuration.
+     *
+     * Each call refreshes a cached copy that `convertProviderConfiguration()`
+     * reads synchronously when it builds session clients.
      *
      * Backend connection details (baseUrl, apiKey) are NOT read here — they are
      * delivered by VS Code 1.120 per-group `options.configuration` payloads on
@@ -260,7 +269,7 @@ export class ConfigManager {
 
         const autoTrimMessages = workspaceConfig.get<boolean>(ConfigManager.AUTO_TRIM_MESSAGES_KEY, false);
 
-        return {
+        const config: LiteLLMConfig = {
             inactivityTimeout,
             disableCaching,
             disableQuotaToolRedaction,
@@ -281,6 +290,9 @@ export class ConfigManager {
             rateLimitMaxDelayMs,
             autoTrimMessages,
         };
+        this._lastConfig = config;
+        // Shallow copy so callers cannot mutate the cached config in place.
+        return { ...config };
     }
 
     /**
@@ -350,7 +362,15 @@ export class ConfigManager {
             backendName,
             baseUrl,
             apiKey,
-            client: new LiteLLMClient({ url: baseUrl, key: apiKey }, userAgent),
+            client: new LiteLLMClient(
+                {
+                    url: baseUrl,
+                    key: apiKey,
+                    discoveryTimeoutMs:
+                        this._lastConfig?.discoveryTimeoutMs ?? ConfigManager.DEFAULT_DISCOVERY_TIMEOUT_MS,
+                },
+                userAgent
+            ),
         };
     }
 

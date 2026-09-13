@@ -118,6 +118,31 @@ suite("ConfigManager Unit Tests", () => {
         assert.strictEqual(enabledConfig.autoTrimMessages, true);
     });
 
+    test("convertProviderConfiguration passes the configured discoveryTimeoutMs to the session client", async () => {
+        settingsMap.set("litellm-connector.discoveryTimeoutMs", 15_000);
+        await configManager.getConfig();
+
+        const session = configManager.convertProviderConfiguration("group-a", {
+            baseUrl: "http://localhost:4000",
+            apiKey: "secret",
+        });
+
+        assert.ok(session);
+        const clientConfig = (session?.client as unknown as { config: { discoveryTimeoutMs?: number } }).config;
+        assert.strictEqual(clientConfig.discoveryTimeoutMs, 15_000);
+    });
+
+    test("session client falls back to the 5000ms discovery timeout before the first getConfig", () => {
+        const session = configManager.convertProviderConfiguration("group-a", {
+            baseUrl: "http://localhost:4000",
+            apiKey: "secret",
+        });
+
+        assert.ok(session);
+        const clientConfig = (session?.client as unknown as { config: { discoveryTimeoutMs?: number } }).config;
+        assert.strictEqual(clientConfig.discoveryTimeoutMs, 5_000);
+    });
+
     test("reportFeatureToggles calls telemetry service with correct toggles", async () => {
         const manager = new ConfigManager(mockSecrets);
         const captureStub = sinon.stub();
