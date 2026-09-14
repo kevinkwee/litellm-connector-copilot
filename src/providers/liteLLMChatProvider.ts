@@ -371,6 +371,17 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     }
                     break;
                 } catch (err: unknown) {
+                    if (token.isCancellationRequested) {
+                        // VS Code cancels mid-stream for its own reasons (user
+                        // Stop, agent-loop retries). The resulting abort ends
+                        // decodeSSE cleanly, which the reasoning-only detector
+                        // then misreads as empty content. Surfacing that would
+                        // falsely blame the upstream provider.
+                        throw Object.assign(new Error("Operation cancelled by user"), {
+                            name: "CancellationError",
+                            cause: err,
+                        });
+                    }
                     if (err instanceof ReasoningOnlyError) {
                         if (emptyAttempt < maxEmptyRetries && !token.isCancellationRequested) {
                             emptyAttempt += 1;
@@ -740,9 +751,20 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         };
 
         token.onCancellationRequested(() => {
-            Logger.debug(`[processStreamingResponse] Cancellation requested from VS Code`);
-            StructuredLogger.debug("stream.cancellation_requested", {
+            // The listener runs synchronously inside whoever called cancel(),
+            // so this stack is the only fingerprint of the canceller, e.g.
+            // user action, Copilot agent-loop retry, or session teardown,
+            // which the CancellationToken API itself does not expose.
+            const cancellationStack = new Error().stack;
+            Logger.warn(
+                `[processStreamingResponse] Cancellation requested from VS Code after ${eventCount} events (text=${sawTextPart}, toolCall=${sawToolCallPart}, usage=${sawUsagePart})`
+            );
+            StructuredLogger.warn("stream.cancellation_requested", {
                 eventCount,
+                sawTextPart,
+                sawToolCallPart,
+                sawUsagePart,
+                stack: cancellationStack,
             });
             if (watchdog) {
                 clearTimeout(watchdog);

@@ -1686,6 +1686,45 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         assert.strictEqual(sent.length, 2, "reasoning-only budget must be exhausted");
     });
 
+    test("cancellation during a reasoning-only stream surfaces cancellation, not retry exhaustion", async () => {
+        const encoder = new TextEncoder();
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            emptyResponseRetries: 2,
+            emptyResponseRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const sent: OpenAIChatCompletionRequest[] = [];
+        const tokenSource = new vscode.CancellationTokenSource();
+        // The abort fires while the stream is still open, so decodeSSE ends
+        // cleanly and the reasoning-only detector runs on a cancelled request.
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sent.push(request);
+            return new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(
+                        encoder.encode('data: {"choices":[{"delta":{"reasoning_content":"thought"}}]}\n\n')
+                    );
+                },
+                pull(controller) {
+                    tokenSource.cancel();
+                    controller.close();
+                },
+            });
+        });
+
+        await assert.rejects(() => runChatRequest(provider, reported, tokenSource.token), /Operation cancelled/);
+        assert.strictEqual(sent.length, 1, "a cancelled request must not be resumed");
+    });
+
     test("reasoning-only retries do not consume the transport retry budget", async () => {
         const encoder = new TextEncoder();
         const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
