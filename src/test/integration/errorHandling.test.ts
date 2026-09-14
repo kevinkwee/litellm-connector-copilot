@@ -169,21 +169,30 @@ suite("LiteLLM Error Handling Unit Tests", function () {
             requestInitiator: "test",
         };
 
+        const progressParts: vscode.LanguageModelResponsePart[] = [];
         const progress: vscode.Progress<vscode.LanguageModelResponsePart> = {
-            report: () => {},
+            report: (part) => progressParts.push(part),
         };
 
-        const token = new vscode.CancellationTokenSource().token;
+        await provider.provideLanguageModelChatResponse(
+            model,
+            messages,
+            options,
+            progress,
+            new vscode.CancellationTokenSource().token
+        );
 
-        try {
-            await provider.provideLanguageModelChatResponse(model, messages, options, progress, token);
-            assert.fail("Should have thrown an error");
-        } catch (err) {
-            const error = err as Error;
-            assert.ok(error.message.includes("LiteLLM Error (test-model)"));
-            assert.ok(error.message.includes("Unsupported parameter: temperature"));
-            assert.ok(error.message.includes("This model may not support certain parameters like temperature"));
-        }
+        // The provider completes gracefully with the error as an assistant
+        // text part so VS Code keeps the turn in the conversation history.
+        const errorPart = progressParts.find(
+            (part): part is vscode.LanguageModelTextPart =>
+                typeof (part as unknown as { value?: unknown })?.value === "string" &&
+                String((part as unknown as { value?: unknown }).value).startsWith("[litellm-connector]")
+        );
+        assert.ok(errorPart, "expected the failure to surface as an error text part");
+        assert.ok(errorPart.value.includes("LiteLLM Error (test-model)"));
+        assert.ok(errorPart.value.includes("Unsupported parameter: temperature"));
+        assert.ok(errorPart.value.includes("This model may not support certain parameters like temperature"));
     });
 
     test("provideLanguageModelChatResponse handles generic 400 error", async () => {
@@ -223,26 +232,29 @@ suite("LiteLLM Error Handling Unit Tests", function () {
             tooltip: "test",
         };
 
+        const genericParts: vscode.LanguageModelResponsePart[] = [];
         const progress: vscode.Progress<vscode.LanguageModelResponsePart> = {
-            report: () => {},
+            report: (part) => genericParts.push(part),
         };
 
-        try {
-            const dummyMessages = [
-                new vscode.LanguageModelChatMessage(vscode.LanguageModelChatMessageRole.User, "Hello"),
-            ];
-            await provider.provideLanguageModelChatResponse(
-                model,
-                dummyMessages,
-                { toolMode: vscode.LanguageModelChatToolMode.Auto, requestInitiator: "test" },
-                progress,
-                new vscode.CancellationTokenSource().token
-            );
-            assert.fail("Should have thrown an error");
-        } catch (err) {
-            const error = err as Error;
-            assert.ok(error.message.includes("LiteLLM Error (test-model)"));
-            assert.ok(error.message.includes("Something went wrong"));
-        }
+        const dummyMessages = [new vscode.LanguageModelChatMessage(vscode.LanguageModelChatMessageRole.User, "Hello")];
+        await provider.provideLanguageModelChatResponse(
+            model,
+            dummyMessages,
+            { toolMode: vscode.LanguageModelChatToolMode.Auto, requestInitiator: "test" },
+            progress,
+            new vscode.CancellationTokenSource().token
+        );
+
+        // The provider completes gracefully with the error as an assistant
+        // text part so VS Code keeps the turn in the conversation history.
+        const errorPart = genericParts.find(
+            (part): part is vscode.LanguageModelTextPart =>
+                typeof (part as unknown as { value?: unknown })?.value === "string" &&
+                String((part as unknown as { value?: unknown }).value).startsWith("[litellm-connector]")
+        );
+        assert.ok(errorPart, "expected the failure to surface as an error text part");
+        assert.ok(errorPart.value.includes("LiteLLM Error (test-model)"));
+        assert.ok(errorPart.value.includes("Something went wrong"));
     });
 });

@@ -8,6 +8,7 @@ import type {
     Progress,
     ProvideLanguageModelChatResponseOptions,
 } from "vscode";
+import { LanguageModelTextPart } from "vscode";
 
 import { tryParseJSONObject } from "../utils";
 import { Logger } from "../utils/logger";
@@ -685,7 +686,22 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 } satisfies CopilotMdEntry);
             }
 
-            throw new Error(errorMessage, { cause: err });
+            if (token.isCancellationRequested) {
+                throw Object.assign(new Error("Operation cancelled by user"), {
+                    name: "CancellationError",
+                    cause: err,
+                });
+            }
+
+            // VS Code excludes an errored turn from the conversation history
+            // sent upstream, so a thrown error would erase everything the
+            // model already said this turn; on the next turn the model would
+            // see neither its own partial answer nor the failure. Completing
+            // with the error as an assistant text part keeps the turn in
+            // history; cancellation stays a throw because VS Code renders
+            // that state itself.
+            trackingProgress.report(new LanguageModelTextPart(`[litellm-connector] ${errorMessage}`));
+            Logger.warn(`Chat request surfaced as assistant error text instead of throwing | RequestID: ${requestId}`);
         }
     }
 

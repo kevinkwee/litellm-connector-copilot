@@ -169,22 +169,22 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             },
         ];
 
-        await assert.rejects(
-            () =>
-                provider.provideLanguageModelChatResponse(
-                    model,
-                    messages,
-                    {
-                        modelOptions: {},
-                        tools: [],
-                        toolMode: vscode.LanguageModelChatToolMode.Auto,
-                        requestInitiator: "test",
-                    } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                    { report: () => {} },
-                    new vscode.CancellationTokenSource().token
-                ),
-            /No baseUrl|No apiKey|configure the LiteLLM provider group/i
+        const reportedConfig: vscode.LanguageModelResponsePart[] = [];
+        await provider.provideLanguageModelChatResponse(
+            model,
+            messages,
+            {
+                modelOptions: {},
+                tools: [],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+                requestInitiator: "test",
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            { report: (part) => reportedConfig.push(part) },
+            new vscode.CancellationTokenSource().token
         );
+        const configErrorText = findErrorTextPart(reportedConfig);
+        assert.ok(configErrorText, "missing config must surface as an error text part");
+        assert.match(configErrorText, /No baseUrl|No apiKey|configure the LiteLLM provider group/i);
     });
 
     test("provideLanguageModelChatResponse retries without optional parameters on unsupported param error", async () => {
@@ -426,26 +426,26 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             },
         ];
 
-        await assert.rejects(
-            () =>
-                provider.provideLanguageModelChatResponse(
-                    model,
-                    messages,
-                    {
-                        modelOptions: { temperature: 0.9 },
-                        tools: [],
-                        toolMode: vscode.LanguageModelChatToolMode.Auto,
-                        requestInitiator: "test",
-                        configuration: {
-                            baseUrl: "http://localhost:4000",
-                            apiKey: "test-api-key",
-                        } as unknown as Record<string, unknown>,
-                    } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                    { report: () => {} },
-                    new vscode.CancellationTokenSource().token
-                ),
-            /temperature unsupported/i
+        const reportedParsed: vscode.LanguageModelResponsePart[] = [];
+        await provider.provideLanguageModelChatResponse(
+            model,
+            messages,
+            {
+                modelOptions: { temperature: 0.9 },
+                tools: [],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+                requestInitiator: "test",
+                configuration: {
+                    baseUrl: "http://localhost:4000",
+                    apiKey: "test-api-key",
+                } as unknown as Record<string, unknown>,
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            { report: (part) => reportedParsed.push(part) },
+            new vscode.CancellationTokenSource().token
         );
+        const parsedErrorText = findErrorTextPart(reportedParsed);
+        assert.ok(parsedErrorText, "parsed API error must surface as an error text part");
+        assert.match(parsedErrorText, /temperature unsupported/i);
     });
 
     test("provideLanguageModelChatResponse decorates temperature-related API errors", async () => {
@@ -475,35 +475,35 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             capabilities: { toolCalling: true, imageInput: false },
         };
 
-        await assert.rejects(
-            () =>
-                provider.provideLanguageModelChatResponse(
-                    model,
-                    [
-                        {
-                            role: vscode.LanguageModelChatMessageRole.User,
-                            name: undefined,
-                            content: [new vscode.LanguageModelTextPart("hi")],
-                        },
-                    ],
-                    {
-                        modelOptions: { temperature: 0.9 },
-                        tools: [],
-                        toolMode: vscode.LanguageModelChatToolMode.Auto,
-                        requestInitiator: "test",
-                        configuration: {
-                            baseUrl: "http://localhost:4000",
-                            apiKey: "test-api-key",
-                        } as unknown as Record<string, unknown>,
-                    } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                    { report: () => {} },
-                    new vscode.CancellationTokenSource().token
-                ),
-            /may not support certain parameters/i
+        const reportedDecorated: vscode.LanguageModelResponsePart[] = [];
+        await provider.provideLanguageModelChatResponse(
+            model,
+            [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart("hi")],
+                },
+            ],
+            {
+                modelOptions: { temperature: 0.9 },
+                tools: [],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+                requestInitiator: "test",
+                configuration: {
+                    baseUrl: "http://localhost:4000",
+                    apiKey: "test-api-key",
+                } as unknown as Record<string, unknown>,
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            { report: (part) => reportedDecorated.push(part) },
+            new vscode.CancellationTokenSource().token
         );
+        const decoratedErrorText = findErrorTextPart(reportedDecorated);
+        assert.ok(decoratedErrorText, "decorated API error must surface as an error text part");
+        assert.match(decoratedErrorText, /may not support certain parameters/i);
     });
 
-    test("provideLanguageModelChatResponse rethrows non-API errors", async () => {
+    test("provideLanguageModelChatResponse surfaces non-API errors as response text", async () => {
         const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
 
         interface ProviderWithConfigManager {
@@ -526,32 +526,32 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             capabilities: { toolCalling: true, imageInput: false },
         };
 
-        await assert.rejects(
-            () =>
-                provider.provideLanguageModelChatResponse(
-                    model,
-                    [
-                        {
-                            role: vscode.LanguageModelChatMessageRole.User,
-                            name: undefined,
-                            content: [new vscode.LanguageModelTextPart("hi")],
-                        },
-                    ],
-                    {
-                        modelOptions: {},
-                        tools: [],
-                        toolMode: vscode.LanguageModelChatToolMode.Auto,
-                        requestInitiator: "test",
-                        configuration: {
-                            baseUrl: "http://localhost:4000",
-                            apiKey: "test-api-key",
-                        } as unknown as Record<string, unknown>,
-                    } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                    { report: () => {} },
-                    new vscode.CancellationTokenSource().token
-                ),
-            /boom/
+        const reportedNonApi: vscode.LanguageModelResponsePart[] = [];
+        await provider.provideLanguageModelChatResponse(
+            model,
+            [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart("hi")],
+                },
+            ],
+            {
+                modelOptions: {},
+                tools: [],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+                requestInitiator: "test",
+                configuration: {
+                    baseUrl: "http://localhost:4000",
+                    apiKey: "test-api-key",
+                } as unknown as Record<string, unknown>,
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            { report: (part) => reportedNonApi.push(part) },
+            new vscode.CancellationTokenSource().token
         );
+        const nonApiErrorText = findErrorTextPart(reportedNonApi);
+        assert.ok(nonApiErrorText, "non-API error must surface as an error text part");
+        assert.match(nonApiErrorText, /boom/);
     });
 
     test("provideLanguageModelChatResponse handles streaming response", async () => {
@@ -1162,54 +1162,44 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         );
 
         const reported: vscode.LanguageModelResponsePart[] = [];
-        let threwError = false;
-        let errorMessage = "";
 
-        try {
-            await provider.provideLanguageModelChatResponse(
+        await provider.provideLanguageModelChatResponse(
+            {
+                id: "model-1",
+                name: "model-1",
+                tooltip: "",
+                family: "litellm",
+                version: "1.0.0",
+                maxInputTokens: 1000,
+                maxOutputTokens: 1000,
+                capabilities: { toolCalling: true, imageInput: false },
+            },
+            [
                 {
-                    id: "model-1",
-                    name: "model-1",
-                    tooltip: "",
-                    family: "litellm",
-                    version: "1.0.0",
-                    maxInputTokens: 1000,
-                    maxOutputTokens: 1000,
-                    capabilities: { toolCalling: true, imageInput: false },
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart("hi")],
                 },
-                [
-                    {
-                        role: vscode.LanguageModelChatMessageRole.User,
-                        name: undefined,
-                        content: [new vscode.LanguageModelTextPart("hi")],
-                    },
-                ],
-                {
-                    modelOptions: {},
-                    tools: [],
-                    toolMode: vscode.LanguageModelChatToolMode.Auto,
-                    requestInitiator: "test",
-                    configuration: { baseUrl: "http://localhost:4000", apiKey: "test-api-key" } as unknown as Record<
-                        string,
-                        unknown
-                    >,
-                } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                { report: (part) => reported.push(part) },
-                new vscode.CancellationTokenSource().token
-            );
-        } catch (err) {
-            threwError = true;
-            errorMessage = err instanceof Error ? err.message : String(err);
-        }
-
-        // Empty stream without [DONE] should throw error
-        assert.strictEqual(threwError, true, "Expected provider to throw error for empty stream without [DONE]");
-        assert.match(
-            errorMessage,
-            /Stream ended before \[DONE\] marker/,
-            "Error should indicate missing [DONE] marker"
+            ],
+            {
+                modelOptions: {},
+                tools: [],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+                requestInitiator: "test",
+                configuration: { baseUrl: "http://localhost:4000", apiKey: "test-api-key" } as unknown as Record<
+                    string,
+                    unknown
+                >,
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            { report: (part) => reported.push(part) },
+            new vscode.CancellationTokenSource().token
         );
-        assert.deepStrictEqual(reported.length, 0, "Expected no parts to be emitted for empty stream");
+
+        // The provider completes gracefully with the failure as an error
+        // text part so VS Code keeps the turn in the conversation history.
+        const errorText = findErrorTextPart(reported);
+        assert.ok(errorText, "a stream ending before [DONE] must surface as an error text part");
+        assert.match(errorText, /Stream ended before \[DONE\] marker/);
     });
 
     test("provideLanguageModelChatResponse recovers pending tool calls when stream ends without [DONE] marker", async () => {
@@ -1581,6 +1571,21 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         assert.strictEqual(second[1].reasoning_content, "cut-off thought");
     });
 
+    /**
+     * Returns the graceful-error text part the provider reports instead of
+     * throwing (structural check, no instanceof: the extension host test
+     * environment can load multiple vscode module instances).
+     */
+    function findErrorTextPart(reported: vscode.LanguageModelResponsePart[]): string | undefined {
+        for (const part of reported) {
+            const value = (part as unknown as Record<string, unknown>)?.value;
+            if (typeof value === "string" && value.startsWith("[litellm-connector]")) {
+                return value;
+            }
+        }
+        return undefined;
+    }
+
     function runChatRequest(
         provider: LiteLLMChatProvider,
         reported: vscode.LanguageModelResponsePart[],
@@ -1650,7 +1655,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             });
         });
 
-        await assert.rejects(() => runChatRequest(provider, localReported), /terminated/);
+        await runChatRequest(provider, localReported);
         assert.strictEqual(localSent.length, 1, "A tool call was already emitted, so no second attempt is sent");
         const toolCall = localReported.find(
             (p): p is vscode.LanguageModelToolCallPart =>
@@ -1658,6 +1663,9 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
                 typeof (p as unknown as Record<string, unknown>)?.name === "string"
         );
         assert.ok(toolCall, "the tool call reached VS Code before the transport death");
+        const blockedErrorText = findErrorTextPart(localReported);
+        assert.ok(blockedErrorText, "the blocked transport error must still surface as an error text part");
+        assert.match(blockedErrorText, /terminated/);
     });
 
     test("transport retries exhausted after the budget surfaces the transport error", async () => {
@@ -1687,9 +1695,12 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             });
         });
 
-        await assert.rejects(() => runChatRequest(provider, reported), /terminated/);
+        await runChatRequest(provider, reported);
         // attempt 0 + networkRetries 2 = 3 total requests
         assert.strictEqual(sent.length, 3, "transport budget must be exhausted");
+        const exhaustedErrorText = findErrorTextPart(reported);
+        assert.ok(exhaustedErrorText, "exhausted transport retries must surface as an error text part");
+        assert.match(exhaustedErrorText, /terminated/);
     });
 
     test("reasoning-only retries exhausted after the budget surfaces the descriptive error", async () => {
@@ -1724,13 +1735,13 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             return reasoningOnlyStream();
         });
 
-        await assert.rejects(
-            () => runChatRequest(provider, reported),
-            /reasoning-only response.*after 1 resume attempt/
-        );
+        await runChatRequest(provider, reported);
         // attempt 0 + emptyResponseRetries 1 = 2 total requests, and the
         // empty budget must not spill into the transport budget
         assert.strictEqual(sent.length, 2, "reasoning-only budget must be exhausted");
+        const emptyExhaustedText = findErrorTextPart(reported);
+        assert.ok(emptyExhaustedText, "exhausted reasoning-only retries must surface as an error text part");
+        assert.match(emptyExhaustedText, /reasoning-only response.*after 1 resume attempt/);
     });
 
     test("cancellation during a reasoning-only stream surfaces cancellation, not retry exhaustion", async () => {
@@ -1816,8 +1827,11 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         // 1 reasoning-only retry from the empty budget, then the full
         // transport budget must still be available: 2 more requests after the
         // first transport death (networkRetries 2), 4 in total.
-        await assert.rejects(() => runChatRequest(provider, reported), /terminated/);
+        await runChatRequest(provider, reported);
         assert.strictEqual(sent.length, 4, "empty-budget retry must not shrink the transport budget");
+        const budgetErrorText = findErrorTextPart(reported);
+        assert.ok(budgetErrorText, "the final transport error must surface as an error text part");
+        assert.match(budgetErrorText, /terminated/);
     });
 
     test("inactivity timeout mid-stream triggers a resume attempt", async () => {
