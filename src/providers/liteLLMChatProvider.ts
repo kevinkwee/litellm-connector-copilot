@@ -750,7 +750,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             }, timeoutMs);
         };
 
-        token.onCancellationRequested(() => {
+        const cancellationListener = token.onCancellationRequested(() => {
             // The listener runs synchronously inside whoever called cancel(),
             // so this stack is the only fingerprint of the canceller, e.g.
             // user action, Copilot agent-loop retry, or session teardown,
@@ -931,6 +931,11 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
 
             throw error;
         } finally {
+            // The retry loop in provideLanguageModelChatResponse re-enters
+            // this method per attempt on the same token, so the listener must
+            // not outlive this call, or earlier attempts would log duplicate
+            // cancellation events.
+            cancellationListener.dispose();
             if (watchdog) {
                 clearTimeout(watchdog);
             }

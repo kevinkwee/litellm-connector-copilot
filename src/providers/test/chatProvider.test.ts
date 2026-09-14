@@ -643,6 +643,53 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         assert.strictEqual(textParts.map((p) => p.value).join(""), "Hello");
     });
 
+    test("processStreamingResponse disposes its cancellation listener when the stream ends", async () => {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const { ReadableStream } = await import("node:stream/web");
+        const encoder = new TextEncoder();
+
+        const disposed: boolean[] = [];
+        const token: vscode.CancellationToken = {
+            isCancellationRequested: false,
+            onCancellationRequested: (listener: () => unknown) => {
+                void listener;
+                return { dispose: () => disposed.push(true) };
+            },
+        } as unknown as vscode.CancellationToken;
+
+        const pWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<unknown> };
+            resetStreamingState: () => void;
+            _streamingState: unknown;
+            processStreamingResponse: (
+                stream: AsyncIterable<string>,
+                progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+                token: vscode.CancellationToken
+            ) => Promise<void>;
+        };
+        sandbox.stub(pWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            inactivityTimeout: 60,
+        });
+        const { createInitialStreamingState } = await import("../../adapters/streaming/liteLLMStreamInterpreter.js");
+        pWithConfig.resetStreamingState();
+
+        const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"Hi"}}]}\n'));
+                controller.enqueue(encoder.encode("data: [DONE]\n"));
+                controller.close();
+            },
+        });
+        await pWithConfig.processStreamingResponse(
+            stream as unknown as AsyncIterable<string>,
+            { report: () => {} },
+            token
+        );
+
+        assert.strictEqual(disposed.length, 1, "the cancellation listener must be disposed exactly once");
+    });
+
     test("provideLanguageModelChatResponse emits usage data part via StreamTokenCapture after streaming", async () => {
         const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
 
