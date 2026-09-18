@@ -219,10 +219,10 @@ function extractThinkingValue(part: unknown): string {
  * model continues the same response instead of starting a new one. Reasoning
  * is carried as a thinking part, which convertMessages() maps to the
  * reasoning_content field on the OpenAI payload (LiteLLM's convention for
- * reasoning-native providers like GLM). convertMessages() emits a
- * reasoning-only assistant message (no text, no tool calls) because its
- * hasReasoning guard treats reasoning_content as message content, so no
- * marker text is needed.
+ * reasoning-native providers like GLM). On the wire a reasoning-only resume
+ * becomes an assistant message with empty-string content and
+ * reasoning_content set. The hasReasoning guard in convertMessages() keeps
+ * it from being dropped, so no marker text is needed.
  */
 export function buildResumeMessages(
     originalMessages: readonly vscode.LanguageModelChatRequestMessage[],

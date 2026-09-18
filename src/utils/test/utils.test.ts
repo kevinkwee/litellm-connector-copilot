@@ -188,8 +188,9 @@ suite("Utility Unit Tests", () => {
     test("convertMessages emits reasoning-only assistant message (resume support)", () => {
         // A reasoning-only assistant message has a ThinkingPart (duck-typed:
         // value property, no role) but no text/tool-call parts. It must be
-        // emitted on the wire with reasoning_content and no content so the
-        // model can continue its cut-off reasoning after a transport death.
+        // emitted on the wire with reasoning_content and an explicit
+        // empty-string content, so the model can continue its cut-off
+        // reasoning.
         const thinkingPart = { value: "I was analyzing the bug when the connection dropped" };
         const messages = [
             {
@@ -207,6 +208,8 @@ suite("Utility Unit Tests", () => {
         assert.strictEqual(out.length, 1, "reasoning-only message must not be dropped");
         assert.strictEqual(out[0].role, "assistant");
         assert.strictEqual(out[0].reasoning_content, "I was analyzing the bug when the connection dropped");
+        assert.strictEqual(out[0].content, "", "reasoning-only assistant turn must carry empty-string content");
+        assert.ok(JSON.stringify(out).includes('"content":""'), "content must survive serialization");
     });
 
     test("convertMessages does not emit reasoning for user/system roles", () => {

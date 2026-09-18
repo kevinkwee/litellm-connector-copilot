@@ -418,8 +418,11 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
 
         const text = textParts.join("");
         // A message that carries reasoning (reasoning_content) must be emitted
-        // even without visible text: resumed/reasoning-only assistant turns
-        // have no content but the model needs its prior reasoning to continue.
+        // even without visible text: the model needs its prior reasoning to
+        // continue a resumed turn. Content is an empty string then, not
+        // undefined: a reasoning-only assistant turn must carry an explicit
+        // string content field on the wire, regardless of whether the
+        // receiving transform or provider normalizes a missing key.
         const hasReasoning = role === "assistant" && Boolean(reasoningContent);
         if (text || contentItems.length > 0 || hasReasoning) {
             if (role === "system" || role === "user" || (role === "assistant" && !emittedAssistantToolCall)) {
@@ -427,7 +430,7 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
                 if (messageContent || hasReasoning) {
                     out.push({
                         role: role || "user",
-                        content: messageContent,
+                        content: messageContent ?? "",
                         ...(reasoningContent && role === "assistant" ? { reasoning_content: reasoningContent } : {}),
                     });
                 }

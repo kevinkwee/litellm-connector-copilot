@@ -1569,6 +1569,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         const second = sentRequests[1].messages;
         assert.strictEqual(second.length, 2, "Retry must append a trailing assistant message");
         assert.strictEqual(second[1].reasoning_content, "cut-off thought");
+        assert.strictEqual(second[1].content, "", "reasoning-only retry must carry empty-string content");
     });
 
     /**
