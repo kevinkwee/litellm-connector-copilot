@@ -20,16 +20,15 @@ import { Logger } from "./utils/logger";
  *
  * Strategy:
  * - Always ensure IDs start with 'fc_' to satisfy strict models
- * - Generate IDs in the safe range of 42–63 characters
+ * - Generate IDs in the safe range of 42-63 characters
  * - Use deterministic hashing for stability (same input → same output)
  * - Preserve a readable middle fragment for debugging
  *
  * @param id - The input tool call ID (may be empty, too short, too long, or non-compliant)
- * @param maxLen - Maximum length (default 50, must be >= 42 and <= 63)
- * @returns Normalized ID in range [42, maxLen] starting with 'fc_'
+ * @param maxLen - Preferred length cap for rebuilt IDs (default 56), clamped to [42, 63]
+ * @returns Normalized ID starting with 'fc_', with length in [42, 63]
  */
 export function normalizeToolCallId(id: string, maxLen = 56): string {
-    // Enforce safe bounds: must be at least 42 (OpenAI minimum) and at most 63 (z.AI limit)
     const MIN_LENGTH = 42;
     const MAX_SAFE_LENGTH = 63;
     // Shift by 3 chars to account for "fc_"
@@ -40,29 +39,24 @@ export function normalizeToolCallId(id: string, maxLen = 56): string {
 
     const raw = (id || "").trim();
     const prefix = "fc_";
-    let tcId: string;
-    let tcHasPrefix = false;
-    let tcNoPrefixLength: number;
-    // If ID is empty, generate a deterministic one in the safe range
     if (!raw) {
-        // Generate: fc_ + hash (padded to ensure >= 42 chars)
-        // EffectiveMaxLen (e.g., 50) - prefix length (3) = 47 chars from hash
-        const hashPart = stableHash("empty")
-            .repeat(4)
-            .slice(0, effectiveMaxLen - prefix.length);
+        const hashPart = hashOfLength("empty", effectiveMaxLen - prefix.length);
         const generated = `${prefix}${hashPart}`;
         Logger.trace(`[normalizeToolCallId] Empty ID provided, generated: ${generated} (len: ${generated.length})`);
         return generated;
     }
 
-    if (raw.includes("fc_")) {
-        tcId = raw.split("fc_")[1];
+    // Only a leading fc_ is the provider prefix; an fc_ embedded mid-ID is
+    // ordinary payload and must not let the raw ID pass through as prefixed.
+    let tcId: string;
+    let tcHasPrefix = false;
+    if (raw.startsWith(prefix)) {
+        tcId = raw.slice(prefix.length);
         tcHasPrefix = true;
-        tcNoPrefixLength = tcId.length;
     } else {
         tcId = raw;
-        tcNoPrefixLength = tcId.length;
     }
+    const tcNoPrefixLength = tcId.length;
 
     if (tcHasPrefix) {
         if (tcNoPrefixLength >= MIN_LENGTH_NO_PREFIX && tcNoPrefixLength <= effectiveMaxLen_NoPrefix) {
@@ -70,16 +64,9 @@ export function normalizeToolCallId(id: string, maxLen = 56): string {
             return raw;
         }
 
-        // If it already starts with fc_ and is in the safe range, keep it
-        if (tcNoPrefixLength >= MIN_LENGTH_NO_PREFIX && tcNoPrefixLength <= effectiveMaxLen_NoPrefix) {
-            Logger.trace(`[normalizeToolCallId] Valid ID kept as-is: ${raw} (len: ${raw.length})`);
-            return raw;
-        }
-
-        // If it starts with fc_ but is too short, pad it deterministically
         if (tcNoPrefixLength < MIN_LENGTH_NO_PREFIX) {
-            const padding = stableHash(tcId, MIN_LENGTH_NO_PREFIX - tcNoPrefixLength);
-            const padded = `fc_${tcId}${padding}`; // checks were done against the un-prefixed variant
+            const padding = hashOfLength(tcId, MIN_LENGTH_NO_PREFIX - tcNoPrefixLength);
+            const padded = `${prefix}${tcId}${padding}`;
             Logger.trace(`[normalizeToolCallId] Short fc_ ID padded: ${tcId} -> ${padded} (len: ${padded.length})`);
             return padded;
         }
@@ -95,7 +82,6 @@ export function normalizeToolCallId(id: string, maxLen = 56): string {
     // We need at least 42 chars, so pad the hash portion to reach minimum length
     let baseOut = `${prefix}${safeMiddle}_${hash}`;
 
-    // Pad to minimum length
     while (baseOut.length < MIN_LENGTH) {
         baseOut += stableHash(raw).slice(0, 2);
     }
@@ -111,7 +97,7 @@ export function normalizeToolCallId(id: string, maxLen = 56): string {
     return final;
 }
 
-function stableHash(input: string, minLen = 16): string {
+function stableHash(input: string): string {
     // Must work in BOTH extension host (node) and web bundle.
     // Use a small, deterministic, non-crypto hash (FNV-1a 64-bit) and encode as hex.
     // Collision risk is low for our use (shrinking IDs) and avoids bundling Node builtins.
@@ -121,7 +107,14 @@ function stableHash(input: string, minLen = 16): string {
         hash ^= BigInt(ch.codePointAt(0) ?? 0);
         hash = (hash * prime) & 0xffffffffffffffffn;
     }
-    return hash.toString(minLen).padStart(minLen, "0");
+    // Fixed 16-char width keeps downstream length arithmetic exact.
+    return hash.toString(16).padStart(16, "0");
+}
+
+function hashOfLength(input: string, length: number): string {
+    // A single 16-char hash cannot cover the largest padding request (39), so tile it.
+    const hash = stableHash(input);
+    return hash.repeat(Math.ceil(length / hash.length)).slice(0, length);
 }
 
 // Tool calling sanitization helpers
