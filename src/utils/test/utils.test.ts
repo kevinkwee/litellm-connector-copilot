@@ -75,6 +75,26 @@ suite("Utility Unit Tests", () => {
         assert.strictEqual(normalizeToolCallId("fc_ab").length, 42);
     });
 
+    test("normalizeToolCallId filler is varied, not a repeated pattern", () => {
+        // Models echo tool call IDs back when emitting text-format tool calls,
+        // and they tend to drop repetitions when copying long repeated runs.
+        // A mistyped ID fails to pair with its tool result, so filler must be
+        // varied per position while staying deterministic for a given raw ID.
+        const twoCharRun = /(.{2})\1{3,}/; // same 2-char unit repeated 4+ times
+        for (const raw of ["call_abc", "tc_abc", "some!@#id", "fc_ab", "fc_a", ""]) {
+            const normalized = normalizeToolCallId(raw);
+            assert.ok(!twoCharRun.test(normalized), `repeated 2-char run in: ${normalized}`);
+        }
+
+        assert.strictEqual(normalizeToolCallId("call_abc").length, 42);
+
+        // Long fillers must not tile one hash block either.
+        const fcAb = normalizeToolCallId("fc_ab");
+        assert.notStrictEqual(fcAb.slice(5, 21), fcAb.slice(21, 37), "filler blocks must differ");
+        const empty = normalizeToolCallId("");
+        assert.notStrictEqual(empty.slice(3, 19), empty.slice(19, 35), "filler blocks must differ");
+    });
+
     test("normalizeToolCallId treats only a leading fc_ as the provider prefix", () => {
         // An fc_ embedded mid-ID must not make the raw ID pass through as
         // "already prefixed": that would return an ID violating the fc_ rule.

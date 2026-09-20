@@ -22,6 +22,7 @@ import { Logger } from "./utils/logger";
  * - Always ensure IDs start with 'fc_' to satisfy strict models
  * - Generate IDs in the safe range of 42-63 characters
  * - Use deterministic hashing for stability (same input → same output)
+ * - Use varied filler when padding
  * - Preserve a readable middle fragment for debugging
  *
  * @param id - The input tool call ID (may be empty, too short, too long, or non-compliant)
@@ -78,20 +79,10 @@ export function normalizeToolCallId(id: string, maxLen = 56): string {
     const safeMiddle = cleanRaw.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 10);
     const hash = stableHash(raw); // Hash the FULL original ID for stability
 
-    // Build initial: fc_ + safeMiddle + _ + hash = 3 + 10 + 1 + 16 = 30 chars minimum
-    // We need at least 42 chars, so pad the hash portion to reach minimum length
-    let baseOut = `${prefix}${safeMiddle}_${hash}`;
-
-    while (baseOut.length < MIN_LENGTH) {
-        baseOut += stableHash(raw).slice(0, 2);
-    }
-
-    let final: string;
-    if (baseOut.length > effectiveMaxLen) {
-        final = baseOut.slice(0, effectiveMaxLen);
-    } else {
-        final = baseOut;
-    }
+    // fc_ + safeMiddle(<=10) + _ + hash(16) tops out at 30 chars; varied filler
+    // grows it to exactly the 42-char minimum.
+    const base = `${prefix}${safeMiddle}_${hash}`;
+    const final = base + hashOfLength(raw, MIN_LENGTH - base.length);
 
     Logger.trace(`[normalizeToolCallId] ID normalized: ${raw} -> ${final} (len: ${final.length})`);
     return final;
@@ -112,9 +103,14 @@ function stableHash(input: string): string {
 }
 
 function hashOfLength(input: string, length: number): string {
-    // A single 16-char hash cannot cover the largest padding request (39), so tile it.
-    const hash = stableHash(input);
-    return hash.repeat(Math.ceil(length / hash.length)).slice(0, length);
+    // Models typo long repeated runs when echoing IDs back from history, so filler must be varied.
+    // The chunk index is part of each seed so no block repeats, while seeding
+    // with the raw input keeps the filler deterministic for a given ID.
+    let out = "";
+    for (let chunkIndex = 0; out.length < length; chunkIndex++) {
+        out += stableHash(`${input}#${chunkIndex}`);
+    }
+    return out.slice(0, length);
 }
 
 // Tool calling sanitization helpers
