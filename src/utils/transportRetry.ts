@@ -214,59 +214,77 @@ function extractThinkingValue(part: unknown): string {
 }
 
 /**
- * Builds the request-body message additions for a resumed request: the
- * already-streamed reasoning and text as trailing assistant content so the
- * model continues the same response instead of starting a new one. Reasoning
- * is carried as a thinking part, which convertMessages() maps to the
+ * Text of the user-role nudge appended after a resumed assistant turn so the
+ * request does not end on an assistant message (assistant prefill), which
+ * some providers reject or mishandle.
+ */
+const CONTINUE_NUDGE_TEXT = "Continue";
+
+function isAssistantRole(role: vscode.LanguageModelChatMessageRole | undefined): boolean {
+    return (
+        role !== undefined &&
+        (role as unknown as number) === (vscode.LanguageModelChatMessageRole.Assistant as unknown as number)
+    );
+}
+
+/**
+ * Builds the message list for a resumed request: the already-streamed
+ * reasoning and text become trailing assistant content so the model
+ * continues the same response instead of starting a new one. Reasoning is
+ * carried as a thinking part, which convertMessages() maps to the
  * reasoning_content field on the OpenAI payload (LiteLLM's convention for
  * reasoning-native providers like GLM). On the wire a reasoning-only resume
  * becomes an assistant message with empty-string content and
  * reasoning_content set. The hasReasoning guard in convertMessages() keeps
  * it from being dropped, so no marker text is needed.
+ *
+ * When the result ends with an assistant turn, a user-role "Continue" nudge
+ * is appended after it: providers that do not support requests ending with
+ * an assistant message (prefill/continuation) reject or restart instead of
+ * continuing, and every provider accepts a user-final request. A request
+ * that already ends with a user message or tool result is left unchanged.
  */
 export function buildResumeMessages(
     originalMessages: readonly vscode.LanguageModelChatRequestMessage[],
     streamedText: string,
     streamedThinking: string
 ): vscode.LanguageModelChatRequestMessage[] {
-    if (!streamedText.trim() && !streamedThinking.trim()) {
-        return [...originalMessages];
-    }
-
     const messages = [...originalMessages];
-    let last: vscode.LanguageModelChatRequestMessage | undefined;
-    if (messages.length > 0) {
-        last = messages[messages.length - 1];
+
+    if (streamedText.trim() || streamedThinking.trim()) {
+        const resumeParts: vscode.LanguageModelResponsePart[] = [];
+        if (streamedThinking.trim()) {
+            resumeParts.push(createThinkingPart(streamedThinking));
+        }
+        if (streamedText.trim()) {
+            resumeParts.push(new vscode.LanguageModelTextPart(streamedText));
+        }
+
+        const last = messages.length > 0 ? messages[messages.length - 1] : undefined;
+        if (last !== undefined && isAssistantRole(last.role)) {
+            // Merge into a trailing assistant message so the wire carries one
+            // coherent assistant turn (thinking part + text part) rather than two.
+            messages[messages.length - 1] = {
+                ...last,
+                content: [...(last.content ?? []), ...resumeParts],
+            } as vscode.LanguageModelChatRequestMessage;
+        } else {
+            messages.push({
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: resumeParts,
+                name: undefined,
+            } as unknown as vscode.LanguageModelChatRequestMessage);
+        }
     }
 
-    const resumeParts: vscode.LanguageModelResponsePart[] = [];
-    if (streamedThinking.trim()) {
-        resumeParts.push(createThinkingPart(streamedThinking));
+    const last = messages.length > 0 ? messages[messages.length - 1] : undefined;
+    if (last !== undefined && isAssistantRole(last.role)) {
+        messages.push({
+            role: vscode.LanguageModelChatMessageRole.User,
+            name: undefined,
+            content: [new vscode.LanguageModelTextPart(CONTINUE_NUDGE_TEXT)],
+        });
     }
-    if (streamedText.trim()) {
-        resumeParts.push(new vscode.LanguageModelTextPart(streamedText));
-    }
-
-    // Merge into a trailing assistant message so the wire carries one coherent
-    // assistant turn (thinking part + text part) rather than two.
-    const lastIsAssistant =
-        last !== undefined &&
-        last.role !== undefined &&
-        (last.role as unknown as number) === (vscode.LanguageModelChatMessageRole.Assistant as unknown as number);
-
-    if (lastIsAssistant && last) {
-        messages[messages.length - 1] = {
-            ...last,
-            content: [...(last.content ?? []), ...resumeParts],
-        } as vscode.LanguageModelChatRequestMessage;
-        return messages;
-    }
-
-    messages.push({
-        role: vscode.LanguageModelChatMessageRole.Assistant,
-        content: resumeParts,
-        name: undefined,
-    } as unknown as vscode.LanguageModelChatRequestMessage);
     return messages;
 }
 

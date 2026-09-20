@@ -34,6 +34,18 @@ function thinkingPart(value: string): vscode.LanguageModelResponsePart {
     return { value } as vscode.LanguageModelResponsePart;
 }
 
+/**
+ * Asserts that a message is the user-role continuation nudge appended after
+ * a resumed assistant turn: a single text part reading "Continue".
+ */
+function assertContinueNudge(message: vscode.LanguageModelChatRequestMessage | undefined): void {
+    assert.ok(message, "expected a continuation nudge message");
+    assert.strictEqual(message.role, vscode.LanguageModelChatMessageRole.User);
+    const content = message.content as vscode.LanguageModelResponsePart[];
+    assert.strictEqual(content.length, 1);
+    assert.strictEqual((content[0] as vscode.LanguageModelTextPart).value, "Continue");
+}
+
 suite("Transport Retry Utilities", () => {
     test("backoffDelayMs doubles per attempt from the base and caps at 30s", () => {
         assert.strictEqual(backoffDelayMs(1, 1000), 1000);
@@ -124,13 +136,14 @@ suite("Transport Retry Utilities", () => {
         const original = [userMessage("hi")];
         const resumed = buildResumeMessages(original, "partial answer", "partial reasoning");
 
-        assert.strictEqual(resumed.length, 2);
+        assert.strictEqual(resumed.length, 3);
         assert.strictEqual(resumed[0].role, vscode.LanguageModelChatMessageRole.User);
         assert.strictEqual(resumed[1].role, vscode.LanguageModelChatMessageRole.Assistant);
         const content = resumed[1].content as vscode.LanguageModelResponsePart[];
         assert.strictEqual(content.length, 2);
         assert.strictEqual((content[0] as { value?: unknown }).value, "partial reasoning");
         assert.strictEqual((content[1] as vscode.LanguageModelTextPart).value, "partial answer");
+        assertContinueNudge(resumed[2]);
         // original list untouched
         assert.strictEqual(original.length, 1);
     });
@@ -144,11 +157,12 @@ suite("Transport Retry Utilities", () => {
         const original = [userMessage("hi"), assistantTurn];
         const resumed = buildResumeMessages(original, "resume text", "");
 
-        assert.strictEqual(resumed.length, 2, "merge keeps the message count");
+        assert.strictEqual(resumed.length, 3, "merge keeps the message count and adds the nudge");
         const content = resumed[1].content as vscode.LanguageModelResponsePart[];
         assert.strictEqual(content.length, 2, "resume parts are appended to the existing turn");
         assert.strictEqual((content[0] as vscode.LanguageModelTextPart).value, "prior turn");
         assert.strictEqual((content[1] as vscode.LanguageModelTextPart).value, "resume text");
+        assertContinueNudge(resumed[2]);
         // original list untouched
         const originalContent = original[1].content as vscode.LanguageModelResponsePart[];
         assert.strictEqual(originalContent.length, 1);
@@ -160,6 +174,51 @@ suite("Transport Retry Utilities", () => {
 
         assert.strictEqual(resumed.length, 1);
         assert.strictEqual(resumed[0].role, vscode.LanguageModelChatMessageRole.User);
+    });
+
+    test("buildResumeMessages adds no nudge when nothing was streamed and the request ends with tool results", () => {
+        // Tool results ride in user-role messages, so an agent-flow request
+        // whose tools already ran ends on a user-role tool-result message.
+        const toolResultTurn = {
+            role: vscode.LanguageModelChatMessageRole.User,
+            name: undefined,
+            content: [{ callId: "call-1", content: [] }],
+        } as unknown as vscode.LanguageModelChatRequestMessage;
+        const original = [userMessage("hi"), toolResultTurn];
+        const resumed = buildResumeMessages(original, "", "");
+
+        assert.strictEqual(resumed.length, 2, "a tool-result-final request is resent unchanged");
+    });
+
+    test("buildResumeMessages appends the nudge when nothing was streamed but the request ends with an assistant message", () => {
+        const assistantTurn = {
+            role: vscode.LanguageModelChatMessageRole.Assistant,
+            name: undefined,
+            content: [new vscode.LanguageModelTextPart("prior turn")],
+        } as vscode.LanguageModelChatRequestMessage;
+        const original = [userMessage("hi"), assistantTurn];
+        const resumed = buildResumeMessages(original, "", "");
+
+        assert.strictEqual(resumed.length, 3);
+        const assistantContent = resumed[1].content as vscode.LanguageModelResponsePart[];
+        assert.strictEqual((assistantContent[0] as vscode.LanguageModelTextPart).value, "prior turn");
+        assertContinueNudge(resumed[2]);
+    });
+
+    test("buildResumeMessages appends the assistant turn and nudge after a trailing tool-result message", () => {
+        // Agent flow with a mid-response transport death: the partial text
+        // becomes a fresh assistant turn after the tool results.
+        const toolResultTurn = {
+            role: vscode.LanguageModelChatMessageRole.User,
+            name: undefined,
+            content: [{ callId: "call-1", content: [] }],
+        } as unknown as vscode.LanguageModelChatRequestMessage;
+        const original = [userMessage("hi"), toolResultTurn];
+        const resumed = buildResumeMessages(original, "partial answer", "");
+
+        assert.strictEqual(resumed.length, 4);
+        assert.strictEqual(resumed[2].role, vscode.LanguageModelChatMessageRole.Assistant);
+        assertContinueNudge(resumed[3]);
     });
 
     test("sleepWithCancellation resolves immediately when already cancelled", async () => {

@@ -1417,9 +1417,11 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         const first = sentRequests[0].messages;
         const second = sentRequests[1].messages;
         assert.strictEqual(first.length, 1, "First attempt carries only the user message");
-        assert.strictEqual(second.length, 2, "Second attempt must append a trailing assistant message");
+        assert.strictEqual(second.length, 3, "Resume appends a trailing assistant message plus the Continue nudge");
         assert.strictEqual(second[1].role, "assistant");
         assert.strictEqual(second[1].content, "Hello wor");
+        assert.strictEqual(second[2].role, "user");
+        assert.strictEqual(second[2].content, "Continue");
     });
 
     test("transport retry sends the streamed reasoning as reasoning_content", async () => {
@@ -1481,9 +1483,11 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
 
         assert.strictEqual(sentRequests.length, 2, "Expected two HTTP attempts");
         const second = sentRequests[1].messages;
-        assert.strictEqual(second.length, 2, "Second attempt must append a trailing assistant message");
+        assert.strictEqual(second.length, 3, "Resume appends a trailing assistant message plus the Continue nudge");
         assert.strictEqual(second[1].reasoning_content, "thinking hard");
         assert.strictEqual(second[1].content, "Hel");
+        assert.strictEqual(second[2].role, "user");
+        assert.strictEqual(second[2].content, "Continue");
     });
 
     test("reasoning-only retry sends the streamed reasoning as reasoning_content", async () => {
@@ -1567,9 +1571,11 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
 
         assert.strictEqual(sentRequests.length, 2, "Expected two HTTP attempts");
         const second = sentRequests[1].messages;
-        assert.strictEqual(second.length, 2, "Retry must append a trailing assistant message");
+        assert.strictEqual(second.length, 3, "Retry appends a trailing assistant message plus the Continue nudge");
         assert.strictEqual(second[1].reasoning_content, "cut-off thought");
         assert.strictEqual(second[1].content, "", "reasoning-only retry must carry empty-string content");
+        assert.strictEqual(second[2].role, "user");
+        assert.strictEqual(second[2].content, "Continue");
     });
 
     /**
@@ -1874,8 +1880,14 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         await runChatRequest(provider, reported);
         assert.strictEqual(sent.length, 2, "watchdog abort must trigger one resume attempt");
         const second = sent[1].messages;
-        assert.strictEqual(second.length, 2, "resume after inactivity timeout must append the partial text");
+        assert.strictEqual(
+            second.length,
+            3,
+            "resume after inactivity timeout appends the partial text plus the Continue nudge"
+        );
         assert.strictEqual(second[1].content, "par");
+        assert.strictEqual(second[2].role, "user");
+        assert.strictEqual(second[2].content, "Continue");
     });
 
     test("transport retry resumes across consecutive attempts without duplicating the assistant turn", async () => {
@@ -1920,12 +1932,16 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         await runChatRequest(provider, reported);
         assert.strictEqual(sent.length, 3, "two failed attempts then success");
         const third = sent[2].messages;
-        assert.strictEqual(third.length, 2, "still exactly one appended assistant turn");
+        assert.strictEqual(third.length, 3, "still exactly one appended assistant turn plus one Continue nudge");
         assert.strictEqual(third[1].content, "Hello ");
+        assert.strictEqual(third[2].role, "user");
+        assert.strictEqual(third[2].content, "Continue");
         // the second request appends only the first attempt's chunk, and the
         // first request is the untouched original
         assert.strictEqual(sent[0].messages.length, 1);
+        assert.strictEqual(sent[1].messages.length, 3, "each resumed attempt carries exactly one nudge");
         assert.strictEqual(sent[1].messages[1].content, "Hel");
+        assert.strictEqual(sent[1].messages[2].content, "Continue");
     });
 
     test("cancellation between attempts aborts instead of sending another request", async () => {
