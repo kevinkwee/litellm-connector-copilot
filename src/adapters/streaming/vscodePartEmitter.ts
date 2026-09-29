@@ -141,10 +141,12 @@ export function emitPartsToVSCode(
                         });
                         // Fallback: emit with raw string if the consumer can handle it, or empty object
                         progress.report(new vscode.LanguageModelToolCallPart(part.id, part.name, {}));
-                        StructuredLogger.warn("vscode.tool_call_parse_failed", {
+                        StructuredLogger.error("vscode.tool_call_parse_failed", {
                             partIndex: idx,
                             toolName: part.name,
                             id: part.id,
+                            argsLength: typeof part.args === "string" ? part.args.length : 0,
+                            argsPreview: typeof part.args === "string" ? part.args.slice(0, 160) : "<non-string>",
                             error: parseErr instanceof Error ? parseErr.message : String(parseErr),
                         });
                     }

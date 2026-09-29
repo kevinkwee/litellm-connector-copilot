@@ -63,12 +63,17 @@ const buildTargets = [
         plugins: [
             createProblemMatcherPlugin("web"),
             {
-                name: "telemetry-web-swap",
+                name: "web-module-swap",
                 setup(build) {
-                    build.onResolve({ filter: /\/posthogAdapter$/ }, (args) => {
-                        if (args.path.endsWith("./posthogAdapter")) {
+                    build.onResolve({ filter: /\/(posthogAdapter|structuredLogFileSink)$/ }, (args) => {
+                        // Node-only modules swap to their .web.ts no-op/browser
+                        // variants in the web target (mirrors the posthogAdapter
+                        // convention). Bare specifier safety: only relative
+                        // "./name" imports are rewritten.
+                        const base = args.path.replace(/^\.\//, "");
+                        if (base !== args.path) {
                             return {
-                                path: path.join(args.resolveDir, "posthogAdapter.web.ts"),
+                                path: path.join(args.resolveDir, `${base}.web.ts`),
                                 external: false
                             };
                         }

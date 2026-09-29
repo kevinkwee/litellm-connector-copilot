@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import type { LogLevel, LogEvent, EventType } from "./types";
+import { StructuredLogFileSink } from "./structuredLogFileSink";
 
 /**
  * Maps our string `LogLevel` to the numeric `vscode.LogLevel` enum so we can
@@ -65,6 +66,7 @@ function shouldSkipForLevel(channel: vscode.LogOutputChannel, level: LogLevel): 
  */
 export class StructuredLogger {
     private static channel: vscode.LogOutputChannel | undefined;
+    private static fileSink: StructuredLogFileSink = new StructuredLogFileSink();
 
     /**
      * Ensures the structured output channel exists.
@@ -84,14 +86,25 @@ export class StructuredLogger {
     /**
      * Initializes the structured logger with a VS Code output channel.
      *
+     * Also points the file sink at the extension's global storage so
+     * diagnostics survive VS Code's output-channel rotation. Mirroring is
+     * controlled by `litellm-connector.debug.structuredLogFile.enabled` and
+     * disables itself when the storage location is unwritable.
+     *
      * @param context - VS Code extension context for subscription management
      */
     public static initialize(context: vscode.ExtensionContext): void {
         // Structured logger gets a dedicated channel to avoid mixing with
         // the top-level Logger output channel ("LiteLLM").
         this.ensureChannel(context);
+        const fileSinkEnabled = vscode.workspace
+            .getConfiguration("litellm-connector.debug")
+            .get("structuredLogFile.enabled", true);
+        const storagePath = context.globalStorageUri?.fsPath;
+        this.fileSink.initialize(fileSinkEnabled ? storagePath : undefined);
         this.info("logger.initialized", {
             note: "Use the log level dropdown in the output panel to change verbosity",
+            logFile: this.fileSink.currentFilePath,
         });
     }
 
@@ -142,6 +155,10 @@ export class StructuredLogger {
         };
 
         const jsonLine = JSON.stringify(logEvent);
+
+        // File mirror first: it must not be affected by any channel failure,
+        // and the sink itself never throws (it disables itself instead).
+        this.fileSink.append(jsonLine);
 
         switch (level) {
             case "trace":

@@ -512,10 +512,13 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                         JSON.parse(buffer.args);
                     } catch {
                         isJsonValid = false;
-                        StructuredLogger.warn("stream.tool_call_args_invalid_json", {
+                        StructuredLogger.error("stream.tool_call_args_invalid_json", {
                             toolName: buffer.name,
                             normalizedId: buffer.id,
                             index,
+                            finishReason,
+                            argsLength: buffer.args.length,
+                            argsPreview: buffer.args.slice(0, 160),
                         });
                     }
 
@@ -1018,6 +1021,12 @@ export function flushPendingBuffers(state: StreamingState): EmittedPart[] {
                 Logger.debug(`[flushPendingBuffers] Flushed /responses tool call: ${buffer.name} (id: ${id})`);
             } catch {
                 Logger.warn(`[flushPendingBuffers] Skipping malformed /responses tool call args (id: ${id})`);
+                StructuredLogger.error("stream.tool_call_args_invalid_json", {
+                    toolName: buffer.name || "unknown_tool",
+                    callId: id,
+                    argsLength: buffer.args.length,
+                    argsPreview: buffer.args.slice(0, 160),
+                });
             }
         }
     }
@@ -1040,6 +1049,11 @@ export function flushPendingBuffers(state: StreamingState): EmittedPart[] {
             Logger.warn(
                 `[flushPendingBuffers] Skipping malformed anonymous tool call args: ${state.anonymousResponseToolArgs}`
             );
+            StructuredLogger.error("stream.tool_call_args_invalid_json", {
+                toolName: state.anonymousResponseToolName,
+                argsLength: state.anonymousResponseToolArgs.length,
+                argsPreview: state.anonymousResponseToolArgs.slice(0, 160),
+            });
         }
     }
     state.anonymousResponseToolName = undefined;
@@ -1061,6 +1075,13 @@ export function flushPendingBuffers(state: StreamingState): EmittedPart[] {
                 Logger.debug(`[flushPendingBuffers] Flushed OpenAI tool call: ${buffer.name} (id: ${buffer.id})`);
             } catch {
                 Logger.warn(`[flushPendingBuffers] Skipping malformed OpenAI tool call args at index ${index}`);
+                StructuredLogger.error("stream.tool_call_args_invalid_json", {
+                    toolName: buffer.name || "unknown_tool",
+                    callId: buffer.id,
+                    index,
+                    argsLength: buffer.args.length,
+                    argsPreview: buffer.args.slice(0, 160),
+                });
             }
         }
     }

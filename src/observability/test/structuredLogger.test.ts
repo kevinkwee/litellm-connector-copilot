@@ -1,7 +1,11 @@
 import * as assert from "assert";
 import * as sinon from "sinon";
 import * as vscode from "vscode";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { StructuredLogger } from "../structuredLogger";
+import { StructuredLogFileSink } from "../structuredLogFileSink";
 import type { LogEvent } from "../types";
 
 suite("StructuredLogger", () => {
@@ -36,6 +40,48 @@ suite("StructuredLogger", () => {
 
         assert.ok(createOutputChannelStub.calledOnce);
         assert.strictEqual(createOutputChannelStub.firstCall.args[0], "LiteLLM Structured");
+    });
+
+    test("initialize wires the file sink and log() mirrors lines to the file", () => {
+        const dir = mkdtempSync(join(tmpdir(), "litellm-structured-"));
+        try {
+            const mockChannel = {
+                trace: () => undefined,
+                debug: () => undefined,
+                info: () => undefined,
+                warn: () => undefined,
+                error: () => undefined,
+                show: () => undefined,
+                dispose: () => undefined,
+            } as unknown as vscode.LogOutputChannel;
+            sandbox.stub(vscode.window, "createOutputChannel").returns(mockChannel);
+            sandbox.stub(vscode.workspace, "getConfiguration").returns({
+                get: (_key: string, defaultValue: unknown) => defaultValue,
+            } as unknown as ReturnType<typeof vscode.workspace.getConfiguration>);
+
+            (StructuredLogger as unknown as { channel: vscode.LogOutputChannel | undefined }).channel = undefined;
+            (StructuredLogger as unknown as { fileSink: StructuredLogFileSink }).fileSink = new StructuredLogFileSink();
+
+            const context = {
+                subscriptions: [],
+                globalStorageUri: { fsPath: dir },
+            } as unknown as vscode.ExtensionContext;
+            StructuredLogger.initialize(context);
+
+            StructuredLogger.info("sink.wiring", { ok: true }, { requestId: "r9" });
+
+            const logsDir = join(dir, "structured-logs");
+            const files = readdirSync(logsDir);
+            assert.strictEqual(files.length, 1, "exactly one daily log file should exist");
+            const content = readFileSync(join(logsDir, files[0]), "utf8");
+            assert.ok(content.includes('"event":"sink.wiring"'), "log line must be mirrored to the file");
+            assert.ok(content.includes('"requestId":"r9"'));
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+            // Restore an inert sink so later tests in this suite never write
+            // through static state that points at this run's deleted temp dir.
+            (StructuredLogger as unknown as { fileSink: StructuredLogFileSink }).fileSink = new StructuredLogFileSink();
+        }
     });
 
     test("trace, debug, info, warn, error delegate to log with correct level", () => {

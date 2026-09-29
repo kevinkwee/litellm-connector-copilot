@@ -3,6 +3,7 @@ import * as sinon from "sinon";
 import * as assert from "assert";
 import { emitPartsToVSCode } from "../vscodePartEmitter";
 import { Logger } from "../../../utils/logger";
+import { StructuredLogger } from "../../../observability/structuredLogger";
 
 suite("vscodePartEmitter", () => {
     let sandbox: sinon.SinonSandbox;
@@ -37,6 +38,25 @@ suite("vscodePartEmitter", () => {
         assert.strictEqual(part.name, "t1");
         assert.strictEqual(part.callId, "call_1");
         assert.deepStrictEqual(part.input, {});
+    });
+
+    test("logs an error-level structured event on tool-call argument parse failure", () => {
+        const errorStub = sandbox.stub(StructuredLogger, "error");
+        const reported: unknown[] = [];
+        const progress = {
+            report: (p: unknown) => reported.push(p),
+        } as vscode.Progress<vscode.LanguageModelResponsePart>;
+
+        emitPartsToVSCode([{ type: "tool_call", index: 0, id: "call_1", name: "t1", args: "{invalid json" }], progress);
+
+        const failureCalls = errorStub.getCalls().filter((call) => call.args[0] === "vscode.tool_call_parse_failed");
+        assert.strictEqual(failureCalls.length, 1);
+        const fields = failureCalls[0].args[1] as Record<string, unknown>;
+        assert.strictEqual(fields.toolName, "t1");
+        assert.strictEqual(fields.argsLength, "{invalid json".length);
+        assert.strictEqual(fields.argsPreview, "{invalid json");
+        assert.strictEqual(reported.length, 1);
+        assert.deepStrictEqual((reported[0] as vscode.LanguageModelToolCallPart).input, {});
     });
 
     test("suppresses cache-control data parts before reporting to VS Code", () => {

@@ -156,6 +156,7 @@ Base URL and API key are configured through **VS Code's Language Models provider
 | `litellm-connector.discoveryFireDebounceMs` | number | `250` | Debounce window (ms) for model-change notifications |
 | `litellm-connector.discoveryFireMinIntervalMs` | number | `2000` | Min interval (ms) between change notifications |
 | `litellm-connector.rateLimitMaxDelaySeconds` | number | `120` | Max cumulative delay (seconds) spent retrying 429 rate-limit responses (honoring `Retry-After`). Set `0` to disable |
+| `litellm-connector.debug.structuredLogFile.enabled` | boolean | `true` | Mirror the "LiteLLM Structured" log to daily JSONL files in extension global storage (14-day retention) so diagnostics survive VS Code's output-channel rotation. Warn/error always mirrored; trace/debug only while the channel level is that verbose. Read at activation (reload to toggle) |
 
 > **Tip**: Most users won't need to touch these — the defaults work great!
 

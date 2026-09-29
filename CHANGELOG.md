@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### 🐛 Fixes
+
+* **🛠️ Corrupted tool-call arguments left no durable evidence**: A buffered streaming tool call with invalid JSON arguments produced only a warn-level line in an output channel VS Code rotates at a small cap, and the malformed-args skips in the end-of-stream recovery flush logged to the plain channel only, so the evidence needed to diagnose silently dropped tool calls was already erased by the time anyone looked. Every invalid-arguments detection point (finish gate, recovery flush, VS Code part emission fallback) now logs an error-level structured event with the argument length and a 160-character preview, and the "LiteLLM Structured" channel is mirrored to daily JSONL files in extension global storage with 14-day retention. Opt out with `litellm-connector.debug.structuredLogFile.enabled`. Tool-call emission behavior is unchanged. (`src/adapters/streaming/liteLLMStreamInterpreter.ts`, `src/adapters/streaming/vscodePartEmitter.ts`, `src/observability/structuredLogger.ts`, `src/observability/structuredLogFileSink.ts`)
+
+### 🧪 Tests
+
+* Regression coverage that invalid buffered arguments produce error-level structured events at the finish gate, in the recovery flush, and at the emission fallback, while the previous emit-or-drop behavior is preserved. (`src/adapters/streaming/test/`)
+
 ## [2.1.9] - 2026-07-09
 
 ### 🐛 Fixes

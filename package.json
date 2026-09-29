@@ -305,6 +305,11 @@
 					"default": 1073741824,
 					"minimum": 0,
 					"description": "Hard ceiling on total `.copilotmd` bytes across all sessions. Oldest files (globally, by mtime) are deleted when exceeded. 0 = unlimited. Default: 1073741824 (1 GiB)."
+				},
+				"litellm-connector.debug.structuredLogFile.enabled": {
+					"type": "boolean",
+					"default": true,
+					"description": "Mirror the 'LiteLLM Structured' log channel to daily JSONL files in the extension's global storage (14-day retention). Warn/error lines are always mirrored; trace/debug lines are mirrored only while the channel level is set to that verbosity. VS Code rotates output-channel logs at a small cap, which erases diagnostics needed to investigate past failures; the file sink retains them across sessions. Read at activation: toggling requires a window reload."
 				}
 			}
 		},

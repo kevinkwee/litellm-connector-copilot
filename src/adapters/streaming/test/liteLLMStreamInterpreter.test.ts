@@ -1,5 +1,7 @@
 import * as assert from "assert";
+import * as sinon from "sinon";
 import { interpretStreamEvent, createInitialStreamingState, flushPendingBuffers } from "../liteLLMStreamInterpreter";
+import { StructuredLogger } from "../../../observability/structuredLogger";
 
 declare const suite: (name: string, fn: () => void) => void;
 declare const test: (name: string, fn: () => void) => void;
@@ -834,6 +836,122 @@ suite("flushPendingBuffers Unit Tests", () => {
         const finishPart = parts[0];
         assert.strictEqual(finishPart.type, "finish");
         assert.strictEqual((finishPart as unknown as { reason: string; type: string }).reason, "incomplete_stream_end");
+    });
+});
+
+suite("Tool Call Args Corruption Logging", () => {
+    let sandbox: sinon.SinonSandbox;
+
+    setup(() => {
+        sandbox = sinon.createSandbox();
+    });
+
+    teardown(() => {
+        sandbox.restore();
+    });
+
+    test("logs an error-level event and drops the buffered call when args are invalid and finish_reason is stop", () => {
+        const state = createInitialStreamingState();
+        const errorStub = sandbox.stub(StructuredLogger, "error");
+        const invalidArgs = '{"incomplete":';
+
+        interpretStreamEvent(
+            {
+                choices: [
+                    {
+                        delta: {
+                            tool_calls: [
+                                {
+                                    index: 0,
+                                    id: "call_corrupt",
+                                    function: { name: "bad_tool", arguments: invalidArgs },
+                                },
+                            ],
+                        },
+                    },
+                ],
+            },
+            state
+        );
+        const parts = interpretStreamEvent({ choices: [{ finish_reason: "stop" }] }, state);
+
+        assert.strictEqual(
+            parts.find((p) => p.type === "tool_call"),
+            undefined
+        );
+        const corruptionCalls = errorStub
+            .getCalls()
+            .filter((call) => call.args[0] === "stream.tool_call_args_invalid_json");
+        assert.strictEqual(corruptionCalls.length, 1);
+        const fields = corruptionCalls[0].args[1] as Record<string, unknown>;
+        assert.strictEqual(fields.toolName, "bad_tool");
+        assert.strictEqual(fields.finishReason, "stop");
+        assert.strictEqual(fields.argsLength, invalidArgs.length);
+        assert.strictEqual(fields.argsPreview, invalidArgs);
+        assert.ok(String(fields.normalizedId).startsWith("fc_"));
+    });
+
+    test("still emits the buffered call when finish_reason is tool_calls, and logs the error-level event", () => {
+        const state = createInitialStreamingState();
+        const errorStub = sandbox.stub(StructuredLogger, "error");
+        const invalidArgs = '{"incomplete":';
+
+        interpretStreamEvent(
+            {
+                choices: [
+                    {
+                        delta: {
+                            tool_calls: [
+                                {
+                                    index: 0,
+                                    id: "call_corrupt",
+                                    function: { name: "bad_tool", arguments: invalidArgs },
+                                },
+                            ],
+                        },
+                    },
+                ],
+            },
+            state
+        );
+        const parts = interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
+
+        const toolCall = parts.find((p) => p.type === "tool_call");
+        assert.ok(toolCall, "Should still emit the buffered call");
+        if (toolCall && toolCall.type === "tool_call") {
+            assert.strictEqual(toolCall.name, "bad_tool");
+            assert.strictEqual(toolCall.args, invalidArgs);
+        }
+        const corruptionCalls = errorStub
+            .getCalls()
+            .filter((call) => call.args[0] === "stream.tool_call_args_invalid_json");
+        assert.strictEqual(corruptionCalls.length, 1);
+        const fields = corruptionCalls[0].args[1] as Record<string, unknown>;
+        assert.strictEqual(fields.finishReason, "tool_calls");
+    });
+
+    test("flushPendingBuffers logs an error-level event when skipping malformed buffered args", () => {
+        const state = createInitialStreamingState();
+        const errorStub = sandbox.stub(StructuredLogger, "error");
+
+        state.toolCallBuffers.set(0, { id: "bad-call", name: "badtool", args: "{invalid" });
+        state.toolCallBuffers.set(1, { id: "good-call", name: "goodtool", args: '{"ok":true}' });
+
+        const parts = flushPendingBuffers(state);
+
+        const emitted = parts.filter((p) => p.type === "tool_call");
+        assert.strictEqual(emitted.length, 1);
+        if (emitted[0] && emitted[0].type === "tool_call") {
+            assert.strictEqual(emitted[0].name, "goodtool");
+        }
+        const corruptionCalls = errorStub
+            .getCalls()
+            .filter((call) => call.args[0] === "stream.tool_call_args_invalid_json");
+        assert.strictEqual(corruptionCalls.length, 1);
+        const fields = corruptionCalls[0].args[1] as Record<string, unknown>;
+        assert.strictEqual(fields.callId, "bad-call");
+        assert.strictEqual(fields.toolName, "badtool");
+        assert.strictEqual(fields.argsPreview, "{invalid");
     });
 });
 
