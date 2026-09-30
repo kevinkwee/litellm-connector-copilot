@@ -42,7 +42,7 @@
 	"browser": "./dist/web/extension.js",
 	"scripts": {
 		"bump-version": "node scripts/bump-version.js",
-		"check": "npm run lint; npm run format; npm run test:coverage;",
+		"check": "npm run lint; npm run format; npm run test:scripts; npm run test:coverage;",
 		"clean": "find ./dist ./out ./coverage ./test-results -delete || true",
 		"clean:build": "find ./dist ./out -delete || true",
 		"clean:tests": "find ./coverage ./test-results -delete || true",
@@ -62,6 +62,7 @@
 		"pretest:coverage": "npm run compile",
 		"test:coverage": "node scripts/test-coverage.mjs",
 		"test:report": "npm run pretest && export VSCODE_TEST_RESULTS_DIR=$PWD/test-results && mkdir -p $VSCODE_TEST_RESULTS_DIR && npm run test",
+		"test:scripts": "node --test scripts/versionUtils.test.mjs scripts/bump-version.test.mjs",
 		"vscode:pack": "npm run clean:build && tsc --noEmit && node esbuild.js --production && npx vsce package",
 		"vscode:pack:dev": "npm run clean:build && tsc --noEmit && node esbuild.js && npx vsce package",
 		"watch": "tsc -watch -p ./"

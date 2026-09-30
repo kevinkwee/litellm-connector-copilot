@@ -12,6 +12,10 @@ All notable changes to this project will be documented in this file.
 
 * Regression coverage that invalid buffered arguments produce error-level structured events at the finish gate, in the recovery flush, and at the emission fallback, while the previous emit-or-drop behavior is preserved. (`src/adapters/streaming/test/`)
 
+### 🧹 Chores
+
+* **Semver-correct dev prerelease tags**: `npm run bump-version dev` now writes `0.1.0-dev.11` instead of `0.1.0-dev11`. Dotted identifiers compare numerically (`dev.10` sorts after `dev.2`), while the old no-dot form sorted `dev10` between `dev1` and `dev2`. Legacy tags still parse, so an existing `-dev9` version migrates to `-dev.10` on its next bump, and unknown bump arguments now print usage and exit 1 instead of silently falling back to a patch bump. The CLI now delegates to the shared `scripts/versionUtils.mjs` helpers, covered by `node --test` suites wired into `npm run check` via `test:scripts`. (`scripts/bump-version.js`, `scripts/versionUtils.mjs`, `scripts/versionUtils.test.mjs`, `scripts/bump-version.test.mjs`)
+
 ## [2.1.9] - 2026-07-09
 
 ### 🐛 Fixes

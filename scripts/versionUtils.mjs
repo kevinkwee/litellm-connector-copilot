@@ -3,11 +3,13 @@
  */
 
 /**
- * Parse a semver-style string with optional prerelease suffix and numeric suffix.
- * Examples: 1.2.3, 1.2.3-dev1, 1.2.3-beta5
+ * Parse a semver-style string with an optional prerelease suffix and numeric suffix.
+ * Examples: 1.2.3, 1.2.3-dev, 1.2.3-dev.1, 1.2.3-beta.3
+ * The legacy no-dot form (1.2.3-dev1) is also accepted so existing tags keep parsing;
+ * formatting always normalizes to the dotted form.
  */
 export function parseVersion(ver) {
-    const m = ver.match(/^(\d+)\.(\d+)\.(\d+)(-([a-zA-Z]+)(\d+)?)?$/);
+    const m = ver.match(/^(\d+)\.(\d+)\.(\d+)(?:-([a-zA-Z]+)(?:\.?(\d+))?)?$/);
     if (!m) {
         throw new Error(`Invalid version: ${ver}`);
     }
@@ -15,15 +17,18 @@ export function parseVersion(ver) {
         major: Number(m[1]),
         minor: Number(m[2]),
         patch: Number(m[3]),
-        suffix: m[5] || null,
-        suffixNum: m[6] ? Number(m[6]) : null,
+        suffix: m[4] || null,
+        suffixNum: m[5] ? Number(m[5]) : null,
     };
 }
 
 export function formatVersion({ major, minor, patch, suffix, suffixNum }) {
     let v = `${major}.${minor}.${patch}`;
     if (suffix) {
-        v += `-${suffix}${suffixNum ?? ''}`;
+        v += `-${suffix}`;
+        if (suffixNum !== null && suffixNum !== undefined) {
+            v += `.${suffixNum}`;
+        }
     }
     return v;
 }
