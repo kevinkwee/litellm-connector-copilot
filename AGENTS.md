@@ -2,7 +2,7 @@
 
 This file provides guidance to AI coding agents when working with code in this repository. It defines repo-wide, tool-agnostic expectations for agents contributing to `litellm-connector-copilot`.
 
-> This is the single source of truth for agent behavior. Tool-specific instruction files (e.g. `.github/copilot-instructions.md`) should **reference** this file and avoid duplicating it.
+> This is the single source of truth for agent behavior. Any tool-specific instruction files should **reference** this file and avoid duplicating it.
 
 ## Project Overview
 
@@ -200,7 +200,6 @@ src/
 ├── config/              # configuration and secrets
 ├── commands/            # command registrations and UI entry points
 ├── observability/       # structured logging, audit trail, debug export
-├── telemetry/           # telemetry service and PostHog adapters
 ├── utils/               # shared utilities (logging, model helpers, pricing)
 └── test/                # integration tests and shared test utilities
 ```
@@ -258,11 +257,10 @@ Folder ownership (unit tests are co-located with the module under test in `src/*
 
 - `src/providers/`: Language Model provider implementations (`liteLLMProviderBase.ts`, `liteLLMChatProvider.ts`, `liteLLMCommitProvider.ts`, `index.ts`)
 - `src/adapters/`: HTTP clients, payload shaping, endpoint-specific parsing, SSE and streaming (`sse/`, `streaming/`), tokenizers
-- `src/utils/`: shared utilities (logging, telemetry, model helpers, pricing)
+- `src/utils/`: shared utilities (logging, local request metrics, model helpers, pricing)
 - `src/config/`: configuration and secrets
 - `src/commands/`: command registrations and UI entry points
 - `src/observability/`: structured logging, audit trail, debug export
-- `src/telemetry/`: telemetry service and adapters
 - `src/test/`: integration tests (`integration/`) and shared test utilities (`utils/`)
 
 ## Error Handling
@@ -307,7 +305,7 @@ When wrapping a caught error in a new one, pass the original through `cause` so 
 - Store API keys only via `ConfigManager` / `SecretStorage`. Provider secrets are declared with `"secret": true` in the `languageModelChatProviders` contribution in `package.json` and encrypted by VS Code. **Never** store secrets in `globalState`.
 - No hardcoded API keys, tokens, or passwords.
 - Do not expose internal details in error messages to end users.
-- Use fake or anonymized data in tests, never real user data. Tests run with `POSTHOG_MOCK=true` and mocked fetch, and must never hit a real LiteLLM proxy.
+- Use fake or anonymized data in tests, never real user data. Tests use mocked fetch and must never hit a real LiteLLM proxy.
 
 ## Observability
 
@@ -450,7 +448,7 @@ When fixing bugs, add a regression test that captures the bug so it cannot silen
 - `npm run test:coverage`: unit tests with coverage report (use this for testing)
 - `npm run bump-version patch|minor|dev`: version bumps
 
-> ⚠️ **DO NOT use `npm run test`**, `npm run check`, or any other npm scripts. They may cause issues. Only run the commands listed above.
+> ⚠️ **Do not use any other npm scripts.** They may cause issues. Only run the commands listed above.
 
 ### When to Run What
 
@@ -678,8 +676,8 @@ The ingress pipeline is agnostic to endpoint choice:
 - **Fallback picker detail/tooltip**: when enabled by `displayPricingInPicker`, `toVSCodeInfo()` appends compact pricing to `detail` and appends a pricing breakdown to `tooltip` for environments where hover pricing tables are unavailable.
 - **Price category strategy**: `derivePriceCategory()` categorizes by `maxCost` (highest per-1M input/output cost) using thresholds `<=10` low, `<20` medium, `<=100` high, otherwise very_high.
 - **Token snapshot cost fields**: `src/adapters/streaming/streamTokenCapture.ts` stores flat estimated fields (`estimatedInputCost`, `estimatedOutputCost`, `estimatedTotalCost`) on `TokenSnapshot`.
-- **Usage payload enrichment**: usage DataParts include `estimated_input_cost`, `estimated_output_cost`, and `estimated_total_cost` in `OpenAIUsagePayload` for downstream consumers and telemetry, while remaining compatible with VS Code's required usage fields.
-- **Telemetry propagation**: `src/utils/telemetry.ts` carries flat estimated cost fields in `IMetrics`. `src/telemetry/telemetryService.ts` accepts nested `cost?: CostSummary` and emits estimated cost event properties.
+- **Usage payload enrichment**: usage DataParts include `estimated_input_cost`, `estimated_output_cost`, and `estimated_total_cost` in `OpenAIUsagePayload` for downstream consumers, while remaining compatible with VS Code's required usage fields.
+- **Metrics logging**: `src/utils/telemetry.ts` carries flat estimated cost fields in `IMetrics` and logs each completed request's token and cost totals to the output channel via `LiteLLMTelemetry.reportMetric()`.
 - **Numeric handling**: scientific-notation pricing values are supported as native `number`. `calculateRequestCost()` normalizes floating artifacts with fixed precision while display formatting handles human-readable rounding.
 
 ### BackendRegistry Contract

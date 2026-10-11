@@ -2,7 +2,6 @@ import * as vscode from "vscode";
 import { formatModelDisplayLabel, type ExtendedModelInformation } from "../utils/modelCapabilities";
 import type { LiteLLMProviderBase } from "../providers/liteLLMProviderBase";
 import { Logger } from "../utils/logger";
-import type { TelemetryService } from "../telemetry/telemetryService";
 
 /**
  * Options for the model picker.
@@ -24,14 +23,6 @@ export interface ModelPickerOptions {
      * Optional callback when the selection is cleared.
      */
     onClear?: () => void;
-    /**
-     * Optional telemetry service.
-     */
-    telemetryService?: TelemetryService;
-    /**
-     * Optional caller context for telemetry.
-     */
-    caller?: string;
 }
 
 /**
@@ -40,10 +31,6 @@ export interface ModelPickerOptions {
  * @param options Picker options.
  */
 export async function showModelPicker(provider: LiteLLMProviderBase, options: ModelPickerOptions): Promise<void> {
-    if (options.telemetryService) {
-        options.telemetryService.captureModelPickerOpened(options.caller || "unknown");
-        options.telemetryService.captureFeatureUsed("model-picker", options.caller || "unknown");
-    }
     try {
         // Ensure models are discovered
         const models = await provider.discoverModels({ silent: true }, new vscode.CancellationTokenSource().token);
@@ -87,9 +74,6 @@ export async function showModelPicker(provider: LiteLLMProviderBase, options: Mo
             await vscode.workspace
                 .getConfiguration("litellm-connector")
                 .update(options.settingKey, undefined, vscode.ConfigurationTarget.Global);
-            if (options.telemetryService) {
-                options.telemetryService.captureConfigChanged(options.settingKey, "model-picker-clear");
-            }
             if (options.onClear) {
                 options.onClear();
             }
@@ -106,9 +90,6 @@ export async function showModelPicker(provider: LiteLLMProviderBase, options: Mo
         await vscode.workspace
             .getConfiguration("litellm-connector")
             .update(options.settingKey, selectedId, vscode.ConfigurationTarget.Global);
-        if (options.telemetryService) {
-            options.telemetryService.captureConfigChanged(options.settingKey, "model-picker-select");
-        }
         if (options.onSelect) {
             options.onSelect(selectedId);
         }

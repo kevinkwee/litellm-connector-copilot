@@ -22,27 +22,20 @@
 		"connector",
 		"copilot connector"
 	],
-	"homepage": "https://github.com/gethnet/litellm-connector-copilot",
+	"homepage": "https://github.com/kevinkwee/litellm-connector-copilot",
 	"bugs": {
-		"url": "https://github.com/gethnet/litellm-connector-copilot/issues"
+		"url": "https://github.com/kevinkwee/litellm-connector-copilot/issues"
 	},
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/gethnet/litellm-connector-copilot"
+		"url": "https://github.com/kevinkwee/litellm-connector-copilot"
 	},
 	"license": "Apache-2.0",
-	"maintainers": [
-		"amwdrizz"
-	],
-	"contributors": [
-		"amwdrizz"
-	],
 	"publisher": "GethNet",
 	"main": "./dist/extension.js",
 	"browser": "./dist/web/extension.js",
 	"scripts": {
 		"bump-version": "node scripts/bump-version.js",
-		"check": "npm run lint; npm run format; npm run test:scripts; npm run test:coverage;",
 		"clean": "find ./dist ./out ./coverage ./test-results -delete || true",
 		"clean:build": "find ./dist ./out -delete || true",
 		"clean:tests": "find ./coverage ./test-results -delete || true",
@@ -56,12 +49,8 @@
 		"lint": "eslint",
 		"lint:fix": "eslint --fix",
 		"memory-profile": "npm run compile && node scripts/run-memory-profile.mjs",
-		"package:marketplace": "node scripts/package-marketplace.mjs",
-		"pretest": "npm run compile",
-		"test": "xvfb-run vscode-test --args=\"--no-sandbox\"",
 		"pretest:coverage": "npm run compile",
 		"test:coverage": "node scripts/test-coverage.mjs",
-		"test:report": "npm run pretest && export VSCODE_TEST_RESULTS_DIR=$PWD/test-results && mkdir -p $VSCODE_TEST_RESULTS_DIR && npm run test",
 		"test:scripts": "node --test scripts/versionUtils.test.mjs scripts/bump-version.test.mjs",
 		"vscode:pack": "npm run clean:build && tsc --noEmit && node esbuild.js --production && npx vsce package",
 		"vscode:pack:dev": "npm run clean:build && tsc --noEmit && node esbuild.js && npx vsce package",
@@ -374,8 +363,6 @@
 		"mocha-junit-reporter": "^2.2.1",
 		"mocha-multi-reporters": "^1.5.0",
 		"ovsx": "^1.0.2",
-		"posthog-js": "^1.396.6",
-		"posthog-node": "^5.39.4",
 		"prettier": "^3.8.4",
 		"rimraf": "^6.0.1",
 		"serve": "^14.2.6",
@@ -388,17 +375,6 @@
 		"vscode": "^1.125.0"
 	},
 	"icon": "assets/logo.png",
-	"badges": [
-		{
-			"description": "Star litellm-connector-copilot on Github",
-			"url": "https://img.shields.io/github/stars/gethnet/litellm-connector-copilot?style=social",
-			"href": "https://github.com/gethnet/litellm-connector-copilot"
-		}
-	],
-	"galleryBanner": {
-		"color": "#100f11",
-		"theme": "dark"
-	},
 	"preview": true,
 	"enabledApiProposals": [
 		"chatProvider",
@@ -409,8 +385,5 @@
 		"languageModelThinkingPart",
 		"languageModelToolResultAudience",
 		"languageModelToolSupportsModel"
-	],
-	"sponsor": {
-		"url": "https://buymeacoffee.com/amwdrizz"
-	}
+	]
 }

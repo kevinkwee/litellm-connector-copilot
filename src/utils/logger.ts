@@ -1,5 +1,4 @@
 import * as vscode from "vscode";
-import type { TelemetryService } from "../telemetry/telemetryService";
 
 /**
  * Returns true if a trace/debug message should be skipped because the
@@ -32,12 +31,10 @@ function shouldSkipTraceOrDebug(channel: vscode.LogOutputChannel, level: "trace"
 
 export class Logger {
     private static channel: vscode.LogOutputChannel;
-    private static telemetryService: TelemetryService | undefined;
 
-    public static initialize(context: vscode.ExtensionContext, telemetryService?: TelemetryService): void {
+    public static initialize(context: vscode.ExtensionContext): void {
         this.channel = vscode.window.createOutputChannel("LiteLLM", { log: true });
         context.subscriptions.push(this.channel);
-        this.telemetryService = telemetryService;
     }
 
     public static info(message: string, ...args: unknown[]): void {
@@ -51,11 +48,8 @@ export class Logger {
     public static error(error: string | Error, ...args: unknown[]): void {
         if (error instanceof Error) {
             this.channel?.error(error.message, ...args, error.stack);
-            this.telemetryService?.captureException(error);
         } else {
             this.channel?.error(error, ...args);
-            // Optional: capture string errors as well?
-            // For now, only real Errors go to captureException
         }
     }
 

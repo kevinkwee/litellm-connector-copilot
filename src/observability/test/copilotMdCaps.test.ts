@@ -16,12 +16,7 @@ import { selectFilesForDeletion, type CapsConfig, type FileMeta } from "../copil
  * "Oldest" is by mtime. `0` for any cap means unlimited (no enforcement).
  */
 
-function makeFile(
-    uri: string,
-    sessionFingerprint: string,
-    mtimeMs: number,
-    sizeBytes: number
-): FileMeta {
+function makeFile(uri: string, sessionFingerprint: string, mtimeMs: number, sizeBytes: number): FileMeta {
     return { uri, sessionFingerprint, mtimeMs, sizeBytes };
 }
 
@@ -33,18 +28,12 @@ const UNLIMITED: CapsConfig = {
 
 suite("selectFilesForDeletion", () => {
     test("returns empty list when no caps are set (all zero = unlimited)", () => {
-        const files = [
-            makeFile("file1", "session-a", 1000, 100),
-            makeFile("file2", "session-a", 2000, 100),
-        ];
+        const files = [makeFile("file1", "session-a", 1000, 100), makeFile("file2", "session-a", 2000, 100)];
         assert.deepStrictEqual(selectFilesForDeletion(files, UNLIMITED), []);
     });
 
     test("returns empty list when no files are over any cap", () => {
-        const files = [
-            makeFile("file1", "session-a", 1000, 100),
-            makeFile("file2", "session-a", 2000, 100),
-        ];
+        const files = [makeFile("file1", "session-a", 1000, 100), makeFile("file2", "session-a", 2000, 100)];
         const caps: CapsConfig = { maxFilesPerSession: 5, maxSessions: 5, maxTotalBytes: 100_000 };
         assert.deepStrictEqual(selectFilesForDeletion(files, caps), []);
     });
@@ -79,10 +68,7 @@ suite("selectFilesForDeletion", () => {
         const toDelete = selectFilesForDeletion(files, caps);
         // session-a: keep newest (a-new), delete a-old
         // session-b: keep newest (b-2), delete b-1
-        assert.deepStrictEqual(
-            toDelete.map((f) => f.uri).sort(),
-            ["a-old", "b-1"]
-        );
+        assert.deepStrictEqual(toDelete.map((f) => f.uri).sort(), ["a-old", "b-1"]);
     });
 
     test("per-session cap = 0 means unlimited (no per-session deletion)", () => {
@@ -109,10 +95,7 @@ suite("selectFilesForDeletion", () => {
         ];
         const caps: CapsConfig = { maxFilesPerSession: 0, maxSessions: 2, maxTotalBytes: 0 };
         const toDelete = selectFilesForDeletion(files, caps);
-        assert.deepStrictEqual(
-            toDelete.map((f) => f.uri).sort(),
-            ["a-1", "a-2"]
-        );
+        assert.deepStrictEqual(toDelete.map((f) => f.uri).sort(), ["a-1", "a-2"]);
     });
 
     test("session-count cap = 0 means unlimited (no session deletion)", () => {
@@ -149,10 +132,7 @@ suite("selectFilesForDeletion", () => {
     });
 
     test("total-bytes cap = 0 means unlimited (no byte-based deletion)", () => {
-        const files = [
-            makeFile("a-1", "session-a", 1000, 1_000_000),
-            makeFile("a-2", "session-a", 2000, 1_000_000),
-        ];
+        const files = [makeFile("a-1", "session-a", 1000, 1_000_000), makeFile("a-2", "session-a", 2000, 1_000_000)];
         const caps: CapsConfig = { maxFilesPerSession: 0, maxSessions: 0, maxTotalBytes: 0 };
         assert.deepStrictEqual(selectFilesForDeletion(files, caps), []);
     });
@@ -165,9 +145,7 @@ suite("selectFilesForDeletion", () => {
         const files: FileMeta[] = [];
         for (let s = 0; s < 3; s++) {
             for (let f = 0; f < 4; f++) {
-                files.push(
-                    makeFile(`s${s}-f${f}`, `session-${s}`, 1000 + s * 4000 + f * 1000, 1000)
-                );
+                files.push(makeFile(`s${s}-f${f}`, `session-${s}`, 1000 + s * 4000 + f * 1000, 1000));
             }
         }
         const caps: CapsConfig = {
@@ -183,10 +161,7 @@ suite("selectFilesForDeletion", () => {
         // session-0's surviving files are s0-f1, s0-f2, s0-f3 (3 files).
         const pass2Deleted = ["s0-f1", "s0-f2", "s0-f3"];
         const expectedDeleted = [...pass1Deleted, ...pass2Deleted].sort();
-        assert.deepStrictEqual(
-            toDelete.map((f) => f.uri).sort(),
-            expectedDeleted
-        );
+        assert.deepStrictEqual(toDelete.map((f) => f.uri).sort(), expectedDeleted);
     });
 
     test("pass-1 survivors are visible to pass-2 (no double-counting)", () => {
@@ -208,9 +183,6 @@ suite("selectFilesForDeletion", () => {
         // Pass 1: session-a cap=2 → delete a-1, a-2, a-3 (3 oldest). session-b under cap.
         // Pass 2: session-count=1 → keep newest session (b, newest=7000). Drop session-a (newest surviving=5000). Delete a-4, a-5.
         const expected = ["a-1", "a-2", "a-3", "a-4", "a-5"].sort();
-        assert.deepStrictEqual(
-            toDelete.map((f) => f.uri).sort(),
-            expected
-        );
+        assert.deepStrictEqual(toDelete.map((f) => f.uri).sort(), expected);
     });
 });

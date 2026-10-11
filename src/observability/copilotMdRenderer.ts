@@ -246,8 +246,7 @@ function requestMessageToMarkdown(message: vscode.LanguageModelChatRequestMessag
     // Raw.ChatRole.Tool rendering) instead of `### User`. VS Code sends tool
     // results as User-role messages with tool-result parts; the role is
     // technically User but the semantic role is Tool.
-    const isToolResultMessage =
-        parts.length > 0 && parts.every((p) => p instanceof vscode.LanguageModelToolResultPart);
+    const isToolResultMessage = parts.length > 0 && parts.every((p) => p instanceof vscode.LanguageModelToolResultPart);
 
     const roleLabel = isToolResultMessage ? "Tool" : roleToString(message.role);
     const capitalizedRole = roleLabel.charAt(0).toUpperCase() + roleLabel.slice(1);
@@ -259,8 +258,7 @@ function requestMessageToMarkdown(message: vscode.LanguageModelChatRequestMessag
     // LanguageModelThinkingPart, so we buffer and concatenate them into one
     // `reasoning: {text}` line (same as the response renderer).
     const ThinkingPart = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart as
-        | (new (value: string | string[], id?: string, metadata?: Record<string, unknown>) => unknown)
-        | undefined;
+        (new (value: string | string[], id?: string, metadata?: Record<string, unknown>) => unknown) | undefined;
 
     const reasoningChunks: string[] = [];
     const otherParts: string[] = [];
@@ -315,8 +313,7 @@ function requestPartToMarkdown(part: vscode.LanguageModelInputPart | unknown): s
     // falling through to the JSON.stringify fallback — the $mid is VS Code's
     // internal marshalling ID, not meaningful content.
     const ThinkingPart = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart as
-        | (new (value: string | string[], id?: string, metadata?: Record<string, unknown>) => unknown)
-        | undefined;
+        (new (value: string | string[], id?: string, metadata?: Record<string, unknown>) => unknown) | undefined;
     if (ThinkingPart && part instanceof ThinkingPart) {
         const thinkingPart = part as { value: string | string[]; id?: string };
         const text = Array.isArray(thinkingPart.value) ? thinkingPart.value.join("\n") : thinkingPart.value;
@@ -434,8 +431,7 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
             // Check for LanguageModelThinkingPart (proposed API). The class
             // may not be available in all VS Code builds, so we resolve it
             // lazily via the vscode namespace rather than a static import.
-            const ThinkingPart = (vscode as unknown as Record<string, unknown>)
-                .LanguageModelThinkingPart as
+            const ThinkingPart = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart as
                 | (new (value: string | string[], id?: string, metadata?: Record<string, unknown>) => unknown)
                 | undefined;
             if (ThinkingPart && part instanceof ThinkingPart) {
@@ -445,9 +441,7 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
                 // restores the original prose instead of splitting it across
                 // dozens of `reasoning: {one word}` lines.
                 const thinkingPart = part as unknown as { value: string | string[]; id?: string };
-                const text = Array.isArray(thinkingPart.value)
-                    ? thinkingPart.value.join("\n")
-                    : thinkingPart.value;
+                const text = Array.isArray(thinkingPart.value) ? thinkingPart.value.join("\n") : thinkingPart.value;
                 reasoningBuffer += text;
             } else {
                 // Unknown part type — skip rather than emitting a confusing
@@ -538,31 +532,19 @@ function snapshotToUsagePayload(snapshot: TokenSnapshot): OpenAIUsagePayload {
     const completionDetails = {
         ...(snapshot.reasoningTokens ? { reasoning_tokens: snapshot.reasoningTokens } : {}),
         ...(snapshot.toolTokens ? { tool_tokens: snapshot.toolTokens } : {}),
-        ...(snapshot.acceptedPredictionTokens
-            ? { accepted_prediction_tokens: snapshot.acceptedPredictionTokens }
-            : {}),
-        ...(snapshot.rejectedPredictionTokens
-            ? { rejected_prediction_tokens: snapshot.rejectedPredictionTokens }
-            : {}),
+        ...(snapshot.acceptedPredictionTokens ? { accepted_prediction_tokens: snapshot.acceptedPredictionTokens } : {}),
+        ...(snapshot.rejectedPredictionTokens ? { rejected_prediction_tokens: snapshot.rejectedPredictionTokens } : {}),
     };
     return {
         prompt_tokens: snapshot.promptTokens,
         completion_tokens: snapshot.completionTokens,
         total_tokens: snapshot.promptTokens + snapshot.completionTokens,
         ...(Object.keys(promptDetails).length > 0 ? { prompt_tokens_details: promptDetails } : {}),
-        ...(Object.keys(completionDetails).length > 0
-            ? { completion_tokens_details: completionDetails }
-            : {}),
+        ...(Object.keys(completionDetails).length > 0 ? { completion_tokens_details: completionDetails } : {}),
         ...(snapshot.systemPromptTokens ? { system_prompt_tokens: snapshot.systemPromptTokens } : {}),
-        ...(snapshot.estimatedInputCost
-            ? { estimated_input_cost: snapshot.estimatedInputCost }
-            : {}),
-        ...(snapshot.estimatedOutputCost
-            ? { estimated_output_cost: snapshot.estimatedOutputCost }
-            : {}),
-        ...(snapshot.estimatedTotalCost
-            ? { estimated_total_cost: snapshot.estimatedTotalCost }
-            : {}),
+        ...(snapshot.estimatedInputCost ? { estimated_input_cost: snapshot.estimatedInputCost } : {}),
+        ...(snapshot.estimatedOutputCost ? { estimated_output_cost: snapshot.estimatedOutputCost } : {}),
+        ...(snapshot.estimatedTotalCost ? { estimated_total_cost: snapshot.estimatedTotalCost } : {}),
     };
 }
 
@@ -620,8 +602,7 @@ export function buildCopilotMdFilename(entry: CopilotMdEntry): string {
 
 /**
  * Computes a stable session fingerprint for grouping requests into session
- * subfolders. See `litellm-connector-copilot-chat-debug-view.md` memory for
- * the rationale.
+ * subfolders.
  *
  * Strategy: hash every `User`-role message that appears **after** the last
  * `System` message and **before** the first `Assistant` message, then derive
@@ -681,7 +662,9 @@ export function buildCopilotMdFilename(entry: CopilotMdEntry): string {
  * - Empty message array: returns a fixed fingerprint (`empty:` → hash) so
  *   the writer always has a folder to write to.
  */
-export async function computeSessionFingerprint(messages: readonly vscode.LanguageModelChatRequestMessage[]): Promise<string> {
+export async function computeSessionFingerprint(
+    messages: readonly vscode.LanguageModelChatRequestMessage[]
+): Promise<string> {
     const seed = pickFingerprintSeed(messages);
     return uuidFromSeed(seed);
 }

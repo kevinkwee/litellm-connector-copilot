@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
 import type { LiteLLMConfig } from "../types";
-import type { TelemetryService } from "../telemetry/telemetryService";
 import { LiteLLMClient } from "../adapters/litellmClient";
 import type { BackendSession } from "../providers/backendSession";
 import { Logger } from "../utils/logger";
@@ -49,8 +48,6 @@ export class ConfigManager {
     private static readonly MIN_RATE_LIMIT_MAX_DELAY_SECONDS = 0;
     private static readonly MAX_RATE_LIMIT_MAX_DELAY_SECONDS = 86_400;
     private static readonly MS_PER_SECOND = 1_000;
-
-    private _telemetryService?: TelemetryService;
 
     // Last config returned by getConfig(). convertProviderConfiguration is
     // synchronous but must hand the session client a discovery timeout, so it
@@ -139,10 +136,6 @@ export class ConfigManager {
             return defaultValue;
         }
         return Math.min(max, Math.max(min, value));
-    }
-
-    public setTelemetryService(service: TelemetryService): void {
-        this._telemetryService = service;
     }
 
     /**
@@ -296,26 +289,6 @@ export class ConfigManager {
     }
 
     /**
-     * Reports current feature toggle states to telemetry.
-     * Call after config changes that may affect feature toggles.
-     */
-    async reportFeatureToggles(source: string): Promise<void> {
-        if (!this._telemetryService) {
-            return;
-        }
-        const config = await this.getConfig();
-        const toggles: [string, boolean][] = [
-            ["commit-message", !!(config.commitModelIdOverride && config.commitModelIdOverride.length > 0)],
-            ["caching", !config.disableCaching],
-            ["quota-tool-redaction", !config.disableQuotaToolRedaction],
-            ["auto-trim-messages", !!config.autoTrimMessages],
-        ];
-        for (const [name, enabled] of toggles) {
-            this._telemetryService.captureFeatureToggled(name, enabled, source);
-        }
-    }
-
-    /**
      * Converts VS Code per-group provider configuration into a BackendSession.
      *
      * Required fields (per `package.json` `languageModelChatProviders.configuration`):
@@ -376,10 +349,10 @@ export class ConfigManager {
 
     /**
      * Dispose hook to align with ExtensionContext subscription lifecycle.
-     * Currently a no-op because ConfigManager does not hold disposable resources.
+     * Drops the cached workspace config; no disposable resources are held.
      */
     async dispose(): Promise<void> {
-        this._telemetryService = undefined;
+        this._lastConfig = undefined;
     }
 
     /**

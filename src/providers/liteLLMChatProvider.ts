@@ -176,10 +176,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         const caller = telemetry.caller || modelWithTags.tags?.[0] || "chat";
         const justification = telemetry.justification;
 
-        if (this._telemetryService) {
-            this._telemetryService.captureModelUsed(model.id, caller);
-        }
-
         let tokensIn: number | undefined;
 
         Logger.info(
@@ -630,21 +626,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 caller,
             };
             LiteLLMTelemetry.reportMetric(metric);
-
-            if (this._telemetryService) {
-                this._telemetryService.captureChatRequest({
-                    request_id: requestId,
-                    caller,
-                    model: model.id,
-                    endpoint: "unknown",
-                    durationMs: metric.durationMs,
-                    tokensIn: tokensIn ?? 0,
-                    tokensOut: 0,
-                    status: "failure",
-                    error: errorMessage,
-                    stack: err instanceof Error ? err.stack : undefined,
-                });
-            }
 
             // Fire-and-forget `.copilotmd` export for the failure case. Only
             // emits when the request got far enough to have a built body. A

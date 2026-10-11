@@ -63,11 +63,7 @@ export class CopilotMdWriter {
             // fingerprint uses SHA-256 via Web Crypto.
             const sessionFingerprint =
                 entry.sessionFingerprint ?? (await computeSessionFingerprint(entry.requestMessages));
-            const sessionFolder = vscode.Uri.joinPath(
-                this.rootFolder,
-                "copilot-debug",
-                sessionFingerprint
-            );
+            const sessionFolder = vscode.Uri.joinPath(this.rootFolder, "copilot-debug", sessionFingerprint);
             const filename = buildCopilotMdFilename(entry);
             const fileUri = vscode.Uri.joinPath(sessionFolder, filename);
 
@@ -172,7 +168,9 @@ export class CopilotMdWriter {
         }
         await Promise.all(
             sessionEntries.map(async ([sessionFingerprint, type]) => {
-                if (type !== vscode.FileType.Directory) {return;}
+                if (type !== vscode.FileType.Directory) {
+                    return;
+                }
                 const sessionFolder = vscode.Uri.joinPath(debugRoot, sessionFingerprint);
                 let fileEntries: [string, vscode.FileType][];
                 try {
@@ -182,8 +180,12 @@ export class CopilotMdWriter {
                 }
                 await Promise.all(
                     fileEntries.map(async ([filename, fileType]) => {
-                        if (fileType !== vscode.FileType.File) {return;}
-                        if (!filename.endsWith(".copilotmd")) {return;}
+                        if (fileType !== vscode.FileType.File) {
+                            return;
+                        }
+                        if (!filename.endsWith(".copilotmd")) {
+                            return;
+                        }
                         const fileUri = vscode.Uri.joinPath(sessionFolder, filename);
                         try {
                             const stat = await vscode.workspace.fs.stat(fileUri);
@@ -218,7 +220,9 @@ export class CopilotMdWriter {
         }
         await Promise.all(
             sessionEntries.map(async ([name, type]) => {
-                if (type !== vscode.FileType.Directory) {return;}
+                if (type !== vscode.FileType.Directory) {
+                    return;
+                }
                 const sessionFolder = vscode.Uri.joinPath(debugRoot, name);
                 try {
                     const entries = await vscode.workspace.fs.readDirectory(sessionFolder);

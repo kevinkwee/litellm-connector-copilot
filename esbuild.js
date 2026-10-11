@@ -26,7 +26,7 @@ const path = require("path");
 
 const production = (process.argv.includes("--production") || process.env.NODE_ENV === "production") ? true : false;
 const watch = process.argv.includes("--watch");
-const generateSourceMaps = process.env.POSTHOG_SOURCEMAPS === "true" || !production;
+const generateSourceMaps = !production;
 
 /** @type {esbuild.BuildOptions} */
 const shared = {
@@ -65,11 +65,10 @@ const buildTargets = [
             {
                 name: "web-module-swap",
                 setup(build) {
-                    build.onResolve({ filter: /\/(posthogAdapter|structuredLogFileSink)$/ }, (args) => {
+                    build.onResolve({ filter: /\/(structuredLogFileSink)$/ }, (args) => {
                         // Node-only modules swap to their .web.ts no-op/browser
-                        // variants in the web target (mirrors the posthogAdapter
-                        // convention). Bare specifier safety: only relative
-                        // "./name" imports are rewritten.
+                        // variants in the web target. Bare specifier safety:
+                        // only relative "./name" imports are rewritten.
                         const base = args.path.replace(/^\.\//, "");
                         if (base !== args.path) {
                             return {

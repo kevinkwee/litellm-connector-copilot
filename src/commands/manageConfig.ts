@@ -1,14 +1,9 @@
 import * as vscode from "vscode";
 import type { ConfigManager } from "../config/configManager";
 import type { LiteLLMChatProvider } from "../providers";
-import type { TelemetryService } from "../telemetry/telemetryService";
 import { Logger } from "../utils/logger";
 
-function createConfigHandler(
-    _configManager: ConfigManager,
-    _provider?: LiteLLMChatProvider,
-    _telemetryService?: TelemetryService
-) {
+function createConfigHandler(_configManager: ConfigManager, _provider?: LiteLLMChatProvider) {
     return async (): Promise<void> => {
         const openLanguageModels = "Open Language Models";
         const choice = await vscode.window.showInformationMessage(
@@ -34,10 +29,7 @@ function createConfigHandler(
  * Creates the handler for the reset configuration command.
  * Shows a confirmation dialog before wiping all configuration.
  */
-function createResetConfigurationHandler(
-    configManager: ConfigManager,
-    _telemetryService?: TelemetryService
-): () => Promise<void> {
+function createResetConfigurationHandler(configManager: ConfigManager): () => Promise<void> {
     return async (): Promise<void> => {
         // Show confirmation dialog
         const reset = "Reset Configuration";
@@ -80,23 +72,13 @@ function createResetConfigurationHandler(
 export function registerManageConfigCommand(
     context: vscode.ExtensionContext,
     configManager: ConfigManager,
-    provider?: LiteLLMChatProvider,
-    telemetryService?: TelemetryService
+    provider?: LiteLLMChatProvider
 ): vscode.Disposable {
-    return vscode.commands.registerCommand(
-        "litellm-connector.manage",
-        createConfigHandler(configManager, provider, telemetryService)
-    );
+    return vscode.commands.registerCommand("litellm-connector.manage", createConfigHandler(configManager, provider));
 }
 
-export function registerShowModelsCommand(
-    provider: LiteLLMChatProvider,
-    telemetryService?: TelemetryService
-): vscode.Disposable {
+export function registerShowModelsCommand(provider: LiteLLMChatProvider): vscode.Disposable {
     return vscode.commands.registerCommand("litellm-connector.showModels", async () => {
-        if (telemetryService) {
-            telemetryService.captureCommandExecuted("litellm-connector.showModels");
-        }
         const models = provider.getLastKnownModels();
         if (!models.length) {
             vscode.window.showInformationMessage(
@@ -138,14 +120,8 @@ export function registerShowModelsCommand(
     });
 }
 
-export function registerReloadModelsCommand(
-    provider: LiteLLMChatProvider,
-    telemetryService?: TelemetryService
-): vscode.Disposable {
+export function registerReloadModelsCommand(provider: LiteLLMChatProvider): vscode.Disposable {
     return vscode.commands.registerCommand("litellm-connector.reloadModels", async () => {
-        if (telemetryService) {
-            telemetryService.captureCommandExecuted("litellm-connector.reloadModels");
-        }
         provider.clearModelCache();
         try {
             await vscode.window.withProgress(
@@ -175,11 +151,10 @@ export function registerReloadModelsCommand(
 
 export function registerResetConfigurationCommand(
     context: vscode.ExtensionContext,
-    configManager: ConfigManager,
-    telemetryService?: TelemetryService
+    configManager: ConfigManager
 ): vscode.Disposable {
     return vscode.commands.registerCommand(
         "litellm-connector.resetConfiguration",
-        createResetConfigurationHandler(configManager, telemetryService)
+        createResetConfigurationHandler(configManager)
     );
 }

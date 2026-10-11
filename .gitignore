@@ -35,9 +35,6 @@ memory-profile-results.json
 *.md
 !README.md
 !CHANGELOG.md
-!CONTRIBUTORS.md
-!README.marketplace.md
-!README.md
 
 # Runtime data
 pids
@@ -224,4 +221,3 @@ $RECYCLE.BIN/
 *.lnk
 .plans/**/*.*
 .plans
-.devcontainer/devcontainer-lock.json

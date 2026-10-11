@@ -7,7 +7,6 @@ import { showModelPicker } from "./modelPicker";
 import { calculateAvailableContext } from "../adapters/tokenUtils";
 import { COMMIT_MESSAGE_PROMPT, COMMIT_SYSTEM_PROMPT } from "../utils/prompts";
 import { stripMarkdownCodeBlocks } from "../utils";
-import type { TelemetryService } from "../telemetry/telemetryService";
 
 async function tryGenerateViaVSCodeModelRequest(
     modelId: string,
@@ -56,16 +55,8 @@ async function tryGenerateViaVSCodeModelRequest(
 /**
  * Registers the command to generate a git commit message.
  */
-export function registerGenerateCommitMessageCommand(
-    _provider: LiteLLMCommitMessageProvider,
-    telemetryService?: TelemetryService
-): vscode.Disposable {
+export function registerGenerateCommitMessageCommand(_provider: LiteLLMCommitMessageProvider): vscode.Disposable {
     return vscode.commands.registerCommand("litellm-connector.generateCommitMessage", async (scm: unknown) => {
-        const startTime = Date.now();
-        if (telemetryService) {
-            telemetryService.captureCommandExecuted("generateCommitMessage");
-            telemetryService.captureFeatureUsed("commit-message", "commit-message");
-        }
         try {
             // Check if model is configured, if not, show picker
             const config = await _provider.getConfigManager().getConfig();
@@ -80,8 +71,6 @@ export function registerGenerateCommitMessageCommand(
                     await showModelPicker(_provider, {
                         title: "Select Commit Message Model",
                         settingKey: "commitModelIdOverride",
-                        telemetryService: telemetryService,
-                        caller: "commit-message",
                     });
                 }
                 return;
@@ -206,14 +195,6 @@ export function registerGenerateCommitMessageCommand(
                         vscode.window.showErrorMessage(
                             "Failed to generate commit message: " + (err instanceof Error ? err.message : String(err))
                         );
-
-                        if (telemetryService) {
-                            telemetryService.captureCommitMessageGenerated({
-                                model: modelId,
-                                durationMs: Date.now() - startTime,
-                                status: "failure",
-                            });
-                        }
                     } finally {
                         inputBox.placeholder = originalPlaceholder;
                         inputBox.enabled = true;

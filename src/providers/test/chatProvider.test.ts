@@ -7,7 +7,6 @@ import { LiteLLMClient } from "../../adapters/litellmClient";
 import type { OpenAIChatCompletionRequest } from "../../types";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
 import { createMockSecrets } from "../../test/utils/testMocks";
-import { createTelemetryMocks } from "../../test/utils/telemetryMock";
 
 /**
  * Seeds the per-group discovery state on a provider so the new routing path
@@ -68,7 +67,6 @@ function seedDiscoveredBackend(sandbox: sinon.SinonSandbox, provider: LiteLLMCha
 
 suite("LiteLLM Chat Provider Unit Tests", () => {
     let sandbox: sinon.SinonSandbox;
-    let telemetryMocks: ReturnType<typeof createTelemetryMocks>;
 
     const mockSecrets = createMockSecrets({
         "litellm-connector.baseUrl": "http://localhost:4000",
@@ -79,12 +77,9 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
 
     setup(() => {
         sandbox = sinon.createSandbox();
-        telemetryMocks = createTelemetryMocks(sandbox);
-        telemetryMocks.setup();
     });
 
     teardown(() => {
-        telemetryMocks.teardown();
         sandbox.restore();
     });
 

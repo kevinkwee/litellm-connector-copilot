@@ -42,9 +42,7 @@ suite("Logger Unit Tests", () => {
      * Must restore the previous stub before re-stubbing (sinon throws if you
      * wrap an already-wrapped method).
      */
-    function restubChannelWithLevel(
-        level: vscode.LogLevel
-    ): {
+    function restubChannelWithLevel(level: vscode.LogLevel): {
         info: sinon.SinonSpy;
         warn: sinon.SinonSpy;
         error: sinon.SinonSpy;

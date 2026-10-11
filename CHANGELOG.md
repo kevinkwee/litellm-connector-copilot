@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 🧹 Chores
+
+* **📚 AGENTS.md restructured to a lean template**: The agent instructions were rebuilt around a standard template, and the strict TDD mandates were removed in favor of the general regression-testing standards. (`AGENTS.md`)
+
+* **🧹 Personal-fork cleanup**: Removed the upstream-only infrastructure this fork does not use: the PostHog telemetry pipeline and its adapters (local metric logging and structured logging remain), marketplace packaging (`README.marketplace.md`, `package-marketplace` script), release/CI/devcontainer workflows, codecov, dependabot, issue templates, contributor docs, the PostHog MCP config, the devcontainer-era workspace file (`litellm-connector-copilot.code-workspace`), the Linux-only `test`/`test:report`/`check` npm scripts, the stale `tasks.json` and launch debug configs, and unreferenced scratch files (`LiteLLM_API.json`, `llm-response.json`, `liteLLM-allowed-routes.json`). `package.json` metadata now points at the fork, and `README.md` was rewritten as a personal-fork README. (repo root, `.github/`, `.vscode/`, `scripts/`, `src/telemetry/`)
+
+## [2.1.10-dev.11] - 2026-09-30
+
 ### 🐛 Fixes
 
 * **🛠️ Corrupted tool-call arguments left no durable evidence**: A buffered streaming tool call with invalid JSON arguments produced only a warn-level line in an output channel VS Code rotates at a small cap, and the malformed-args skips in the end-of-stream recovery flush logged to the plain channel only, so the evidence needed to diagnose silently dropped tool calls was already erased by the time anyone looked. Every invalid-arguments detection point (finish gate, recovery flush, VS Code part emission fallback) now logs an error-level structured event with the argument length and a 160-character preview, and the "LiteLLM Structured" channel is mirrored to daily JSONL files in extension global storage with 14-day retention. Opt out with `litellm-connector.debug.structuredLogFile.enabled`. Tool-call emission behavior is unchanged. (`src/adapters/streaming/liteLLMStreamInterpreter.ts`, `src/adapters/streaming/vscodePartEmitter.ts`, `src/observability/structuredLogger.ts`, `src/observability/structuredLogFileSink.ts`)
@@ -15,6 +23,86 @@ All notable changes to this project will be documented in this file.
 ### 🧹 Chores
 
 * **Semver-correct dev prerelease tags**: `npm run bump-version dev` now writes `0.1.0-dev.11` instead of `0.1.0-dev11`. Dotted identifiers compare numerically (`dev.10` sorts after `dev.2`), while the old no-dot form sorted `dev10` between `dev1` and `dev2`. Legacy tags still parse, so an existing `-dev9` version migrates to `-dev.10` on its next bump, and unknown bump arguments now print usage and exit 1 instead of silently falling back to a patch bump. The CLI now delegates to the shared `scripts/versionUtils.mjs` helpers, covered by `node --test` suites wired into `npm run check` via `test:scripts`. (`scripts/bump-version.js`, `scripts/versionUtils.mjs`, `scripts/versionUtils.test.mjs`, `scripts/bump-version.test.mjs`)
+
+## [2.1.10-dev10] - 2026-09-24
+
+### 🐛 Fixes
+
+* **🛠️ `normalizeToolCallId` provider-prefix and padding handling**: Only a leading `fc_` is treated as a provider-prefixed tool-call id, and the padding filler now varies between runs so regenerated tool-call ids no longer collide on repeated runs. (`src/utils.ts`)
+
+## [2.1.10-dev9] - 2026-09-20
+
+### 🐛 Fixes
+
+* **🛠️ Reasoning-only assistant turns serialize with empty content**: Assistant messages whose content is reasoning-only now emit an explicit empty-string `content` instead of being dropped. (`src/utils.ts`)
+* **🛠️ Mid-stream resumes append a "Continue" nudge**: The rebuilt request after a transport retry now appends a user "Continue" nudge after the resumed assistant turn, so providers continue the response instead of echoing it. (`src/utils/transportRetry.ts`)
+
+## [2.1.10-dev8] - 2026-09-14
+
+### 🐛 Fixes
+
+* **🛠️ Error and cancellation surfacing**: Request errors are surfaced as response text instead of thrown exceptions, streaming cancellation is surfaced instead of being masked by reasoning-only retry exhaustion, and the streaming cancellation listener is disposed when the stream ends. (`src/providers/liteLLMChatProvider.ts`)
+
+## [2.1.10-dev7] - 2026-09-14
+
+### 🐛 Fixes
+
+* **🛠️ `discoveryTimeoutMs` reaches session clients**: The discovery timeout setting is now threaded into the per-session HTTP clients built by `convertProviderConfiguration`, not just the discovery fetch. (`src/config/configManager.ts`)
+
+## [2.1.10-dev6] - 2026-09-09
+
+### 🚀 Features
+
+* **🔁 Reasoning-only response retries**: Streaming responses that complete with only reasoning content and no text are retried instead of surfacing an empty reply. (`src/providers/liteLLMChatProvider.ts`)
+* **🌡️ Per-model temperature**: A `temperature` configuration property is exposed per model in VS Code's model settings (only for models that support the parameter) and sent with every request. (`src/utils/modelCapabilities.ts`, `src/providers/base/requestBuilder.ts`)
+* **✂️ Opt-in `autoTrimMessages`**: New `autoTrimMessages` setting trims older messages to fit the model input token budget, covering both the proactive per-request trim and the recovery retry after a context-overflow rejection. Off by default. (`src/adapters/tokenUtils.ts`, `src/config/configManager.ts`)
+* **🎚️ Configurable retry budgets**: The 429 retry budget is configurable via `rateLimitMaxDelaySeconds` (honoring `Retry-After`), and the `networkRetries` cap was removed. (`src/adapters/litellmClient.ts`)
+
+### 🐛 Fixes
+
+* **🛠️ Watchdog abort on clean stream completion**: The inactivity watchdog's abort now surfaces instead of being swallowed when the stream completes cleanly. (`src/providers/liteLLMChatProvider.ts`)
+* **🛠️ Reasoning-only assistant messages in `convertMessages`**: Assistant turns whose content is reasoning-only are accepted instead of rejected. (`src/utils.ts`)
+
+### 🧹 Chores
+
+* Removed legacy and deprecated code paths, the unused v2 message pipeline, and decorative comment banners; inlined language model provider registration. Regression coverage added for transport retry and mid-stream resume. (`src/`)
+
+## [2.1.10-dev5] - 2026-09-03
+
+### 🚀 Features
+
+* **🔁 Transport-level retry with mid-stream resume**: When a stream dies mid-response, the connector rebuilds the request and resumes from the last assistant turn instead of failing the request. (`src/utils/transportRetry.ts`, `src/providers/liteLLMChatProvider.ts`)
+
+## [2.1.10-dev4] - 2026-07-27
+
+### 🐛 Fixes
+
+* **🛠️ Visible separation between reasoning and text**: Rendered output now marks the boundary between reasoning and text content so the two are visually distinguishable. (`src/observability/copilotMdRenderer.ts`)
+
+## [2.1.10-dev3] - 2026-07-27
+
+### 🐛 Fixes
+
+* **🛠️ Continuous reasoning lines**: Thinking parts are concatenated into continuous reasoning lines instead of fragmented blocks. (`src/observability/copilotMdRenderer.ts`)
+
+## [2.1.10-dev2] - 2026-07-27
+
+### 🚀 Features
+
+* **🧠 Thinking parts and tool message rendering in transcripts**: `.copilotmd` exports render reasoning thinking parts and tool messages. (`src/observability/copilotMdRenderer.ts`)
+
+## [2.1.10-dev1] - 2026-07-27
+
+### 🚀 Features
+
+* **🧾 `.copilot.md` markdown transcript logging**: Chat requests are exported as `.copilotmd` files (byte-compatible with Copilot Chat's debug view) with per-session retention caps, a new **LiteLLM: Open .copilotmd Export Folder** command, and a stable per-session fingerprint (UUID v5 via SHA-1) attached to request metadata. (`src/observability/`, `src/commands/openCopilotMdFolder.ts`)
+* **🚦 Log-level pre-filtering guards**: Hot-path trace/debug logging is gated by the channel's configured level to avoid message-formatting costs during long streaming responses. (`src/utils/logger.ts`)
+
+### 🐛 Fixes
+
+* **🛠️ Expanded reasoning effort levels with corrected fallback behavior**: Reasoning effort levels were expanded and the fallback selection corrected, including per-model effort overrides. (`src/utils/modelCapabilities.ts`, `src/utils/reasoningEffortFallback.ts`)
+* **🛠️ `reasoning_effort: "none"` sent explicitly**: The parameter is now passed as `"none"` instead of being suppressed from the request. (`src/providers/base/requestBuilder.ts`)
+* **🛠️ Transcript export fixes**: Response text parts are concatenated before export and the `.copilotmd` destination root resolution was fixed. (`src/observability/`)
 
 ## [2.1.9] - 2026-07-09
 

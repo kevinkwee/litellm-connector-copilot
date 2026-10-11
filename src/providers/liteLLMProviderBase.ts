@@ -17,7 +17,6 @@ import {
 import { ConfigManager } from "../config/configManager";
 import { Logger } from "../utils/logger";
 import { LiteLLMTelemetry } from "../utils/telemetry";
-import type { TelemetryService } from "../telemetry/telemetryService";
 import { getSupportedReasoningEfforts, isOpenAIParamSupported } from "../utils/modelCapabilities";
 import type { SupportedReasoningEffort } from "../types";
 import {
@@ -83,8 +82,6 @@ export abstract class LiteLLMProviderBase {
     // it, causing an infinite retry loop.
     private _usageOptOutModels = new Set<string>();
 
-    protected _telemetryService?: TelemetryService;
-
     constructor(
         protected readonly secrets: vscode.SecretStorage,
         protected readonly userAgent: string,
@@ -132,10 +129,6 @@ export abstract class LiteLLMProviderBase {
                 ),
         };
         this._transport = new Transport(transportDeps);
-    }
-
-    public setTelemetryService(service: TelemetryService): void {
-        this._telemetryService = service;
     }
 
     /** Exposes the ConfigManager for external access (e.g., commands that need configuration). */

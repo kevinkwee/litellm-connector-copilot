@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import type { LiteLLMModelInfo, OpenAIChatMessage } from "../types";
 import { isAnthropicModel } from "../utils/modelUtils";
 import { selectTokenizer } from "./tokenizers/selectTokenizer";
-import type { TelemetryService } from "../telemetry/telemetryService";
+import { Logger } from "../utils/logger";
 
 // Token estimation constants for binary media types
 // These are conservative estimates to avoid context window overflow
@@ -54,12 +54,6 @@ const SMART_OUTPUT_RESERVATION_MAX = 64000;
 interface OutputReservationOptions {
     estimatedInputTokens?: number;
     modelInfo?: LiteLLMModelInfo;
-}
-
-let telemetryServiceInstance: TelemetryService | undefined;
-
-export function setTelemetryService(service: TelemetryService): void {
-    telemetryServiceInstance = service;
 }
 
 /**
@@ -353,8 +347,10 @@ export function trimMessagesToFitBudget(
         }
     }
 
-    if (telemetryServiceInstance && selected.length < messageArray.length) {
-        telemetryServiceInstance.captureTrimExecuted(model.id, "chat", originalTokens, used, budget);
+    if (selected.length < messageArray.length) {
+        Logger.info(
+            `[TokenTrim] model=${model.id} caller=chat original_tokens=${originalTokens} kept_tokens=${used} budget=${budget}`
+        );
     }
 
     return selected;

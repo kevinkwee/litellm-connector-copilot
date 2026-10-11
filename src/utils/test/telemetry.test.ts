@@ -3,7 +3,6 @@ import * as sinon from "sinon";
 import type { IMetrics } from "..//telemetry";
 import { LiteLLMTelemetry } from "..//telemetry";
 import { Logger } from "..//logger";
-import type { TelemetryService } from "../../telemetry/telemetryService";
 
 /**
  * Sinon's `args[0]` is typed as `any`, which trips no-unsafe-* lint rules
@@ -24,11 +23,9 @@ suite("Telemetry Unit Tests", () => {
         sandbox = sinon.createSandbox();
         loggerDebugStub = sandbox.stub(Logger, "debug");
         loggerInfoStub = sandbox.stub(Logger, "info");
-        LiteLLMTelemetry.setTelemetryService(undefined as unknown as TelemetryService);
     });
 
     teardown(() => {
-        LiteLLMTelemetry.setTelemetryService(undefined as unknown as TelemetryService);
         sandbox.restore();
     });
 
@@ -87,106 +84,6 @@ suite("Telemetry Unit Tests", () => {
         const logMessage = firstArg<string>(loggerDebugStub);
         // Ensure cacheReadRatio is not falsey but undefined, and doesn't appear in debug log
         assert.ok(!logMessage.includes('"cacheReadRatio"'));
-    });
-
-    test("captureRequestCompletedWithCache passes cacheReadRatio to capture method", () => {
-        const captureRequestCompletedWithCache = sandbox.stub();
-        const captureRequestFailed = sandbox.stub();
-        const captureRequestCachingBypassed = sandbox.stub();
-        const telemetryServiceStub = {
-            captureRequestCompletedWithCache,
-            captureRequestFailed,
-            captureRequestCachingBypassed,
-        } as unknown as TelemetryService;
-
-        LiteLLMTelemetry.setTelemetryService(telemetryServiceStub);
-
-        const customProps: IMetrics = {
-            requestId: "custom-req-123",
-            caller: "inline-completions",
-            model: "gpt-4",
-            durationMs: 120,
-            tokensIn: 800,
-            tokensOut: 400,
-            cacheReadRatio: 0.25,
-            status: "success",
-        };
-
-        LiteLLMTelemetry.reportMetric(customProps);
-
-        assert.strictEqual(loggerInfoStub.calledOnce, true);
-        assert.strictEqual(captureRequestCompletedWithCache.calledOnce, true);
-        interface CompletedWithCacheProps {
-            cacheReadRatio?: number;
-        }
-        const props = firstArg<CompletedWithCacheProps>(captureRequestCompletedWithCache);
-        assert.strictEqual(props.cacheReadRatio, 0.25);
-        assert.strictEqual(captureRequestFailed.called, false);
-        assert.strictEqual(captureRequestCachingBypassed.called, false);
-    });
-
-    test("captureRequestCompletedWithCache omits cacheReadRatio when undefined", () => {
-        const captureRequestCompletedWithCache = sandbox.stub();
-        const telemetryServiceStub = {
-            captureRequestCompletedWithCache,
-            captureRequestFailed: sandbox.stub(),
-            captureRequestCachingBypassed: sandbox.stub(),
-        } as unknown as TelemetryService;
-
-        LiteLLMTelemetry.setTelemetryService(telemetryServiceStub);
-
-        const customProps: IMetrics = {
-            requestId: "custom-req-456",
-            caller: "terminal-chat",
-            model: "gpt-4",
-            durationMs: 90,
-            tokensIn: 600,
-            tokensOut: 300,
-            cacheReadRatio: undefined,
-            status: "success",
-        };
-
-        LiteLLMTelemetry.reportMetric(customProps);
-
-        assert.strictEqual(captureRequestCompletedWithCache.calledOnce, true);
-        interface CompletedWithCacheProps {
-            cacheReadRatio?: number;
-        }
-        const props = firstArg<CompletedWithCacheProps>(captureRequestCompletedWithCache);
-        assert.strictEqual(props.cacheReadRatio, undefined);
-    });
-
-    test("reportMetric forwards caching_bypassed status to captureRequestCachingBypassed", () => {
-        const captureRequestCachingBypassed = sandbox.stub();
-        const telemetryServiceStub = {
-            captureRequestCompletedWithCache: sandbox.stub(),
-            captureRequestFailed: sandbox.stub(),
-            captureRequestCachingBypassed,
-        } as unknown as TelemetryService;
-
-        LiteLLMTelemetry.setTelemetryService(telemetryServiceStub);
-
-        LiteLLMTelemetry.reportMetric({
-            requestId: "req-cache-bypass-123",
-            model: "anthropic/claude-3",
-            status: "caching_bypassed",
-            caller: "chat",
-            error: "provider_caching_not_supported",
-        });
-
-        assert.strictEqual(captureRequestCachingBypassed.calledOnce, true);
-        interface CachingBypassedProps {
-            request_id: string;
-            caller: string;
-            model: string;
-            endpoint: string;
-            reason?: string;
-        }
-        const props = firstArg<CachingBypassedProps>(captureRequestCachingBypassed);
-        assert.strictEqual(props.request_id, "req-cache-bypass-123");
-        assert.strictEqual(props.caller, "chat");
-        assert.strictEqual(props.endpoint, "unknown");
-        assert.strictEqual(props.reason, "provider_caching_not_supported");
     });
 
     test("Timer methods return numbers", () => {
@@ -250,39 +147,5 @@ suite("Telemetry Unit Tests", () => {
             const logMessage = firstArg<string>(loggerDebugStub);
             assert.ok(logMessage.includes(`"caller":"${caller}"`), `Should log caller: ${caller}`);
         }
-    });
-
-    test("reportMetric forwards requestId to captureRequestFailed", () => {
-        const captureRequestFailed = sandbox.stub();
-        const telemetryServiceStub = {
-            captureRequestFailed,
-            captureRequestCompletedWithCache: sandbox.stub(),
-            captureRequestCachingBypassed: sandbox.stub(),
-        } as unknown as TelemetryService;
-
-        LiteLLMTelemetry.setTelemetryService(telemetryServiceStub);
-
-        LiteLLMTelemetry.reportMetric({
-            requestId: "req-metric-fail-123",
-            model: "gpt-4",
-            durationMs: 50,
-            status: "failure",
-            error: "network_error",
-            caller: "chat",
-        });
-
-        assert.strictEqual(captureRequestFailed.calledOnce, true);
-        interface CapturedFailureProps {
-            request_id: string;
-            caller: string;
-            model: string;
-            endpoint: string;
-            durationMs: number;
-            errorType: string;
-        }
-        const props = firstArg<CapturedFailureProps>(captureRequestFailed);
-        assert.strictEqual(props.request_id, "req-metric-fail-123");
-        assert.strictEqual(props.caller, "chat");
-        assert.strictEqual(props.errorType, "network_error");
     });
 });

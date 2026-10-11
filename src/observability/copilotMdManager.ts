@@ -11,8 +11,9 @@ import { CopilotMdWriter } from "./copilotMdWriter";
  * Singleton coordinator that:
  * 1. Reads `litellm-connector.debug.copilotMdExport.*` settings on each call
  *    (so users can change caps without reloading the window).
- * 2. Resolves the destination root (`globalStorageUri` by default, or the
- *    first workspace folder when `destination: "workspace"`).
+ * 2. Resolves the destination root (VS Code's per-workspace
+ *    `storageUri` by default, or `globalStorageUri` when
+ *    `destination: "globalStorage"`).
  * 3. Returns `undefined` quickly when the feature is disabled — no entry
  *    rendering, no I/O, no allocation. The hot path pays nothing.
  * 4. Constructs a short-lived {@link CopilotMdWriter} per export with the
@@ -34,8 +35,9 @@ export class CopilotMdManager {
     private static _instance: CopilotMdManager | undefined;
 
     /**
-     * The extension context. Used to resolve `globalStorageUri` (the default
-     * destination) and to register disposables.
+     * The extension context. Used to resolve the destination roots
+     * (`storageUri` for the default workspace destination, `globalStorageUri`
+     * for the opt-in) and to register disposables.
      */
     private context: vscode.ExtensionContext | undefined;
 

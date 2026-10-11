@@ -101,7 +101,7 @@ suite("renderCopilotMd", () => {
         assert.ok(md.includes("maxPromptTokens  : 8192"));
         assert.ok(md.includes("maxResponseTokens: 1024"));
         assert.ok(md.includes("location         : 1"));
-        assert.ok(md.includes("otherOptions     : {\"stream\":true}"));
+        assert.ok(md.includes('otherOptions     : {"stream":true}'));
         assert.ok(md.includes("intent           : undefined"));
         assert.ok(md.includes("startTime        : 2026-07-26T10:00:00.000Z"));
         assert.ok(md.includes("endTime          : 2026-07-26T10:00:05.000Z"));
@@ -363,10 +363,8 @@ suite("renderCopilotMd", () => {
         // this test is a no-op (the parts are silently skipped). That's
         // acceptable because the production behavior is verified by the
         // real .copilotmd exports.
-        const ThinkingPart = (vscode as unknown as Record<string, unknown>)
-            .LanguageModelThinkingPart as
-            | (new (value: string | string[], id?: string, metadata?: Record<string, unknown>) => unknown)
-            | undefined;
+        const ThinkingPart = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart as
+            (new (value: string | string[], id?: string, metadata?: Record<string, unknown>) => unknown) | undefined;
         if (!ThinkingPart) {
             // Class not available in this test host — skip silently.
             return;
@@ -423,10 +421,7 @@ suite("renderCopilotMd", () => {
         // line has `"completion_tokens":50`, so `"completion_tokens":5` would
         // be a prefix match and give a false positive; use the exact value
         // including the closing brace to avoid the prefix trap.
-        assert.ok(
-            !md.includes('"completion_tokens":5}'),
-            "usage payload leaked into response body"
-        );
+        assert.ok(!md.includes('"completion_tokens":5}'), "usage payload leaked into response body");
     });
 
     test("renders the trailing <style> block verbatim", () => {
@@ -513,10 +508,7 @@ suite("computeSessionFingerprint", () => {
                 name: undefined,
             },
         ];
-        assert.notStrictEqual(
-            await computeSessionFingerprint(messages1),
-            await computeSessionFingerprint(messages2)
-        );
+        assert.notStrictEqual(await computeSessionFingerprint(messages1), await computeSessionFingerprint(messages2));
     });
 
     test("skips leading System messages (agent instructions are identical across sessions in a mode)", async () => {

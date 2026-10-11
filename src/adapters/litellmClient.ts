@@ -12,7 +12,6 @@ import { transformToResponsesFormat } from "./responsesAdapter";
 import { Logger } from "../utils/logger";
 import { isAnthropicModel } from "../utils/modelUtils";
 import { LiteLLMTelemetry } from "../utils/telemetry";
-import type { TelemetryService } from "../telemetry/telemetryService";
 
 /**
  * Error thrown when a /model/info discovery request times out.
@@ -27,8 +26,6 @@ class DiscoveryTimeoutError extends Error {
 }
 
 export class LiteLLMClient {
-    private _telemetryService?: TelemetryService;
-
     private static readonly DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
     private static readonly DEFAULT_RATE_LIMIT_MAX_DELAY_MS = 120_000;
 
@@ -36,10 +33,6 @@ export class LiteLLMClient {
         private readonly config: LiteLLMClientConfig,
         private readonly userAgent: string
     ) {}
-
-    public setTelemetryService(service: TelemetryService): void {
-        this._telemetryService = service;
-    }
 
     /**
      * Fetches model information from the LiteLLM proxy.
@@ -88,10 +81,6 @@ export class LiteLLMClient {
                 throw controller.signal.reason;
             }
 
-            if (this._telemetryService) {
-                const errorType = err instanceof Error ? err.name : "FetchError";
-                this._telemetryService.captureConnectionError("getModelInfo", errorType);
-            }
             throw err;
         } finally {
             clearTimeout(timer);
@@ -158,28 +147,20 @@ export class LiteLLMClient {
         }
 
         Logger.trace(`Counting tokens for model ${request.model} at ${this.config.url}/utils/token_counter`);
-        try {
-            const resp = await fetch(`${this.config.url}/utils/token_counter`, {
-                method: "POST",
-                headers: this.getHeaders(),
-                body: JSON.stringify(request),
-                signal: controller.signal,
-            });
+        const resp = await fetch(`${this.config.url}/utils/token_counter`, {
+            method: "POST",
+            headers: this.getHeaders(),
+            body: JSON.stringify(request),
+            signal: controller.signal,
+        });
 
-            if (!resp.ok) {
-                const errorText = await resp.text();
-                Logger.error(`Failed to count tokens: ${resp.status} ${resp.statusText} - ${errorText}`);
-                throw new Error(`Failed to count tokens: ${resp.status} ${resp.statusText}`);
-            }
-
-            return resp.json() as Promise<LiteLLMTokenCounterResponse>;
-        } catch (err) {
-            if (this._telemetryService) {
-                const errorType = err instanceof Error ? err.name : "FetchError";
-                this._telemetryService.captureConnectionError("countTokens", errorType);
-            }
-            throw err;
+        if (!resp.ok) {
+            const errorText = await resp.text();
+            Logger.error(`Failed to count tokens: ${resp.status} ${resp.statusText} - ${errorText}`);
+            throw new Error(`Failed to count tokens: ${resp.status} ${resp.statusText}`);
         }
+
+        return resp.json() as Promise<LiteLLMTokenCounterResponse>;
     }
 
     /**
@@ -217,24 +198,15 @@ export class LiteLLMClient {
         }
 
         Logger.trace(`Sending chat request to ${endpoint}`, { model: request.model });
-        let response: Response;
-        try {
-            response = await this.fetchWithRateLimit(
-                `${this.config.url}${endpoint}`,
-                {
-                    method: "POST",
-                    headers: this.getHeaders(request.model, modelInfo),
-                    body: JSON.stringify(body),
-                },
-                { token }
-            );
-        } catch (err) {
-            if (this._telemetryService) {
-                const errorType = err instanceof Error ? err.name : "FetchError";
-                this._telemetryService.captureConnectionError("chat", errorType);
-            }
-            throw err;
-        }
+        let response: Response = await this.fetchWithRateLimit(
+            `${this.config.url}${endpoint}`,
+            {
+                method: "POST",
+                headers: this.getHeaders(request.model, modelInfo),
+                body: JSON.stringify(body),
+            },
+            { token }
+        );
 
         // Handle unsupported parameters by stripping them and retrying once
         if (response.status === 400) {
@@ -341,9 +313,6 @@ export class LiteLLMClient {
         if (!response.ok) {
             const errorText = await response.text();
             Logger.error(`LiteLLM API error: ${response.status} ${response.statusText}`, errorText);
-            if (this._telemetryService && response.status === 429) {
-                this._telemetryService.captureQuotaError(request.model, "chat");
-            }
             throw new Error(`LiteLLM API error: ${response.status} ${response.statusText}\n${errorText}`);
         }
 

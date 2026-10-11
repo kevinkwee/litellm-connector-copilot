@@ -62,37 +62,6 @@ export interface LogEvent {
 }
 
 /**
- * Hook points in the request lifecycle.
- */
-export type HookPoint =
-    "before:prepare" | "before:transform" | "before:transmit" | "after:transmit" | "after:receive" | "after:transform";
-
-/**
- * Context passed to hook handlers.
- */
-export interface HookContext {
-    /** Stable request ID */
-    requestId: string;
-    /** Model ID */
-    modelId: string;
-    /** Endpoint path */
-    endpoint: string;
-    /** Caller context */
-    caller: string;
-    /** Current request payload (undefined after transmit) */
-    request?: Record<string, unknown>;
-    /** Current response payload (undefined before receive) */
-    response?: Record<string, unknown>;
-    /** Additional metadata */
-    metadata: Record<string, unknown>;
-}
-
-/**
- * Hook handler function signature.
- */
-export type HookHandler = (point: HookPoint, context: HookContext) => void | Promise<void>;
-
-/**
  * Audit summary for a completed request.
  */
 export interface AuditSummary {
@@ -120,28 +89,4 @@ export interface AuditSummary {
     warnings: string[];
     /** All events for this request */
     events: LogEvent[];
-}
-
-/**
- * Telemetry metric for reporting.
- */
-export interface TelemetryMetric {
-    /** Stable request ID */
-    requestId: string;
-    /** Model ID */
-    model: string;
-    /** Duration in milliseconds */
-    durationMs?: number;
-    /** Input tokens */
-    tokensIn?: number;
-    /** Output tokens */
-    tokensOut?: number;
-    /** Status */
-    status: "success" | "failure" | "caching_bypassed";
-    /** Error message (if failure) */
-    error?: string;
-    /** Caller context */
-    caller?: string;
-    /** Endpoint path */
-    endpoint?: string;
 }

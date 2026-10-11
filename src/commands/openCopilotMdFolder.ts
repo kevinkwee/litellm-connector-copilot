@@ -3,9 +3,9 @@
  *
  * Reveals the directory where `.copilotmd` request logs are being written,
  * so the user can browse them in the OS file explorer without having to
- * know the path. Handles both `globalStorage` (the default, hidden in the
- * extension's data dir) and `workspace` destinations, and gracefully
- * degrades when no `.copilotmd` files have been written yet.
+ * know the path. Handles both `workspace` (the default, VS Code's hidden
+ * per-workspace extension storage) and `globalStorage` destinations, and
+ * gracefully degrades when no `.copilotmd` files have been written yet.
  */
 
 import * as vscode from "vscode";
@@ -21,7 +21,7 @@ export function registerOpenCopilotMdFolderCommand(): vscode.Disposable {
     return vscode.commands.registerCommand("litellm-connector.openCopilotMdFolder", async () => {
         const config = vscode.workspace.getConfiguration("litellm-connector.debug.copilotMdExport");
         const enabled = config.get<boolean>("enabled", false);
-        const destination = config.get<CopilotMdDestination>("destination", "globalStorage");
+        const destination = config.get<CopilotMdDestination>("destination", "workspace");
 
         if (!enabled) {
             const enable = await vscode.window.showInformationMessage(

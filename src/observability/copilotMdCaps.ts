@@ -55,13 +55,17 @@ export function selectFilesForDeletion(files: FileMeta[], caps: CapsConfig): Fil
     if (caps.maxFilesPerSession > 0) {
         const bySession = new Map<string, FileMeta[]>();
         for (const f of files) {
-            if (toDelete.has(f.uri)) {continue;}
+            if (toDelete.has(f.uri)) {
+                continue;
+            }
             const bucket = bySession.get(f.sessionFingerprint) ?? [];
             bucket.push(f);
             bySession.set(f.sessionFingerprint, bucket);
         }
         for (const bucket of bySession.values()) {
-            if (bucket.length <= caps.maxFilesPerSession) {continue;}
+            if (bucket.length <= caps.maxFilesPerSession) {
+                continue;
+            }
             // Sort oldest first; delete the leading overflow.
             bucket.sort(byMtimeAsc);
             const overflow = bucket.length - caps.maxFilesPerSession;
@@ -78,7 +82,9 @@ export function selectFilesForDeletion(files: FileMeta[], caps: CapsConfig): Fil
     if (caps.maxSessions > 0) {
         const sessionNewestMtime = new Map<string, number>();
         for (const f of files) {
-            if (toDelete.has(f.uri)) {continue;}
+            if (toDelete.has(f.uri)) {
+                continue;
+            }
             const current = sessionNewestMtime.get(f.sessionFingerprint) ?? -Infinity;
             if (f.mtimeMs > current) {
                 sessionNewestMtime.set(f.sessionFingerprint, f.mtimeMs);
@@ -86,11 +92,11 @@ export function selectFilesForDeletion(files: FileMeta[], caps: CapsConfig): Fil
         }
         const sortedSessions = [...sessionNewestMtime.entries()].sort((a, b) => b[1] - a[1]);
         if (sortedSessions.length > caps.maxSessions) {
-            const dropped = new Set(
-                sortedSessions.slice(caps.maxSessions).map(([fp]) => fp)
-            );
+            const dropped = new Set(sortedSessions.slice(caps.maxSessions).map(([fp]) => fp));
             for (const f of files) {
-                if (toDelete.has(f.uri)) {continue;}
+                if (toDelete.has(f.uri)) {
+                    continue;
+                }
                 if (dropped.has(f.sessionFingerprint)) {
                     toDelete.set(f.uri, f);
                 }
@@ -108,7 +114,9 @@ export function selectFilesForDeletion(files: FileMeta[], caps: CapsConfig): Fil
             survivors.sort(byMtimeAsc);
             let remaining = totalBytes;
             for (const f of survivors) {
-                if (remaining <= caps.maxTotalBytes) {break;}
+                if (remaining <= caps.maxTotalBytes) {
+                    break;
+                }
                 toDelete.set(f.uri, f);
                 remaining -= f.sizeBytes;
             }

@@ -6,7 +6,6 @@ import type { ConfigManager } from "../../config/configManager";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types";
 import { createMockSecrets } from "../../test/utils/testMocks";
 import { EffortFallbackCache } from "../../utils/reasoningEffortFallback";
-import { createTelemetryMocks } from "../../test/utils/telemetryMock";
 import { getModelTags } from "../../utils/modelCapabilities";
 import type { DerivedModelCapabilities } from "../../utils/modelCapabilities";
 import type { BackendSession } from "../backendSession";
@@ -158,7 +157,6 @@ function seedBackendForCall(
 
 suite("LiteLLMProviderBase", () => {
     let sandbox: sinon.SinonSandbox;
-    let telemetryMocks: ReturnType<typeof createTelemetryMocks>;
 
     const mockSecrets = createMockSecrets({
         "litellm-connector.baseUrl": "http://localhost:4000",
@@ -169,12 +167,9 @@ suite("LiteLLMProviderBase", () => {
 
     setup(() => {
         sandbox = sinon.createSandbox();
-        telemetryMocks = createTelemetryMocks(sandbox);
-        telemetryMocks.setup();
     });
 
     teardown(() => {
-        telemetryMocks.teardown();
         sandbox.restore();
     });
 

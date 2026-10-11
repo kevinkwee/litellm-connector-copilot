@@ -45,10 +45,4 @@ suite("LiteLLMCommitMessageProvider", () => {
         // No discovery has run, so the registry has no capability cache entry.
         assert.strictEqual(provider.getModelInfo("unknown-model"), undefined);
     });
-
-    test("setTelemetryService stores the telemetry service for the base pipeline", () => {
-        const provider = new LiteLLMCommitMessageProvider(mockSecrets, userAgent);
-        provider.setTelemetryService({ captureException: sandbox.stub() } as never);
-        assert.ok(provider);
-    });
 });

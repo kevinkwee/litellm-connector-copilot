@@ -2,7 +2,6 @@ import * as assert from "assert";
 import * as vscode from "vscode";
 import * as sinon from "sinon";
 import { ConfigManager } from "../configManager";
-import type { TelemetryService } from "../../telemetry/telemetryService";
 
 suite("ConfigManager Unit Tests", () => {
     let mockSecrets: vscode.SecretStorage;
@@ -141,36 +140,6 @@ suite("ConfigManager Unit Tests", () => {
         assert.ok(session);
         const clientConfig = (session?.client as unknown as { config: { discoveryTimeoutMs?: number } }).config;
         assert.strictEqual(clientConfig.discoveryTimeoutMs, 5_000);
-    });
-
-    test("reportFeatureToggles calls telemetry service with correct toggles", async () => {
-        const manager = new ConfigManager(mockSecrets);
-        const captureStub = sinon.stub();
-        const telemetryMock = {
-            captureFeatureToggled: captureStub,
-        } as unknown as TelemetryService;
-        manager.setTelemetryService(telemetryMock);
-
-        settingsMap.set("litellm-connector.commitModelIdOverride", "gpt-4");
-        settingsMap.set("litellm-connector.disableCaching", false);
-        settingsMap.set("litellm-connector.disableQuotaToolRedaction", false);
-
-        settingsMap.set("litellm-connector.forceResponsesEndpoint", true);
-        settingsMap.set("litellm-connector.allowChatCompletionsFallback", true);
-
-        await manager.reportFeatureToggles("test_source");
-
-        assert.strictEqual(captureStub.callCount, 4);
-        assert.ok(captureStub.calledWith("commit-message", true, "test_source"));
-        assert.ok(captureStub.calledWith("caching", true, "test_source"));
-        assert.ok(captureStub.calledWith("quota-tool-redaction", true, "test_source"));
-        assert.ok(captureStub.calledWith("auto-trim-messages", false, "test_source"));
-    });
-
-    test("reportFeatureToggles is a no-op without telemetry service", async () => {
-        const manager = new ConfigManager(mockSecrets);
-        // This should not throw
-        await manager.reportFeatureToggles("test");
     });
 
     test("should read forceResponsesEndpoint from workspace settings", async () => {

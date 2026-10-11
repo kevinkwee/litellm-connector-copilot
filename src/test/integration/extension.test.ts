@@ -5,7 +5,6 @@ import * as sinon from "sinon";
 import * as extension from "../../extension";
 import * as providers from "../../providers";
 import { Logger } from "../../utils/logger";
-import { TelemetryService } from "../../telemetry/telemetryService";
 import { createMockSecrets, createMockOutputChannel, createMockMemento } from "../utils/testMocks";
 
 /**
@@ -28,7 +27,6 @@ function stubActivationEnvironment(
     refreshStub: sinon.SinonStub;
     showInfoStub: sinon.SinonStub;
     configChangeHandler: () => ((e: vscode.ConfigurationChangeEvent) => void) | undefined;
-    telemetry: ReturnType<typeof stubTelemetryService>;
 } {
     sandbox.stub(vscode.window, "createOutputChannel").returns(createMockOutputChannel());
     sandbox.stub(vscode.extensions, "getExtension").returns({ packageJSON: { version: "1.2.3" } } as never);
@@ -39,7 +37,6 @@ function stubActivationEnvironment(
     sandbox.stub(vscode.commands, "registerCommand").returns({ dispose() {} } as vscode.Disposable);
     const executeCommandStub = sandbox.stub(vscode.commands, "executeCommand").resolves(undefined);
     const refreshStub = sandbox.stub(providers.LiteLLMChatProvider.prototype, "refreshModelInformation");
-    sandbox.stub(providers.LiteLLMChatProvider.prototype, "setTelemetryService");
 
     let capturedConfigHandler: ((e: vscode.ConfigurationChangeEvent) => void) | undefined;
     sandbox.stub(vscode.workspace, "onDidChangeConfiguration").callsFake((listener) => {
@@ -53,27 +50,6 @@ function stubActivationEnvironment(
         refreshStub,
         showInfoStub,
         configChangeHandler: () => capturedConfigHandler,
-        telemetry: stubTelemetryService(sandbox),
-    };
-}
-
-/**
- * Stubs `TelemetryService` at the prototype level so every instance the
- * `activate` function constructs will funnel its capture*() calls into the
- * sinon stubs we return. Tests can then assert on telemetry side-effects
- * without standing up a real PostHog adapter.
- */
-function stubTelemetryService(sandbox: sinon.SinonSandbox): {
-    captureException: sinon.SinonStub;
-    captureExtensionActivated: sinon.SinonStub;
-    captureFeatureAdoption: sinon.SinonStub;
-    captureFeatureUsageSnapshot: sinon.SinonStub;
-} {
-    return {
-        captureException: sandbox.stub(TelemetryService.prototype, "captureException"),
-        captureExtensionActivated: sandbox.stub(TelemetryService.prototype, "captureExtensionActivated"),
-        captureFeatureAdoption: sandbox.stub(TelemetryService.prototype, "captureFeatureAdoption"),
-        captureFeatureUsageSnapshot: sandbox.stub(TelemetryService.prototype, "captureFeatureUsageSnapshot"),
     };
 }
 
@@ -97,7 +73,7 @@ function createContextWithState(
 /**
  * Activates the extension under the given context.  The activation is
  * intercepted by the suite-level `setup` hook, which records the context
- * for teardown disposal (which detaches the process error listeners).
+ * for teardown disposal.
  */
 function activateAndTrack(context: vscode.ExtensionContext): void {
     extension.activate(context);
@@ -130,9 +106,9 @@ suite("Extension Activation Unit Tests", () => {
     });
 
     teardown(async () => {
-        // Dispose every context registered during the test so process
-        // listeners (uncaughtException / unhandledRejection) get detached
-        // before the next test stubs the same APIs again.
+        // Dispose every context registered during the test so activation
+        // subscriptions are cleaned up before the next test stubs the same
+        // APIs again.
         for (const ctx of activeContexts) {
             for (const sub of ctx.subscriptions) {
                 try {
@@ -330,105 +306,6 @@ suite("Extension Activation Unit Tests", () => {
     // Bulk coverage tests for the remaining extension.ts lines. Each test in
     // the suite below covers multiple uncovered branches in `activate` to keep
     // the test count small while raising line/branch coverage.
-
-    test("activate wires process error listeners and removes them on dispose", async () => {
-        const context = createContextWithState(sandbox);
-        const env = stubActivationEnvironment(sandbox, context);
-        // Capture the listeners that `activate` registers on `process` so we
-        // can call them directly.  We intercept `process.on` for our two
-        // events of interest only; all other `process.on` calls (e.g. Node
-        // internals) flow through the real `process.on` so the event loop
-        // continues to function.
-        const captured: Record<string, ((...args: unknown[]) => void)[]> = {
-            uncaughtException: [],
-            unhandledRejection: [],
-        };
-        const realOn = process.on.bind(process);
-        const onStub = ((event: string | symbol, listener: (...args: unknown[]) => void): NodeJS.Process => {
-            if (event === "uncaughtException" || event === "unhandledRejection") {
-                captured[event as "uncaughtException" | "unhandledRejection"].push(listener);
-            }
-            return realOn(event as Parameters<typeof process.on>[0], listener as Parameters<typeof process.on>[1]);
-        }) as never;
-        sandbox.stub(process, "on").callsFake(onStub);
-
-        activateAndTrack(context);
-
-        // Fire each captured listener directly with matching/non-matching input.
-        // This avoids triggering Mocha's own uncaughtException handler, which
-        // would fail the test.
-        const fireOn = (event: "uncaughtException" | "unhandledRejection", payload: unknown): void => {
-            for (const listener of captured[event]) {
-                listener(payload);
-            }
-        };
-
-        const uncaught = new Error("boom");
-        uncaught.stack = "Error: boom\n    at litellm-connector-copilot:1:1";
-        fireOn("uncaughtException", uncaught);
-
-        const rejection = new Error("rej");
-        rejection.stack = "Error: rej\n    at litellm-connector:1:1";
-        fireOn("unhandledRejection", rejection);
-
-        // Non-Error rejection (must not crash, must not call capture).
-        fireOn("unhandledRejection", "plain string");
-
-        // Unrelated stack must be ignored.
-        const unrelated = new Error("unrelated");
-        unrelated.stack = "Error: unrelated\n    at other:1:1";
-        fireOn("uncaughtException", unrelated);
-
-        // Allow any microtasks queued by the listener bodies to drain.
-        await new Promise((resolve) => setImmediate(resolve));
-
-        // The capture calls should be exactly 2 (uncaught + rejection) with
-        // the matching caller names.
-        const calls = env.telemetry.captureException.getCalls();
-        const callers = calls.map((c) => (c.args[1] as { caller?: string } | undefined)?.caller);
-        assert.ok(
-            callers.includes("uncaughtException"),
-            "uncaughtException listener should fire telemetry with the scoped caller"
-        );
-        assert.ok(
-            callers.includes("unhandledRejection"),
-            "unhandledRejection listener should fire telemetry with the scoped caller"
-        );
-        assert.strictEqual(calls.length, 2, "unrelated stacks and non-Error rejections must be ignored");
-
-        // Exercise the dispose callback that detaches the listeners by
-        // disposing every subscription registered on the context.  Verify
-        // the detachment by checking that `process.listeners` no longer
-        // contains the original listeners (a stable identity comparison
-        // against the references we captured).
-        const preDetach = {
-            uncaughtException: process.listeners("uncaughtException").slice(),
-            unhandledRejection: process.listeners("unhandledRejection").slice(),
-        };
-        for (const sub of context.subscriptions) {
-            sub.dispose();
-        }
-        const postDetach = {
-            uncaughtException: process.listeners("uncaughtException"),
-            unhandledRejection: process.listeners("unhandledRejection"),
-        };
-        for (const capturedListener of captured.uncaughtException) {
-            assert.strictEqual(
-                postDetach.uncaughtException.includes(capturedListener as NodeJS.UncaughtExceptionListener),
-                false,
-                "uncaughtException listener should be detached after dispose"
-            );
-        }
-        for (const capturedListener of captured.unhandledRejection) {
-            assert.strictEqual(
-                postDetach.unhandledRejection.includes(capturedListener as NodeJS.UnhandledRejectionListener),
-                false,
-                "unhandledRejection listener should be detached after dispose"
-            );
-        }
-        // preDetach is referenced for readability; mark as used.
-        assert.ok(preDetach, "captured pre-dispose listener list");
-    });
 
     test("activate fires the post-registration refresh and tracks the provider registration in subscriptions", async () => {
         const ctx = createContextWithState(sandbox);
