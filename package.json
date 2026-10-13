@@ -376,7 +376,13 @@
 	},
 	"icon": "assets/logo.png",
 	"preview": true,
+	"capabilities": {
+		"agentsWindow": {
+			"supported": true
+		}
+	},
 	"enabledApiProposals": [
+		"agentsWindowActivation",
 		"chatProvider",
 		"languageModelCapabilities",
 		"languageModelPricing",

@@ -45,6 +45,11 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Removed upstream's PostHog telemetry pipeline, marketplace packaging, CI/CD, and community scaffolding. Local metric logging and structured logging remain.
 - `npm run bump-version dev` now emits semver-correct dotted prerelease tags (e.g. `2.1.10-dev.11`).
 
+### Agents window (Copilot SDK harness) compatibility
+- The manifest declares `capabilities.agentsWindow.supported: true` plus the `agentsWindowActivation` API proposal, so the extension runs in the Agents window even when no editor window is open there.
+- Requires `chat.agentHost.byokModels.enabled` to be on (default). If it is off, re-enable it, because the Agents window loads BYOK models only through that bridge. Separately, models surface only when `extensions.experimental.enableAgentsWindowCapability` is on (default). If that setting is off, or your VS Code build predates it, add the explicit override: `"extensions.supportAgentsWindow": { "GethNet.litellm-connector-copilot": true }`.
+- Streaming limitation: in Agents window (Agent Host) sessions, responses arrive as one block after generation instead of incrementally. This is a VS Code buffering limitation, not a connector bug. The connector streams normally in editor-window chat. Tracked upstream in microsoft/vscode#339493. Related caveats: BYOK models may be rejected for subagents (microsoft/vscode#333802) and BYOK over SSH hosts is unsupported (microsoft/vscode#325738).
+
 ## Building locally
 
 On Windows, run npm scripts from Git Bash because the `clean` scripts use Unix `find`.

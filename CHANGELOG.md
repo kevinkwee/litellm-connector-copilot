@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### ✨ Features
+
+* **🪟 Agents window (Copilot SDK harness) compatibility**: The manifest now declares `capabilities.agentsWindow.supported: true` with the `agentsWindowActivation` API proposal, so the code-carrying extension runs in Agents window sessions and its models appear in the model picker even when no editor window is open. Previously VS Code disabled code-carrying extensions there by default, which read as "extension off". (`package.json`)
+    * Requires `chat.agentHost.byokModels.enabled` (default on). If it is off, re-enable it, because the Agents window loads BYOK models only through that bridge.
+    * Models surface when `extensions.experimental.enableAgentsWindowCapability` is on (default on). If it is off, the explicit override for the extension-enablement gate is `"extensions.supportAgentsWindow": { "GethNet.litellm-connector-copilot": true }`.
+    * Known upstream limitation: Agent Host sessions buffer the whole completion before rendering, so responses arrive in one block instead of streaming incrementally (microsoft/vscode#339493). Editor-window chat streams normally.
+
 ### 🧹 Chores
 
 * **📚 AGENTS.md restructured to a lean template**: The agent instructions were rebuilt around a standard template, and the strict TDD mandates were removed in favor of the general regression-testing standards. (`AGENTS.md`)
