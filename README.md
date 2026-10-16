@@ -35,6 +35,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - `normalizeToolCallId` only treats a leading `fc_` as a provider prefix and varies the padding filler, preventing dropped or duplicated tool call ids on repeated runs.
 - Request errors are surfaced as response text instead of thrown exceptions, and the streaming cancellation listener is disposed when the stream ends.
 - `discoveryTimeoutMs` is passed through to per-session clients.
+- Model discovery applies LiteLLM's paused-model rule: deployments a proxy admin paused (`model_info.blocked`) are dropped during `/model/info` discovery, a public model name stays listed while at least one of its deployments is live, and each name is listed once.
 
 ### New settings
 - `litellm-connector.autoTrimMessages` (opt-in, off by default): trims older messages to fit the model input token budget, covering both the proactive per-request trim and the recovery retry after a context-overflow rejection.

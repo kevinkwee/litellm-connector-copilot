@@ -687,7 +687,7 @@ The `BackendRegistry` (class `LiteLLMProviderRegistry` in `src/providers/litellm
 The contract is **public read, internal write**:
 
 - **Public surface (read + ingress)**:
-  - `discoverModels(options, token)`: the only way for VS Code (or any consumer) to fetch a model list and populate the registry. The registry owns the HTTP fetch, the namespacing (`<routing>/<rawModel>` ids), and the change detection. Consumers see a single ingress that returns the model list, updates the registry, and fires the change event as a unit.
+  - `discoverModels(options, token)`: the only way for VS Code (or any consumer) to fetch a model list and populate the registry. The registry owns the HTTP fetch, the namespacing (`<routing>/<rawModel>` ids), and the change detection. Consumers see a single ingress that returns the model list, updates the registry, and fires the change event as a unit. Discovery applies LiteLLM's paused-model listing rule (see `toListableDeployments`): deployments with `model_info.blocked === true` are dropped, each public `model_name` is listed once from its first live deployment, and a name whose every deployment is paused is hidden.
   - `lookup(id)`: resolve a namespaced id to its routing entry (`{baseUrl, apiKey, rawModelName, routingIdentity}`). The response path uses this as the fallback when VS Code does not pass the per-group BYOK config on the call.
   - `extractRawName(id)`: strip the routing prefix from a namespaced id.
   - `getModelInfo(id)` / `getDerivedCapabilities(id)`: read the per-model capability caches populated during discovery. These are NOT a model-list cache. They cache the capability info for known models and feed the request hot path.

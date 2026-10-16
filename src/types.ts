@@ -274,6 +274,13 @@ export interface LiteLLMModelInfo {
     id?: string;
     db_model?: boolean;
     key?: string;
+    /**
+     * Admin pause flag, the same field as LiteLLM_ProxyModelTable.blocked on
+     * the proxy. Deployments with this flag true are hidden from the model
+     * picker; a public model_name with at least one non-paused deployment
+     * stays listable.
+     */
+    blocked?: boolean | null;
     max_tokens?: number;
     max_input_tokens?: number;
     max_output_tokens?: number;
