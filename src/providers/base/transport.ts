@@ -17,17 +17,20 @@ export class Transport {
     private readonly configManager: TransportDeps["configManager"];
     private readonly userAgent: string;
     private readonly logger: TransportDeps["logger"];
+    private readonly onUnsupportedParameter?: TransportDeps["onUnsupportedParameter"];
     private readonly liteLLMClientFactory: (backend: {
         url: string;
         key?: string;
         disableCaching?: boolean;
         rateLimitMaxDelayMs?: number;
+        onUnsupportedParameter?: (model: string, param: string) => void;
     }) => LiteLLMClient;
 
     constructor(deps: TransportDeps) {
         this.configManager = deps.configManager;
         this.userAgent = deps.userAgent;
         this.logger = deps.logger;
+        this.onUnsupportedParameter = deps.onUnsupportedParameter;
         this.liteLLMClientFactory =
             deps.liteLLMClientFactory ??
             ((backend) =>
@@ -37,6 +40,7 @@ export class Transport {
                         key: backend.key,
                         disableCaching: backend.disableCaching,
                         rateLimitMaxDelayMs: backend.rateLimitMaxDelayMs,
+                        onUnsupportedParameter: backend.onUnsupportedParameter,
                     },
                     this.userAgent
                 ));
@@ -116,7 +120,13 @@ export class Transport {
         this.logger.trace(
             `[transport.sendRequestToLiteLLM] Creating client: baseUrl=${baseUrl}, timeout=${modelInfo?.timeout ?? "default"}ms, disableCaching=${disableCaching}`
         );
-        const client = this.liteLLMClientFactory({ url: baseUrl, key: apiKey, disableCaching, rateLimitMaxDelayMs });
+        const client = this.liteLLMClientFactory({
+            url: baseUrl,
+            key: apiKey,
+            disableCaching,
+            rateLimitMaxDelayMs,
+            onUnsupportedParameter: this.onUnsupportedParameter,
+        });
 
         this.logger.info(
             `[transport.sendRequestToLiteLLM] Sending request to LiteLLM: model=${request.model} caller=${caller} streaming=true`

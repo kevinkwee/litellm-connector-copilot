@@ -216,8 +216,10 @@ export class LiteLLMClient {
             if (
                 errorLower.includes("unsupported parameter") ||
                 errorLower.includes("unknown parameter") ||
+                errorLower.includes("unrecognized request argument") ||
                 errorLower.includes("extra_headers") ||
                 errorLower.includes("no-cache") ||
+                errorLower.includes("cache_control") ||
                 errorLower.includes("unexpected keyword argument")
             ) {
                 Logger.warn(`Detected unsupported parameters for ${request.model}, attempting to strip and retry.`);
@@ -230,10 +232,19 @@ export class LiteLLMClient {
                 // Cast to unknown first for index signature access
                 const stripedAsAny = strippedBody as unknown as Record<string, unknown>;
 
-                // 1. Handle explicit mentions of parameters in the error message
+                // 1a. Handle explicit mentions of parameters in the error message
                 // Common patterns: "unsupported parameter: 'temperature'", "unexpected keyword argument 'top_p'"
                 const paramMatch = errorText.match(/(?:parameter|argument|key)\s+['"]?([a-zA-Z0-9_-]+)['"]?/i);
-                if (paramMatch && paramMatch[1]) {
+
+                // 1b. Anthropic prompt-caching marker: strip it whenever the error
+                // names it, regardless of message shape. Provider and pydantic
+                // errors both reference the raw field name, while the generic
+                // regex above misses wrapped forms like "parameter: 'cache_control'".
+                if (errorLower.includes("cache_control")) {
+                    Logger.info(`Stripping ${request.model} prompt-caching marker: cache_control rejected`);
+                    delete stripedAsAny.cache_control;
+                    this.config.onUnsupportedParameter?.(request.model, "cache_control");
+                } else if (paramMatch && paramMatch[1]) {
                     const paramName = paramMatch[1];
                     Logger.info(`Stripping specific parameter: ${paramName}`);
                     delete stripedAsAny[paramName];

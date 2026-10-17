@@ -27,6 +27,12 @@ export interface RequestBuilderDeps {
         modelId?: string
     ) => void;
     isParameterSupported: (param: string, modelInfo: LiteLLMModelInfo | undefined, modelId?: string) => boolean;
+    /**
+     * Parameters a live 400 taught us to omit for this raw model id. Fed by
+     * the registry's learned-unsupported store so a single failed request
+     * short-circuits later ones.
+     */
+    getUnsupportedParameters: (modelId: string) => ReadonlySet<string>;
     getTelemetryOptions: (options: vscode.ProvideLanguageModelChatResponseOptions) => {
         caller?: string;
         justification?: string;
@@ -58,7 +64,14 @@ export interface TransportDeps {
         key?: string;
         disableCaching?: boolean;
         rateLimitMaxDelayMs?: number;
+        onUnsupportedParameter?: (model: string, param: string) => void;
     }) => LiteLLMClient;
+    /**
+     * Forwarded into every per-request LiteLLMClient. Called by the client's
+     * 400 strip-and-retry path so the owning provider can persist learned
+     * parameter incompatibilities (registry `recordUnsupportedParameter`).
+     */
+    onUnsupportedParameter?: (model: string, param: string) => void;
 }
 
 export interface SendRequestArgs {

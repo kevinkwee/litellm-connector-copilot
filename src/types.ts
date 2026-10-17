@@ -27,6 +27,22 @@ export interface OpenAIChatMessageContentItem {
 }
 
 /**
+ * Anthropic thinking block carried on assistant messages. Only signed or
+ * safety-redacted blocks are sent; unsigned reasoning text travels via
+ * `reasoning_content`, which LiteLLM maps for reasoning-native providers.
+ * LiteLLM forwards these blocks to Anthropic's Messages API verbatim.
+ */
+export interface OpenAIThinkingBlock {
+    type: "thinking" | "redacted_thinking";
+    /** Visible thinking text; empty for omitted-display and absent for redacted blocks. */
+    thinking?: string;
+    /** Anthropic signature verifying the block was model-generated. */
+    signature?: string;
+    /** Opaque encrypted payload of a redacted thinking block. */
+    data?: string;
+}
+
+/**
  * OpenAI-style chat message used for router requests.
  */
 export interface OpenAIChatMessage {
@@ -48,6 +64,13 @@ export interface OpenAIChatMessage {
      * See: https://docs.litellm.ai/docs/reasoning_content
      */
     reasoning_content?: string;
+    /**
+     * Signed or redacted Anthropic thinking blocks replayed into tool loops.
+     * Set only when the response carried verifiable (signed or redacted)
+     * blocks; when present, `reasoning_content` is omitted because LiteLLM's
+     * Anthropic transform reads only these blocks.
+     */
+    thinking_blocks?: OpenAIThinkingBlock[];
 }
 
 /**
@@ -155,6 +178,13 @@ export interface LiteLLMParams {
 export interface LiteLLMConfig {
     inactivityTimeout?: number;
     disableCaching?: boolean;
+    /**
+     * Anthropic prompt-caching TTL for Claude requests. Adds a top-level
+     * `cache_control` directive so the proxy marks the request for prompt
+     * caching. Unrelated to `disableCaching` (the proxy response cache).
+     * Default: "5m".
+     */
+    anthropicPromptCaching?: AnthropicPromptCachingMode;
     disableQuotaToolRedaction?: boolean;
     /**
      * Enable/disable the model override system.
@@ -265,6 +295,12 @@ export interface LiteLLMClientConfig {
      * Default: 120000. Set to 0 to disable rate-limit retries.
      */
     rateLimitMaxDelayMs?: number;
+    /**
+     * Observability hook: invoked when a 400 response forces a parameter to
+     * be stripped and the request retried. Lets callers persist the learned
+     * incompatibility so later requests proactively omit the parameter.
+     */
+    onUnsupportedParameter?: (model: string, param: string) => void;
 }
 
 /**
@@ -361,6 +397,21 @@ export interface LiteLLMTokenCounterResponse {
 }
 
 /**
+ * Anthropic prompt-caching setting. "5m" and "1h" map to the CachePoint TTL
+ * the Claude API charges for cache writes; "off" disables the directive.
+ */
+export type AnthropicPromptCachingMode = "off" | "5m" | "1h";
+
+/**
+ * Anthropic CachePoint directive. `ttl` is omitted for the 5-minute tier
+ * (the API default); the 1-hour tier must be declared explicitly.
+ */
+export interface AnthropicCacheControlDirective {
+    type: "ephemeral";
+    ttl?: "1h";
+}
+
+/**
  * OpenAI-style chat completion request.
  */
 export interface OpenAIChatCompletionRequest {
@@ -376,6 +427,11 @@ export interface OpenAIChatCompletionRequest {
     tools?: OpenAIFunctionToolDef[];
     tool_choice?: string | object;
     stream_options?: { include_usage?: boolean };
+    /**
+     * Anthropic prompt-caching directive forwarded by LiteLLM to the Claude
+     * API for automatic prompt caching. Set only for Anthropic models.
+     */
+    cache_control?: AnthropicCacheControlDirective;
     /**
      * LiteLLM proxy metadata. The proxy reads `metadata.session_id` and
      * promotes it to `litellm_session_id` (see

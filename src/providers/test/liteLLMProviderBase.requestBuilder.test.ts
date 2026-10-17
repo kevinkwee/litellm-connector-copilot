@@ -19,6 +19,7 @@ suite("RequestBuilder", () => {
             detectQuotaToolRedaction: (messages, tools) => ({ tools, confidence: "none" as const }),
             stripUnsupportedParametersFromRequest: () => {},
             isParameterSupported: () => true,
+            getUnsupportedParameters: () => new Set<string>(),
             // Mirrors `LiteLLMProviderBase.getTelemetryOptions`: VS Code's
             // per-model picker selections arrive via `options.modelConfiguration`.
             getTelemetryOptions: (options: vscode.ProvideLanguageModelChatResponseOptions) => ({
@@ -127,6 +128,7 @@ suite("RequestBuilder", () => {
                 detectQuotaToolRedaction: (messages, tools) => ({ tools, confidence: "none" as const }),
                 stripUnsupportedParametersFromRequest: () => {},
                 isParameterSupported: (param: string) => param !== "temperature",
+                getUnsupportedParameters: () => new Set<string>(),
                 getTelemetryOptions: (options: vscode.ProvideLanguageModelChatResponseOptions) => ({
                     caller: "test",
                     justification: undefined,
@@ -194,6 +196,7 @@ suite("RequestBuilder", () => {
             detectQuotaToolRedaction: (messages, tools) => ({ tools, confidence: "none" as const }),
             stripUnsupportedParametersFromRequest: () => {},
             isParameterSupported: (param: string) => param !== "tool_choice", // tool_choice not supported
+            getUnsupportedParameters: () => new Set<string>(),
             getTelemetryOptions: () => ({ caller: "test", justification: undefined, modelConfiguration: {} }),
             usageOptOutModels: new Set(),
             extractRawModelName: (id: string) => {
@@ -332,5 +335,143 @@ suite("RequestBuilder", () => {
         // Only the recent message fits the tiny budget, so the oversized one is dropped.
         assert.strictEqual(req.messages.length, 1);
         assert.strictEqual(req.messages[0].content, "hi");
+    });
+
+    suite("Anthropic prompt caching", () => {
+        const claudeModel = {
+            id: "bg/claude-opus",
+            maxInputTokens: 100_000,
+            maxOutputTokens: 8_192,
+        } as vscode.LanguageModelChatInformation;
+        const anthropicInfo = {
+            litellm_provider: "anthropic",
+            supports_prompt_caching: true,
+        } as LiteLLMModelInfo;
+        const messages: vscode.LanguageModelChatRequestMessage[] = [
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelTextPart("hi")],
+                name: undefined,
+            },
+        ];
+
+        function options(modelOptions: Record<string, unknown>): vscode.ProvideLanguageModelChatResponseOptions {
+            return { modelOptions } as vscode.ProvideLanguageModelChatResponseOptions;
+        }
+
+        setup(() => {
+            // getTelemetryOptions receives the full VS Code options object here
+            // because `modelOptions` is the per-request opt-out channel.
+            configManager.getConfig.resolves({});
+        });
+
+        test("marks Anthropic requests with the default 5m ephemeral CachePoint", async () => {
+            const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), anthropicInfo, "call");
+
+            assert.deepStrictEqual(req.cache_control, { type: "ephemeral" });
+        });
+
+        test("adds ttl 1h when the setting requests the 1-hour tier", async () => {
+            configManager.getConfig.resolves({ anthropicPromptCaching: "1h" });
+
+            const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), anthropicInfo, "call");
+
+            assert.deepStrictEqual(req.cache_control, { type: "ephemeral", ttl: "1h" });
+        });
+
+        test("omits the marker when the setting is off", async () => {
+            configManager.getConfig.resolves({ anthropicPromptCaching: "off" });
+
+            const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), anthropicInfo, "call");
+
+            assert.strictEqual(req.cache_control, undefined);
+        });
+
+        test("omits the marker for non-Anthropic models", async () => {
+            const openaiInfo = { litellm_provider: "openai" } as LiteLLMModelInfo;
+
+            const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), openaiInfo, "call");
+
+            assert.strictEqual(req.cache_control, undefined);
+        });
+
+        test("omits the marker when model info declares supports_prompt_caching false", async () => {
+            const noCachingInfo = {
+                litellm_provider: "anthropic",
+                supports_prompt_caching: false,
+            } as LiteLLMModelInfo;
+
+            const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), noCachingInfo, "call");
+
+            assert.strictEqual(req.cache_control, undefined);
+        });
+
+        test("omits the marker when the caller opts out via modelOptions", async () => {
+            const req = await builder.buildOpenAIChatRequest(
+                messages,
+                claudeModel,
+                options({ promptCaching: false }),
+                anthropicInfo,
+                "call"
+            );
+
+            assert.strictEqual(req.cache_control, undefined);
+        });
+
+        test("omits the marker for a model that already rejected it live", async () => {
+            const learnedBuilder = new RequestBuilder({
+                configManager,
+                getReasoningEffort: () => undefined,
+                detectQuotaToolRedaction: (messages, tools) => ({ tools, confidence: "none" as const }),
+                stripUnsupportedParametersFromRequest: () => {},
+                isParameterSupported: () => true,
+                getUnsupportedParameters: (id: string) =>
+                    id.includes("claude") ? new Set(["cache_control"]) : new Set<string>(),
+                getTelemetryOptions: () => ({ caller: "test", justification: undefined, modelConfiguration: {} }),
+                usageOptOutModels: new Set(),
+                extractRawModelName: (id: string) => {
+                    const slash = id.indexOf("/");
+                    return slash < 0 ? id : id.slice(slash + 1);
+                },
+            });
+
+            const req = await learnedBuilder.buildOpenAIChatRequest(
+                messages,
+                claudeModel,
+                options({}),
+                anthropicInfo,
+                "call"
+            );
+
+            assert.strictEqual(req.cache_control, undefined);
+        });
+
+        test("keeps the marker for models that never rejected it", async () => {
+            const learnedBuilder = new RequestBuilder({
+                configManager,
+                getReasoningEffort: () => undefined,
+                detectQuotaToolRedaction: (messages, tools) => ({ tools, confidence: "none" as const }),
+                stripUnsupportedParametersFromRequest: () => {},
+                isParameterSupported: () => true,
+                getUnsupportedParameters: (id: string) =>
+                    id.includes("gpt-") ? new Set(["cache_control"]) : new Set<string>(),
+                getTelemetryOptions: () => ({ caller: "test", justification: undefined, modelConfiguration: {} }),
+                usageOptOutModels: new Set(),
+                extractRawModelName: (id: string) => {
+                    const slash = id.indexOf("/");
+                    return slash < 0 ? id : id.slice(slash + 1);
+                },
+            });
+
+            const req = await learnedBuilder.buildOpenAIChatRequest(
+                messages,
+                claudeModel,
+                options({}),
+                anthropicInfo,
+                "call"
+            );
+
+            assert.deepStrictEqual(req.cache_control, { type: "ephemeral" });
+        });
     });
 });

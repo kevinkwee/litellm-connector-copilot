@@ -32,7 +32,9 @@ async function tryGenerateViaVSCodeModelRequest(
         messages,
         {
             justification: "Generate a concise git commit message from staged changes.",
-            modelOptions: {},
+            // Commit prompts are one-shot messages with no reusable prefix, so
+            // the cache-write premium could never pay off for this caller.
+            modelOptions: { promptCaching: false },
         },
         token
     );

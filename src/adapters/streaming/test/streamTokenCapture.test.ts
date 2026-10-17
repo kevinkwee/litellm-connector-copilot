@@ -1,7 +1,9 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
+import type { OpenAIUsagePayload } from "../../../types";
 import { StreamTokenCapture } from "../streamTokenCapture";
 import { calculateRequestCost } from "../../../utils/pricingCalculator";
+import { normalizeUsagePayload, type RawUsagePayload } from "../usagePayload";
 
 suite("StreamTokenCapture", () => {
     function createInnerProgress(): {
@@ -41,7 +43,7 @@ suite("StreamTokenCapture", () => {
         return new vscode.LanguageModelToolCallPart(callId, name, args);
     }
 
-    function asUsagePart(payload: Record<string, unknown>): vscode.LanguageModelDataPart {
+    function asUsagePart(payload: Record<string, unknown> | OpenAIUsagePayload): vscode.LanguageModelDataPart {
         const bytes = new TextEncoder().encode(JSON.stringify(payload));
         return new vscode.LanguageModelDataPart(bytes, "usage");
     }
@@ -231,6 +233,55 @@ suite("StreamTokenCapture", () => {
         assert.strictEqual(forwardedUsage.estimated_input_cost, expectedCost.inputCost);
         assert.strictEqual(forwardedUsage.estimated_output_cost, expectedCost.outputCost);
         assert.strictEqual(forwardedUsage.estimated_total_cost, expectedCost.totalCost);
+    });
+
+    test("captures LiteLLM Anthropic cache counters and bills writes at the cache-write price", () => {
+        const reportedParts: vscode.LanguageModelDataPart[] = [];
+        const progress: vscode.Progress<vscode.LanguageModelResponsePart> = {
+            report: (part) => {
+                if (part instanceof vscode.LanguageModelDataPart && part.mimeType === "usage") {
+                    reportedParts.push(part);
+                }
+            },
+        };
+
+        const capture = new StreamTokenCapture("claude-opus", progress, {
+            model: "claude-opus",
+            mode: "chat",
+            litellm_provider: "anthropic",
+            pricing: {
+                inputCostPerToken: 2e-6,
+                outputCostPerToken: 3e-6,
+                // 1.25x input per 1M, mirrored from Anthropic's 5m write price
+                cacheCreationCostPerToken: 2.5e-6,
+                // 0.1x input per 1M
+                cacheReadCostPerToken: 2e-7,
+            },
+        });
+
+        // The interpreter normalizes the raw LiteLLM frame before the usage
+        // part reaches the tracker; mirror that step here.
+        capture.progress.report(
+            asUsagePart(
+                normalizeUsagePayload({
+                    prompt_tokens: 1000,
+                    completion_tokens: 25,
+                    total_tokens: 1025,
+                    prompt_tokens_details: { cached_tokens: 400, cache_creation_tokens: 100 },
+                    cache_creation_input_tokens: 100,
+                    cache_read_input_tokens: 400,
+                } as RawUsagePayload)
+            )
+        );
+        const snapshot = capture.getSnapshot();
+
+        assert.strictEqual(snapshot.promptTokens, 1000);
+        assert.strictEqual(snapshot.cachedTokens, 400);
+        assert.strictEqual(snapshot.cacheCreationInputTokens, 100);
+        // Non-cached input: (1000 - 400 - 100) * 2e-6 = 0.001
+        // Reads: 400 * 2e-7 = 0.00008; writes: 100 * 2.5e-6 = 0.00025
+        assert.strictEqual(snapshot.estimatedInputCost, 0.00133);
+        assert.strictEqual(snapshot.estimatedOutputCost, 0.000075);
     });
 
     test("counts ThinkingPart as reasoning and plain TextPart as completion only", () => {

@@ -3,11 +3,13 @@ import type { LiteLLMConfig } from "../types";
 import { LiteLLMClient } from "../adapters/litellmClient";
 import type { BackendSession } from "../providers/backendSession";
 import { Logger } from "../utils/logger";
+import { normalizeAnthropicPromptCachingMode } from "../utils/promptCaching";
 import { deriveGroupNameFromUrl } from "../utils";
 
 export class ConfigManager {
     private static readonly INACTIVITY_TIMEOUT_KEY = "litellm-connector.inactivityTimeout";
     private static readonly DISABLE_CACHING_KEY = "litellm-connector.disableCaching";
+    private static readonly ANTHROPIC_PROMPT_CACHING_KEY = "litellm-connector.anthropicPromptCaching";
     private static readonly DISABLE_QUOTA_TOOL_REDACTION_KEY = "litellm-connector.disableQuotaToolRedaction";
     private static readonly KEY_MODEL_OVERRIDES_ENABLE = "litellm-connector.enableModelOverrides";
     private static readonly MODEL_CAPABILITIES_OVERRIDES_KEY = "litellm-connector.modelCapabilitiesOverrides";
@@ -154,6 +156,9 @@ export class ConfigManager {
 
         const inactivityTimeout = workspaceConfig.get<number>(ConfigManager.INACTIVITY_TIMEOUT_KEY, 60);
         const disableCaching = workspaceConfig.get<boolean>(ConfigManager.DISABLE_CACHING_KEY, true);
+        const anthropicPromptCaching = normalizeAnthropicPromptCachingMode(
+            workspaceConfig.get<unknown>(ConfigManager.ANTHROPIC_PROMPT_CACHING_KEY)
+        );
         const disableQuotaToolRedaction = workspaceConfig.get<boolean>(
             ConfigManager.DISABLE_QUOTA_TOOL_REDACTION_KEY,
             false
@@ -265,6 +270,7 @@ export class ConfigManager {
         const config: LiteLLMConfig = {
             inactivityTimeout,
             disableCaching,
+            anthropicPromptCaching,
             disableQuotaToolRedaction,
             enableModelOverrides,
             modelCapabilitiesOverrides,

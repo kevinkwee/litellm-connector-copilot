@@ -1,6 +1,7 @@
 import * as assert from "assert";
 import * as sinon from "sinon";
 import { interpretStreamEvent, createInitialStreamingState, flushPendingBuffers } from "../liteLLMStreamInterpreter";
+import { TAGGED_CALL_CLOSER, TAGGED_CALL_OPENER, PIPE_CLOSER, PIPE_OPENER } from "../textToolCallParser";
 import { StructuredLogger } from "../../../observability/structuredLogger";
 
 declare const suite: (name: string, fn: () => void) => void;
@@ -71,6 +72,7 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
                 choices: [
                     {
                         delta: {
+                            reasoning_content: "thought",
                             content: "hi",
                             tool_calls: [
                                 {
@@ -80,11 +82,8 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
                                 },
                             ],
                         },
-                        // Simulate thinking surfaced in /responses style alongside OpenAI delta
                     },
                 ],
-                type: "response.output_reasoning.delta",
-                delta: "thought",
             },
             state
         );
@@ -661,10 +660,6 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
     test("should handle /responses format edge cases", () => {
         const state = createInitialStreamingState();
 
-        // Reasoning delta
-        const parts1 = interpretStreamEvent({ type: "response.output_reasoning.delta", delta: "thinking" }, state);
-        assert.strictEqual(parts1[0].type, "thinking");
-
         // response.completed with partial usage
         const parts2 = interpretStreamEvent(
             {
@@ -707,8 +702,7 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
                 choices: [
                     {
                         delta: {
-                            content:
-                                'before <tool_call>{"id":"call_text_1","name":"search","arguments":{"query":"vscode"}}</tool_call> after',
+                            content: `before ${TAGGED_CALL_OPENER}{"id":"call_text_1","name":"search","arguments":{"query":"vscode"}}${TAGGED_CALL_CLOSER} after`,
                         },
                     },
                 ],
@@ -738,7 +732,7 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
                 choices: [
                     {
                         delta: {
-                            content: '<|tool_call_begin|>{"name":"filesystem","arguments":{"path":"/tmp"}',
+                            content: `${PIPE_OPENER}{"name":"filesystem","arguments":{"path":"/tmp"}`,
                         },
                     },
                 ],
@@ -752,7 +746,7 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
                 choices: [
                     {
                         delta: {
-                            content: "}<|tool_call_end|>",
+                            content: `}${PIPE_CLOSER}`,
                         },
                     },
                 ],
@@ -955,117 +949,224 @@ suite("Tool Call Args Corruption Logging", () => {
     });
 });
 
-suite("Anthropic Thinking Block Support", () => {
-    test("emits thinking part when content_block_start with type=thinking", () => {
+suite("Anthropic prompt-cache usage parsing", () => {
+    test("normalizes LiteLLM Anthropic usage counters on chat frames", () => {
         const state = createInitialStreamingState();
 
         const parts = interpretStreamEvent(
             {
-                type: "response.content_block_start",
-                index: 0,
-                block: { type: "thinking", id: "thought-1" },
+                choices: [{ delta: {}, finish_reason: "stop" }],
+                usage: {
+                    prompt_tokens: 1000,
+                    completion_tokens: 50,
+                    total_tokens: 1050,
+                    prompt_tokens_details: { cached_tokens: 400, cache_creation_tokens: 100 },
+                    cache_creation_input_tokens: 100,
+                    cache_read_input_tokens: 400,
+                },
             },
             state
         );
 
-        assert.ok(parts.length >= 1, "Should emit at least one part");
-        const thinkingPart = parts.find((p) => p.type === "thinking");
-        assert.ok(thinkingPart, "Should emit a thinking part");
-        if (thinkingPart && thinkingPart.type === "thinking") {
-            assert.strictEqual(thinkingPart.value, "");
-            assert.strictEqual(thinkingPart.metadata?.display, undefined);
-        }
+        const usagePart = parts.find((p) => p.type === "data" && p.mimeType === "usage");
+        assert.ok(usagePart && usagePart.type === "data");
+        const usage = usagePart.value as {
+            prompt_tokens_details?: { cached_tokens?: number; cache_creation_input_tokens?: number };
+        };
+        assert.strictEqual(usage.prompt_tokens_details?.cached_tokens, 400);
+        assert.strictEqual(usage.prompt_tokens_details?.cache_creation_input_tokens, 100);
     });
 
-    test("emits thinking part with display=summarized when content_block_start specifies it", () => {
+    test("forwards top-level Anthropic cache counters on response.completed", () => {
         const state = createInitialStreamingState();
 
         const parts = interpretStreamEvent(
             {
-                type: "response.content_block_start",
-                index: 0,
-                block: { type: "thinking", id: "thought-1", display: "summarized" },
+                type: "response.completed",
+                response: {
+                    usage: {
+                        input_tokens: 200,
+                        output_tokens: 10,
+                        cache_creation_input_tokens: 40,
+                        cache_read_input_tokens: 60,
+                    },
+                },
             },
             state
         );
 
-        const thinkingPart = parts.find((p) => p.type === "thinking");
-        assert.ok(thinkingPart && thinkingPart.type === "thinking");
-        if (thinkingPart && thinkingPart.type === "thinking") {
-            assert.strictEqual(thinkingPart.metadata?.display, "summarized");
+        const usagePart = parts.find((p) => p.type === "data" && p.mimeType === "usage");
+        assert.ok(usagePart && usagePart.type === "data");
+        const usage = usagePart.value as {
+            prompt_tokens_details?: { cached_tokens?: number; cache_creation_input_tokens?: number };
+        };
+        assert.strictEqual(usage.prompt_tokens_details?.cached_tokens, 60);
+        assert.strictEqual(usage.prompt_tokens_details?.cache_creation_input_tokens, 40);
+    });
+});
+
+suite("Anthropic thinking block preservation", () => {
+    test("streams text deltas under one id and seals the block with signature metadata", () => {
+        const state = createInitialStreamingState();
+
+        const first = interpretStreamEvent({ choices: [{ delta: { reasoning_content: "First " } }] }, state);
+        const second = interpretStreamEvent({ choices: [{ delta: { reasoning_content: "chunk" } }] }, state);
+        const seal = interpretStreamEvent(
+            {
+                choices: [
+                    {
+                        delta: {
+                            reasoning_content: "",
+                            thinking_blocks: [{ type: "thinking", thinking: "First chunk", signature: "SIG1" }],
+                        },
+                    },
+                ],
+            },
+            state
+        );
+
+        for (const part of [...first, ...second]) {
+            assert.strictEqual(part.type, "thinking");
+            assert.strictEqual((part as { id?: string }).id, "litellm-thinking-1");
+            assert.ok((part as { value: string }).value.length > 0);
         }
+        const sealed = seal[0];
+        assert.strictEqual(sealed.type, "thinking");
+        assert.strictEqual((sealed as { id?: string }).id, "litellm-thinking-1");
+        const metadata = (sealed as { metadata?: Record<string, unknown> }).metadata;
+        assert.strictEqual(metadata?.signature, "SIG1");
+        assert.strictEqual(metadata?._completeThinking, "First chunk");
     });
 
-    test("emits thinking part with redactedData when content_block_start has redacted=true", () => {
+    test("seals an omitted-display block with an empty text replay", () => {
         const state = createInitialStreamingState();
 
         const parts = interpretStreamEvent(
             {
-                type: "response.content_block_start",
-                index: 0,
-                block: { type: "thinking", id: "thought-1", redacted: true, redacted_data: "encrypted_blob_123" },
+                choices: [
+                    {
+                        delta: {
+                            reasoning_content: "",
+                            thinking_blocks: [{ type: "thinking", thinking: "", signature: "SIG2" }],
+                        },
+                    },
+                ],
             },
             state
         );
 
-        const thinkingPart = parts.find((p) => p.type === "thinking");
-        assert.ok(thinkingPart && thinkingPart.type === "thinking");
-        if (thinkingPart && thinkingPart.type === "thinking") {
-            assert.strictEqual(thinkingPart.value, "");
-            assert.strictEqual(thinkingPart.metadata?.redactedData, "encrypted_blob_123");
-            assert.strictEqual(thinkingPart.metadata?.display, "omitted");
-        }
+        assert.strictEqual(parts.length, 1);
+        assert.strictEqual(parts[0].type, "thinking");
+        assert.strictEqual((parts[0] as { id?: string }).id, "litellm-thinking-1");
+        const metadata = (parts[0] as { metadata?: Record<string, unknown> }).metadata;
+        assert.strictEqual(metadata?.signature, "SIG2");
+        assert.strictEqual(metadata?._completeThinking, "");
     });
 
-    test("emits signature-only thinking part when content_block_delta has signature_delta", () => {
+    test("emits redacted blocks as redactedData metadata", () => {
         const state = createInitialStreamingState();
 
         const parts = interpretStreamEvent(
             {
-                type: "response.content_block_delta",
-                index: 0,
-                delta: { type: "signature_delta", signature: "OmitSigExample123" },
+                choices: [
+                    {
+                        delta: {
+                            reasoning_content: "",
+                            thinking_blocks: [{ type: "redacted_thinking", data: "ENC3" }],
+                        },
+                    },
+                ],
             },
             state
         );
 
-        const thinkingPart = parts.find((p) => p.type === "thinking");
-        assert.ok(thinkingPart && thinkingPart.type === "thinking");
-        if (thinkingPart && thinkingPart.type === "thinking") {
-            assert.strictEqual(thinkingPart.value, "");
-            assert.strictEqual(thinkingPart.metadata?.signature, "OmitSigExample123");
-            assert.strictEqual(thinkingPart.metadata?.display, "omitted");
-        }
+        assert.strictEqual(parts.length, 1);
+        const metadata = (parts[0] as { metadata?: Record<string, unknown> }).metadata;
+        assert.strictEqual(metadata?.redactedData, "ENC3");
+        assert.strictEqual(metadata?.signature, undefined);
+        assert.strictEqual(metadata?._completeThinking, undefined);
     });
 
-    test("preserves display metadata in output_reasoning.delta when display is set", () => {
+    test("starts a fresh id after a sealed block", () => {
         const state = createInitialStreamingState();
 
-        // First set display via content_block_start
-        interpretStreamEvent(
+        interpretStreamEvent({ choices: [{ delta: { reasoning_content: "block one" } }] }, state);
+        const firstSeal = interpretStreamEvent(
             {
-                type: "response.content_block_start",
-                index: 0,
-                block: { type: "thinking", id: "thought-1", display: "omitted" },
+                choices: [
+                    {
+                        delta: {
+                            reasoning_content: "",
+                            thinking_blocks: [{ type: "thinking", thinking: "block one", signature: "SIG1" }],
+                        },
+                    },
+                ],
+            },
+            state
+        );
+        const laterText = interpretStreamEvent({ choices: [{ delta: { reasoning_content: "block two" } }] }, state);
+        const secondSeal = interpretStreamEvent(
+            {
+                choices: [
+                    {
+                        delta: {
+                            reasoning_content: "",
+                            thinking_blocks: [{ type: "thinking", thinking: "block two", signature: "SIG9" }],
+                        },
+                    },
+                ],
             },
             state
         );
 
-        // Now receive reasoning delta but display is still "omitted" means no thinking_delta events
-        // In practice, display:omitted means the model won't send thinking deltas, only signature
+        assert.strictEqual((firstSeal[0] as { id?: string }).id, "litellm-thinking-1");
+        assert.strictEqual((laterText[0] as { id?: string }).id, "litellm-thinking-2");
+        assert.strictEqual((secondSeal[0] as { id?: string }).id, "litellm-thinking-2");
+    });
+
+    test("ignores unsigned thinking_blocks entries", () => {
+        const state = createInitialStreamingState();
+
         const parts = interpretStreamEvent(
             {
-                type: "response.output_reasoning.delta",
-                delta: "This should not happen with display:omitted",
+                choices: [
+                    {
+                        delta: {
+                            reasoning_content: "piece",
+                            thinking_blocks: [{ type: "thinking", thinking: "piece" }],
+                        },
+                    },
+                ],
             },
             state
         );
 
-        // If display:omitted and we still get deltas, they should carry the metadata
-        const thinkingPart = parts.find((p) => p.type === "thinking");
-        assert.ok(thinkingPart && thinkingPart.type === "thinking");
-        if (thinkingPart && thinkingPart.type === "thinking") {
-            assert.strictEqual(thinkingPart.metadata?.display, "omitted");
-        }
+        const thinkingParts = parts.filter((p) => p.type === "thinking");
+        assert.strictEqual(thinkingParts.length, 1, "only the text delta part is emitted");
+        const metadata = (thinkingParts[0] as { metadata?: Record<string, unknown> }).metadata;
+        assert.strictEqual(metadata, undefined);
+    });
+
+    test("ignores blocks with malformed signature or data fields", () => {
+        const state = createInitialStreamingState();
+
+        const parts = interpretStreamEvent(
+            {
+                choices: [
+                    {
+                        delta: {
+                            reasoning_content: "",
+                            thinking_blocks: [
+                                { type: "thinking", signature: 42, thinking: "x" },
+                                { type: "redacted_thinking", data: 42 },
+                            ],
+                        },
+                    },
+                ],
+            },
+            state
+        );
+
+        assert.strictEqual(parts.filter((p) => p.type === "thinking").length, 0);
     });
 });

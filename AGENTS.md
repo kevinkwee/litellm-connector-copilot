@@ -257,7 +257,7 @@ Folder ownership (unit tests are co-located with the module under test in `src/*
 
 - `src/providers/`: Language Model provider implementations (`liteLLMProviderBase.ts`, `liteLLMChatProvider.ts`, `liteLLMCommitProvider.ts`, `index.ts`)
 - `src/adapters/`: HTTP clients, payload shaping, endpoint-specific parsing, SSE and streaming (`sse/`, `streaming/`), tokenizers
-- `src/utils/`: shared utilities (logging, local request metrics, model helpers, pricing)
+- `src/utils/`: shared utilities (logging, local request metrics, model helpers, pricing, `thinkingBlocks`, `promptCaching`)
 - `src/config/`: configuration and secrets
 - `src/commands/`: command registrations and UI entry points
 - `src/observability/`: structured logging, audit trail, debug export
@@ -604,6 +604,8 @@ This extension integrates LiteLLM proxies into VS Code's Language Model APIs (ch
   - `src/adapters/litellmClient.ts`: HTTP client and endpoint routing integration.
   - `src/adapters/responsesAdapter.ts`: LiteLLM `/responses` endpoint payload translation.
   - `/responses` stream event handling (`output_item.delta`, `output_item.done`, anonymous tool buffering) lives in `src/adapters/streaming/liteLLMStreamInterpreter.ts`.
+  - `src/adapters/streaming/usagePayload.ts`: normalizes LiteLLM's usage variants into the internal shape and resolves the Anthropic cache-write and cache-read counters from `prompt_tokens_details`, `input_token_details`, or the top-level mirrors (in that precedence).
+  - `src/adapters/streaming/textToolCallParser.ts`: the parser for tool calls that LiteLLM backends stream wrapped in tagged text fragments (tag constants, escape-safe patterns, stable text splitting).
   - `src/adapters/tokenUtils.ts`: token budgeting, trimming, and related helpers.
 
 - **Config**: `src/config/configManager.ts`
@@ -638,6 +640,20 @@ Keep this pipeline shared unless the change is intentionally protocol-specific a
 - **Response emission**: emit `LanguageModelResponsePart`, `LanguageModelToolCallPart`, `LanguageModelToolResultPart` to the progress callback.
 - **Tool call parsing**: extract and validate tool calls from streaming chunks.
 - **Cost tracking**: pricing from LiteLLM `/model/info` is extracted and propagated through `StreamTokenCapture`. Request-level estimated costs are attached to usage payloads and telemetry metrics.
+
+### Anthropic Thinking Preservation (Claude)
+
+Claude reasoning arrives as thinking deltas plus signature and redacted-thinking frames in the LiteLLM stream. Because the connector wraps Claude without a protocol layer of its own, tool call rounds replay history through VS Code, so signed reasoning must survive as VS Code-replayable parts or the model re-derives (and re-bills) its reasoning and can drift mid-task. The stream interpreter seals each signed block into an empty-value thinking part whose `metadata` carries `signature` plus `_completeThinking` (the exact block text), or `redactedData` for redacted blocks. The metadata keys match what the built-in Copilot providers already persist, so VS Code stores and replays these parts in later tool call rounds (its one-sealed-thinking-part-per-round rule makes the last sealed block of a round the one replayed).
+
+- **Emission**: `src/adapters/streaming/liteLLMStreamInterpreter.ts`; part ids are `litellm-thinking-N`. Unsigned or malformed signed blocks are ignored rather than reconstructed.
+- **Replay**: `convertMessages` (`src/utils.ts`, via `src/utils/thinkingBlocks.ts`) rebuilds `thinking_blocks` from sealed parts and omits `reasoning_content` when blocks exist. Unsigned reasoning parts keep `reasoning_content`, so the transport-retry resume path is unchanged.
+- **Role safety**: blocks and signatures are only attached to assistant messages; user and system roles never carry them.
+
+### Anthropic Prompt Caching
+
+- `litellm-connector.anthropicPromptCaching` (`off` | `5m` | `1h`, default `5m`) adds a top-level `cache_control: {type: "ephemeral"}` directive (plus `ttl: "1h"` on the higher tier) to chat requests; LiteLLM forwards it to the Claude API as the automatic prompt-caching marker. Unrelated to `disableCaching`, which bypasses the proxy response cache.
+- **Gating**: `src/utils/promptCaching.ts` allows the marker only for Anthropic-family requests where `modelInfo.litellm_provider` is authoritative, `supports_prompt_caching` is not explicitly false, and `options.modelOptions.promptCaching` is not false. Commit generation opts out: its prompts are one-shot messages with no reusable prefix, so the cache-write premium never pays off.
+- **Live learning**: when a 400 names `cache_control`, `litellmClient.chat` strips it and retries once, then notifies the transport, which records it through the registry (`recordUnsupportedParameter`). The request builder consults `getUnsupportedParameters`, so later requests omit the marker without paying a failed round trip. The learned key is the raw model name (the request body's `model` value).
 
 ### Commit-Specific Logic (Commit Provider)
 
@@ -676,6 +692,7 @@ The ingress pipeline is agnostic to endpoint choice:
 - **Fallback picker detail/tooltip**: when enabled by `displayPricingInPicker`, `toVSCodeInfo()` appends compact pricing to `detail` and appends a pricing breakdown to `tooltip` for environments where hover pricing tables are unavailable.
 - **Price category strategy**: `derivePriceCategory()` categorizes by `maxCost` (highest per-1M input/output cost) using thresholds `<=10` low, `<20` medium, `<=100` high, otherwise very_high.
 - **Token snapshot cost fields**: `src/adapters/streaming/streamTokenCapture.ts` stores flat estimated fields (`estimatedInputCost`, `estimatedOutputCost`, `estimatedTotalCost`) on `TokenSnapshot`.
+- **Cache usage parsing**: `src/adapters/streaming/usagePayload.ts` resolves `cache_creation_input_tokens` (cache write) and `cache_read_input_tokens` (cache read) from `prompt_tokens_details`, `input_token_details`, or the top-level mirrors (in that precedence). `StreamTokenCapture` bills cache-write tokens at the cache-write price and cache-read tokens at the cache-read price, and Snapshots carry the separate write/read tallies.
 - **Usage payload enrichment**: usage DataParts include `estimated_input_cost`, `estimated_output_cost`, and `estimated_total_cost` in `OpenAIUsagePayload` for downstream consumers, while remaining compatible with VS Code's required usage fields.
 - **Metrics logging**: `src/utils/telemetry.ts` carries flat estimated cost fields in `IMetrics` and logs each completed request's token and cost totals to the output channel via `LiteLLMTelemetry.reportMetric()`.
 - **Numeric handling**: scientific-notation pricing values are supported as native `number`. `calculateRequestCost()` normalizes floating artifacts with fixed precision while display formatting handles human-readable rounding.
@@ -692,6 +709,7 @@ The contract is **public read, internal write**:
   - `extractRawName(id)`: strip the routing prefix from a namespaced id.
   - `getModelInfo(id)` / `getDerivedCapabilities(id)`: read the per-model capability caches populated during discovery. These are NOT a model-list cache. They cache the capability info for known models and feed the request hot path.
   - `size()`, `clear()`, `clearCaches()`: registration-state reads and reset. `clear()` wipes the routing table (user-initiated reload). `clearCaches()` wipes the capability caches and the backoff controller.
+  - `recordUnsupportedParameter(modelId, param)` / `getUnsupportedParameters(modelId)`: the in-session store of parameters a live 400 taught the client to strip. Keyed by the raw model name (the request body's `model` value). The transport wires the client's strip-and-retry callback into `recordUnsupportedParameter`; the request builder reads `getUnsupportedParameters` to skip re-sending what a model already rejected.
   - `onDidChange`: fires when a backend's model set has actually changed. The base provider subscribes once and forwards to VS Code's `onDidChangeLanguageModelChatInformation`.
 
 - **Internal surface (write, NOT part of the public contract)**:

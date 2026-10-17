@@ -210,6 +210,16 @@
 						"experimental"
 					]
 				},
+				"litellm-connector.anthropicPromptCaching": {
+					"type": "string",
+					"enum": [
+						"off",
+						"5m",
+						"1h"
+					],
+					"default": "5m",
+					"description": "Anthropic prompt-caching TTL for Claude requests sent through LiteLLM. Unrelated to disableCaching, which bypasses the proxy response cache. 5m marks requests with a 5 minute CachePoint (cache writes cost 1.25x input tokens). 1h uses a 1 hour CachePoint (cache writes cost 2x input tokens). off never marks. Only applied to Anthropic Claude models; commit message generation never marks."
+				},
 				"litellm-connector.enableModelOverrides": {
 					"type": "boolean",
 					"default": true,

@@ -228,6 +228,109 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.strictEqual(retryHeaders["Cache-Control"], undefined);
     });
 
+    test("chat strips a rejected cache_control marker and records the incompatibility", async () => {
+        const onUnsupportedParameter = sandbox.stub();
+        const client = new LiteLLMClient({ ...config, onUnsupportedParameter }, userAgent);
+
+        const errorResponse = {
+            ok: false,
+            status: 400,
+            statusText: "Bad Request",
+            text: async () => "Extra inputs are not permitted: cache_control",
+            clone: function () {
+                return this;
+            },
+        };
+        const successResponse = {
+            ok: true,
+            status: 200,
+            body: new ReadableStream(),
+        };
+
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.onCall(0).resolves(errorResponse as unknown as Response);
+        fetchStub.onCall(1).resolves(successResponse as unknown as Response);
+
+        await client.chat({
+            model: "anthropic/claude-opus",
+            messages: [],
+            cache_control: { type: "ephemeral" },
+        });
+
+        assert.strictEqual(fetchStub.callCount, 2, "Should have retried once");
+        assert.ok(onUnsupportedParameter.calledOnceWithExactly("anthropic/claude-opus", "cache_control"));
+
+        const retryCallInit = fetchStub.getCall(1).args[1] as RequestInit | undefined;
+        const retryCallBodyStr = retryCallInit?.body as string | undefined;
+        const retryCallBody = retryCallBodyStr ? (JSON.parse(retryCallBodyStr) as Record<string, unknown>) : {};
+        assert.strictEqual(retryCallBody.cache_control, undefined);
+    });
+
+    test("chat strips cache_control when the error names it after a colon", async () => {
+        const onUnsupportedParameter = sandbox.stub();
+        const client = new LiteLLMClient({ ...config, onUnsupportedParameter }, userAgent);
+
+        const errorResponse = {
+            ok: false,
+            status: 400,
+            statusText: "Bad Request",
+            text: async () => "Unsupported parameter: 'cache_control'",
+            clone: function () {
+                return this;
+            },
+        };
+        const successResponse = {
+            ok: true,
+            status: 200,
+            body: new ReadableStream(),
+        };
+
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.onCall(0).resolves(errorResponse as unknown as Response);
+        fetchStub.onCall(1).resolves(successResponse as unknown as Response);
+
+        await client.chat({
+            model: "anthropic/claude-opus",
+            messages: [],
+            cache_control: { type: "ephemeral", ttl: "1h" },
+        });
+
+        assert.strictEqual(fetchStub.callCount, 2);
+        assert.ok(onUnsupportedParameter.calledOnceWithExactly("anthropic/claude-opus", "cache_control"));
+
+        const retryCallBodyStr = (fetchStub.getCall(1).args[1] as RequestInit | undefined)?.body as string | undefined;
+        const retryCallBody = retryCallBodyStr ? (JSON.parse(retryCallBodyStr) as Record<string, unknown>) : {};
+        assert.strictEqual(retryCallBody.cache_control, undefined);
+    });
+
+    test("chat leaves cache_control untouched when the 400 mentions no parameter", async () => {
+        const onUnsupportedParameter = sandbox.stub();
+        const client = new LiteLLMClient({ ...config, onUnsupportedParameter }, userAgent);
+
+        const rejected = {
+            ok: false,
+            status: 400,
+            statusText: "Bad Request",
+            text: async () => "daily spend limit exceeded",
+            clone: function () {
+                return this;
+            },
+        };
+        sandbox.stub(global, "fetch").resolves(rejected as unknown as Response);
+
+        await assert.rejects(
+            async () =>
+                client.chat({
+                    model: "anthropic/claude-opus",
+                    messages: [],
+                    cache_control: { type: "ephemeral" },
+                }),
+            /daily spend limit exceeded/
+        );
+
+        assert.ok(onUnsupportedParameter.notCalled);
+    });
+
     test("parseRetryAfterDelayMs handles seconds, future date, and invalid values", () => {
         const client = new LiteLLMClient(config, userAgent);
 

@@ -52,6 +52,8 @@ interface BaseTestAccess {
         clear: () => void;
         clearCaches: () => void;
         size: () => number;
+        recordUnsupportedParameter: (modelId: string, param: string) => void;
+        getUnsupportedParameters: (modelId: string) => ReadonlySet<string>;
     };
     _transport: {
         sendRequestToLiteLLM: (
@@ -1646,6 +1648,20 @@ suite("LiteLLMProviderBase", () => {
             // Smoke test: constructor doesn't throw.
             new LiteLLMChatProvider(mockSecrets, userAgent);
             assert.ok(true);
+        });
+    });
+
+    suite("learned unsupported parameters", () => {
+        test("base forwards transport strip callbacks into the registry", () => {
+            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const record = sandbox.stub(access(provider)._registry, "recordUnsupportedParameter");
+            const transport = access(provider)._transport as unknown as {
+                onUnsupportedParameter?: (model: string, param: string) => void;
+            };
+
+            transport.onUnsupportedParameter?.("claude-opus", "cache_control");
+
+            sinon.assert.calledOnceWithExactly(record, "claude-opus", "cache_control");
         });
     });
 });

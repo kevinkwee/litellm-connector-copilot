@@ -12,6 +12,16 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Expanded reasoning effort levels with corrected fallback behavior.
 - `reasoning_effort: "none"` is now sent explicitly instead of the parameter being silently dropped.
 
+### Claude reasoning continuity across tool calls
+- Claude's encrypted thinking is preserved across tool call rounds: signed thinking blocks are sealed into VS Code replayable thinking parts (signature plus the exact block text in part metadata, matching the keys the built-in Copilot providers persist), and redacted thinking blocks carry the redacted data. On later rounds the connector rebuilds Anthropic `thinking_blocks` from those parts, so the model keeps its reasoning context instead of re-deriving it.
+- Unsigned or malformed signed blocks are ignored rather than reconstructed; user and system messages never receive signatures.
+- Claude stream usage reports Anthropic prompt-cache counters separately: cache-write tokens are billed at the cache-write price and cache-read tokens at the cache-read price in the estimated request costs.
+
+### Anthropic prompt caching
+- New setting `litellm-connector.anthropicPromptCaching` (`off` | `5m` | `1h`, default `5m`) marks Claude requests with a top-level `cache_control` ephemeral CachePoint that LiteLLM forwards to the Claude API, so repeated prefixes (system prompt, tools, conversation history) are served from Anthropic's prompt cache. Unrelated to `litellm-connector.disableCaching`, which bypasses the LiteLLM proxy response cache.
+- `1h` cache writes cost 2x input tokens versus 1.25x for `5m`; cache reads cost 0.1x for both tiers. Applies only to Anthropic Claude models; commit message generation never marks its one-shot prompts.
+- If a model rejects the marker, the connector strips it, retries the request, and remembers the rejection for the rest of the session (no repeat failure cost).
+
 ### `.copilotmd` session transcripts
 - Chat requests are exported as `.copilotmd` markdown files (byte-compatible with Copilot Chat's debug view) into `copilot-debug/<session fingerprint>/` under VS Code's hidden per-workspace extension storage (default) or global storage, configured via `litellm-connector.debug.copilotMdExport.*`. The export is off by default.
 - Per-session retention caps keep the export folder bounded.
@@ -38,6 +48,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Model discovery applies LiteLLM's paused-model rule: deployments a proxy admin paused (`model_info.blocked`) are dropped during `/model/info` discovery, a public model name stays listed while at least one of its deployments is live, and each name is listed once.
 
 ### New settings
+- `litellm-connector.anthropicPromptCaching` (Anthropic prompt caching, default `5m`): see the dedicated section above.
 - `litellm-connector.autoTrimMessages` (opt-in, off by default): trims older messages to fit the model input token budget, covering both the proactive per-request trim and the recovery retry after a context-overflow rejection.
 - Per-model temperature: a `temperature` configuration property is exposed per model in VS Code's model settings (only for models that support the parameter) and sent with every request.
 

@@ -2,6 +2,7 @@ import type * as vscode from "vscode";
 import { convertMessages, convertTools, validateRequest } from "../../utils";
 import { trimMessagesToFitBudget } from "../../adapters/tokenUtils";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest, OpenAIFunctionToolDef } from "../../types";
+import { DEFAULT_ANTHROPIC_PROMPT_CACHING, resolveAnthropicCacheControl } from "../../utils/promptCaching";
 import type { RequestBuilderDeps } from "./types";
 
 export class RequestBuilder {
@@ -10,6 +11,7 @@ export class RequestBuilder {
     private readonly detectQuotaToolRedaction: RequestBuilderDeps["detectQuotaToolRedaction"];
     private readonly stripUnsupportedParametersFromRequest: RequestBuilderDeps["stripUnsupportedParametersFromRequest"];
     private readonly isParameterSupported: RequestBuilderDeps["isParameterSupported"];
+    private readonly getUnsupportedParameters: RequestBuilderDeps["getUnsupportedParameters"];
     private readonly getTelemetryOptions: RequestBuilderDeps["getTelemetryOptions"];
     private readonly usageOptOutModels: RequestBuilderDeps["usageOptOutModels"];
     private readonly extractRawModelName: RequestBuilderDeps["extractRawModelName"];
@@ -20,6 +22,7 @@ export class RequestBuilder {
         this.detectQuotaToolRedaction = deps.detectQuotaToolRedaction;
         this.stripUnsupportedParametersFromRequest = deps.stripUnsupportedParametersFromRequest;
         this.isParameterSupported = deps.isParameterSupported;
+        this.getUnsupportedParameters = deps.getUnsupportedParameters;
         this.getTelemetryOptions = deps.getTelemetryOptions;
         this.usageOptOutModels = deps.usageOptOutModels;
         this.extractRawModelName = deps.extractRawModelName;
@@ -112,6 +115,25 @@ export class RequestBuilder {
         }
         if (this.isParameterSupported("top_p", modelInfo, rawModelId) && typeof mo.top_p === "number") {
             requestBody.top_p = mo.top_p;
+        }
+
+        // Anthropic prompt caching: LiteLLM forwards a top-level `cache_control`
+        // directive to the Claude API for automatic prompt caching. Gated on the
+        // workspace TTL setting, provider support, the per-request opt-out
+        // (commit generation has no reusable prefix worth caching), and what a
+        // previous request learned live about the model's acceptance of the marker.
+        const cacheControl = resolveAnthropicCacheControl({
+            mode: config.anthropicPromptCaching ?? DEFAULT_ANTHROPIC_PROMPT_CACHING,
+            modelId: rawModelId,
+            modelInfo,
+            requestOptOut: mo.promptCaching === false,
+        });
+        if (
+            cacheControl &&
+            this.isParameterSupported("cache_control", modelInfo, rawModelId) &&
+            !this.getUnsupportedParameters(rawModelId).has("cache_control")
+        ) {
+            requestBody.cache_control = cacheControl;
         }
 
         if (toolConfig.tools) {

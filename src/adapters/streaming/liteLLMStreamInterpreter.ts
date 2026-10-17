@@ -1,8 +1,10 @@
-import type { OpenAIUsageCompletionTokenDetails, OpenAIUsagePayload, OpenAIUsagePromptTokenDetails } from "../../types";
 import { isCacheControlMimeType, normalizeToolCallId } from "../../utils";
 import { sanitizeToolName } from "../../utils/toolNameUtils";
 import { Logger } from "../../utils/logger";
 import { StructuredLogger } from "../../observability/structuredLogger";
+import { redactedThinkingMetadata, signedThinkingMetadata } from "../../utils/thinkingBlocks";
+import { normalizeUsagePayload, type RawUsagePayload } from "./usagePayload";
+import { parseTaggedToolCalls, splitStableTextAndPendingTaggedContent } from "./textToolCallParser";
 
 /**
  * Discriminated union of response parts the stream interpreter emits toward
@@ -25,24 +27,20 @@ export interface StreamingState {
     responseToolCallOrder: string[];
     mergeReasoningContentInChoices: boolean;
     /**
-     * Anonymous tool buffering — used when upstream streams tool args before emitting a stable
-     * call_id (preserved from ResponsesClient robustness).
-     * Note: if multiple anonymous calls interleave without call_ids they cannot be disambiguated.
+     * Anonymous tool buffering: used when upstream streams tool args before emitting a stable
+     * call_id. If multiple anonymous calls interleave without call_ids they cannot be disambiguated.
      */
     anonymousResponseToolName: string | undefined;
     anonymousResponseToolArgs: string;
     /**
-     * Tracks the current thinking block type for Anthropic content_block events.
-     * "thinking" = normal thinking block
-     * "redacted_thinking" = safety-redacted thinking block (encrypted content)
+     * Thinking-block id allocation. Text deltas of one Anthropic
+     * thinking block share an id so VS Code and the Agents window merge them
+     * with that block's sealed part; a sealed (signature or redacted) part
+     * ends the id so the next block streams under a fresh one. Ids carry no
+     * upstream meaning; they only group the parts of one block.
      */
-    currentThinkingBlockType: "thinking" | "redacted_thinking" | undefined;
-    /**
-     * Tracks the display mode for the current thinking block.
-     * "summarized" = thinking content is visible (default)
-     * "omitted" = only signature present, no thinking_delta events
-     */
-    currentThinkingDisplay: "summarized" | "omitted" | undefined;
+    thinkingBlockCounter: number;
+    currentThinkingBlockId: string | undefined;
 }
 
 export function createInitialStreamingState(): StreamingState {
@@ -56,235 +54,41 @@ export function createInitialStreamingState(): StreamingState {
         mergeReasoningContentInChoices: false,
         anonymousResponseToolName: undefined,
         anonymousResponseToolArgs: "",
-        currentThinkingBlockType: undefined,
-        currentThinkingDisplay: undefined,
+        thinkingBlockCounter: 0,
+        currentThinkingBlockId: undefined,
     };
 }
 
-interface RawUsagePayload {
-    prompt_tokens?: number;
-    completion_tokens?: number;
-    system_tokens?: number;
-    prompt_tokens_details?: { cached_tokens?: number; cache_creation_input_tokens?: number };
-    completion_tokens_details?: {
-        reasoning_tokens?: number;
-        tool_tokens?: number;
-        accepted_prediction_tokens?: number;
-        rejected_prediction_tokens?: number;
-    };
-    input_token_details?: { cached_tokens?: number; cache_creation_input_tokens?: number };
-    output_token_details?: {
-        reasoning_tokens?: number;
-        tool_tokens?: number;
-        accepted_prediction_tokens?: number;
-        rejected_prediction_tokens?: number;
-    };
+function nextThinkingBlockId(state: StreamingState): string {
+    state.thinkingBlockCounter += 1;
+    return `litellm-thinking-${state.thinkingBlockCounter}`;
 }
 
-function normalizeUsagePayload(usage: RawUsagePayload): OpenAIUsagePayload {
-    const promptTokenDetails: OpenAIUsagePromptTokenDetails = {};
-    const cachedTokens = usage.prompt_tokens_details?.cached_tokens ?? usage.input_token_details?.cached_tokens;
-    if (typeof cachedTokens === "number") {
-        promptTokenDetails.cached_tokens = cachedTokens;
-    } else if (usage.input_token_details !== undefined || usage.prompt_tokens_details !== undefined) {
-        promptTokenDetails.cached_tokens = 0;
+function ensureCurrentThinkingBlockId(state: StreamingState): string {
+    if (state.currentThinkingBlockId === undefined) {
+        state.currentThinkingBlockId = nextThinkingBlockId(state);
     }
-
-    const cacheCreationInputTokens =
-        usage.prompt_tokens_details?.cache_creation_input_tokens ??
-        usage.input_token_details?.cache_creation_input_tokens;
-    if (typeof cacheCreationInputTokens === "number") {
-        promptTokenDetails.cache_creation_input_tokens = cacheCreationInputTokens;
-    }
-
-    const completionTokenDetails: OpenAIUsageCompletionTokenDetails = {};
-    // Prefer completion_tokens_details over output_token_details (OpenAI vs Anthropic naming)
-    const reasoningTokens =
-        usage.completion_tokens_details?.reasoning_tokens ?? usage.output_token_details?.reasoning_tokens;
-    if (typeof reasoningTokens === "number") {
-        completionTokenDetails.reasoning_tokens = reasoningTokens;
-    }
-    // Only set to 0 if the provider explicitly sent 0 in completion_tokens_details.
-    // Don't set to 0 if output_token_details exists but doesn't have reasoning_tokens
-    // (that means the value was not provided by upstream, not that it's 0).
-    const toolTokens = usage.completion_tokens_details?.tool_tokens ?? usage.output_token_details?.tool_tokens;
-    if (typeof toolTokens === "number") {
-        completionTokenDetails.tool_tokens = toolTokens;
-    }
-    const acceptedPredictionTokens =
-        usage.completion_tokens_details?.accepted_prediction_tokens ??
-        usage.output_token_details?.accepted_prediction_tokens;
-    if (typeof acceptedPredictionTokens === "number") {
-        completionTokenDetails.accepted_prediction_tokens = acceptedPredictionTokens;
-    }
-    const rejectedPredictionTokens =
-        usage.completion_tokens_details?.rejected_prediction_tokens ??
-        usage.output_token_details?.rejected_prediction_tokens;
-    if (typeof rejectedPredictionTokens === "number") {
-        completionTokenDetails.rejected_prediction_tokens = rejectedPredictionTokens;
-    }
-
-    const normalized: OpenAIUsagePayload = {
-        prompt_tokens: usage.prompt_tokens ?? 0,
-        completion_tokens: usage.completion_tokens ?? 0,
-        total_tokens: (usage.prompt_tokens ?? 0) + (usage.completion_tokens ?? 0),
-    };
-
-    if (Object.keys(promptTokenDetails).length > 0) {
-        normalized.prompt_tokens_details = promptTokenDetails;
-    }
-    if (Object.keys(completionTokenDetails).length > 0) {
-        normalized.completion_tokens_details = completionTokenDetails;
-    }
-    if (typeof usage.system_tokens === "number") {
-        normalized.system_prompt_tokens = usage.system_tokens;
-    }
-
-    return normalized;
+    return state.currentThinkingBlockId;
 }
 
-interface ParsedTextToolCall {
-    id?: string;
-    name: string;
-    args: string;
+interface RawThinkingBlock {
+    type: string;
+    thinking?: unknown;
+    signature?: unknown;
+    data?: unknown;
 }
 
-function toJsonArgumentString(value: unknown): string {
-    if (typeof value === "string") {
-        const trimmed = value.trim();
-        if (!trimmed) {
-            return "{}";
-        }
-        try {
-            JSON.parse(trimmed);
-            return trimmed;
-        } catch {
-            return JSON.stringify({ value });
-        }
-    }
-
-    if (value === undefined || value === null) {
-        return "{}";
-    }
-
-    if (typeof value === "object") {
-        try {
-            return JSON.stringify(value);
-        } catch {
-            return "{}";
-        }
-    }
-
-    return JSON.stringify({ value });
-}
-
-function parseTextToolPayload(payload: unknown): ParsedTextToolCall[] {
-    if (!payload || typeof payload !== "object") {
+function extractRawThinkingBlocks(raw: unknown): RawThinkingBlock[] {
+    if (!Array.isArray(raw)) {
         return [];
     }
-
-    const record = payload as Record<string, unknown>;
-
-    if (Array.isArray(record.tool_calls)) {
-        const calls: ParsedTextToolCall[] = [];
-        for (const entry of record.tool_calls) {
-            if (!entry || typeof entry !== "object") {
-                continue;
-            }
-            const callRecord = entry as Record<string, unknown>;
-            const fn =
-                callRecord.function && typeof callRecord.function === "object"
-                    ? (callRecord.function as Record<string, unknown>)
-                    : undefined;
-            const name =
-                typeof fn?.name === "string"
-                    ? fn.name
-                    : typeof callRecord.name === "string"
-                      ? callRecord.name
-                      : undefined;
-
-            if (!name) {
-                continue;
-            }
-
-            calls.push({
-                id: typeof callRecord.id === "string" ? callRecord.id : undefined,
-                name,
-                args: toJsonArgumentString(fn?.arguments ?? callRecord.arguments),
-            });
+    const blocks: RawThinkingBlock[] = [];
+    for (const entry of raw) {
+        if (entry && typeof entry === "object" && typeof (entry as Record<string, unknown>).type === "string") {
+            blocks.push(entry as RawThinkingBlock);
         }
-        return calls;
     }
-
-    const functionObject =
-        record.function && typeof record.function === "object"
-            ? (record.function as Record<string, unknown>)
-            : undefined;
-    const name =
-        typeof record.name === "string"
-            ? record.name
-            : typeof functionObject?.name === "string"
-              ? functionObject.name
-              : undefined;
-    if (!name) {
-        return [];
-    }
-
-    return [
-        {
-            id: typeof record.id === "string" ? record.id : undefined,
-            name,
-            args: toJsonArgumentString(record.arguments ?? functionObject?.arguments ?? record.input),
-        },
-    ];
-}
-
-function parseTaggedToolCalls(text: string): { textWithoutParsedCalls: string; toolCalls: ParsedTextToolCall[] } {
-    const toolCalls: ParsedTextToolCall[] = [];
-    let remaining = text;
-
-    const patterns = [/<tool_call>([\s\S]*?)<\/tool_call>/g, /<\|tool_call_begin\|>([\s\S]*?)<\|tool_call_end\|>/g];
-
-    for (const pattern of patterns) {
-        remaining = remaining.replace(pattern, (fullMatch: string, payloadText: string): string => {
-            const payloadTrimmed = payloadText.trim();
-            if (!payloadTrimmed) {
-                return "";
-            }
-            try {
-                const parsedPayload = JSON.parse(payloadTrimmed) as unknown;
-                const parsedCalls = parseTextToolPayload(parsedPayload);
-                if (parsedCalls.length > 0) {
-                    toolCalls.push(...parsedCalls);
-                    return "";
-                }
-            } catch {
-                // Keep original text when payload is not valid JSON.
-            }
-            return fullMatch;
-        });
-    }
-
-    return { textWithoutParsedCalls: remaining, toolCalls };
-}
-
-function splitStableTextAndPendingTaggedContent(text: string): { stableText: string; pendingText: string } {
-    const openers = ["<tool_call>", "<|tool_call_begin|>"];
-    const closestOpenIndex = Math.max(...openers.map((token) => text.lastIndexOf(token)));
-    if (closestOpenIndex < 0) {
-        return { stableText: text, pendingText: "" };
-    }
-
-    const pendingCandidate = text.slice(closestOpenIndex);
-    const hasClosingTag = pendingCandidate.includes("</tool_call>") || pendingCandidate.includes("<|tool_call_end|>");
-    if (hasClosingTag) {
-        return { stableText: text, pendingText: "" };
-    }
-
-    return {
-        stableText: text.slice(0, closestOpenIndex),
-        pendingText: pendingCandidate,
-    };
+    return blocks;
 }
 
 /**
@@ -358,8 +162,11 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                 : undefined;
         const mergeReasoningIntoContent = state.mergeReasoningContentInChoices && !!reasoningContent;
 
+        // Reasoning text streams as incremental deltas sharing one block id,
+        // so VS Code and the Agents window group them with the block's sealed
+        // part when the signature arrives.
         if (reasoningContent && !mergeReasoningIntoContent) {
-            thinkingParts.push({ type: "thinking", value: reasoningContent });
+            thinkingParts.push({ type: "thinking", value: reasoningContent, id: ensureCurrentThinkingBlockId(state) });
             Logger.trace(`[interpretStreamEvent] Emitted thinking part, length=${reasoningContent.length}`);
             StructuredLogger.trace("stream.reasoning_emitted", {
                 length: reasoningContent.length,
@@ -372,6 +179,38 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
             });
         }
 
+        // Anthropic thinking blocks ride on the thinking deltas. Text-only
+        // entries mirror the reasoning_content stream and are ignored here;
+        // a signed entry seals its block (the text deltas already carried the
+        // text) and a redacted entry replaces the text with opaque data.
+        for (const block of extractRawThinkingBlocks(delta?.thinking_blocks)) {
+            if (block.type === "thinking" && typeof block.signature === "string" && block.signature.length > 0) {
+                const blockId = state.currentThinkingBlockId ?? nextThinkingBlockId(state);
+                const blockText = typeof block.thinking === "string" ? block.thinking : "";
+                thinkingParts.push({
+                    type: "thinking",
+                    value: "",
+                    id: blockId,
+                    metadata: signedThinkingMetadata(block.signature, blockText),
+                });
+                state.currentThinkingBlockId = undefined;
+                Logger.trace(
+                    `[interpretStreamEvent] Sealed thinking block (id: ${blockId}, text ${blockText.length} chars, signature ${block.signature.length} bytes)`
+                );
+            } else if (block.type === "redacted_thinking" && typeof block.data === "string" && block.data.length > 0) {
+                const redactedId = nextThinkingBlockId(state);
+                thinkingParts.push({
+                    type: "thinking",
+                    value: "",
+                    id: redactedId,
+                    metadata: redactedThinkingMetadata(block.data),
+                });
+                Logger.trace(
+                    `[interpretStreamEvent] Emitted redacted thinking block (id: ${redactedId}, ${block.data.length} bytes)`
+                );
+            }
+        }
+
         const deltaContent = typeof delta?.content === "string" && delta.content ? delta.content : undefined;
         const contentForParsing = mergeReasoningIntoContent
             ? `${reasoningContent ?? ""}${deltaContent ?? ""}`
@@ -379,7 +218,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
 
         if (contentForParsing) {
             // Some LiteLLM backends emit tool calls as tagged text payloads
-            // (for example <tool_call>{...}</tool_call>) instead of structured
+            // (for example an inline JSON tool-call marker) instead of structured
             // delta.tool_calls arrays. Parse those tags here so VS Code receives
             // LanguageModelToolCallPart instead of raw JSON text.
             const combinedText = `${state.textToolParserBuffer}${contentForParsing}`;
@@ -576,80 +415,6 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
             preview: data.delta.substring(0, 100),
         });
     }
-    if (data.type === "response.output_reasoning.delta" && typeof data.delta === "string") {
-        Logger.trace(`[interpretStreamEvent] Emitting /responses thinking delta: ${data.delta.length} chars`);
-        // Include display metadata if set (for display: "omitted" mode, no thinking_delta events)
-        const metadata = state.currentThinkingDisplay ? { display: state.currentThinkingDisplay } : undefined;
-        thinkingParts.push({ type: "thinking", value: data.delta, metadata });
-        StructuredLogger.trace("stream.responses_reasoning_delta", {
-            length: data.delta.length,
-            preview: data.delta.substring(0, 100),
-            display: state.currentThinkingDisplay,
-        });
-    }
-
-    // 2a. Handle Anthropic content_block_start for thinking blocks
-    if (data.type === "response.content_block_start") {
-        const block = data.block as Record<string, unknown> | undefined;
-        if (block?.type === "thinking") {
-            const isRedacted = block.redacted === true;
-            state.currentThinkingBlockType = isRedacted ? "redacted_thinking" : "thinking";
-            state.currentThinkingDisplay = block.display as "summarized" | "omitted" | undefined;
-
-            // Always emit an empty thinking part when a thinking block starts.
-            // For redacted: includes redactedData and display:omitted.
-            // For display:omitted: includes display:omitted (no thinking_delta events will follow).
-            // For normal: includes display if specified, otherwise just an empty start marker.
-            // This ensures VS Code consumer knows a thinking block has started.
-            const thinkingMetadata: Record<string, unknown> = {};
-            if (isRedacted) {
-                const redactedData = typeof block.redacted_data === "string" ? block.redacted_data : undefined;
-                thinkingMetadata.redactedData = redactedData;
-                thinkingMetadata.display = "omitted";
-                Logger.info(`[interpretStreamEvent] Emitting redacted_thinking block, data present: ${!!redactedData}`);
-                StructuredLogger.trace("stream.redacted_thinking_block", {
-                    hasRedactedData: !!redactedData,
-                });
-            } else if (state.currentThinkingDisplay) {
-                thinkingMetadata.display = state.currentThinkingDisplay;
-                Logger.trace(
-                    `[interpretStreamEvent] Emitting thinking block with display: ${state.currentThinkingDisplay}`
-                );
-                StructuredLogger.trace("stream.thinking_block_with_display", {
-                    display: state.currentThinkingDisplay,
-                });
-            } else {
-                Logger.trace(`[interpretStreamEvent] content_block_start for thinking block`);
-            }
-
-            thinkingParts.push({
-                type: "thinking",
-                value: "",
-                metadata: Object.keys(thinkingMetadata).length > 0 ? thinkingMetadata : undefined,
-            });
-        }
-    }
-
-    // 2b. Handle Anthropic content_block_delta for signature_delta
-    if (data.type === "response.content_block_delta") {
-        const delta = data.delta as Record<string, unknown> | undefined;
-        if (delta?.type === "signature_delta") {
-            const signature = typeof delta.signature === "string" ? delta.signature : undefined;
-            state.currentThinkingDisplay = "omitted";
-            Logger.info(
-                `[interpretStreamEvent] Emitting signature-only thinking part, signature length: ${signature?.length ?? 0}`
-            );
-            thinkingParts.push({
-                type: "thinking",
-                value: "",
-                metadata: { signature, display: "omitted" },
-            });
-            StructuredLogger.trace("stream.signature_delta", {
-                signatureLength: signature?.length ?? 0,
-            });
-        }
-    }
-
     // 2b. Robust event shape: response.output_item.delta (keyed on item.call_id)
     // This is the event shape used by ResponsesClient — preserved here for providers
     // that stream tool args via output_item.delta rather than output_tool_call.*.
@@ -745,6 +510,8 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                       output_tokens?: number;
                       system_tokens?: number;
                       input_token_details?: { cached_tokens?: number; cache_creation_input_tokens?: number };
+                      cache_creation_input_tokens?: number;
+                      cache_read_input_tokens?: number;
                       output_token_details?: {
                           reasoning_tokens?: number;
                           tool_tokens?: number;
@@ -799,6 +566,8 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                 system_tokens: response?.usage?.system_tokens,
                 input_token_details: response?.usage?.input_token_details,
                 output_token_details: response?.usage?.output_token_details,
+                cache_creation_input_tokens: response?.usage?.cache_creation_input_tokens,
+                cache_read_input_tokens: response?.usage?.cache_read_input_tokens,
             });
 
             if (!usageValue.prompt_tokens_details) {

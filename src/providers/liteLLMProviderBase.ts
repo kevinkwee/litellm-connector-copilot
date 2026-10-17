@@ -107,6 +107,7 @@ export abstract class LiteLLMProviderBase {
             detectQuotaToolRedaction: this.detectQuotaToolRedaction.bind(this),
             stripUnsupportedParametersFromRequest: this.stripUnsupportedParametersFromRequest.bind(this),
             isParameterSupported: this.isParameterSupported.bind(this),
+            getUnsupportedParameters: (modelId: string) => this._registry.getUnsupportedParameters(modelId),
             getTelemetryOptions: this.getTelemetryOptions.bind(this),
             usageOptOutModels: this._usageOptOutModels,
             extractRawModelName: (modelId: string) => this.getRawModelName(modelId),
@@ -117,6 +118,9 @@ export abstract class LiteLLMProviderBase {
             configManager: this._configManager,
             userAgent: this.userAgent,
             logger: Logger,
+            onUnsupportedParameter: (model: string, param: string) => {
+                this._registry.recordUnsupportedParameter(model, param);
+            },
             liteLLMClientFactory: (backend) =>
                 new LiteLLMClient(
                     {
@@ -124,6 +128,7 @@ export abstract class LiteLLMProviderBase {
                         key: backend.key,
                         disableCaching: backend.disableCaching,
                         rateLimitMaxDelayMs: backend.rateLimitMaxDelayMs,
+                        onUnsupportedParameter: backend.onUnsupportedParameter,
                     },
                     this.userAgent
                 ),
@@ -867,6 +872,7 @@ export abstract class LiteLLMProviderBase {
             "presence_penalty",
             "top_p",
             "cache",
+            "cache_control",
             "no_cache",
             "no-cache",
             "extra_body",

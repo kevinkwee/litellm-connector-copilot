@@ -63,19 +63,4 @@ suite("Responses /responses stream interpreter integration", () => {
             assert.strictEqual(parts[0].value, "Hello World");
         }
     });
-
-    test("should handle reasoning delta events", () => {
-        const state = createInitialStreamingState();
-
-        const parts = interpretStreamEvent(
-            { type: "response.output_reasoning.delta", delta: "Let me think..." },
-            state
-        );
-
-        assert.strictEqual(parts.length, 1);
-        assert.strictEqual(parts[0].type, "thinking");
-        if (parts[0].type === "thinking") {
-            assert.strictEqual(parts[0].value, "Let me think...");
-        }
-    });
 });

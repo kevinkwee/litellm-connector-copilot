@@ -300,6 +300,136 @@ suite("Utility Unit Tests", () => {
         assert.ok(!serialized.includes("reasoning_content"));
     });
 
+    test("convertMessages replays signed thinking parts as thinking_blocks next to tool calls", () => {
+        const signedPart = {
+            value: "",
+            id: "litellm-thinking-1",
+            metadata: { signature: "SIG1", _completeThinking: "Plan the read first" },
+        };
+        const messages = [
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [
+                    signedPart as unknown as vscode.LanguageModelTextPart,
+                    new vscode.LanguageModelToolCallPart("call-seal", "read", { p: 1 }),
+                ],
+                name: undefined,
+            },
+        ] as unknown as vscode.LanguageModelChatRequestMessage[];
+
+        const out = convertMessages(messages) as {
+            role: string;
+            content?: unknown;
+            reasoning_content?: string;
+            thinking_blocks?: { type: string; thinking?: string; signature?: string }[];
+        }[];
+
+        assert.strictEqual(out.length, 1);
+        assert.strictEqual(out[0].reasoning_content, undefined, "blocks replace the reasoning_content path");
+        assert.deepStrictEqual(out[0].thinking_blocks, [
+            { type: "thinking", thinking: "Plan the read first", signature: "SIG1" },
+        ]);
+    });
+
+    test("convertMessages replays omitted-display signed blocks with empty thinking text", () => {
+        const signedPart = {
+            value: "",
+            id: "litellm-thinking-1",
+            metadata: { signature: "SIG2", _completeThinking: "" },
+        };
+        const messages = [
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [signedPart as unknown as vscode.LanguageModelTextPart],
+                name: undefined,
+            },
+        ] as unknown as vscode.LanguageModelChatRequestMessage[];
+
+        const out = convertMessages(messages) as {
+            thinking_blocks?: { type: string; thinking?: string; signature?: string }[];
+            reasoning_content?: string;
+        }[];
+
+        assert.deepStrictEqual(out[0].thinking_blocks, [{ type: "thinking", thinking: "", signature: "SIG2" }]);
+        assert.strictEqual(out[0].reasoning_content, undefined);
+    });
+
+    test("convertMessages replays redacted payloads and keeps the turn emitted", () => {
+        const redactedPart = { value: "", id: "litellm-thinking-1", metadata: { redactedData: "ENC3" } };
+        const messages = [
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [redactedPart as unknown as vscode.LanguageModelTextPart],
+                name: undefined,
+            },
+        ] as unknown as vscode.LanguageModelChatRequestMessage[];
+
+        const out = convertMessages(messages) as {
+            role: string;
+            content?: unknown;
+            reasoning_content?: string;
+            thinking_blocks?: { type: string; data?: string }[];
+        }[];
+
+        assert.strictEqual(out[0].reasoning_content, undefined);
+        assert.deepStrictEqual(out[0].thinking_blocks, [{ type: "redacted_thinking", data: "ENC3" }]);
+    });
+
+    test("convertMessages keeps unsigned thinking parts on reasoning_content", () => {
+        const unsignedPart = { value: "plain resume reasoning" };
+        const messages = [
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [unsignedPart as unknown as vscode.LanguageModelTextPart],
+                name: undefined,
+            },
+        ] as unknown as vscode.LanguageModelChatRequestMessage[];
+
+        const out = convertMessages(messages) as { reasoning_content?: string; thinking_blocks?: unknown }[];
+
+        assert.strictEqual(out[0].reasoning_content, "plain resume reasoning");
+        assert.strictEqual(out[0].thinking_blocks, undefined);
+    });
+
+    test("convertMessages does not replay signatures for user roles", () => {
+        const signedPart = { value: "", id: "id-x", metadata: { signature: "SIGUSER", _completeThinking: "s" } };
+        const messages = [
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [signedPart as unknown as vscode.LanguageModelTextPart],
+                name: undefined,
+            },
+        ] as unknown as vscode.LanguageModelChatRequestMessage[];
+
+        const out = convertMessages(messages) as unknown[];
+        const serialized = JSON.stringify(out);
+        assert.ok(!serialized.includes("SIGUSER"), "user-role signed thinking must not reach the wire");
+        assert.ok(!serialized.includes("thinking_blocks"));
+    });
+
+    test("convertMessages keeps blocks of multiple sealed parts in emission order", () => {
+        const first = { value: "", id: "a", metadata: { signature: "SIG1", _completeThinking: "one" } };
+        const second = { value: "", id: "b", metadata: { redactedData: "ENC9" } };
+        const third = { value: "", id: "c", metadata: { signature: "SIG2", _completeThinking: "" } };
+        const messages = [
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [first, second, third].map((p) => p as unknown as vscode.LanguageModelTextPart),
+                name: undefined,
+            },
+        ] as unknown as vscode.LanguageModelChatRequestMessage[];
+
+        const out = convertMessages(messages) as {
+            thinking_blocks?: { type: string; thinking?: string; signature?: string; data?: string }[];
+        }[];
+
+        assert.deepStrictEqual(out[0].thinking_blocks, [
+            { type: "thinking", thinking: "one", signature: "SIG1" },
+            { type: "redacted_thinking", data: "ENC9" },
+            { type: "thinking", thinking: "", signature: "SIG2" },
+        ]);
+    });
+
     test("validateRequest throws when tool call is followed by non-user message", () => {
         const callId = "abc";
         const toolCall = new vscode.LanguageModelToolCallPart(callId, "toolA", { q: 1 });

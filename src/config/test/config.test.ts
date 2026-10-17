@@ -213,6 +213,54 @@ suite("ConfigManager Unit Tests", () => {
         assert.strictEqual((await configManager.getConfig()).networkRetries, 3);
     });
 
+    suite("anthropicPromptCaching", () => {
+        test("defaults to 5m when the setting is unset", async () => {
+            const config = await configManager.getConfig();
+
+            assert.strictEqual(config.anthropicPromptCaching, "5m");
+        });
+
+        test("honors the explicit 5m value", async () => {
+            settingsMap.set("litellm-connector.anthropicPromptCaching", "5m");
+
+            const config = await configManager.getConfig();
+
+            assert.strictEqual(config.anthropicPromptCaching, "5m");
+        });
+
+        test("honors the 1h value", async () => {
+            settingsMap.set("litellm-connector.anthropicPromptCaching", "1h");
+
+            const config = await configManager.getConfig();
+
+            assert.strictEqual(config.anthropicPromptCaching, "1h");
+        });
+
+        test("honors the off value", async () => {
+            settingsMap.set("litellm-connector.anthropicPromptCaching", "off");
+
+            const config = await configManager.getConfig();
+
+            assert.strictEqual(config.anthropicPromptCaching, "off");
+        });
+
+        test("falls back to 5m for an invalid string", async () => {
+            settingsMap.set("litellm-connector.anthropicPromptCaching", "weekly");
+
+            const config = await configManager.getConfig();
+
+            assert.strictEqual(config.anthropicPromptCaching, "5m");
+        });
+
+        test("falls back to 5m for a non-string value", async () => {
+            settingsMap.set("litellm-connector.anthropicPromptCaching", 6);
+
+            const config = await configManager.getConfig();
+
+            assert.strictEqual(config.anthropicPromptCaching, "5m");
+        });
+    });
+
     test("every LiteLLMConfig field is populated by getConfig() (anti-dead-config guard)", async () => {
         // This test exists because settings were previously declared, read into
         // LiteLLMConfig, and reported to telemetry WITHOUT any runtime behavior.
@@ -226,6 +274,7 @@ suite("ConfigManager Unit Tests", () => {
         const liveFields: (keyof typeof config)[] = [
             "inactivityTimeout",
             "disableCaching",
+            "anthropicPromptCaching",
             "disableQuotaToolRedaction",
             "enableModelOverrides",
             "modelCapabilitiesOverrides",

@@ -4,10 +4,17 @@ import type {
     OpenAIChatMessage,
     OpenAIChatRole,
     OpenAIFunctionToolDef,
+    OpenAIThinkingBlock,
     OpenAIToolCall,
     OpenAIChatMessageContentItem,
 } from "./types";
 import { Logger } from "./utils/logger";
+import {
+    buildThinkingBlocks,
+    readRedactedData,
+    readThinkingSignature,
+    type ThinkingPartLike,
+} from "./utils/thinkingBlocks";
 
 /**
  * Normalize tool call IDs to be compatible with OpenAI-compatible providers
@@ -296,12 +303,12 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
         const contentItems: OpenAIChatMessageContentItem[] = [];
         const toolCalls: OpenAIToolCall[] = [];
         const toolResults: { callId: string; content: string }[] = [];
-        // Reasoning/thinking text collected from LanguageModelThinkingPart parts.
-        // Kept separate from `textParts` so it goes into the assistant message's
-        // `reasoning_content` field (not `content`) — matching LiteLLM's
-        // `reasoning_content` convention for reasoning-native providers
-        // (GLM-5.2, DeepSeek, Qwen, etc.).
         const reasoningParts: string[] = [];
+        // Thinking parts that carry a verifiable Anthropic marker (a signature
+        // or a redacted payload). They replay as message-level `thinking_blocks`
+        // instead of `reasoning_content`, because LiteLLM's Anthropic transform
+        // reads only the block form and drops reasoning text.
+        const sealedThinkingBlocks: OpenAIThinkingBlock[] = [];
 
         for (const part of m.content ?? []) {
             if (part instanceof vscode.LanguageModelTextPart) {
@@ -359,23 +366,30 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
                 const content = collectToolResultText(part as { content?: readonly unknown[] });
                 toolResults.push({ callId, content });
             } else if (isThinkingPart(part)) {
-                // LanguageModelThinkingPart — model's internal reasoning/thinking
-                // content. Collected into `reasoningParts` (separate from
-                // `textParts`) so it goes into the assistant message's
-                // `reasoning_content` field, NOT `content`. This matches LiteLLM's
-                // `reasoning_content` convention for reasoning-native providers
-                // (GLM-5.2, DeepSeek, Qwen, etc.) which accept and return
-                // `reasoning_content` as a distinct field on assistant messages.
+                // LanguageModelThinkingPart: the model's internal reasoning
+                // content. Signed or redacted parts replay as Anthropic
+                // `thinking_blocks`; unsigned parts are collected into
+                // `reasoningParts` (separate from `textParts`) so they go into
+                // the assistant message's `reasoning_content` field, NOT
+                // `content`. This matches LiteLLM's `reasoning_content`
+                // convention for reasoning-native providers (GLM-5.2, DeepSeek,
+                // Qwen, etc.) which accept and return `reasoning_content` as a
+                // distinct field on assistant messages.
                 //
-                // Putting reasoning in `content` would be incorrect — the model
+                // Putting reasoning in `content` would be incorrect. The model
                 // would see its reasoning as regular response text, not as
                 // reasoning, which breaks the reasoning chain semantics and can
                 // confuse the model about what it actually said vs. what it
-                // thought. With `reasoning_content`, the model correctly
-                // distinguishes "this was my internal reasoning before the tool
-                // call" from "this was my visible response."
-                //
-                // See: https://docs.litellm.ai/docs/reasoning_content
+                // thought. See: https://docs.litellm.ai/docs/reasoning_content
+                const partLike = part as unknown as ThinkingPartLike;
+                if (readThinkingSignature(partLike) !== undefined || readRedactedData(partLike) !== undefined) {
+                    const built = buildThinkingBlocks([partLike]);
+                    if (built.length > 0) {
+                        sealedThinkingBlocks.push(...built);
+                        Logger.trace("[convertMessages] Replaying sealed thinking part as thinking_blocks");
+                        continue;
+                    }
+                }
                 const thinkingText = getThinkingPartText(part);
                 if (thinkingText) {
                     reasoningParts.push(thinkingText);
@@ -387,8 +401,13 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
         let emittedAssistantToolCall = false;
         // Combine all reasoning parts into one string for the assistant message's
         // `reasoning_content` field. Only set on assistant-role messages; system
-        // and user messages don't carry reasoning content.
-        const reasoningContent = reasoningParts.length > 0 ? reasoningParts.join("\n") : undefined;
+        // and user messages don't carry reasoning content. Blocks take
+        // precedence: when a turn carries verifiable blocks, the reasoning text
+        // path is dropped entirely because LiteLLM's Anthropic transform would
+        // ignore it next to the blocks.
+        const reasoningContent =
+            reasoningParts.length > 0 && sealedThinkingBlocks.length === 0 ? reasoningParts.join("\n") : undefined;
+        const thinkingBlocks = sealedThinkingBlocks.length > 0 ? sealedThinkingBlocks : undefined;
 
         if (toolCalls.length > 0) {
             const messageContent = buildMessageContent(textParts, contentItems);
@@ -397,6 +416,7 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
                 content: messageContent || undefined,
                 tool_calls: toolCalls,
                 ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+                ...(thinkingBlocks ? { thinking_blocks: thinkingBlocks } : {}),
             });
             emittedAssistantToolCall = true;
         }
@@ -406,13 +426,14 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
         }
 
         const text = textParts.join("");
-        // A message that carries reasoning (reasoning_content) must be emitted
-        // even without visible text: the model needs its prior reasoning to
-        // continue a resumed turn. Content is an empty string then, not
-        // undefined: a reasoning-only assistant turn must carry an explicit
-        // string content field on the wire, regardless of whether the
-        // receiving transform or provider normalizes a missing key.
-        const hasReasoning = role === "assistant" && Boolean(reasoningContent);
+        // A message that carries reasoning (reasoning_content or replayable
+        // thinking blocks) must be emitted even without visible text: the model
+        // needs its prior reasoning to continue a resumed turn. Content is an
+        // empty string then, not undefined: a reasoning-only assistant turn
+        // must carry an explicit string content field on the wire, regardless
+        // of whether the receiving transform or provider normalizes a missing
+        // key.
+        const hasReasoning = role === "assistant" && (Boolean(reasoningContent) || Boolean(thinkingBlocks));
         if (text || contentItems.length > 0 || hasReasoning) {
             if (role === "system" || role === "user" || (role === "assistant" && !emittedAssistantToolCall)) {
                 const messageContent = buildMessageContent(textParts, contentItems);
@@ -421,6 +442,7 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
                         role: role || "user",
                         content: messageContent ?? "",
                         ...(reasoningContent && role === "assistant" ? { reasoning_content: reasoningContent } : {}),
+                        ...(thinkingBlocks && role === "assistant" ? { thinking_blocks: thinkingBlocks } : {}),
                     });
                 }
             }

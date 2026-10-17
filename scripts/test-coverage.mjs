@@ -70,9 +70,13 @@ if (hasXvfb) {
     env: process.env,
   });
 } else {
+  // On Windows the bare `vscode-test` name resolves to the POSIX sh shim,
+  // which a no-shell spawn cannot run; shell: true lets Windows resolve the
+  // .cmd shim instead.
   child = spawn("vscode-test", testArgs, {
     stdio: "inherit",
     env: process.env,
+    shell: process.platform === "win32",
   });
 }
 
