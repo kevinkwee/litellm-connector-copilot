@@ -259,6 +259,26 @@ suite("renderCopilotMd", () => {
         assert.ok(md.includes("file content here"));
     });
 
+    test("renders an image part inside a tool result as a size placeholder", () => {
+        const entry = makeMinimalEntry({
+            requestMessages: [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    content: [
+                        new vscode.LanguageModelToolResultPart("call_1", [
+                            new vscode.LanguageModelDataPart(new Uint8Array(2048), "image/png"),
+                        ]),
+                    ],
+                    name: undefined,
+                },
+            ],
+        });
+        const md = renderCopilotMd(entry);
+
+        assert.ok(md.includes("<image/png, 2.0 KB>"));
+        assert.ok(!md.includes('"0":0'), "raw image bytes must not reach the transcript");
+    });
+
     test("renders tool-result-only messages as ### Tool (not ### User)", () => {
         // VS Code sends tool results as User-role messages with
         // LanguageModelToolResultPart parts. Copilot's format renders these

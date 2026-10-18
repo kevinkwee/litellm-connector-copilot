@@ -22,8 +22,15 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - `1h` cache writes cost 2x input tokens versus 1.25x for `5m`; cache reads cost 0.1x for both tiers. Applies only to Anthropic Claude models; commit message generation never marks its one-shot prompts.
 - If a model rejects the marker, the connector strips it, retries the request, and remembers the rejection for the rest of the session (no repeat failure cost).
 
+### Multimodal tool results
+- An image returned by a tool now reaches the model instead of being silently dropped.
+- The wire shape follows the provider family. Anthropic, Gemini/Vertex and Bedrock models receive `image_url` parts inside the `role: "tool"` message. OpenAI-compatible models (OpenAI, OpenRouter, DeepSeek, Moonshot, Mistral, SambaNova and anything unknown) receive placeholder text in the tool message plus one following user message with the images, because LiteLLM's transforms for those providers keep only the text of a content list and would drop the image.
+- Images from parallel tool calls are grouped into one user message after the last tool message of the run, so tool-call adjacency is preserved, and each image group is attributed to the tool that produced it.
+- Parts tagged with a `LanguageModelPartAudience` that excludes the model are not uploaded.
+- Images returned by tools count toward the token budget, and `.copilotmd` transcripts render them as a size placeholder instead of raw bytes.
+
 ### `.copilotmd` session transcripts
-- Chat requests are exported as `.copilotmd` markdown files (byte-compatible with Copilot Chat's debug view) into `copilot-debug/<session fingerprint>/` under VS Code's hidden per-workspace extension storage (default) or global storage, configured via `litellm-connector.debug.copilotMdExport.*`. The export is off by default.
+- Chat requests are exported as `.copilotmd` markdown files (byte-compatible with Copilot Chat's debug view, except tool result binaries, which render as size placeholders) into `copilot-debug/<session fingerprint>/` under VS Code's hidden per-workspace extension storage (default) or global storage, configured via `litellm-connector.debug.copilotMdExport.*`. The export is off by default.
 - Per-session retention caps keep the export folder bounded.
 - New command: **LiteLLM: Open .copilotmd Export Folder**.
 - Reasoning/thinking parts and tool messages are rendered in transcripts; thinking parts are concatenated into continuous reasoning lines with visible separation between reasoning and text.

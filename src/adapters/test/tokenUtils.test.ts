@@ -337,6 +337,27 @@ suite("TokenUtils Unit Tests", () => {
         assert.ok(count > 0);
     });
 
+    test("countOpenAIChatMessagesTokens counts a data-URI image part", () => {
+        // 1500 image bytes become a 2000-character base64 payload: 85 base
+        // tokens plus ceil(1500 / 750) = 2 scaled tokens.
+        const dataUri = `data:image/png;base64,${Buffer.alloc(1500).toString("base64")}`;
+        const count = countOpenAIChatMessagesTokens(
+            [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUri } }] }],
+            "m"
+        );
+
+        assert.strictEqual(count, 87);
+    });
+
+    test("countOpenAIChatMessagesTokens charges the base image cost for a remote image URL", () => {
+        const count = countOpenAIChatMessagesTokens(
+            [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/a.png" } }] }],
+            "m"
+        );
+
+        assert.strictEqual(count, 85);
+    });
+
     test("isContextOverflowError matches known patterns", () => {
         const codeError = Object.assign(new Error("overflow"), { code: "context_length_exceeded" });
         const tokenError = Object.assign(new Error("overflow"), { code: "tokens_exceeded" });

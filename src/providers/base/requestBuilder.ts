@@ -3,6 +3,7 @@ import { convertMessages, convertTools, validateRequest } from "../../utils";
 import { trimMessagesToFitBudget } from "../../adapters/tokenUtils";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest, OpenAIFunctionToolDef } from "../../types";
 import { DEFAULT_ANTHROPIC_PROMPT_CACHING, resolveAnthropicCacheControl } from "../../utils/promptCaching";
+import { resolveToolResultImageMode } from "../../utils/modelUtils";
 import type { RequestBuilderDeps } from "./types";
 
 export class RequestBuilder {
@@ -63,7 +64,9 @@ export class RequestBuilder {
             config.autoTrimMessages === true
                 ? trimMessagesToFitBudget(messages, toolConfig.tools, model, modelInfo)
                 : messages;
-        const openaiMessages = convertMessages(messagesToUse);
+        const openaiMessages = convertMessages(messagesToUse, {
+            toolResultImageMode: resolveToolResultImageMode(modelInfo),
+        });
         validateRequest(messagesToUse);
 
         const reasoningEffort = this.getReasoningEffort(options, model, modelInfo);

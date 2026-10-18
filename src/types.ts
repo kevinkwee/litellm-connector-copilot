@@ -27,6 +27,18 @@ export interface OpenAIChatMessageContentItem {
 }
 
 /**
+ * Wire shape used to carry the images a tool produced.
+ *
+ * - `native`: `image_url` parts inside the `role: "tool"` message. Correct for
+ *   provider families whose LiteLLM transform parses list content on tool
+ *   messages (Anthropic, Gemini/Vertex, Bedrock).
+ * - `hoist`: placeholder text in the tool message plus one following user
+ *   message carrying the images. Required for OpenAI-compatible providers,
+ *   whose transforms keep only the text of a list and would drop the image.
+ */
+export type ToolResultImageMode = "native" | "hoist";
+
+/**
  * Anthropic thinking block carried on assistant messages. Only signed or
  * safety-redacted blocks are sent; unsigned reasoning text travels via
  * `reasoning_content`, which LiteLLM maps for reasoning-native providers.

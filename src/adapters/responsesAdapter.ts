@@ -9,6 +9,61 @@ import { normalizeToolCallId } from "../utils";
 import { Logger } from "../utils/logger";
 
 /**
+ * Wraps an image as a Responses user or assistant message item.
+ *
+ * LiteLLM's Responses-to-chat transform recognizes images in message content
+ * only as `input_image` (see `_transform_input_image_item_to_image_item`). An
+ * `image_url` item carries no `text` field, so the transform skips it as an
+ * empty text block and the image never reaches the model.
+ *
+ * The content must be an array: LiteLLM rejects a bare content object.
+ * @param role Author of the image.
+ * @param imageUrl Data URI or remote URL of the image.
+ */
+function toResponsesImageMessage(role: "user" | "assistant", imageUrl: string): LiteLLMResponseInputItem {
+    return {
+        type: "message",
+        role,
+        content: [{ type: "input_image", image_url: imageUrl }],
+    } as unknown as LiteLLMResponseInputItem;
+}
+
+/**
+ * Flattens tool message content into the string the Responses tool output
+ * carries.
+ *
+ * Array content only reaches this path when a caller bypasses the image mode
+ * decision, so image parts are logged and dropped instead of being serialized
+ * into `output` as raw bytes.
+ * @param content Tool message content.
+ */
+function toToolOutputText(content: unknown): string {
+    if (typeof content === "string") {
+        return content;
+    }
+    if (Array.isArray(content)) {
+        const items = content as OpenAIChatMessageContentItem[];
+        if (items.some((item) => item.type === "image_url")) {
+            Logger.warn(
+                "[responsesAdapter] Tool message carried image parts; sending its text only. Responses requests move tool images into a user message."
+            );
+        }
+        return items
+            .filter((item) => item.type === "text" && typeof item.text === "string")
+            .map((item) => item.text)
+            .join("");
+    }
+    if (content === undefined || content === null) {
+        return "";
+    }
+    try {
+        return JSON.stringify(content) ?? "";
+    } catch {
+        return String(content);
+    }
+}
+
+/**
  * Transform a chat/completions request body to the responses API format.
  * The responses API uses "input" (array format) instead of "messages".
  * Tools use the SAME standard OpenAI format as chat/completions.
@@ -70,16 +125,8 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
                             content: contentItem.text,
                         });
                     } else if (contentItem.type === "image_url" && contentItem.image_url?.url) {
-                        Logger.debug(
-                            `[responsesAdapter] User image: type=${contentItem.type}, url=${contentItem.image_url.url.substring(0, 50)}...`
-                        );
-                        // LiteLLM /responses requires content to be a string or array — NOT a bare dict.
-                        // Wrap the content item in an array to avoid ValueError: Invalid content type: <class 'dict'>
-                        inputArray.push({
-                            type: "message",
-                            role: "user",
-                            content: [contentItem],
-                        } as unknown as LiteLLMResponseInputItem);
+                        Logger.debug("[responsesAdapter] Adding user image message item");
+                        inputArray.push(toResponsesImageMessage("user", contentItem.image_url.url));
                     }
                 }
             }
@@ -98,16 +145,8 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
                             content: contentItem.text,
                         });
                     } else if (contentItem.type === "image_url" && contentItem.image_url?.url) {
-                        Logger.debug(
-                            `[responsesAdapter] Assistant image: type=${contentItem.type}, url=${contentItem.image_url.url.substring(0, 50)}...`
-                        );
-                        // LiteLLM /responses requires content to be a string or array — NOT a bare dict.
-                        // Wrap the content item in an array to avoid ValueError: Invalid content type: <class 'dict'>
-                        inputArray.push({
-                            type: "message",
-                            role: "assistant",
-                            content: [contentItem],
-                        } as unknown as LiteLLMResponseInputItem);
+                        Logger.debug("[responsesAdapter] Adding assistant image message item");
+                        inputArray.push(toResponsesImageMessage("assistant", contentItem.image_url.url));
                     }
                 }
             }
@@ -175,11 +214,10 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
             if (toolCallId) {
                 const normalizedId = toolCallIdMap.get(toolCallId) || normalizeToolCallId(toolCallId);
                 Logger.debug(`[responsesAdapter] Adding function_call_output (id: ${normalizedId})`);
-                const toolContent = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
                 inputArray.push({
                     type: "function_call_output",
                     call_id: normalizedId,
-                    output: toolContent || "Success",
+                    output: toToolOutputText(msg.content) || "Success",
                 });
             }
         }

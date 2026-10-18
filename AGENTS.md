@@ -635,7 +635,7 @@ Keep this pipeline shared unless the change is intentionally protocol-specific a
 
 ### Chat-Specific Logic (Chat Provider)
 
-- **Request part conversion**: handle `LanguageModelTextPart` and `LanguageModelBinaryPart` (vision). Images must be encoded for OpenAI-compatible payloads.
+- **Request part conversion**: handle `LanguageModelTextPart` and `LanguageModelBinaryPart` (vision). Images must be encoded for OpenAI-compatible payloads. Tool result images follow the provider-specific shapes described in [Multimodal Tool Results](#multimodal-tool-results).
 - **Streaming state management**: buffer partial tool calls when SSE frames arrive fragmented.
 - **Response emission**: emit `LanguageModelResponsePart`, `LanguageModelToolCallPart`, `LanguageModelToolResultPart` to the progress callback.
 - **Tool call parsing**: extract and validate tool calls from streaming chunks.
@@ -648,6 +648,16 @@ Claude reasoning arrives as thinking deltas plus signature and redacted-thinking
 - **Emission**: `src/adapters/streaming/liteLLMStreamInterpreter.ts`; part ids are `litellm-thinking-N`. Unsigned or malformed signed blocks are ignored rather than reconstructed.
 - **Replay**: `convertMessages` (`src/utils.ts`, via `src/utils/thinkingBlocks.ts`) rebuilds `thinking_blocks` from sealed parts and omits `reasoning_content` when blocks exist. Unsigned reasoning parts keep `reasoning_content`, so the transport-retry resume path is unchanged.
 - **Role safety**: blocks and signatures are only attached to assistant messages; user and system roles never carry them.
+
+### Multimodal Tool Results
+
+Images returned by a tool (a screenshot tool, a chart renderer, an MCP server) travel to the model instead of being dropped. `convertMessages` collects them into `image_url` items, but the wire shape depends on the provider family because LiteLLM's transforms disagree about tool message content.
+
+- **Native shape**: Anthropic, Gemini/Vertex and Bedrock transforms parse `image_url` parts inside a `role: "tool"` message, so the images stay in the tool message.
+- **Hoisted shape**: OpenAI-compatible providers run tool messages through `convert_content_list_to_str`, which keeps only text, so the tool message carries a placeholder and one user message after the run carries the images. Grouping after the last tool message preserves the tool-call adjacency that strict providers require, and each image group is attributed to its tool so parallel calls stay distinguishable.
+- **Mode selection**: `resolveToolResultImageMode` in `src/utils/modelUtils.ts` picks the shape from `modelInfo.litellm_provider`, and `src/providers/base/requestBuilder.ts` passes it to `convertMessages`. Unknown providers and `/responses` requests hoist, because hoisting keeps the images reachable while native content risks silent loss.
+- **Audience filtering**: a tool result part whose `audience` list excludes `Assistant` is not uploaded. Parts without the flag stay unconditional.
+- **Responses API**: `src/adapters/responsesAdapter.ts` carries message images as `input_image` items, the only shape LiteLLM's Responses-to-chat transform reads.
 
 ### Anthropic Prompt Caching
 

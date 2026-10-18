@@ -118,6 +118,22 @@ export function countTokens(
 }
 
 /**
+ * Estimates the token cost of an `image_url` content item.
+ *
+ * A data URI is sized from its base64 payload. A remote URL is charged only the
+ * base image cost because its bytes are not available while counting.
+ * @param url Image URL carried by the content item.
+ */
+function estimateImagePartTokens(url: string): number {
+    const dataUriMatch = /^data:([^;,]+);base64,/i.exec(url);
+    if (!dataUriMatch) {
+        return IMAGE_TOKEN_BASE;
+    }
+    const byteLength = Math.ceil(((url.length - dataUriMatch[0].length) * 3) / 4);
+    return estimateMediaTokenCost(dataUriMatch[1], byteLength) || IMAGE_TOKEN_BASE;
+}
+
+/**
  * Counts tokens for the OpenAI-style transport messages that are actually sent
  * to LiteLLM after trimming and tool conversion.
  */
@@ -136,6 +152,8 @@ export function countOpenAIChatMessagesTokens(
             for (const part of message.content) {
                 if (part.type === "text" && typeof part.text === "string") {
                     total += tokenizer.countTokens(part.text).tokens;
+                } else if (part.type === "image_url" && typeof part.image_url?.url === "string") {
+                    total += estimateImagePartTokens(part.image_url.url);
                 }
             }
         }

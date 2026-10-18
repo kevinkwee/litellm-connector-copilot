@@ -461,14 +461,17 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
 
 /**
  * Renders the content array of a `LanguageModelToolResultPart` as text.
- * Mirrors Copilot's tool-result rendering: text parts become their `.value`,
- * data parts become `JSON.stringify`, anything else falls back to stringify.
+ * Text parts become their `.value`, binary parts become a size placeholder so
+ * raw bytes never reach the transcript, and anything else falls back to
+ * `JSON.stringify`.
  */
 function renderToolResultContent(content: (vscode.LanguageModelTextPart | unknown)[]): string {
     const chunks: string[] = [];
     for (const item of content) {
         if (item instanceof vscode.LanguageModelTextPart) {
             chunks.push((item as vscode.LanguageModelTextPart).value);
+        } else if (item instanceof vscode.LanguageModelDataPart) {
+            chunks.push(formatBinaryPartPlaceholder(item.mimeType, item.data.byteLength));
         } else {
             try {
                 chunks.push(JSON.stringify(item));
@@ -478,6 +481,23 @@ function renderToolResultContent(content: (vscode.LanguageModelTextPart | unknow
         }
     }
     return chunks.join("\n");
+}
+
+/**
+ * Summarizes a binary part as `<mime, size>` for the transcript.
+ * @param mimeType MIME type of the part.
+ * @param byteLength Size of the part payload in bytes.
+ */
+function formatBinaryPartPlaceholder(mimeType: string, byteLength: number): string {
+    let size: string;
+    if (byteLength < 1024) {
+        size = `${byteLength} B`;
+    } else if (byteLength < 1024 * 1024) {
+        size = `${(byteLength / 1024).toFixed(1)} KB`;
+    } else {
+        size = `${(byteLength / (1024 * 1024)).toFixed(1)} MB`;
+    }
+    return `<${mimeType}, ${size}>`;
 }
 
 /**
