@@ -36,6 +36,11 @@ import { sha1BytesAsync } from "../utils/discoveryHash";
  * - `requestType` line: Copilot emits this when the endpoint metadata is
  *   an object (`urlOrRequestMetadata.type`). We always have a string
  *   `baseUrl` from the LiteLLM proxy config, so we always emit `url:`.
+ * - Binary parts: Copilot serializes a `LanguageModelDataPart` with
+ *   `JSON.stringify`, which writes the entire byte array into the file, both for
+ *   request messages and for tool results. We write a `<mime, size>` placeholder
+ *   instead, so an exported transcript stays readable and never carries raw
+ *   binary bytes.
  *
  * Everything else is line-for-line compatible.
  */
@@ -319,10 +324,10 @@ function requestPartToMarkdown(part: vscode.LanguageModelInputPart | unknown): s
         const text = Array.isArray(thinkingPart.value) ? thinkingPart.value.join("\n") : thinkingPart.value;
         return `reasoning: ${text}`;
     }
-    // LanguageModelDataPart — opaque binary data; serialize as JSON like Copilot
-    // does for non-text image content.
+    // LanguageModelDataPart: opaque binary content, rendered as a size placeholder
+    // so the transcript stays readable and carries no raw bytes.
     if (part instanceof vscode.LanguageModelDataPart) {
-        return JSON.stringify(part);
+        return formatBinaryPartPlaceholder(part.mimeType, part.data.byteLength);
     }
     // Fallback: unknown part shape (e.g. a proposed-API part we don't model).
     // Match Copilot's `JSON.stringify(item)` behavior for non-text content.

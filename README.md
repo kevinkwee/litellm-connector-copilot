@@ -30,7 +30,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Images returned by tools count toward the token budget, and `.copilotmd` transcripts render them as a size placeholder instead of raw bytes.
 
 ### `.copilotmd` session transcripts
-- Chat requests are exported as `.copilotmd` markdown files (byte-compatible with Copilot Chat's debug view, except tool result binaries, which render as size placeholders) into `copilot-debug/<session fingerprint>/` under VS Code's hidden per-workspace extension storage (default) or global storage, configured via `litellm-connector.debug.copilotMdExport.*`. The export is off by default.
+- Chat requests are exported as `.copilotmd` markdown files (byte-compatible with Copilot Chat's debug view, except binary parts, which render as size placeholders instead of raw bytes) into `copilot-debug/<session fingerprint>/` under VS Code's hidden per-workspace extension storage (default) or global storage, configured via `litellm-connector.debug.copilotMdExport.*`. The export is off by default.
 - Per-session retention caps keep the export folder bounded.
 - New command: **LiteLLM: Open .copilotmd Export Folder**.
 - Reasoning/thinking parts and tool messages are rendered in transcripts; thinking parts are concatenated into continuous reasoning lines with visible separation between reasoning and text.

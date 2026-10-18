@@ -17,12 +17,13 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Fixes
 
+* **🧾 Transcripts no longer embed raw binary parts**: a binary part in a request message, such as an image the user attached, now renders as `<image/png, 2.0 KB>` in `.copilotmd` transcripts instead of a JSON byte array. Tool result binaries render the same way, so an exported transcript never carries raw binary bytes. (`src/observability/copilotMdRenderer.ts`)
 * **🖼️ `/responses` message images use the item type LiteLLM reads**: conversation images were wrapped as `{type: "image_url"}` inside message content, but LiteLLM's Responses-to-chat transform recognizes only `input_image` and `input_file`, and skips any other item that has no `text` field, so those images were dropped before reaching the model. They are now sent as `{type: "input_image", image_url}`. A tool message that somehow carries array content now contributes its text instead of being JSON-stringified into the tool output. (`src/adapters/responsesAdapter.ts`)
 * **🧹 Dead `/responses` stream handlers removed**: the interpreter no longer registers `response.output_reasoning.delta`, `response.content_block_start`, or `response.content_block_delta` handlers, which no LiteLLM `/responses` stream emits, and the unused per-block thinking state fields are gone. Stream behavior is unchanged. (`src/adapters/streaming/liteLLMStreamInterpreter.ts`)
 
 ### 🧪 Tests
 
-* Coverage for native and hoisted tool result images, parallel tool runs, image-only results, audience filtering, `cache_control` stripping with an image present, non-image binaries, image MIME casing, image token counting, the Responses `input_image` shape, and the transcript placeholder. (`src/utils/test/utils.test.ts`, `src/utils/test/toolResultImageMode.test.ts`, `src/adapters/test/responsesAdapter.test.ts`, `src/adapters/test/tokenUtils.test.ts`, `src/observability/test/copilotMdRenderer.test.ts`)
+* Coverage for native and hoisted tool result images, parallel tool runs, image-only results, audience filtering, `cache_control` stripping with an image present, non-image binaries, image MIME casing, image token counting, the Responses `input_image` shape, and the transcript placeholder for binary parts in tool results and request messages. (`src/utils/test/utils.test.ts`, `src/utils/test/toolResultImageMode.test.ts`, `src/adapters/test/responsesAdapter.test.ts`, `src/adapters/test/tokenUtils.test.ts`, `src/observability/test/copilotMdRenderer.test.ts`)
 
 ### 🧹 Chores
 
