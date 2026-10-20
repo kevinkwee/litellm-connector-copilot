@@ -6,9 +6,9 @@ import {
     flushPendingBuffers,
     hasBufferedToolCalls,
 } from "../liteLLMStreamInterpreter";
-import { TAGGED_CALL_CLOSER, TAGGED_CALL_OPENER, PIPE_CLOSER, PIPE_OPENER } from "../textToolCallParser";
 import { StructuredLogger } from "../../../observability/structuredLogger";
 import { Logger } from "../../../utils/logger";
+import { UpstreamStreamError } from "../../../utils/transportRetry";
 
 declare const suite: (name: string, fn: () => void) => void;
 declare const test: (name: string, fn: () => void) => void;
@@ -39,7 +39,7 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
 
         // Simulate abort/reset for a new request on same connection
         state.toolCallBuffers.clear();
-        state.emittedTextToolCallIds.clear();
+        state.emittedToolCallIds.clear();
 
         // Next request reuses index 0; should not be corrupted by stale args
         interpretStreamEvent(
@@ -698,8 +698,137 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
         assert.strictEqual(textPart.type, "text");
         assert.strictEqual(textPart.value, "hello");
     });
+});
 
-    test("should parse tagged text tool calls into structured tool_call parts", () => {
+suite("Upstream error frames", () => {
+    function assertThrowsUpstreamError(fn: () => void): UpstreamStreamError {
+        try {
+            fn();
+        } catch (err) {
+            assert.ok(err instanceof UpstreamStreamError, `expected UpstreamStreamError, got ${String(err)}`);
+            return err;
+        }
+        assert.fail("expected the frame to throw");
+    }
+
+    test("a LiteLLM mid-stream error frame throws with its status and code", () => {
+        const state = createInitialStreamingState("req-err");
+
+        const error = assertThrowsUpstreamError(() =>
+            interpretStreamEvent(
+                {
+                    error: {
+                        message: "Overloaded",
+                        type: "overloaded_error",
+                        code: 529,
+                    },
+                },
+                state
+            )
+        );
+
+        assert.strictEqual(error.status, 529);
+        assert.strictEqual(error.type, "overloaded_error");
+        assert.strictEqual(error.detail, "Overloaded");
+        assert.strictEqual(error.retriable, true);
+        assert.match(error.message, /Overloaded/);
+    });
+
+    test("a rejected request in an error frame is not retriable", () => {
+        const state = createInitialStreamingState();
+
+        const error = assertThrowsUpstreamError(() =>
+            interpretStreamEvent(
+                {
+                    error: {
+                        message: "Unsupported parameter: temperature",
+                        type: "invalid_request_error",
+                        code: "400",
+                    },
+                },
+                state
+            )
+        );
+
+        assert.strictEqual(error.status, 400);
+        assert.strictEqual(error.retriable, false);
+    });
+
+    test("a symbolic code is not read as an HTTP status", () => {
+        const error = assertThrowsUpstreamError(() =>
+            interpretStreamEvent(
+                { error: { code: "rate_limit_exceeded", message: "slow down" } },
+                createInitialStreamingState()
+            )
+        );
+
+        assert.strictEqual(error.status, undefined);
+        assert.strictEqual(error.code, "rate_limit_exceeded");
+        assert.strictEqual(error.retriable, true);
+    });
+
+    test("/responses error and response.failed events throw", () => {
+        const fromErrorEvent = assertThrowsUpstreamError(() =>
+            interpretStreamEvent(
+                { type: "error", code: "server_error", message: "upstream exploded" },
+                createInitialStreamingState()
+            )
+        );
+        assert.strictEqual(fromErrorEvent.code, "server_error");
+        assert.strictEqual(fromErrorEvent.detail, "upstream exploded");
+
+        const fromFailedEvent = assertThrowsUpstreamError(() =>
+            interpretStreamEvent(
+                { type: "response.failed", response: { error: { code: 503, message: "unavailable" } } },
+                createInitialStreamingState()
+            )
+        );
+        assert.strictEqual(fromFailedEvent.status, 503);
+        assert.strictEqual(fromFailedEvent.retriable, true);
+    });
+
+    test("a response.failed event without an error payload still throws", () => {
+        const withoutResponse = assertThrowsUpstreamError(() =>
+            interpretStreamEvent({ type: "response.failed" }, createInitialStreamingState())
+        );
+        assert.strictEqual(withoutResponse.type, "response.failed");
+
+        const withEmptyResponse = assertThrowsUpstreamError(() =>
+            interpretStreamEvent({ type: "response.failed", response: {} }, createInitialStreamingState())
+        );
+        assert.strictEqual(withEmptyResponse.type, "response.failed");
+    });
+
+    test("an empty error object still marks the frame as a failure", () => {
+        const error = assertThrowsUpstreamError(() =>
+            interpretStreamEvent({ error: {} }, createInitialStreamingState())
+        );
+
+        assert.strictEqual(error.type, "error");
+    });
+
+    test("a null error field is not a failure frame", () => {
+        const parts = interpretStreamEvent(
+            { choices: [{ delta: { content: "still fine" } }], error: null },
+            createInitialStreamingState()
+        );
+
+        assert.deepStrictEqual(
+            parts.flatMap((part) => (part.type === "text" ? [part.value] : [])),
+            ["still fine"]
+        );
+    });
+
+    test("a plain string error field becomes an unlabelled failure", () => {
+        const error = assertThrowsUpstreamError(() =>
+            interpretStreamEvent({ error: "gateway closed" }, createInitialStreamingState())
+        );
+
+        assert.strictEqual(error.detail, "gateway closed");
+        assert.strictEqual(error.retriable, false);
+    });
+
+    test("emits tool-call-shaped text in the answer as plain text", () => {
         const state = createInitialStreamingState();
 
         const parts = interpretStreamEvent(
@@ -707,7 +836,7 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
                 choices: [
                     {
                         delta: {
-                            content: `before ${TAGGED_CALL_OPENER}{"id":"call_text_1","name":"search","arguments":{"query":"vscode"}}${TAGGED_CALL_CLOSER} after`,
+                            content: 'before <tool_call>{"name":"search"}</tool_call> after',
                         },
                     },
                 ],
@@ -715,56 +844,33 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
             state
         );
 
-        const toolCallPart = parts.find((part) => part.type === "tool_call");
-        assert.ok(toolCallPart && toolCallPart.type === "tool_call");
-        if (toolCallPart && toolCallPart.type === "tool_call") {
-            assert.strictEqual(toolCallPart.name, "search");
-            assert.strictEqual(toolCallPart.args, '{"query":"vscode"}');
-        }
-
-        const textOutput = parts
-            .filter((part): part is Extract<(typeof parts)[number], { type: "text" }> => part.type === "text")
-            .map((part) => part.value)
-            .join("");
-        assert.strictEqual(textOutput, "before  after");
+        assert.deepStrictEqual(
+            parts.flatMap((part) => (part.type === "text" ? [part.value] : [])),
+            ['before <tool_call>{"name":"search"}</tool_call> after']
+        );
+        assert.deepStrictEqual(
+            parts.filter((part) => part.type === "tool_call"),
+            []
+        );
     });
 
-    test("should buffer split tagged text tool calls and emit once closed", () => {
+    test("splits a text answer across deltas without buffering it", () => {
         const state = createInitialStreamingState();
 
         const firstParts = interpretStreamEvent(
-            {
-                choices: [
-                    {
-                        delta: {
-                            content: `${PIPE_OPENER}{"name":"filesystem","arguments":{"path":"/tmp"}`,
-                        },
-                    },
-                ],
-            },
+            { choices: [{ delta: { content: "<tool_call>{half of a payload" } }] },
             state
         );
-        assert.strictEqual(firstParts.length, 0, "first partial chunk should not emit output yet");
+        const secondParts = interpretStreamEvent({ choices: [{ delta: { content: " that never closes" } }] }, state);
 
-        const secondParts = interpretStreamEvent(
-            {
-                choices: [
-                    {
-                        delta: {
-                            content: `}${PIPE_CLOSER}`,
-                        },
-                    },
-                ],
-            },
-            state
+        assert.deepStrictEqual(
+            firstParts.flatMap((part) => (part.type === "text" ? [part.value] : [])),
+            ["<tool_call>{half of a payload"]
         );
-
-        const toolCallPart = secondParts.find((part) => part.type === "tool_call");
-        assert.ok(toolCallPart && toolCallPart.type === "tool_call");
-        if (toolCallPart && toolCallPart.type === "tool_call") {
-            assert.strictEqual(toolCallPart.name, "filesystem");
-            assert.strictEqual(toolCallPart.args, '{"path":"/tmp"}');
-        }
+        assert.deepStrictEqual(
+            secondParts.flatMap((part) => (part.type === "text" ? [part.value] : [])),
+            [" that never closes"]
+        );
     });
 });
 
@@ -929,7 +1035,7 @@ suite("flushPendingBuffers Unit Tests", () => {
 
     test("skips a chat-completions buffer whose call id was already emitted", () => {
         const state = createInitialStreamingState();
-        state.emittedTextToolCallIds.add("fc_call_dup");
+        state.emittedToolCallIds.add("fc_call_dup");
         state.toolCallBuffers.set(0, { id: "fc_call_dup", name: "read_file", args: '{"p":1}' });
 
         const parts = flushPendingBuffers(state);
@@ -1110,28 +1216,11 @@ suite("Tool Call Args Corruption Logging", () => {
         assert.strictEqual(fields.argsPreview, "{invalid");
     });
 
-    test("still reports the corrupt arguments of a call already emitted as tagged text", () => {
+    test("still reports the corrupt arguments of a call whose id was already emitted", () => {
         const state = createInitialStreamingState();
         const errorStub = sandbox.stub(StructuredLogger, "error");
-        interpretStreamEvent(
-            {
-                choices: [
-                    {
-                        delta: {
-                            tool_calls: [
-                                { index: 0, id: "call_dup", function: { name: "read_file", arguments: '{"p":' } },
-                            ],
-                        },
-                    },
-                ],
-            },
-            state
-        );
-        const taggedCall = JSON.stringify({ id: "call_dup", name: "read_file", arguments: { p: 1 } });
-        interpretStreamEvent(
-            { choices: [{ delta: { content: `${TAGGED_CALL_OPENER}${taggedCall}${TAGGED_CALL_CLOSER}` } }] },
-            state
-        );
+        state.emittedToolCallIds.add("fc_call_dup");
+        state.toolCallBuffers.set(0, { id: "fc_call_dup", name: "read_file", args: '{"p":' });
 
         interpretStreamEvent({ choices: [{ finish_reason: "stop" }] }, state);
 
@@ -1316,18 +1405,11 @@ suite("Dropped tool call buffer logging", () => {
         assert.deepStrictEqual(droppedEventFields(warnStub), []);
     });
 
-    test("stays silent for an invalid buffer whose call id was already emitted as tagged text", () => {
+    test("stays silent for an invalid buffer whose call id was already emitted", () => {
         const state = createInitialStreamingState(REQUEST_ID);
         const warnStub = sandbox.stub(StructuredLogger, "warn");
-        interpretStreamEvent(
-            toolCallDelta({ id: "call_dup", function: { name: "read_file", arguments: '{"p":' } }),
-            state
-        );
-        const taggedCall = JSON.stringify({ id: "call_dup", name: "read_file", arguments: { p: 1 } });
-        interpretStreamEvent(
-            { choices: [{ delta: { content: `${TAGGED_CALL_OPENER}${taggedCall}${TAGGED_CALL_CLOSER}` } }] },
-            state
-        );
+        state.emittedToolCallIds.add("call_dup");
+        state.toolCallBuffers.set(0, { id: "call_dup", name: "read_file", args: '{"p":' });
 
         interpretStreamEvent({ choices: [{ finish_reason: "stop" }] }, state);
 

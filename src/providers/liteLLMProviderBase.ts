@@ -76,10 +76,10 @@ export abstract class LiteLLMProviderBase {
     protected readonly _effortFallbackCache: EffortFallbackCache;
     // Per-session memo of models that have rejected `stream_options.include_usage`
     // on a live upstream call. NOT a model-info cache: it cannot be corrupted by
-    // stale capability data and it is keyed by the namespaced id VS Code hands
-    // back at request time. Without this, the request builder would re-send
-    // `include_usage: true` on every request to a model that previously rejected
-    // it, causing an infinite retry loop.
+    // stale capability data. Keyed by the raw model name, because the key used on
+    // write must be the name the request body carries as `model`. Without this,
+    // the request builder would re-send `include_usage: true` on every request to
+    // a model that previously rejected it, causing an infinite retry loop.
     private _usageOptOutModels = new Set<string>();
 
     constructor(
@@ -546,7 +546,9 @@ export abstract class LiteLLMProviderBase {
 
                 const errorMessage = err instanceof Error ? err.message : String(err);
                 if (this.isUsageIncludeUsageParameterError(errorMessage)) {
-                    this._usageOptOutModels.add(model.id);
+                    // The memo key must be the name the request body carries as
+                    // `model`, so the namespaced picker id must not be stored here.
+                    this._usageOptOutModels.add(request.model);
                     clearUsageFlag();
 
                     if (!usageRetryAttempted) {
@@ -733,17 +735,16 @@ export abstract class LiteLLMProviderBase {
     /**
      * Resolves the per-group configuration for a response-time call.
      *
-     * Discovery-time call paths and the per-group config come from
-     * `options.configuration` (set by VS Code 1.120 at discovery time).
-     * Response-time paths in VS Code 1.120 do NOT pass the per-group config
-     * on `options.configuration` — the proposed-type definition for
-     * `ProvideLanguageModelChatResponseOptions` does not declare that field.
+     * Discovery calls receive the per-group config on `options.configuration`.
+     * The proposed type for `ProvideLanguageModelChatResponseOptions` does not
+     * declare that field, so a response-time call may pass no per-group config
+     * at all, or an object that is not one.
      *
-     * As a fallback we consult the in-memory `LiteLLMProviderRegistry` keyed
-     * by the model id. The registry is populated by every successful
-     * discovery call, so a model that's been discovered in this session is
-     * routable. If neither channel has the model, the call is a
-     * configuration problem and the transport surfaces a visible error.
+     * The registry is the fallback. It records every model object it returns, so
+     * the object VS Code hands back at request time resolves to its own group
+     * even when two groups share a hostname. An object the registry did not
+     * produce falls back to the id lookup, which is enough for a single group per
+     * host.
      */
     private async getCallTimeConfiguration(
         options: vscode.ProvideLanguageModelChatResponseOptions,
@@ -752,20 +753,12 @@ export abstract class LiteLLMProviderBase {
         const opt = options as vscode.ProvideLanguageModelChatResponseOptions & {
             configuration?: Record<string, unknown>;
         };
-        // The `options.configuration` field on the proposed-type
-        // `ProvideLanguageModelChatResponseOptions` is unreliable in VS Code
-        // 1.120+. Empirically: VS Code may pass an EMPTY configuration
-        // object (truthy, but no `baseUrl` or `apiKey`) for some calls,
-        // particularly for models that were picked from a group other
-        // than the one currently being routed. The wolfram group tends to
-        // not include `configuration` at all (so we fall back to the
-        // registry); the geth group tends to include an empty object
-        // (an empty object would otherwise short-circuit the registry
-        // fallback and produce a "No baseUrl provided" runtime error).
-        //
-        // We trust `options.configuration` ONLY when it has both a usable
-        // `baseUrl` (string, non-empty) and a usable `apiKey` (string,
-        // non-empty). Anything else falls through to the registry.
+        // VS Code may pass `options.configuration` at response time with no
+        // `baseUrl`/`apiKey`: absent entirely, or present but empty. An empty
+        // object is truthy and would otherwise short-circuit the registry
+        // fallback and fail with "No baseUrl provided". Trust the field only
+        // when both strings are non-empty; anything else falls through to the
+        // registry.
         const optBaseUrl = typeof opt.configuration?.baseUrl === "string" ? opt.configuration.baseUrl.trim() : "";
         const optApiKey = typeof opt.configuration?.apiKey === "string" ? opt.configuration.apiKey.trim() : "";
 
@@ -799,14 +792,11 @@ export abstract class LiteLLMProviderBase {
             );
         }
         // No options.configuration at response time (the common case in VS
-        // Code 1.120+). Fall back to the in-memory registry. The model id
-        // VS Code hands back is the namespaced `<routing>/<raw>` form
-        // produced by `LiteLLMProviderRegistry.toVSCodeInfo`; the registry
-        // maps that id back to the {baseUrl, apiKey} of the backend that
-        // produced it. The request builder extracts the raw model name
-        // from `model.id` for `request.model`; the transport only needs
-        // baseUrl + apiKey.
-        const entry = this._registry.lookup(model.id);
+        // Code 1.120+). Fall back to the registry, preferring the model object
+        // VS Code passed back over its id: the object is the exact one this
+        // group's discovery returned, so it routes correctly even when two
+        // groups share a hostname and therefore produce the same ids.
+        const entry = this._registry.lookupInfo(model) ?? this._registry.lookup(model.id);
         if (entry) {
             Logger.trace(`getCallTimeConfiguration: registry HIT modelId="${model.id}" -> baseUrl="${entry.baseUrl}"`);
             // Same ergonomic-toggle merge as the options.configuration path

@@ -4,7 +4,7 @@ import { Logger } from "../../utils/logger";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import { redactedThinkingMetadata, signedThinkingMetadata } from "../../utils/thinkingBlocks";
 import { normalizeUsagePayload, type RawUsagePayload } from "./usagePayload";
-import { parseTaggedToolCalls, splitStableTextAndPendingTaggedContent } from "./textToolCallParser";
+import { UpstreamStreamError } from "../../utils/transportRetry";
 
 /**
  * Discriminated union of response parts the stream interpreter emits toward
@@ -28,8 +28,8 @@ export interface StreamingState {
     /** Ties this stream's diagnostics to its request when several sessions stream at once. */
     readonly requestId: string | undefined;
     toolCallBuffers: Map<number, ChatToolCallBuffer>;
-    emittedTextToolCallIds: Set<string>;
-    textToolParserBuffer: string;
+    /** Call ids already delivered, so a repeated id cannot execute a tool twice. */
+    emittedToolCallIds: Set<string>;
     responseToolCallBuffers: Map<string, { id: string; name?: string; args: string }>;
     responseToolCallOrder: string[];
     mergeReasoningContentInChoices: boolean;
@@ -54,8 +54,7 @@ export function createInitialStreamingState(requestId?: string): StreamingState 
     return {
         requestId,
         toolCallBuffers: new Map(),
-        emittedTextToolCallIds: new Set(),
-        textToolParserBuffer: "",
+        emittedToolCallIds: new Set(),
         responseToolCallBuffers: new Map(),
         responseToolCallOrder: [],
         mergeReasoningContentInChoices: false,
@@ -164,7 +163,7 @@ function settleChatToolCallBuffers(state: StreamingState, finishReason: string):
                 argsPreview: buffer.args.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS),
             });
         }
-        if (state.emittedTextToolCallIds.has(buffer.id)) {
+        if (state.emittedToolCallIds.has(buffer.id)) {
             continue;
         }
         if (!isJsonValid && finishReason !== "tool_calls") {
@@ -172,7 +171,7 @@ function settleChatToolCallBuffers(state: StreamingState, finishReason: string):
             continue;
         }
         parts.push({ type: "tool_call", index, id: buffer.id, name: buffer.name, args: buffer.args });
-        state.emittedTextToolCallIds.add(buffer.id);
+        state.emittedToolCallIds.add(buffer.id);
         StructuredLogger.trace("stream.tool_call_emitted", {
             toolName: buffer.name,
             normalizedId: buffer.id,
@@ -219,9 +218,90 @@ function extractRawThinkingBlocks(raw: unknown): RawThinkingBlock[] {
     return blocks;
 }
 
+/** Longest upstream error detail carried into the user-facing message. */
+const UPSTREAM_ERROR_DETAIL_MAX_CHARS = 300;
+
+function readText(value: unknown): string | undefined {
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+/**
+ * Reads an HTTP status from an error frame. LiteLLM's ProxyException puts the
+ * status in `code`, so a three-digit `code` counts; a symbolic code such as
+ * `invalid_request_error` does not.
+ */
+function readUpstreamStatus(error: Record<string, unknown>): number | undefined {
+    for (const candidate of [error.status, error.status_code, error.code]) {
+        if (typeof candidate === "number" && Number.isInteger(candidate) && candidate >= 100 && candidate <= 599) {
+            return candidate;
+        }
+        if (typeof candidate === "string" && /^\d{3}$/.test(candidate.trim())) {
+            return Number(candidate.trim());
+        }
+    }
+    return undefined;
+}
+
+function toUpstreamStreamError(error: unknown): UpstreamStreamError | undefined {
+    if (typeof error === "string") {
+        return new UpstreamStreamError(
+            undefined,
+            undefined,
+            undefined,
+            error.trim().slice(0, UPSTREAM_ERROR_DETAIL_MAX_CHARS) || undefined
+        );
+    }
+    if (!error || typeof error !== "object") {
+        return undefined;
+    }
+    const record = error as Record<string, unknown>;
+    const status = readUpstreamStatus(record);
+    const code = readText(record.code);
+    const type = readText(record.type);
+    const detail = (readText(record.message) ?? readText(record.detail))?.slice(0, UPSTREAM_ERROR_DETAIL_MAX_CHARS);
+    if (status === undefined && code === undefined && type === undefined && detail === undefined) {
+        return undefined;
+    }
+    return new UpstreamStreamError(status, code, type, detail);
+}
+
+/**
+ * Reads an in-stream failure frame. Recognized shapes:
+ * - `{"error": {...}}`: the LiteLLM proxy's mid-stream failure after the
+ *   response headers were already sent;
+ * - `{"type": "error", ...}`: an OpenAI Responses API error event;
+ * - `{"type": "response.failed", "response": {"error": {...}}}`.
+ */
+function extractUpstreamStreamError(data: Record<string, unknown>): UpstreamStreamError | undefined {
+    if (data.type === "response.failed") {
+        const response = data.response as Record<string, unknown> | undefined;
+        return (
+            toUpstreamStreamError(response?.error ?? response) ??
+            new UpstreamStreamError(undefined, undefined, "response.failed", readText(data.message))
+        );
+    }
+    if (data.error !== undefined && data.error !== null) {
+        return (
+            toUpstreamStreamError(data.error) ??
+            new UpstreamStreamError(undefined, undefined, "error", readText(data.message))
+        );
+    }
+    if (data.type === "error") {
+        return (
+            toUpstreamStreamError(data) ??
+            new UpstreamStreamError(undefined, undefined, "error", readText(data.message))
+        );
+    }
+    return undefined;
+}
+
 /**
  * Interprets a single JSON frame from LiteLLM (OpenAI or /responses format)
  * and returns a list of emitted parts.
+ *
+ * @throws {UpstreamStreamError} when the frame reports an upstream failure.
+ * Throwing rather than returning a part keeps a swallowed error impossible:
+ * the caller's stream loop stops and the retry loop decides whether to resume.
  */
 export function interpretStreamEvent(json: unknown, state: StreamingState): EmittedPart[] {
     const thinkingParts: EmittedPart[] = [];
@@ -231,6 +311,11 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
     const responseParts: EmittedPart[] = [];
     const finishParts: EmittedPart[] = [];
     const data = json as Record<string, unknown>;
+
+    const upstreamError = extractUpstreamStreamError(data);
+    if (upstreamError) {
+        throw upstreamError;
+    }
 
     // Log the incoming event at trace level
     Logger.trace("[interpretStreamEvent] Processing event", {
@@ -298,7 +383,6 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
             Logger.trace(`[interpretStreamEvent] Emitted thinking part, length=${reasoningContent.length}`);
             StructuredLogger.trace("stream.reasoning_emitted", {
                 length: reasoningContent.length,
-                preview: reasoningContent.slice(0, 50),
             });
         } else if (reasoningContent && mergeReasoningIntoContent) {
             Logger.trace(`[interpretStreamEvent] Merging reasoning into content, length=${reasoningContent.length}`);
@@ -345,42 +429,14 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
             : deltaContent;
 
         if (contentForParsing) {
-            // Some LiteLLM backends emit tool calls as tagged text payloads
-            // (for example an inline JSON tool-call marker) instead of structured
-            // delta.tool_calls arrays. Parse those tags here so VS Code receives
-            // LanguageModelToolCallPart instead of raw JSON text.
-            const combinedText = `${state.textToolParserBuffer}${contentForParsing}`;
-            const { stableText, pendingText } = splitStableTextAndPendingTaggedContent(combinedText);
-            const { textWithoutParsedCalls, toolCalls } = parseTaggedToolCalls(stableText);
-            state.textToolParserBuffer = pendingText;
-
-            if (textWithoutParsedCalls) {
-                textParts.push({ type: "text", value: textWithoutParsedCalls });
-                Logger.trace(`[interpretStreamEvent] Emitted text part, length=${textWithoutParsedCalls.length}`);
-                StructuredLogger.trace("stream.text_emitted", {
-                    length: textWithoutParsedCalls.length,
-                    preview: textWithoutParsedCalls.slice(0, 50),
-                });
-            }
-
-            for (const parsedToolCall of toolCalls) {
-                const normalizedId = normalizeToolCallId(
-                    parsedToolCall.id && parsedToolCall.id.trim().length > 0
-                        ? parsedToolCall.id
-                        : `text_tool_call_${state.emittedTextToolCallIds.size + toolCallParts.length + 1}`
-                );
-                if (state.emittedTextToolCallIds.has(normalizedId)) {
-                    continue;
-                }
-                toolCallParts.push({
-                    type: "tool_call",
-                    index: toolCallParts.length,
-                    id: normalizedId,
-                    name: parsedToolCall.name,
-                    args: parsedToolCall.args,
-                });
-                state.emittedTextToolCallIds.add(normalizedId);
-            }
+            // The model's visible answer is emitted verbatim. Text that looks
+            // like a tool-call marker stays text: only the structured
+            // `delta.tool_calls` and /responses call events may trigger a tool.
+            textParts.push({ type: "text", value: contentForParsing });
+            Logger.trace(`[interpretStreamEvent] Emitted text part, length=${contentForParsing.length}`);
+            StructuredLogger.trace("stream.text_emitted", {
+                length: contentForParsing.length,
+            });
         }
 
         if (delta?.tool_calls && Array.isArray(delta.tool_calls)) {
@@ -406,7 +462,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                     const rawId = (tc.id as string) || "";
                     const newId = rawId ? normalizeToolCallId(rawId) : "";
                     // Skip if this tool call ID was already emitted in a previous turn
-                    if (newId && state.emittedTextToolCallIds.has(newId)) {
+                    if (newId && state.emittedToolCallIds.has(newId)) {
                         Logger.trace(`[interpretStreamEvent] Skipping duplicate tool call ID: ${newId}`);
                         StructuredLogger.trace("stream.tool_call_skipped_duplicate", { id: newId });
                         continue;
@@ -443,32 +499,6 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
         }
 
         if (choice.finish_reason && typeof choice.finish_reason === "string") {
-            if (state.textToolParserBuffer.trim().length > 0) {
-                const { textWithoutParsedCalls, toolCalls } = parseTaggedToolCalls(state.textToolParserBuffer);
-                if (textWithoutParsedCalls) {
-                    textParts.push({ type: "text", value: textWithoutParsedCalls });
-                }
-                for (const parsedToolCall of toolCalls) {
-                    const normalizedId = normalizeToolCallId(
-                        parsedToolCall.id && parsedToolCall.id.trim().length > 0
-                            ? parsedToolCall.id
-                            : `text_tool_call_${state.emittedTextToolCallIds.size + toolCallParts.length + 1}`
-                    );
-                    if (state.emittedTextToolCallIds.has(normalizedId)) {
-                        continue;
-                    }
-                    toolCallParts.push({
-                        type: "tool_call",
-                        index: toolCallParts.length,
-                        id: normalizedId,
-                        name: parsedToolCall.name,
-                        args: parsedToolCall.args,
-                    });
-                    state.emittedTextToolCallIds.add(normalizedId);
-                }
-                state.textToolParserBuffer = "";
-            }
-
             toolCallParts.push(...settleChatToolCallBuffers(state, choice.finish_reason));
 
             finishParts.push({ type: "finish", reason: choice.finish_reason });
@@ -498,7 +528,6 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
         textParts.push({ type: "text", value: data.delta });
         StructuredLogger.trace("stream.responses_text_delta", {
             length: data.delta.length,
-            preview: data.delta.substring(0, 100),
         });
     }
     // 2b. Robust event shape: response.output_item.delta (keyed on item.call_id)
@@ -804,7 +833,6 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                 textParts.push({ type: "text", value: part.text });
                 StructuredLogger.trace("stream.gemini_text", {
                     length: part.text.length,
-                    preview: part.text.substring(0, 100),
                 });
             }
             const functionCall = part.functionCall as { name?: string; args?: unknown; id?: string } | undefined;

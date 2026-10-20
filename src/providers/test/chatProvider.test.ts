@@ -3,10 +3,11 @@ import * as sinon from "sinon";
 import * as vscode from "vscode";
 
 import { LiteLLMChatProvider } from "../";
-import { LiteLLMClient } from "../../adapters/litellmClient";
+import { LiteLLMApiError, LiteLLMClient } from "../../adapters/litellmClient";
 import type { OpenAIChatCompletionRequest } from "../../types";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
 import { createMockSecrets } from "../../test/utils/testMocks";
+import { createMockSSEStream } from "../../test/utils/testStreamUtils";
 
 /**
  * Seeds the per-group discovery state on a provider so the new routing path
@@ -40,6 +41,7 @@ function seedDiscoveredBackend(sandbox: sinon.SinonSandbox, provider: LiteLLMCha
     interface Internals {
         _registry: {
             setModelsForBackend: (
+                backendKey: string,
                 baseUrl: string,
                 apiKey: string,
                 routingIdentity: string,
@@ -54,9 +56,13 @@ function seedDiscoveredBackend(sandbox: sinon.SinonSandbox, provider: LiteLLMCha
         };
     }
     const providerInternals = provider as unknown as Internals;
-    providerInternals._registry.setModelsForBackend("http://localhost:4000", "test-api-key", "localhost:4000", [
-        seededModel,
-    ]);
+    providerInternals._registry.setModelsForBackend(
+        "http://localhost:4000#seeded",
+        "http://localhost:4000",
+        "test-api-key",
+        "localhost:4000",
+        [seededModel]
+    );
     sandbox.stub(providerInternals._configManager, "convertProviderConfiguration").returns({
         backendName: "localhost:4000",
         baseUrl: "http://localhost:4000",
@@ -182,7 +188,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         assert.match(configErrorText, /No baseUrl|No apiKey|configure the LiteLLM provider group/i);
     });
 
-    test("provideLanguageModelChatResponse retries without optional parameters on unsupported param error", async () => {
+    test("provideLanguageModelChatResponse reports an unsupported model parameter once", async () => {
         const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
 
         interface ProviderWithConfigManager {
@@ -192,39 +198,14 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         }
         const providerWithConfig = provider as unknown as ProviderWithConfigManager;
         sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({ url: "http://localhost:4000" });
-        // Seed the discovered model list so the new per-group routing path in
-        // `sendRequestToLiteLLM` (which prefers `getDiscoveredModelBackend` over legacy
-        // `resolveBackends`) finds a backend. Without this the request fails with
-        // "LiteLLM configuration not found" before reaching the stubbed `chat` call.
+        // Seed the discovered model list so the per-group routing path in
+        // `sendRequestToLiteLLM` finds a backend; otherwise the request fails
+        // with "LiteLLM configuration not found" before reaching the stub.
         seedDiscoveredBackend(sandbox, provider, "model-1");
 
         const chatStub = sandbox.stub(LiteLLMClient.prototype, "chat");
-        const encoder = new TextEncoder();
-        chatStub.onFirstCall().rejects(new Error("LiteLLM API error\nunsupported parameter"));
-        chatStub.onSecondCall().callsFake(async (request: { temperature?: number; top_p?: number }) => {
-            assert.strictEqual(request.temperature, undefined);
-            assert.strictEqual(request.top_p, undefined);
-            const stream = new ReadableStream<Uint8Array>({
-                start(controller) {
-                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                    controller.close();
-                },
-            });
-            // Ensure the mock stream has getReader for decodeSSE
-            if (!(stream as unknown as { getReader: unknown }).getReader) {
-                (stream as unknown as { getReader: () => unknown }).getReader = () => {
-                    const reader = (stream as unknown as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]();
-                    return {
-                        read: async (): Promise<{ done: boolean | undefined; value: Uint8Array | undefined }> => {
-                            const next = (await reader.next()) as IteratorResult<Uint8Array, undefined>;
-                            return { done: next.done, value: next.value };
-                        },
-                        releaseLock: () => {},
-                    };
-                };
-            }
-            return stream;
-        });
+        const errorBody = JSON.stringify({ error: { message: "Unsupported parameter: temperature" } });
+        chatStub.rejects(new LiteLLMApiError(400, errorBody, `LiteLLM API error: 400 Bad Request\n${errorBody}`));
 
         const model: vscode.LanguageModelChatInformation = {
             id: "model-1",
@@ -245,6 +226,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             },
         ];
 
+        const parts: vscode.LanguageModelResponsePart[] = [];
         await provider.provideLanguageModelChatResponse(
             model,
             messages,
@@ -258,11 +240,17 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
                     unknown
                 >,
             } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-            { report: () => {} },
+            { report: (part) => parts.push(part) },
             new vscode.CancellationTokenSource().token
         );
 
-        assert.strictEqual(chatStub.callCount, 2);
+        // Resending the same body would be rejected identically, so the failure
+        // surfaces once with the proxy-side fix instead of being retried.
+        assert.strictEqual(chatStub.callCount, 1);
+        const errorPart = parts.find(
+            (part) => part instanceof vscode.LanguageModelTextPart && part.value.includes("additional_drop_params")
+        );
+        assert.ok(errorPart, "expected the rejection to surface with the proxy-side hint");
     });
 
     test("provideLanguageModelChatResponse uses the model VS Code selected without a settings override", async () => {
@@ -749,14 +737,15 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
     test("requests usage by default and suppresses include_usage after upstream rejects stream_options", async () => {
         const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
         const providerAny = provider as unknown as {
-            _usageOptOutModels: Set<string>;
             buildOpenAIChatRequest: (typeof LiteLLMChatProvider.prototype)["buildOpenAIChatRequest"];
-            sendRequestWithRetry: (typeof LiteLLMChatProvider.prototype)["sendRequestWithRetry"];
             _configManager: { getConfig: () => Promise<{ url: string }> };
         };
 
         sandbox.stub(providerAny._configManager, "getConfig").resolves({ url: "http://localhost:4000" });
-        seedDiscoveredBackend(sandbox, provider, "model-usage");
+        // A namespaced id is what VS Code hands back, and the request body must
+        // carry the raw name, so the memo is only correct if both sides agree.
+        const NAMESPACED_ID = "localhost:4000/model-usage";
+        seedDiscoveredBackend(sandbox, provider, NAMESPACED_ID);
 
         const messages: vscode.LanguageModelChatRequestMessage[] = [
             {
@@ -766,7 +755,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             },
         ];
         const model = {
-            id: "model-usage",
+            id: NAMESPACED_ID,
             name: "model-usage",
             tooltip: "",
             family: "litellm",
@@ -775,64 +764,61 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             maxOutputTokens: 1000,
             capabilities: { toolCalling: true, imageInput: false },
         };
+        const requestOptions = {
+            modelOptions: {},
+            tools: [],
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+            requestInitiator: "test",
+            configuration: { baseUrl: "http://localhost:4000", apiKey: "test-api-key" } as unknown as Record<
+                string,
+                unknown
+            >,
+        } as unknown as vscode.ProvideLanguageModelChatResponseOptions;
 
         const requestBody = await providerAny.buildOpenAIChatRequest(
             messages,
             model,
-            {
-                modelOptions: {},
-                tools: [],
-                toolMode: vscode.LanguageModelChatToolMode.Auto,
-                requestInitiator: "test",
-                configuration: { baseUrl: "http://localhost:4000", apiKey: "test-api-key" } as unknown as Record<
-                    string,
-                    unknown
-                >,
-            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            requestOptions,
             undefined,
             "chat"
         );
         assert.deepStrictEqual(requestBody.stream_options, { include_usage: true });
 
-        const encoder = new TextEncoder();
-        const successStream = new ReadableStream<Uint8Array>({
-            start(controller) {
-                controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"ok"}}]}' + "\n\n"));
-                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                controller.close();
-            },
-        });
-
-        const sendStub = sandbox
-            .stub(providerAny, "sendRequestWithRetry")
+        // Exercise the real retry path: the rejection must make the retry drop
+        // the flag, and the memo must be keyed so the next request omits it too.
+        const usageErrorBody = "Unsupported parameter: stream_options";
+        const chatStub = sandbox.stub(LiteLLMClient.prototype, "chat");
+        chatStub
             .onFirstCall()
-            .rejects(new Error("LiteLLM API error: 400\nUnsupported parameter: stream_options"))
-            .onSecondCall()
-            .resolves(successStream);
+            .rejects(new LiteLLMApiError(400, usageErrorBody, `LiteLLM API error: 400 Bad Request\n${usageErrorBody}`));
+        chatStub.onSecondCall().callsFake(async () => createMockSSEStream(["ok"]));
 
-        const reported: vscode.LanguageModelResponsePart[] = [];
+        const token = new vscode.CancellationTokenSource().token;
         await provider.provideLanguageModelChatResponse(
             model,
             messages,
-            {
-                modelOptions: {},
-                tools: [],
-                toolMode: vscode.LanguageModelChatToolMode.Auto,
-                requestInitiator: "test",
-                configuration: { baseUrl: "http://localhost:4000", apiKey: "test-api-key" } as unknown as Record<
-                    string,
-                    unknown
-                >,
-            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-            { report: (part) => reported.push(part) },
-            new vscode.CancellationTokenSource().token
+            requestOptions,
+            { report: () => undefined },
+            token
         );
 
-        assert.ok(
-            providerAny._usageOptOutModels.has("model-usage"),
-            "Model should be marked as usage opt-out after rejection"
+        assert.strictEqual(chatStub.callCount, 2, "one rejection plus one retry");
+        const retryRequest = chatStub.getCall(1).args[0] as OpenAIChatCompletionRequest;
+        assert.strictEqual(retryRequest.stream_options, undefined, "the retry must not resend stream_options");
+
+        // A later request must not pay the same failed round trip. This is what
+        // the memo is for, and it only works when both sides use the raw name.
+        await provider.provideLanguageModelChatResponse(
+            model,
+            messages,
+            requestOptions,
+            { report: () => undefined },
+            token
         );
-        assert.strictEqual(sendStub.callCount, 2);
+
+        assert.strictEqual(chatStub.callCount, 3, "the second request must need a single attempt");
+        const laterRequest = chatStub.getCall(2).args[0] as OpenAIChatCompletionRequest;
+        assert.strictEqual(laterRequest.stream_options, undefined, "the memo must suppress the flag");
     });
 
     test("prefers streamed usage metrics over estimated counts", async () => {
@@ -1567,7 +1553,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
     function findErrorTextPart(reported: vscode.LanguageModelResponsePart[]): string | undefined {
         for (const part of reported) {
             const value = (part as unknown as Record<string, unknown>)?.value;
-            if (typeof value === "string" && value.startsWith("[litellm-connector]")) {
+            if (typeof value === "string" && value.includes("[litellm-connector]")) {
                 return value;
             }
         }

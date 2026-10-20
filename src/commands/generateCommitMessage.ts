@@ -7,6 +7,7 @@ import { showModelPicker } from "./modelPicker";
 import { calculateAvailableContext } from "../adapters/tokenUtils";
 import { COMMIT_MESSAGE_PROMPT, COMMIT_SYSTEM_PROMPT } from "../utils/prompts";
 import { stripMarkdownCodeBlocks } from "../utils";
+import { splitConnectorNotice } from "../utils/connectorNotice";
 
 async function tryGenerateViaVSCodeModelRequest(
     modelId: string,
@@ -40,6 +41,7 @@ async function tryGenerateViaVSCodeModelRequest(
     );
 
     let accumulated = "";
+    let forwardedChars = 0;
     for await (const chunk of response.stream) {
         if (token.isCancellationRequested) {
             break;
@@ -47,11 +49,22 @@ async function tryGenerateViaVSCodeModelRequest(
 
         if (chunk instanceof vscode.LanguageModelTextPart) {
             accumulated += chunk.value;
-            onProgress(chunk.value);
+            // A notice can follow partial model text (a stop reason or a failure
+            // after a partial answer), so scan the whole response. A notice that
+            // starts a block means the response is not a commit message.
+            const { modelText, notice } = splitConnectorNotice(accumulated);
+            if (notice !== undefined) {
+                throw new Error(notice || "The model returned a connector notice instead of a commit message.");
+            }
+            if (modelText.length > forwardedChars) {
+                const safeChunk = modelText.slice(forwardedChars);
+                forwardedChars = modelText.length;
+                onProgress(safeChunk);
+            }
         }
     }
 
-    return stripMarkdownCodeBlocks(accumulated);
+    return stripMarkdownCodeBlocks(splitConnectorNotice(accumulated).modelText);
 }
 
 /**
@@ -147,7 +160,9 @@ export function registerGenerateCommitMessageCommand(_provider: LiteLLMCommitMes
                 return;
             }
 
-            // Clear existing message
+            // Keep the draft, so a failed or cancelled generation does not throw
+            // away what the user had typed.
+            const previousValue = inputBox.value;
             inputBox.value = "";
             const originalPlaceholder = inputBox.placeholder;
             inputBox.placeholder = "Generating commit message...";
@@ -160,6 +175,7 @@ export function registerGenerateCommitMessageCommand(_provider: LiteLLMCommitMes
                     cancellable: true,
                 },
                 async (progress, token) => {
+                    let succeeded = false;
                     try {
                         let accumulatedText = "";
                         let generatedMessage: string | undefined;
@@ -176,6 +192,10 @@ export function registerGenerateCommitMessageCommand(_provider: LiteLLMCommitMes
                                 }
                             );
                         } catch (vscodeRouteErr) {
+                            if (token.isCancellationRequested) {
+                                Logger.info("Commit message generation cancelled; restoring the previous message");
+                                return;
+                            }
                             Logger.error("VS Code model request route failed", vscodeRouteErr);
                             vscode.window.showErrorMessage(
                                 "Failed to generate commit message: " +
@@ -191,15 +211,29 @@ export function registerGenerateCommitMessageCommand(_provider: LiteLLMCommitMes
                             return;
                         }
 
+                        // A cancelled generation must not replace what the user
+                        // typed with a partial message.
+                        if (token.isCancellationRequested) {
+                            Logger.info("Commit message generation cancelled; restoring the previous message");
+                            return;
+                        }
+
                         inputBox.value = generatedMessage;
+                        succeeded = true;
                     } catch (err) {
-                        Logger.error("Failed to generate commit message", err);
-                        vscode.window.showErrorMessage(
-                            "Failed to generate commit message: " + (err instanceof Error ? err.message : String(err))
-                        );
+                        if (!token.isCancellationRequested) {
+                            Logger.error("Failed to generate commit message", err);
+                            vscode.window.showErrorMessage(
+                                "Failed to generate commit message: " +
+                                    (err instanceof Error ? err.message : String(err))
+                            );
+                        }
                     } finally {
                         inputBox.placeholder = originalPlaceholder;
                         inputBox.enabled = true;
+                        if (!succeeded) {
+                            inputBox.value = previousValue;
+                        }
                     }
                 }
             );

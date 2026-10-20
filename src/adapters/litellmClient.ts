@@ -25,6 +25,79 @@ class DiscoveryTimeoutError extends Error {
     }
 }
 
+/**
+ * Error thrown for a non-2xx proxy response. The message has the
+ * `LiteLLM API error: <status> <statusText>\n<body>` shape that the provider's
+ * user-facing formatting parses; `status` and `bodyText` stay available for
+ * callers that need to explain the rejection.
+ */
+export class LiteLLMApiError extends Error {
+    public constructor(
+        public readonly status: number,
+        public readonly bodyText: string,
+        message: string
+    ) {
+        super(message);
+        this.name = "LiteLLMApiError";
+    }
+}
+
+const UNSUPPORTED_PARAMETER_PHRASES = [
+    "unsupported parameter",
+    "unknown parameter",
+    "unrecognized request argument",
+    "unexpected keyword argument",
+    "extra inputs are not permitted",
+    "does not support parameter",
+];
+
+/** True when a rejection body names a request parameter the model does not accept. */
+export function isUnsupportedParameterError(bodyText: string): boolean {
+    const lowered = bodyText.toLowerCase();
+    return UNSUPPORTED_PARAMETER_PHRASES.some((phrase) => lowered.includes(phrase));
+}
+
+/**
+ * Names the parameter a rejection body reports as unsupported, when the message
+ * puts the name right after the phrase (quoted, in brackets or braces, or after
+ * a colon or equals sign). The name is not searched for anywhere else in the
+ * body: a JSON body quotes every one of its keys, so a bare quoted-token search
+ * would name `error` or `message` instead.
+ */
+export function findRejectedParameter(bodyText: string): string | undefined {
+    const phrase =
+        /(?:unsupported|unknown|unrecognized|unexpected|invalid|extra|does\s+not\s+support)\s+(?:keyword\s+)?(?:parameter|argument|request argument|inputs?|keys?)s?(?:\s+supplied)?\s*/i;
+    const rest = bodyText.match(phrase);
+    if (!rest || rest.index === undefined) {
+        return undefined;
+    }
+    const afterPhrase = bodyText.slice(rest.index + rest[0].length);
+    // Accepted shapes: `: temperature`, `: ['temperature']`, `: {'temperature': ...}`,
+    // `'temperature'`. Anything else (for example "Unsupported parameter for this
+    // model") names no parameter, and guessing one would mislead the user.
+    const named = afterPhrase.match(
+        /^(?:[:=]\s*['"`]?([A-Za-z0-9_.-]+)|[:=]\s*\[\s*['"`]([A-Za-z0-9_.-]+)|[:=]\s*\{\s*['"`]([A-Za-z0-9_.-]+)|['"`]([A-Za-z0-9_.-]+))/
+    );
+    return named?.[1] ?? named?.[2] ?? named?.[3] ?? named?.[4];
+}
+
+/**
+ * Error thrown when a `/model/info` discovery request fails with a non-2xx
+ * response. `status` lets the caller tell an unhealthy endpoint (worth
+ * retrying, and worth falling back to the last known model list) from a group
+ * that is misconfigured (400, 401, 403, or 404), where the stale list would hide
+ * the problem.
+ */
+export class LiteLLMDiscoveryError extends Error {
+    public constructor(
+        public readonly status: number,
+        public readonly statusText: string
+    ) {
+        super(`Failed to fetch model info: ${status} ${statusText}`);
+        this.name = "LiteLLMDiscoveryError";
+    }
+}
+
 export class LiteLLMClient {
     private static readonly DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
     private static readonly DEFAULT_RATE_LIMIT_MAX_DELAY_MS = 120_000;
@@ -67,13 +140,13 @@ export class LiteLLMClient {
                 }
 
                 Logger.error(`Failed to fetch model info: ${resp.status} ${resp.statusText}`);
-                throw new Error(`Failed to fetch model info: ${resp.status} ${resp.statusText}`);
+                throw new LiteLLMDiscoveryError(resp.status, resp.statusText);
             }
 
             const status = lastResponse?.status ?? 404;
             const statusText = lastResponse?.statusText ?? "Not Found";
             Logger.error(`Failed to fetch model info after trying fallback URLs: ${status} ${statusText}`);
-            throw new Error(`Failed to fetch model info: ${status} ${statusText}`);
+            throw new LiteLLMDiscoveryError(status, statusText);
         } catch (err) {
             // Check if the error was caused by our timeout
             if (controller.signal.aborted && controller.signal.reason instanceof DiscoveryTimeoutError) {
@@ -198,8 +271,9 @@ export class LiteLLMClient {
         }
 
         Logger.trace(`Sending chat request to ${endpoint}`, { model: request.model });
-        let response: Response = await this.fetchWithRateLimit(
-            `${this.config.url}${endpoint}`,
+        const url = `${this.config.url}${endpoint}`;
+        let response = await this.fetchWithRateLimit(
+            url,
             {
                 method: "POST",
                 headers: this.getHeaders(request.model, modelInfo),
@@ -208,113 +282,25 @@ export class LiteLLMClient {
             { token }
         );
 
-        // Handle unsupported parameters by stripping them and retrying once
+        // Only the parameters this connector adds on its own are ever stripped
+        // and retried. A parameter the proxy itself claimed to support is
+        // reported instead: hiding it would send the same rejected body on
+        // every later request.
         if (response.status === 400) {
-            const errorText = await response.clone().text();
-            const errorLower = errorText.toLowerCase();
-
-            if (
-                errorLower.includes("unsupported parameter") ||
-                errorLower.includes("unknown parameter") ||
-                errorLower.includes("unrecognized request argument") ||
-                errorLower.includes("extra_headers") ||
-                errorLower.includes("no-cache") ||
-                errorLower.includes("cache_control") ||
-                errorLower.includes("unexpected keyword argument")
-            ) {
-                Logger.warn(`Detected unsupported parameters for ${request.model}, attempting to strip and retry.`);
-
-                const strippedBody: OpenAIChatCompletionRequest | LiteLLMResponsesRequest = JSON.parse(
-                    JSON.stringify(body)
-                ) as OpenAIChatCompletionRequest | LiteLLMResponsesRequest;
-                const headers = this.getHeaders(request.model, modelInfo);
-
-                // Cast to unknown first for index signature access
-                const stripedAsAny = strippedBody as unknown as Record<string, unknown>;
-
-                // 1a. Handle explicit mentions of parameters in the error message
-                // Common patterns: "unsupported parameter: 'temperature'", "unexpected keyword argument 'top_p'"
-                const paramMatch = errorText.match(/(?:parameter|argument|key)\s+['"]?([a-zA-Z0-9_-]+)['"]?/i);
-
-                // 1b. Anthropic prompt-caching marker: strip it whenever the error
-                // names it, regardless of message shape. Provider and pydantic
-                // errors both reference the raw field name, while the generic
-                // regex above misses wrapped forms like "parameter: 'cache_control'".
-                if (errorLower.includes("cache_control")) {
-                    Logger.info(`Stripping ${request.model} prompt-caching marker: cache_control rejected`);
-                    delete stripedAsAny.cache_control;
-                    this.config.onUnsupportedParameter?.(request.model, "cache_control");
-                } else if (paramMatch && paramMatch[1]) {
-                    const paramName = paramMatch[1];
-                    Logger.info(`Stripping specific parameter: ${paramName}`);
-                    delete stripedAsAny[paramName];
-                }
-
-                // Special-case: some providers reject a top-level `cache` object.
-                // LiteLLM proxy caching controls should live under extra_body.cache, but we defensively strip both.
-                if (errorLower.includes("unknown parameter") && errorLower.includes("cache")) {
-                    delete stripedAsAny.cache;
-                    if (strippedBody.extra_body && typeof strippedBody.extra_body === "object") {
-                        const eb = strippedBody.extra_body as unknown as Record<string, unknown>;
-                        if (eb.cache && typeof eb.cache === "object") {
-                            const cache = eb.cache as Record<string, unknown>;
-                            delete cache["no-cache"];
-                            delete cache.no_cache;
-                            if (Object.keys(cache).length === 0) {
-                                delete eb.cache;
-                            }
-                        }
-                        if (Object.keys(eb).length === 0) {
-                            delete strippedBody.extra_body;
-                        }
-                    }
-                    delete headers["Cache-Control"];
-                }
-
-                // 2. Always strip caching if mentioned or if it was a likely culprit
-                if (errorLower.includes("no-cache") || errorLower.includes("no_cache")) {
-                    // Some proxies put the cache-bypass flags at the top level
-                    // instead of under extra_body.cache. Strip both spellings.
-                    const bodyAny = strippedBody as unknown as Record<string, unknown>;
-                    delete bodyAny.no_cache;
-                    delete bodyAny["no-cache"];
-
-                    // Some backends interpret top-level `cache` as an OpenAI param and reject it
-                    delete bodyAny.cache;
-
-                    // Current LiteLLM format: extra_body.cache["no-cache"]
-                    if (strippedBody.extra_body && typeof strippedBody.extra_body === "object") {
-                        const eb = strippedBody.extra_body as Record<string, unknown>;
-                        const cache = eb.cache;
-                        if (cache && typeof cache === "object") {
-                            delete (cache as Record<string, unknown>)["no-cache"];
-                        }
-                        // If cache object is now empty, remove it
-                        if (
-                            cache &&
-                            typeof cache === "object" &&
-                            Object.keys(cache as Record<string, unknown>).length === 0
-                        ) {
-                            delete eb.cache;
-                        }
-                        // If extra_body is now empty, remove it
-                        if (Object.keys(eb).length === 0) {
-                            delete strippedBody.extra_body;
-                        }
-                    }
-                    delete headers["Cache-Control"];
-                }
-
-                // 3. Fallback: if we couldn't identify a specific param but it's a 400,
-                // we might want to strip common problematic ones if they exist,
-                // but for now we rely on the regex match above.
-
+            const retry = this.planConnectorParameterRetry(
+                await response.clone().text(),
+                body,
+                request.model,
+                modelInfo
+            );
+            if (retry) {
+                Logger.warn(`Retrying ${request.model} without a connector-added parameter the proxy rejected`);
                 response = await this.fetchWithRateLimit(
-                    `${this.config.url}${endpoint}`,
+                    url,
                     {
                         method: "POST",
-                        headers: headers,
-                        body: JSON.stringify(strippedBody),
+                        headers: retry.headers,
+                        body: JSON.stringify(retry.body),
                     },
                     { token }
                 );
@@ -324,7 +310,11 @@ export class LiteLLMClient {
         if (!response.ok) {
             const errorText = await response.text();
             Logger.error(`LiteLLM API error: ${response.status} ${response.statusText}`, errorText);
-            throw new Error(`LiteLLM API error: ${response.status} ${response.statusText}\n${errorText}`);
+            throw new LiteLLMApiError(
+                response.status,
+                errorText,
+                `LiteLLM API error: ${response.status} ${response.statusText}\n${errorText}`
+            );
         }
 
         if (!response.body) {
@@ -333,6 +323,79 @@ export class LiteLLMClient {
         }
 
         return response.body as ReadableStream<Uint8Array>;
+    }
+
+    /**
+     * Builds the retry body and headers for a 400 that rejects a parameter this
+     * connector adds itself. Returns undefined when the rejection names no such
+     * parameter, in which case the caller must surface the error instead.
+     *
+     * Two families qualify:
+     * - `cache_control`, the Anthropic prompt-caching marker added by the
+     *   request builder. It is reported through `onUnsupportedParameter` so
+     *   later requests omit it without paying a failed round trip.
+     * - the cache-bypass flag added for `litellm-connector.disableCaching`
+     *   (`extra_body.cache["no-cache"]` plus its `Cache-Control` header).
+     *
+     * Nothing else in the body is touched: any other parameter is either the
+     * user's own configuration or was accepted by the proxy's capability data,
+     * and the caller reports the rejection instead of guessing.
+     */
+    private planConnectorParameterRetry(
+        errorText: string,
+        body: OpenAIChatCompletionRequest | LiteLLMResponsesRequest,
+        modelId: string,
+        modelInfo: LiteLLMModelInfo | undefined
+    ): { body: OpenAIChatCompletionRequest | LiteLLMResponsesRequest; headers: Record<string, string> } | undefined {
+        const errorLower = errorText.toLowerCase();
+        const promptCachingRejected = errorLower.includes("cache_control");
+        const cacheBypassRejected =
+            errorLower.includes("no-cache") ||
+            errorLower.includes("no_cache") ||
+            (errorLower.includes("cache") &&
+                (errorLower.includes("unknown parameter") ||
+                    errorLower.includes("unsupported parameter") ||
+                    errorLower.includes("extra inputs are not permitted")));
+        if (!promptCachingRejected && !cacheBypassRejected) {
+            return undefined;
+        }
+
+        const retryBody = JSON.parse(JSON.stringify(body)) as OpenAIChatCompletionRequest | LiteLLMResponsesRequest;
+        const retryBodyRecord = retryBody as unknown as Record<string, unknown>;
+        const headers = this.getHeaders(modelId, modelInfo);
+        let strippedSomething = false;
+
+        if (promptCachingRejected && "cache_control" in retryBodyRecord) {
+            Logger.info(`Stripping ${modelId} prompt-caching marker: cache_control rejected`);
+            delete retryBodyRecord.cache_control;
+            this.config.onUnsupportedParameter?.(modelId, "cache_control");
+            strippedSomething = true;
+        }
+
+        if (cacheBypassRejected) {
+            if (retryBody.extra_body && typeof retryBody.extra_body === "object") {
+                const extraBody = retryBody.extra_body as Record<string, unknown>;
+                const cache = extraBody.cache;
+                if (cache && typeof cache === "object" && "no-cache" in (cache as Record<string, unknown>)) {
+                    delete (cache as Record<string, unknown>)["no-cache"];
+                    strippedSomething = true;
+                    if (Object.keys(cache as Record<string, unknown>).length === 0) {
+                        delete extraBody.cache;
+                    }
+                }
+                if (Object.keys(extraBody).length === 0) {
+                    delete retryBody.extra_body;
+                }
+            }
+            if (headers["Cache-Control"] !== undefined) {
+                delete headers["Cache-Control"];
+                strippedSomething = true;
+            }
+        }
+
+        // A body that did not change would be rejected identically, so do not
+        // spend a second request on it.
+        return strippedSomething ? { body: retryBody, headers } : undefined;
     }
 
     private getHeaders(modelId?: string, modelInfo?: LiteLLMModelInfo): Record<string, string> {

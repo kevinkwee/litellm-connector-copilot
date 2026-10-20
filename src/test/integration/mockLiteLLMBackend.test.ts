@@ -184,9 +184,15 @@ suite("MockLiteLLMBackend", () => {
                 await makeHttpRequest(`http://localhost:${testPort}/models`, "GET");
                 assert.fail("Expected connection to fail after stop");
             } catch (err) {
-                // Expected - connection should fail
+                // Node's happy-eyeballs connect reports a refused connection as
+                // an AggregateError with an empty message and an ECONNREFUSED code,
+                // so the code, not the text, is what identifies the refusal.
+                const failure = err as Error & { code?: string };
                 assert.ok(
-                    (err as Error).message.includes("ECONNREFUSED") || (err as Error).message.includes("refused")
+                    failure.code === "ECONNREFUSED" ||
+                        failure.message.includes("ECONNREFUSED") ||
+                        failure.message.includes("refused"),
+                    `expected a refused connection, got ${failure.code ?? failure.message}`
                 );
             }
         });

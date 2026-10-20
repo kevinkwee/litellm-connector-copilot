@@ -34,6 +34,76 @@ export class InactivityTimeoutError extends Error {
     }
 }
 
+/** HTTP statuses whose mid-stream failure a fresh request can plausibly survive. */
+const RETRIABLE_UPSTREAM_STATUS = new Set([408, 409, 425, 429]);
+
+/**
+ * Substrings of upstream error codes and types that mean "try again", used when
+ * the error frame carries no HTTP status.
+ */
+const RETRIABLE_UPSTREAM_MARKERS = [
+    "overloaded",
+    "rate_limit",
+    "rate limit",
+    "server_error",
+    "internal_error",
+    "service_unavailable",
+    "timeout",
+    "unavailable",
+];
+
+function isRetriableUpstreamFailure(status?: number, code?: string, type?: string): boolean {
+    if (status !== undefined) {
+        return RETRIABLE_UPSTREAM_STATUS.has(status) || (status >= 500 && status <= 599);
+    }
+    const haystack = `${code ?? ""} ${type ?? ""}`.toLowerCase();
+    return RETRIABLE_UPSTREAM_MARKERS.some((marker) => haystack.includes(marker));
+}
+
+/**
+ * Failure the upstream reported inside the stream body after the response had
+ * already started. LiteLLM's proxy yields `data: {"error": {...}}` when the
+ * upstream dies mid-generation, and the Responses API sends `error` and
+ * `response.failed` events. An ignored frame reads as a clean completion, or as
+ * a reasoning-only response when nothing had been emitted yet, so the
+ * interpreter throws this instead of returning a part.
+ *
+ * `retriable` is what the transport retry loop consults: transient upstream
+ * failures resume the request the same way a dropped socket does, while a
+ * rejected request surfaces its message instead of being resent.
+ */
+export class UpstreamStreamError extends Error {
+    public readonly retriable: boolean;
+
+    public constructor(
+        public readonly status: number | undefined,
+        public readonly code: string | undefined,
+        public readonly type: string | undefined,
+        public readonly detail: string | undefined
+    ) {
+        super(describeUpstreamFailure(status, code, type, detail));
+        this.name = "UpstreamStreamError";
+        this.retriable = isRetriableUpstreamFailure(status, code, type);
+    }
+}
+
+function describeUpstreamFailure(
+    status: number | undefined,
+    code: string | undefined,
+    type: string | undefined,
+    detail: string | undefined
+): string {
+    // LiteLLM's ProxyException carries the HTTP status in `code`; printing it
+    // next to `HTTP <status>` would repeat the same fact.
+    const codeAsLabel = code !== undefined && !/^\d{3}$/.test(code) ? code : undefined;
+    const labels = [codeAsLabel ?? type, status !== undefined ? `HTTP ${status}` : undefined].filter(
+        (label): label is string => typeof label === "string" && label.length > 0
+    );
+    const label = labels.length > 0 ? ` (${labels.join(", ")})` : "";
+    const reason = detail ? `: ${detail}` : ": the provider ended the response early";
+    return `Upstream stream error${label}${reason}`;
+}
+
 /**
  * Sentinel for a stream that completed cleanly but produced no text and no
  * tool calls, only reasoning (or nothing). VS Code's agent loop treats this
@@ -57,14 +127,20 @@ export class ReasoningOnlyError extends Error {
 /**
  * True when the error represents a transport-level failure that a new HTTP
  * request can plausibly recover from. Deliberately narrow: HTTP status errors
- * (LiteLLM API error), cancellations, and upstream API errors are NOT retried
- * because a fresh request would either be rejected identically or produce
- * duplicated content. ReasoningOnlyError is NOT classified here because it has
- * its own, separate retry budget (emptyResponseRetries).
+ * (`LiteLLMApiError`), cancellations, and upstream stream failures marked
+ * non-retriable are NOT retried, because a fresh request would be rejected
+ * identically or produce duplicated content. `UpstreamStreamError` is the
+ * upstream failure this function consults directly: it returns its `retriable`
+ * flag, so a transient mid-stream death resumes like a dropped socket while a
+ * rejected request surfaces its message. `ReasoningOnlyError` is NOT classified
+ * here because it has its own, separate retry budget (`emptyResponseRetries`).
  */
 export function isTransportRetriableError(err: unknown): boolean {
     if (err instanceof InactivityTimeoutError) {
         return true;
+    }
+    if (err instanceof UpstreamStreamError) {
+        return err.retriable;
     }
     if (err instanceof ReasoningOnlyError) {
         return false;
