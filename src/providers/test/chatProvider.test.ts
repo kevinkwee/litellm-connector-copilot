@@ -596,27 +596,13 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         assert.deepStrictEqual(decoded, ['{"choices":[{"delta":{"content":"Hello"}}]}']);
 
         // Exercise the streaming pipeline directly (deterministic unit test).
-        // We MUST reset the streaming state so that the internal _streamingState is initialized.
-        const providerAsChat = provider as LiteLLMChatProvider;
-        // Accessing protected members for testing
-        const providerTest = providerAsChat as unknown as {
-            resetStreamingState: () => void;
-            _streamingState: unknown;
+        const providerTest = provider as unknown as {
             processStreamingResponse: (
                 stream: AsyncIterable<string>,
                 progress: vscode.Progress<vscode.LanguageModelResponsePart>,
                 token: vscode.CancellationToken
             ) => Promise<void>;
         };
-
-        if (typeof providerTest.resetStreamingState === "function") {
-            providerTest.resetStreamingState();
-        } else if (providerTest._streamingState === undefined) {
-            // Fallback for older versions or if the method is truly private and not exposed via any
-            const { createInitialStreamingState } =
-                await import("../../adapters/streaming/liteLLMStreamInterpreter.js");
-            (providerTest as { _streamingState: unknown })._streamingState = createInitialStreamingState();
-        }
 
         await providerTest.processStreamingResponse(
             makeStream() as unknown as AsyncIterable<string>,
@@ -654,8 +640,6 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
 
         const pWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<unknown> };
-            resetStreamingState: () => void;
-            _streamingState: unknown;
             processStreamingResponse: (
                 stream: AsyncIterable<string>,
                 progress: vscode.Progress<vscode.LanguageModelResponsePart>,
@@ -666,8 +650,6 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             url: "http://localhost:4000",
             inactivityTimeout: 60,
         });
-        const { createInitialStreamingState } = await import("../../adapters/streaming/liteLLMStreamInterpreter.js");
-        pWithConfig.resetStreamingState();
 
         const stream = new ReadableStream<Uint8Array>({
             start(controller) {

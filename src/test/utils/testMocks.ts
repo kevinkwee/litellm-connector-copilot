@@ -57,6 +57,33 @@ export function createMockModel(
     } as vscode.LanguageModelChatInformation;
 }
 
+/** Chat request options for the local test backend. */
+export function createMockChatResponseOptions(): vscode.ProvideLanguageModelChatResponseOptions {
+    return {
+        modelOptions: {},
+        tools: [],
+        toolMode: vscode.LanguageModelChatToolMode.Auto,
+        requestInitiator: "test",
+        configuration: { baseUrl: "http://localhost:4000", apiKey: "test-api-key" },
+    } as vscode.ProvideLanguageModelChatResponseOptions;
+}
+
+export function createMockUserMessage(text: string): vscode.LanguageModelChatRequestMessage {
+    return {
+        role: vscode.LanguageModelChatMessageRole.User,
+        name: undefined,
+        content: [new vscode.LanguageModelTextPart(text)],
+    };
+}
+
+/** Concatenates the text parts a provider reported, ignoring every other part type. */
+export function collectResponseText(parts: readonly vscode.LanguageModelResponsePart[]): string {
+    return parts
+        .filter((part): part is vscode.LanguageModelTextPart => part instanceof vscode.LanguageModelTextPart)
+        .map((part) => part.value)
+        .join("");
+}
+
 /**
  * Creates a mock vscode.LogOutputChannel for tests.
  * All logging methods are no-ops. Useful when stubbing `vscode.window.createOutputChannel`.

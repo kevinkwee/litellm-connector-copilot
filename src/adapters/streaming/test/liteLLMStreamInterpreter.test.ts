@@ -1,6 +1,11 @@
 import * as assert from "assert";
 import * as sinon from "sinon";
-import { interpretStreamEvent, createInitialStreamingState, flushPendingBuffers } from "../liteLLMStreamInterpreter";
+import {
+    interpretStreamEvent,
+    createInitialStreamingState,
+    flushPendingBuffers,
+    reportUnfinishedToolCallBuffers,
+} from "../liteLLMStreamInterpreter";
 import { TAGGED_CALL_CLOSER, TAGGED_CALL_OPENER, PIPE_CLOSER, PIPE_OPENER } from "../textToolCallParser";
 import { StructuredLogger } from "../../../observability/structuredLogger";
 
@@ -946,6 +951,221 @@ suite("Tool Call Args Corruption Logging", () => {
         assert.strictEqual(fields.callId, "bad-call");
         assert.strictEqual(fields.toolName, "badtool");
         assert.strictEqual(fields.argsPreview, "{invalid");
+    });
+});
+
+suite("Dropped tool call buffer logging", () => {
+    const DROPPED_EVENT = "stream.tool_call_buffer_dropped";
+    let sandbox: sinon.SinonSandbox;
+
+    setup(() => {
+        sandbox = sinon.createSandbox();
+    });
+
+    teardown(() => {
+        sandbox.restore();
+    });
+
+    function toolCallDelta(toolCall: Record<string, unknown>): Record<string, unknown> {
+        return { choices: [{ delta: { tool_calls: [{ index: 0, ...toolCall }] } }] };
+    }
+
+    function droppedEventFields(warnStub: sinon.SinonStub): Record<string, unknown>[] {
+        return warnStub
+            .getCalls()
+            .filter((call) => call.args[0] === DROPPED_EVENT)
+            .map((call) => call.args[1] as Record<string, unknown>);
+    }
+
+    test("reports an id-less buffer discarded at finish", () => {
+        const state = createInitialStreamingState();
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        interpretStreamEvent(toolCallDelta({ function: { arguments: '{"mode":"background"}' } }), state);
+
+        interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
+
+        assert.deepStrictEqual(droppedEventFields(warnStub), [
+            {
+                reason: "incomplete_at_finish",
+                index: 0,
+                finishReason: "tool_calls",
+                hasId: false,
+                argsLength: '{"mode":"background"}'.length,
+            },
+        ]);
+    });
+
+    test("reports a buffer with no arguments discarded at finish", () => {
+        const state = createInitialStreamingState();
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        interpretStreamEvent(
+            toolCallDelta({ id: "call_empty", function: { name: "list_files", arguments: "" } }),
+            state
+        );
+
+        interpretStreamEvent({ choices: [{ finish_reason: "stop" }] }, state);
+
+        assert.deepStrictEqual(droppedEventFields(warnStub), [
+            {
+                reason: "incomplete_at_finish",
+                index: 0,
+                finishReason: "stop",
+                hasId: true,
+                argsLength: 0,
+            },
+        ]);
+    });
+
+    test("reports a complete call with invalid JSON arguments discarded at a non-tool finish", () => {
+        const state = createInitialStreamingState();
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        interpretStreamEvent(
+            toolCallDelta({ id: "call_cut", function: { name: "write_file", arguments: '{"path":"a.ts","con' } }),
+            state
+        );
+
+        interpretStreamEvent({ choices: [{ finish_reason: "length" }] }, state);
+
+        assert.deepStrictEqual(droppedEventFields(warnStub), [
+            {
+                reason: "invalid_json_args",
+                index: 0,
+                finishReason: "length",
+                hasId: true,
+                argsLength: '{"path":"a.ts","con'.length,
+            },
+        ]);
+    });
+
+    test("reports every buffer still open when a stream ends without a finish frame", () => {
+        const state = createInitialStreamingState();
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        interpretStreamEvent(
+            toolCallDelta({ id: "call_open", function: { name: "read_file", arguments: '{"p":1}' } }),
+            state
+        );
+        interpretStreamEvent(
+            {
+                choices: [
+                    {
+                        delta: {
+                            tool_calls: [{ index: 1, id: "call_second", function: { name: "ls", arguments: "{}" } }],
+                        },
+                    },
+                ],
+            },
+            state
+        );
+
+        reportUnfinishedToolCallBuffers(state);
+
+        assert.deepStrictEqual(
+            droppedEventFields(warnStub).map((fields) => [fields.reason, fields.index]),
+            [
+                ["stream_ended_before_finish", 0],
+                ["stream_ended_before_finish", 1],
+            ]
+        );
+    });
+
+    test("reports a buffer replaced by a new call id at the same index", () => {
+        const state = createInitialStreamingState();
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        interpretStreamEvent(
+            toolCallDelta({ id: "call_first", function: { name: "read_file", arguments: '{"p"' } }),
+            state
+        );
+
+        interpretStreamEvent(
+            toolCallDelta({ id: "call_second", function: { name: "list_files", arguments: "" } }),
+            state
+        );
+
+        assert.deepStrictEqual(droppedEventFields(warnStub), [
+            {
+                reason: "replaced_by_new_id",
+                index: 0,
+                finishReason: undefined,
+                hasId: true,
+                argsLength: '{"p"'.length,
+            },
+        ]);
+    });
+
+    test("stays silent when the buffered tool call is emitted", () => {
+        const state = createInitialStreamingState();
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        interpretStreamEvent(
+            toolCallDelta({ id: "call_ok", function: { name: "read_file", arguments: '{"p":1}' } }),
+            state
+        );
+
+        interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
+
+        assert.deepStrictEqual(droppedEventFields(warnStub), []);
+    });
+
+    test("stays silent when invalid JSON arguments are still emitted at a tool_calls finish", () => {
+        const state = createInitialStreamingState();
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        interpretStreamEvent(
+            toolCallDelta({ id: "call_cut", function: { name: "write_file", arguments: '{"path":' } }),
+            state
+        );
+
+        interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
+
+        assert.deepStrictEqual(droppedEventFields(warnStub), []);
+    });
+
+    test("stays silent for an invalid buffer whose call id was already emitted as tagged text", () => {
+        const state = createInitialStreamingState();
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        interpretStreamEvent(
+            toolCallDelta({ id: "call_dup", function: { name: "read_file", arguments: '{"p":' } }),
+            state
+        );
+        const taggedCall = JSON.stringify({ id: "call_dup", name: "read_file", arguments: { p: 1 } });
+        interpretStreamEvent(
+            { choices: [{ delta: { content: `${TAGGED_CALL_OPENER}${taggedCall}${TAGGED_CALL_CLOSER}` } }] },
+            state
+        );
+
+        interpretStreamEvent({ choices: [{ finish_reason: "stop" }] }, state);
+
+        assert.deepStrictEqual(droppedEventFields(warnStub), []);
+    });
+
+    test("reports nothing unfinished after a finish frame settles every buffer", () => {
+        const state = createInitialStreamingState();
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        interpretStreamEvent(
+            toolCallDelta({ id: "call_ok", function: { name: "read_file", arguments: '{"p":1}' } }),
+            state
+        );
+        interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
+
+        reportUnfinishedToolCallBuffers(state);
+
+        assert.deepStrictEqual(droppedEventFields(warnStub), []);
+    });
+
+    test("reports a malformed buffer skipped by premature-end recovery", () => {
+        const state = createInitialStreamingState();
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        state.toolCallBuffers.set(0, { id: "call_cut", name: "write_file", args: "{invalid" });
+
+        flushPendingBuffers(state);
+
+        assert.deepStrictEqual(droppedEventFields(warnStub), [
+            {
+                reason: "invalid_json_args",
+                index: 0,
+                finishReason: undefined,
+                hasId: true,
+                argsLength: "{invalid".length,
+            },
+        ]);
     });
 });
 

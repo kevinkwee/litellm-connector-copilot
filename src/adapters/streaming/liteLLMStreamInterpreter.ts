@@ -18,8 +18,14 @@ export type EmittedPart =
     | { type: "finish"; reason?: string }
     | { type: "response"; usage?: { inputTokens?: number; outputTokens?: number } };
 
+interface ChatToolCallBuffer {
+    id?: string;
+    name?: string;
+    args: string;
+}
+
 export interface StreamingState {
-    toolCallBuffers: Map<number, { id?: string; name?: string; args: string }>;
+    toolCallBuffers: Map<number, ChatToolCallBuffer>;
     completedToolCallIndices: Set<number>;
     emittedTextToolCallIds: Set<string>;
     textToolParserBuffer: string;
@@ -69,6 +75,35 @@ function ensureCurrentThinkingBlockId(state: StreamingState): string {
         state.currentThinkingBlockId = nextThinkingBlockId(state);
     }
     return state.currentThinkingBlockId;
+}
+
+type DroppedToolCallReason =
+    "replaced_by_new_id" | "incomplete_at_finish" | "invalid_json_args" | "stream_ended_before_finish";
+
+/**
+ * Logs a chat-completions tool call discarded before it reaches VS Code. Without
+ * this log the loss only surfaces downstream, as a missing tool call or a stream
+ * misread as reasoning-only.
+ */
+function logDroppedToolCallBuffer(
+    reason: DroppedToolCallReason,
+    index: number,
+    buffer: ChatToolCallBuffer,
+    finishReason?: string
+): void {
+    const fields = { reason, index, finishReason, hasId: !!buffer.id, argsLength: buffer.args.length };
+    Logger.warn(`[toolCallBuffer] Dropped buffered tool call at index ${index} (${reason})`, fields);
+    StructuredLogger.warn("stream.tool_call_buffer_dropped", fields);
+}
+
+/**
+ * Logs every chat-completions tool call still buffered at the end of a stream,
+ * since the stream state is discarded with it.
+ */
+export function reportUnfinishedToolCallBuffers(state: StreamingState): void {
+    for (const [index, buffer] of state.toolCallBuffers) {
+        logDroppedToolCallBuffer("stream_ended_before_finish", index, buffer);
+    }
 }
 
 interface RawThinkingBlock {
@@ -266,6 +301,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                 // Normalize incoming ID before comparison since buffer stores normalized IDs
                 const incomingId = tc.id ? normalizeToolCallId(tc.id as string) : undefined;
                 if (incomingId && buffer && buffer.id !== incomingId) {
+                    logDroppedToolCallBuffer("replaced_by_new_id", index, buffer);
                     state.toolCallBuffers.delete(index);
                     buffer = undefined;
                 }
@@ -379,8 +415,12 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                             index,
                             finishReason,
                         });
+                    } else if (!isDuplicate) {
+                        logDroppedToolCallBuffer("invalid_json_args", index, buffer, finishReason);
                     }
                     state.completedToolCallIndices.add(index);
+                } else {
+                    logDroppedToolCallBuffer("incomplete_at_finish", index, buffer, choice.finish_reason);
                 }
             }
             state.toolCallBuffers.clear();
@@ -843,7 +883,7 @@ export function flushPendingBuffers(state: StreamingState): EmittedPart[] {
                 });
                 Logger.debug(`[flushPendingBuffers] Flushed OpenAI tool call: ${buffer.name} (id: ${buffer.id})`);
             } catch {
-                Logger.warn(`[flushPendingBuffers] Skipping malformed OpenAI tool call args at index ${index}`);
+                logDroppedToolCallBuffer("invalid_json_args", index, buffer);
                 StructuredLogger.error("stream.tool_call_args_invalid_json", {
                     toolName: buffer.name || "unknown_tool",
                     callId: buffer.id,

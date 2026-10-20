@@ -29,8 +29,8 @@ import {
     createInitialStreamingState,
     interpretStreamEvent,
     flushPendingBuffers,
+    reportUnfinishedToolCallBuffers,
 } from "../adapters/streaming/liteLLMStreamInterpreter";
-import type { StreamingState } from "../adapters/streaming/liteLLMStreamInterpreter";
 import { emitPartsToVSCode } from "../adapters/streaming/vscodePartEmitter";
 import type { EffortFallbackCache } from "../utils/reasoningEffortFallback";
 import { StreamTokenCapture } from "../adapters/streaming/streamTokenCapture";
@@ -51,12 +51,12 @@ import {
  *
  * All shared orchestration (model discovery, request building, trimming, parameter filtering,
  * endpoint routing) is implemented in LiteLLMProviderBase.
+ *
+ * One instance serves every concurrent request (chat sessions, subagents, and background
+ * requests such as title generation), so request state never lives in instance fields: stream
+ * buffers live for one upstream attempt, and the token capture lives for one request.
  */
 export class LiteLLMChatProvider extends LiteLLMProviderBase implements LanguageModelChatProvider {
-    // Streaming state
-    private _streamingState: StreamingState = createInitialStreamingState();
-    private _tokenCapture?: StreamTokenCapture;
-
     constructor(secrets: vscode.SecretStorage, userAgent: string, effortFallbackCache?: EffortFallbackCache) {
         super(secrets, userAgent, effortFallbackCache);
     }
@@ -141,7 +141,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         progress: Progress<LanguageModelResponsePart>,
         token: CancellationToken
     ): Promise<void> {
-        this.resetStreamingState();
         const startTime = LiteLLMTelemetry.startTimer();
         const requestStartDate = new Date();
         const requestId = Math.random().toString(36).substring(7);
@@ -195,8 +194,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         // `StreamTokenCapture` uses the model id for `countTokens` heuristics
         // (tokenizer family lookup). The namespaced id breaks those heuristics,
         // so we hand it the raw model name instead.
-        this._tokenCapture = new StreamTokenCapture(this.getRawModelName(model.id), progress, modelInfo);
-        const tokenCapture = this._tokenCapture;
+        const tokenCapture = new StreamTokenCapture(this.getRawModelName(model.id), progress, modelInfo);
         const responsePartCollector = new ResponsePartCollector(tokenCapture.progress);
         // Bind `trackingProgress` to the collector's wrapped progress so every
         // downstream streaming call both reports to VS Code (via tokenCapture)
@@ -360,12 +358,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     );
                     await this.processStreamingResponse(stream, trackedProgress, token, contentCounters);
 
-                    // Flush usage data if no upstream usage was seen during streaming
-                    // This ensures usage is always reported to VS Code
-                    const capture = this._tokenCapture;
-                    if (capture) {
-                        capture.flushUsage();
-                    }
+                    // Upstream may stream no usage frame; VS Code still needs one usage report.
+                    tokenCapture.flushUsage();
                     break;
                 } catch (err: unknown) {
                     if (token.isCancellationRequested) {
@@ -395,7 +389,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                                 delayMs: delay,
                                 resumedReasoningChars: accumulator.thinking.length,
                             });
-                            this._tokenCapture?.resetAccumulation();
+                            tokenCapture.resetAccumulation();
                             await sleepWithCancellation(delay, token);
                             // Do NOT count this against the transport attempt
                             // budget; treat the next iteration as a fresh resume.
@@ -474,23 +468,12 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     });
                     // Fresh attempt: drop partial-response token accounting so
                     // the next usage snapshot reflects only the resumed stream.
-                    this._tokenCapture?.resetAccumulation();
+                    tokenCapture.resetAccumulation();
                     await sleepWithCancellation(delay, token);
                 }
             }
 
-            const snapshot = this._tokenCapture?.getSnapshot() ?? {
-                promptTokens: tokensIn ?? 0,
-                cachedTokens: 0,
-                cacheCreationInputTokens: 0,
-                systemPromptTokens: 0,
-                completionTokens: 0,
-                reasoningTokens: 0,
-                toolTokens: 0,
-                acceptedPredictionTokens: 0,
-                rejectedPredictionTokens: 0,
-                sawUpstreamUsage: false,
-            };
+            const snapshot = tokenCapture.getSnapshot();
 
             const tokensOut = Math.max(snapshot.completionTokens, snapshot.toolTokens);
             const tokensInForTelemetry = snapshot.promptTokens ?? tokensIn;
@@ -648,18 +631,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     ourRequestId: requestId,
                     timeToFirstTokenMs: undefined,
                     resolvedModel: model.id,
-                    usage: this._tokenCapture?.getSnapshot() ?? {
-                        promptTokens: tokensIn ?? 0,
-                        cachedTokens: 0,
-                        cacheCreationInputTokens: 0,
-                        systemPromptTokens: 0,
-                        completionTokens: 0,
-                        reasoningTokens: 0,
-                        toolTokens: 0,
-                        acceptedPredictionTokens: 0,
-                        rejectedPredictionTokens: 0,
-                        sawUpstreamUsage: false,
-                    },
+                    usage: tokenCapture.getSnapshot(),
                     responseParts: responsePartCollector.parts,
                     status: "failure",
                     statusReason: errorMessage,
@@ -686,18 +658,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         }
     }
 
-    protected resetStreamingState(): void {
-        // Reset the streaming buffers (tool call state)
-        // but NOT _tokenCapture, which is needed for usage reporting after the stream ends
-        this._streamingState = createInitialStreamingState();
-    }
-
-    protected clearAllStreamingState(): void {
-        // Complete reset including token capture (used only when aborting/cancelling)
-        this._streamingState = createInitialStreamingState();
-        this._tokenCapture = undefined;
-    }
-
     /**
      * Processes an SSE streaming response from LiteLLM and emits VS Code response parts.
      *
@@ -717,6 +677,9 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
 
         const config = await this._configManager.getConfig();
         const timeoutMs = (config.inactivityTimeout ?? 60) * 1000;
+        // Scoped to one upstream attempt: a resumed retry is a new upstream
+        // response, so nothing buffered by the failed attempt belongs to it.
+        const streamingState = createInitialStreamingState();
         let watchdog: NodeJS.Timeout | undefined;
         let eventCount = 0;
         let wasWatchdogAbort = false;
@@ -726,6 +689,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         let sawTextPart = false;
         let sawToolCallPart = false;
         let sawUsagePart = false;
+        let reasoningChars = 0;
 
         // Create an AbortController to actually cancel the stream on timeout
         const controller = new AbortController();
@@ -790,14 +754,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 }
                 const json = jsonResult.value;
 
-                // Ensure streaming state is initialized (e.g. if processStreamingResponse is called directly in tests)
-                if (!this._streamingState) {
-                    Logger.trace(`[processStreamingResponse] Initializing streaming state on first event`);
-                    this.resetStreamingState();
-                }
-
                 Logger.trace(`[processStreamingResponse] Event #${eventCount}: Interpreting event`);
-                const parts = interpretStreamEvent(json, this._streamingState);
+                const parts = interpretStreamEvent(json, streamingState);
                 Logger.trace(
                     `[processStreamingResponse] Event #${eventCount}: Got ${parts.length} parts, emitting to VS Code`
                 );
@@ -821,6 +779,9 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         if (contentCounters) {
                             contentCounters.sawUsagePart = true;
                         }
+                    } else if (part.type === "thinking") {
+                        reasoningChars +=
+                            typeof part.value === "string" ? part.value.length : part.value.join("").length;
                     }
                 }
                 emitPartsToVSCode(parts, progress);
@@ -841,6 +802,12 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 throw new InactivityTimeoutError(timeoutMs, eventCount);
             }
 
+            // A cancelled stream drops its buffers by design, so only a stream
+            // that ended on its own reports unfinished tool calls as lost.
+            if (!token.isCancellationRequested) {
+                reportUnfinishedToolCallBuffers(streamingState);
+            }
+
             // Reasoning-only detection: a cleanly-completed stream that emitted
             // ONLY thinking parts (plus perhaps a usage data part) contains
             // nothing the agent loop can act on. VS Code renders it as
@@ -856,7 +823,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     eventCount,
                     sawUsagePart,
                 });
-                throw new ReasoningOnlyError(eventCount, 0);
+                throw new ReasoningOnlyError(eventCount, reasoningChars);
             }
         } catch (error: unknown) {
             Logger.error(`[processStreamingResponse] Stream processing failed after ${eventCount} events`, {
@@ -876,7 +843,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     error.message.includes("stream ended") ||
                     error.message.includes("unexpected end"));
 
-            if (isStreamEndError && this._streamingState && eventCount > 0) {
+            if (isStreamEndError && eventCount > 0) {
                 Logger.info(
                     `[processStreamingResponse] Attempting recovery: flushing ${eventCount} buffered tool calls`
                 );
@@ -884,13 +851,12 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     reason: "stream_incomplete",
                     eventCount,
                     hasBufferedCalls:
-                        this._streamingState.responseToolCallBuffers.size > 0 ||
-                        this._streamingState.toolCallBuffers.size > 0,
+                        streamingState.responseToolCallBuffers.size > 0 || streamingState.toolCallBuffers.size > 0,
                 });
 
                 try {
                     // Flush all pending buffers and emit them
-                    const recoveredParts = flushPendingBuffers(this._streamingState);
+                    const recoveredParts = flushPendingBuffers(streamingState);
                     // recoveredParts includes at least the finish part, so check length > 1
                     if (recoveredParts.length > 1) {
                         // -1 because last part is finish
@@ -936,19 +902,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             if (watchdog) {
                 clearTimeout(watchdog);
             }
-            Logger.debug(`[processStreamingResponse] Clearing streaming state (eventCount=${eventCount})`);
-            StructuredLogger.debug("stream.state_cleared", {
-                eventCount,
-            });
-            // Always reset streaming state on stream completion (success or error)
-            // to prevent stale buffers from corrupting subsequent requests
-            this.resetStreamingState();
         }
-    }
-
-    private stripControlTokens(text: string): string {
-        return text
-            .replace(/<\|[a-zA-Z0-9_-]+_section_(?:begin|end)\|>/g, "")
-            .replace(/<\|tool_call_(?:argument_)?(?:begin|end)\|>/g, "");
     }
 }

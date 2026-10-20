@@ -583,6 +583,9 @@ This extension integrates LiteLLM proxies into VS Code's Language Model APIs (ch
   - Implements `vscode.LanguageModelChatProvider` against the current stable API surface.
   - Extends `LiteLLMProviderBase` and adds chat-protocol behavior only.
   - Handles chat-specific streaming, tool call buffering, response part emission (text, thinking, data, tool calls), and message parsing.
+  - One instance serves every concurrent request (chat sessions, subagents, and background requests such as title generation), so request state never lives in instance fields. Shared instance state would let one session's tool calls, text, or usage reach another session's response.
+    - The stream interpreter state is created per upstream attempt in `processStreamingResponse`, because a resumed retry is a new upstream response.
+    - `StreamTokenCapture` and the retry accumulators are locals of `provideLanguageModelChatResponse`, because they span every attempt of one request.
   - Reads per-group configuration from `options.configuration` on each call (no global config caching).
   - Returns `LanguageModelChatInformation` entries with `isUserSelectable: true` so models appear in the picker.
   - Reuses the base request pipeline for normalization, filtering, trimming, and routing.
