@@ -17,6 +17,11 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Unsigned or malformed signed blocks are ignored rather than reconstructed; user and system messages never receive signatures.
 - Claude stream usage reports Anthropic prompt-cache counters separately: cache-write tokens are billed at the cache-write price and cache-read tokens at the cache-read price in the estimated request costs.
 
+### DeepSeek reasoning continuity across tool calls
+- DeepSeek thinking mode requires `reasoning_content` on every assistant turn in the active tool loop whenever the request carries tools, including turns where the model produced no reasoning. Omitting the field makes the upstream return `400 ... The reasoning_content in the thinking mode must be passed back to the API.`
+- For DeepSeek models, the connector fills `reasoning_content: ""` on active-turn assistant messages that have no reasoning part. Real reasoning replayed by VS Code is preserved.
+- The fill is DeepSeek-only and scoped to the active turn (assistant messages after the latest real user message). Completed turns and every non-DeepSeek model keep their existing payload unchanged.
+
 ### Anthropic prompt caching
 - New setting `litellm-connector.anthropicPromptCaching` (`off` | `5m` | `1h`, default `5m`) marks Claude requests with a top-level `cache_control` ephemeral CachePoint that LiteLLM forwards to the Claude API, so repeated prefixes (system prompt, tools, conversation history) are served from Anthropic's prompt cache. Unrelated to `litellm-connector.disableCaching`, which bypasses the LiteLLM proxy response cache.
 - `1h` cache writes cost 2x input tokens versus 1.25x for `5m`; cache reads cost 0.1x for both tiers. Applies only to Anthropic Claude models; commit message generation never marks its one-shot prompts.

@@ -659,6 +659,16 @@ Claude reasoning arrives as thinking deltas plus signature and redacted-thinking
 - **Replay**: `convertMessages` (`src/utils.ts`, via `src/utils/thinkingBlocks.ts`) rebuilds `thinking_blocks` from sealed parts and omits `reasoning_content` when blocks exist. Unsigned reasoning parts keep `reasoning_content`, so the transport-retry resume path is unchanged.
 - **Role safety**: blocks and signatures are only attached to assistant messages; user and system roles never carry them.
 
+### DeepSeek reasoning_content Passback
+
+DeepSeek thinking mode requires `reasoning_content` on every assistant turn in the active tool loop whenever the request carries `tools`, including turns where the model produced no reasoning. Omitting the field returns `400 ... The reasoning_content in the thinking mode must be passed back to the API.` VS Code replays the reasoning part within a tool loop but strips it from completed turns on a new user turn; the latter is tolerated because the upstream validates the active tool-call continuation.
+
+- **Fill**: `convertMessages` (`src/utils.ts`) accepts `ensureReasoningContentInActiveTurn`. When enabled, assistant messages after the latest real user message carry a string `reasoning_content`; turns with replayed reasoning keep it, turns without reasoning get `""`. The boundary is precomputed so completed turns are not rewritten, and hoisted tool-result image messages do not move it.
+- **Gating**: `isDeepSeekModel` (`src/utils/modelUtils.ts`) matches `litellm_provider` or the raw model id. `RequestBuilder` enables the fill only for a DeepSeek model whose request carries tools. No other model receives the field.
+- **Scope**: the fill targets chat-completions requests. `transformToResponsesFormat` (`src/adapters/responsesAdapter.ts`) drops `reasoning_content`, so a DeepSeek model forced onto `/responses` receives no fill and can return the same 400.
+- **Empty-string safety**: the two `reasoning_content` spreads test `!== undefined`, not truthiness; `""` is a valid value and must reach the wire.
+- **Tests**: `src/utils/test/utils.test.ts` covers the active-turn boundary, completed-turn isolation, reasoning preservation, hoisted tool-result images, and the empty-string regression. `src/utils/test/isDeepSeekModel.test.ts` covers DeepSeek detection, and `src/providers/test/liteLLMProviderBase.requestBuilder.test.ts` covers the tools-present gate.
+
 ### Multimodal Tool Results
 
 Images returned by a tool (a screenshot tool, a chart renderer, an MCP server) travel to the model instead of being dropped. `convertMessages` collects them into `image_url` items, but the wire shape depends on the provider family because LiteLLM's transforms disagree about tool message content.

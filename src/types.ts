@@ -79,8 +79,9 @@ export interface OpenAIChatMessage {
     /**
      * Signed or redacted Anthropic thinking blocks replayed into tool loops.
      * Set only when the response carried verifiable (signed or redacted)
-     * blocks; when present, `reasoning_content` is omitted because LiteLLM's
-     * Anthropic transform reads only these blocks.
+     * blocks. `reasoning_content` is omitted when these are present, except on
+     * an active-turn message under `ensureReasoningContentInActiveTurn`, which
+     * carries both. LiteLLM's Anthropic transform reads only the blocks.
      */
     thinking_blocks?: OpenAIThinkingBlock[];
 }

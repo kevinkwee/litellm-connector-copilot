@@ -391,6 +391,149 @@ suite("Utility Unit Tests", () => {
         assert.strictEqual(out[0].thinking_blocks, undefined);
     });
 
+    test("convertMessages fills empty reasoning_content for active-turn assistant turns", () => {
+        const callId = "call-deepseek-1";
+        const messages = [
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelTextPart("do the work")],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [new vscode.LanguageModelToolCallPart(callId, "run", { x: 1 })],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelToolResultPart(callId, [new vscode.LanguageModelTextPart("ok")])],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [new vscode.LanguageModelTextPart("done")],
+                name: undefined,
+            },
+        ] as unknown as vscode.LanguageModelChatRequestMessage[];
+
+        const out = convertMessages(messages, { ensureReasoningContentInActiveTurn: true }) as {
+            role: string;
+            reasoning_content?: string;
+        }[];
+        const serialized = JSON.stringify(out);
+
+        assert.strictEqual(out[1].reasoning_content, "", "tool-call turn without reasoning must carry the field");
+        assert.strictEqual(out[3].reasoning_content, "", "text turn without reasoning must carry the field");
+        assert.ok(serialized.includes('"reasoning_content":""'), "empty string must survive serialization");
+        assert.ok(!serialized.includes('reasoning_content":null'), "the field must be a string");
+    });
+
+    test("convertMessages leaves completed turns untouched when filling the active turn", () => {
+        const firstCallId = "call-deepseek-completed";
+        const secondCallId = "call-deepseek-active";
+        const messages = [
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelTextPart("first turn")],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [new vscode.LanguageModelToolCallPart(firstCallId, "run", {})],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [
+                    new vscode.LanguageModelToolResultPart(firstCallId, [new vscode.LanguageModelTextPart("ok")]),
+                ],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelTextPart("second turn")],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [new vscode.LanguageModelToolCallPart(secondCallId, "run", {})],
+                name: undefined,
+            },
+        ] as unknown as vscode.LanguageModelChatRequestMessage[];
+
+        const out = convertMessages(messages, { ensureReasoningContentInActiveTurn: true }) as {
+            role: string;
+            reasoning_content?: string;
+        }[];
+
+        assert.strictEqual(out[1].reasoning_content, undefined, "completed turn must keep its original payload");
+        assert.strictEqual(out[4].reasoning_content, "", "active turn must carry the empty field");
+    });
+
+    test("convertMessages preserves replayed reasoning in the active turn", () => {
+        const reasoningPart = { value: "real reasoning" };
+        const messages = [
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelTextPart("continue")],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [
+                    reasoningPart as unknown as vscode.LanguageModelTextPart,
+                    new vscode.LanguageModelToolCallPart("call-deepseek-reasoned", "run", {}),
+                ],
+                name: undefined,
+            },
+        ] as unknown as vscode.LanguageModelChatRequestMessage[];
+
+        const out = convertMessages(messages, { ensureReasoningContentInActiveTurn: true }) as {
+            reasoning_content?: string;
+        }[];
+
+        assert.strictEqual(out[1].reasoning_content, "real reasoning");
+    });
+
+    test("convertMessages does not let a hoisted tool-result image message close the active turn", () => {
+        const callId = "call-deepseek-image";
+        const image = vscode.LanguageModelDataPart.image(new Uint8Array(Buffer.from("png")), "image/png");
+        const messages = [
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelTextPart("inspect")],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [new vscode.LanguageModelToolCallPart(callId, "screenshot", {})],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelToolResultPart(callId, [image])],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [new vscode.LanguageModelToolCallPart("call-deepseek-next", "run", {})],
+                name: undefined,
+            },
+        ] as unknown as vscode.LanguageModelChatRequestMessage[];
+
+        const out = convertMessages(messages, {
+            toolResultImageMode: "hoist",
+            ensureReasoningContentInActiveTurn: true,
+        }) as { role: string; reasoning_content?: string }[];
+
+        assert.strictEqual(out[1].reasoning_content, "", "the tool-call turn before the hoisted image is active");
+        assert.strictEqual(
+            out[out.length - 1].reasoning_content,
+            "",
+            "the turn after the hoisted image is still active"
+        );
+    });
+
     test("convertMessages does not replay signatures for user roles", () => {
         const signedPart = { value: "", id: "id-x", metadata: { signature: "SIGUSER", _completeThinking: "s" } };
         const messages = [
