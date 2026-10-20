@@ -452,12 +452,9 @@ export interface OpenAIChatCompletionRequest {
      * per-session spend tracking, cache grouping, and the `session_id`
      * column in the spend logs / `LiteLLM_SpendLogs` table.
      *
-     * The connector sets `session_id` to the same fingerprint it uses for
-     * `.copilotmd` session folder grouping, so a request's spend-log row
-     * and its `.copilotmd` file land under the same session key. This is
-     * opt-in via `litellm-connector.debug.copilotMdExport.enabled` — when
-     * the export is off, no `metadata` is attached and LiteLLM falls back
-     * to its default session-id behavior (a per-request UUID).
+     * Always set by the chat provider, even when the `.copilotmd` export is
+     * off; the id is also the `.copilotmd` folder name. See
+     * `src/utils/chatSessionId.ts` for how it is derived.
      */
     metadata?: {
         session_id?: string;

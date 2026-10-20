@@ -12,7 +12,7 @@ export type { LogLevel, EventType, LogEvent, AuditSummary } from "./types";
 // `.copilotmd` request-log export, byte-compatible with VS Code Copilot's
 // Chat Debug View export format. See `copilotMdRenderer.ts` for the format
 // reference.
-export { renderCopilotMd, buildCopilotMdFilename, computeSessionFingerprint } from "./copilotMdRenderer";
+export { renderCopilotMd, buildCopilotMdFilename } from "./copilotMdRenderer";
 export type { CopilotMdEntry } from "./copilotMdRenderer";
 export { selectFilesForDeletion } from "./copilotMdCaps";
 export type { CapsConfig, FileMeta } from "./copilotMdCaps";

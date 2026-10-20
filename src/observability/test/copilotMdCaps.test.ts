@@ -16,8 +16,8 @@ import { selectFilesForDeletion, type CapsConfig, type FileMeta } from "../copil
  * "Oldest" is by mtime. `0` for any cap means unlimited (no enforcement).
  */
 
-function makeFile(uri: string, sessionFingerprint: string, mtimeMs: number, sizeBytes: number): FileMeta {
-    return { uri, sessionFingerprint, mtimeMs, sizeBytes };
+function makeFile(uri: string, sessionId: string, mtimeMs: number, sizeBytes: number): FileMeta {
+    return { uri, sessionId, mtimeMs, sizeBytes };
 }
 
 const UNLIMITED: CapsConfig = {

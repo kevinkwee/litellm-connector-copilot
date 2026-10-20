@@ -257,7 +257,7 @@ Folder ownership (unit tests are co-located with the module under test in `src/*
 
 - `src/providers/`: Language Model provider implementations (`liteLLMProviderBase.ts`, `liteLLMChatProvider.ts`, `liteLLMCommitProvider.ts`, `index.ts`)
 - `src/adapters/`: HTTP clients, payload shaping, endpoint-specific parsing, SSE and streaming (`sse/`, `streaming/`), tokenizers
-- `src/utils/`: shared utilities (logging, local request metrics, model helpers, pricing, `thinkingBlocks`, `promptCaching`, `connectorNotice`, `transportRetry`)
+- `src/utils/`: shared utilities (logging, local request metrics, model helpers, pricing, `chatSessionId`, `thinkingBlocks`, `promptCaching`, `connectorNotice`, `transportRetry`)
 - `src/config/`: configuration and secrets
 - `src/commands/`: command registrations and UI entry points
 - `src/observability/`: structured logging, audit trail, debug export
@@ -591,6 +591,7 @@ This extension integrates LiteLLM proxies into VS Code's Language Model APIs (ch
     - The stream interpreter state is created per upstream attempt in `processStreamingResponse`, because a resumed retry is a new upstream response.
     - `StreamTokenCapture` and the retry accumulators are locals of `provideLanguageModelChatResponse`, because they span every attempt of one request.
   - Reads the per-group credentials from the model object VS Code passes back (see [Configuration Flow](#configuration-flow-per-group)); the per-model picker configuration still arrives on `options.configuration`.
+  - Resolves the session id once per request through `resolveChatSessionId` and attaches it to `metadata.session_id` and the `.copilotmd` entry (see [Session Identity](#session-identity)).
   - Returns `LanguageModelChatInformation` entries with `isUserSelectable: true` so models appear in the picker.
   - Reuses the base request pipeline for normalization, filtering, trimming, and routing.
 
@@ -684,6 +685,14 @@ Images returned by a tool (a screenshot tool, a chart renderer, an MCP server) t
 - `litellm-connector.anthropicPromptCaching` (`off` | `5m` | `1h`, default `5m`) adds a top-level `cache_control: {type: "ephemeral"}` directive (plus `ttl: "1h"` on the higher tier) to chat requests; LiteLLM forwards it to the Claude API as the automatic prompt-caching marker. Unrelated to `disableCaching`, which bypasses the proxy response cache.
 - **Gating**: `src/utils/promptCaching.ts` allows the marker only for Anthropic-family requests where `modelInfo.litellm_provider` is authoritative, `supports_prompt_caching` is not explicitly false, and `options.modelOptions.promptCaching` is not false. Commit generation opts out: its prompts are one-shot messages with no reusable prefix, so the cache-write premium never pays off.
 - **Live learning**: when a 400 names `cache_control`, `litellmClient.chat` strips it and retries once, then notifies the transport, which records it through the registry (`recordUnsupportedParameter`). The request builder consults `getUnsupportedParameters`, so later requests omit the marker without paying a failed round trip. The learned key is the raw model name (the request body's `model` value).
+
+### Session Identity
+
+`src/utils/chatSessionId.ts` resolves one canonical lowercase UUID per chat request. The same id is sent as `metadata.session_id` (LiteLLM promotes it to `litellm_session_id`) and used as the `.copilotmd` session folder, so spend logs and transcripts group identically.
+
+- **Preferred source**: the internal `options.modelOptions._conversationId` field, which VS Code forwards from the originating conversation. Copilot Chat sets it in editor windows (subagents share the parent's id); the agent host BYOK proxy sets it to the Copilot SDK session id from VS Code 1.143 on. The field is undocumented, so it is validated rather than trusted.
+- **Shape allowlist**: an already-canonical UUID passes through unchanged (so LiteLLM rows match VS Code's session id); any other non-empty string is hashed to a namespaced UUID v5. Because the id becomes a directory name, this allowlist is also what prevents path traversal.
+- **Fallback**: when the host sends no id (title generation, commit generation, other extensions calling `vscode.lm`, Agents window on VS Code before 1.143), the id is a UUID v5 of the conversation's opening context: every message before the first assistant reply, system prompt included. That fingerprint is stable across turns unless the system prompt is rebuilt mid-conversation, and it separates sessions running under different agents or modes. It still collides when two conversations share both the system prompt and the opening request, so it must not be treated as a substitute for the host id.
 
 ### Commit-Specific Logic (Commit Provider)
 
