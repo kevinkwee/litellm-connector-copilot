@@ -4,10 +4,11 @@ import {
     interpretStreamEvent,
     createInitialStreamingState,
     flushPendingBuffers,
-    reportUnfinishedToolCallBuffers,
+    hasBufferedToolCalls,
 } from "../liteLLMStreamInterpreter";
 import { TAGGED_CALL_CLOSER, TAGGED_CALL_OPENER, PIPE_CLOSER, PIPE_OPENER } from "../textToolCallParser";
 import { StructuredLogger } from "../../../observability/structuredLogger";
+import { Logger } from "../../../utils/logger";
 
 declare const suite: (name: string, fn: () => void) => void;
 declare const test: (name: string, fn: () => void) => void;
@@ -38,7 +39,6 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
 
         // Simulate abort/reset for a new request on same connection
         state.toolCallBuffers.clear();
-        state.completedToolCallIndices.clear();
         state.emittedTextToolCallIds.clear();
 
         // Next request reuses index 0; should not be corrupted by stale args
@@ -768,6 +768,57 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
     });
 });
 
+suite("Tool call argument deltas", () => {
+    function toolCallFrame(toolCall: Record<string, unknown>): Record<string, unknown> {
+        return { choices: [{ delta: { tool_calls: [{ index: 0, ...toolCall }] } }] };
+    }
+
+    function emittedArgs(state: ReturnType<typeof createInitialStreamingState>): string[] {
+        const parts = interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
+        return parts.flatMap((part) => (part.type === "tool_call" ? [part.args] : []));
+    }
+
+    test("serializes an object arguments delta so the call still parses", () => {
+        const state = createInitialStreamingState();
+        interpretStreamEvent(
+            toolCallFrame({ id: "call_obj", function: { name: "read_file", arguments: { p: 1 } } }),
+            state
+        );
+
+        assert.deepStrictEqual(emittedArgs(state), ['{"p":1}']);
+    });
+
+    test("serializes an object arguments delta appended to an open call", () => {
+        const state = createInitialStreamingState();
+        interpretStreamEvent(toolCallFrame({ id: "call_obj", function: { name: "read_file", arguments: "" } }), state);
+        interpretStreamEvent(toolCallFrame({ function: { arguments: { p: 1 } } }), state);
+
+        assert.deepStrictEqual(emittedArgs(state), ['{"p":1}']);
+    });
+
+    test("ignores a numeric arguments delta", () => {
+        const state = createInitialStreamingState();
+        interpretStreamEvent(
+            toolCallFrame({ id: "call_num", function: { name: "read_file", arguments: '{"p":1}' } }),
+            state
+        );
+        interpretStreamEvent(toolCallFrame({ function: { arguments: 0 } }), state);
+
+        assert.deepStrictEqual(emittedArgs(state), ['{"p":1}']);
+    });
+
+    test("ignores a null arguments delta", () => {
+        const state = createInitialStreamingState();
+        interpretStreamEvent(
+            toolCallFrame({ id: "call_null", function: { name: "read_file", arguments: '{"p":1}' } }),
+            state
+        );
+        interpretStreamEvent(toolCallFrame({ function: { arguments: null } }), state);
+
+        assert.deepStrictEqual(emittedArgs(state), ['{"p":1}']);
+    });
+});
+
 suite("flushPendingBuffers Unit Tests", () => {
     test("flushes /responses-format tool calls and emits with reason: incomplete_stream_end", () => {
         const state = createInitialStreamingState();
@@ -810,19 +861,15 @@ suite("flushPendingBuffers Unit Tests", () => {
 
     test("skips malformed tool call args and still emits valid ones", () => {
         const state = createInitialStreamingState();
-
-        // Add a malformed tool call (invalid JSON)
         state.toolCallBuffers.set(0, { id: "bad-call", name: "badtool", args: "{invalid" });
         state.toolCallBuffers.set(1, { id: "good-call", name: "goodtool", args: '{"ok":true}' });
 
         const parts = flushPendingBuffers(state);
 
-        // Should still emit at least the finish part and try to emit good calls
-        const toolCallParts = parts.filter((p) => p.type === "tool_call");
-        assert.ok(toolCallParts.length <= 2, "Should skip invalid calls or emit only valid ones");
-        const finishPart = parts[parts.length - 1];
-        assert.strictEqual(finishPart.type, "finish");
-        assert.strictEqual((finishPart as unknown as { reason: string; type: string }).reason, "incomplete_stream_end");
+        assert.deepStrictEqual(
+            parts.flatMap((part) => (part.type === "tool_call" ? [part.name] : [])),
+            ["goodtool"]
+        );
     });
 
     test("handles empty buffers gracefully and still emits finish", () => {
@@ -835,6 +882,116 @@ suite("flushPendingBuffers Unit Tests", () => {
         const finishPart = parts[0];
         assert.strictEqual(finishPart.type, "finish");
         assert.strictEqual((finishPart as unknown as { reason: string; type: string }).reason, "incomplete_stream_end");
+    });
+
+    test("skips an unnamed /responses call instead of inventing a tool name", () => {
+        const state = createInitialStreamingState();
+        state.responseToolCallBuffers.set("call-x", { id: "call-x", args: '{"q":1}' });
+        state.responseToolCallOrder = ["call-x"];
+
+        const parts = flushPendingBuffers(state);
+
+        assert.deepStrictEqual(
+            parts.filter((part) => part.type === "tool_call"),
+            []
+        );
+    });
+
+    test("omits malformed anonymous arguments from its warning", () => {
+        const state = createInitialStreamingState();
+        const warnStub = sinon.stub(Logger, "warn");
+        state.anonymousResponseToolName = "execute_code";
+        state.anonymousResponseToolArgs = '{"secret":"token-123"';
+
+        try {
+            flushPendingBuffers(state);
+        } finally {
+            warnStub.restore();
+        }
+
+        assert.deepStrictEqual(
+            warnStub.getCalls().map((call) => String(call.args[0]).includes("token-123")),
+            [false]
+        );
+    });
+
+    test("drops an id-less chat-completions buffer instead of inventing a call id", () => {
+        const state = createInitialStreamingState();
+        state.toolCallBuffers.set(0, { id: "", name: "tool", args: '{"mode":"background"}' });
+
+        const parts = flushPendingBuffers(state);
+
+        assert.deepStrictEqual(
+            parts.filter((part) => part.type === "tool_call"),
+            []
+        );
+    });
+
+    test("skips a chat-completions buffer whose call id was already emitted", () => {
+        const state = createInitialStreamingState();
+        state.emittedTextToolCallIds.add("fc_call_dup");
+        state.toolCallBuffers.set(0, { id: "fc_call_dup", name: "read_file", args: '{"p":1}' });
+
+        const parts = flushPendingBuffers(state);
+
+        assert.deepStrictEqual(
+            parts.filter((part) => part.type === "tool_call"),
+            []
+        );
+    });
+});
+
+suite("hasBufferedToolCalls", () => {
+    test("is false for a fresh stream", () => {
+        assert.strictEqual(hasBufferedToolCalls(createInitialStreamingState()), false);
+    });
+
+    test("is true while a chat-completions tool call is open", () => {
+        const state = createInitialStreamingState();
+        interpretStreamEvent(
+            { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "ls" } }] } }] },
+            state
+        );
+
+        assert.strictEqual(hasBufferedToolCalls(state), true);
+    });
+
+    test("is true while a /responses tool call is open", () => {
+        const state = createInitialStreamingState();
+        interpretStreamEvent(
+            {
+                type: "response.output_item.delta",
+                item: { type: "function_call", call_id: "call_1", name: "ls", arguments: "{" },
+            },
+            state
+        );
+
+        assert.strictEqual(hasBufferedToolCalls(state), true);
+    });
+
+    test("is true while an anonymous /responses tool call is open", () => {
+        const state = createInitialStreamingState();
+        interpretStreamEvent(
+            { type: "response.output_item.delta", item: { type: "function_call", arguments: "{" } },
+            state
+        );
+
+        assert.strictEqual(hasBufferedToolCalls(state), true);
+    });
+
+    test("is false once a finish frame settles the chat-completions buffers", () => {
+        const state = createInitialStreamingState();
+        interpretStreamEvent(
+            {
+                choices: [
+                    { delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "ls", arguments: "{}" } }] } },
+                ],
+            },
+            state
+        );
+        interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
+
+        assert.strictEqual(hasBufferedToolCalls(state), false);
     });
 });
 
@@ -948,14 +1105,63 @@ suite("Tool Call Args Corruption Logging", () => {
             .filter((call) => call.args[0] === "stream.tool_call_args_invalid_json");
         assert.strictEqual(corruptionCalls.length, 1);
         const fields = corruptionCalls[0].args[1] as Record<string, unknown>;
-        assert.strictEqual(fields.callId, "bad-call");
+        assert.strictEqual(fields.normalizedId, "bad-call");
         assert.strictEqual(fields.toolName, "badtool");
         assert.strictEqual(fields.argsPreview, "{invalid");
+    });
+
+    test("still reports the corrupt arguments of a call already emitted as tagged text", () => {
+        const state = createInitialStreamingState();
+        const errorStub = sandbox.stub(StructuredLogger, "error");
+        interpretStreamEvent(
+            {
+                choices: [
+                    {
+                        delta: {
+                            tool_calls: [
+                                { index: 0, id: "call_dup", function: { name: "read_file", arguments: '{"p":' } },
+                            ],
+                        },
+                    },
+                ],
+            },
+            state
+        );
+        const taggedCall = JSON.stringify({ id: "call_dup", name: "read_file", arguments: { p: 1 } });
+        interpretStreamEvent(
+            { choices: [{ delta: { content: `${TAGGED_CALL_OPENER}${taggedCall}${TAGGED_CALL_CLOSER}` } }] },
+            state
+        );
+
+        interpretStreamEvent({ choices: [{ finish_reason: "stop" }] }, state);
+
+        assert.strictEqual(
+            errorStub.getCalls().filter((call) => call.args[0] === "stream.tool_call_args_invalid_json").length,
+            1
+        );
+    });
+
+    test("tags a malformed /responses call skipped by recovery with its request id", () => {
+        const state = createInitialStreamingState("req-responses");
+        const errorStub = sandbox.stub(StructuredLogger, "error");
+        state.responseToolCallBuffers.set("call-bad", { id: "call-bad", name: "search", args: "{invalid" });
+        state.responseToolCallOrder = ["call-bad"];
+
+        flushPendingBuffers(state);
+
+        assert.deepStrictEqual(
+            errorStub
+                .getCalls()
+                .filter((call) => call.args[0] === "stream.tool_call_args_invalid_json")
+                .map((call) => (call.args[1] as Record<string, unknown>).requestId),
+            ["req-responses"]
+        );
     });
 });
 
 suite("Dropped tool call buffer logging", () => {
     const DROPPED_EVENT = "stream.tool_call_buffer_dropped";
+    const REQUEST_ID = "req-7";
     let sandbox: sinon.SinonSandbox;
 
     setup(() => {
@@ -978,7 +1184,7 @@ suite("Dropped tool call buffer logging", () => {
     }
 
     test("reports an id-less buffer discarded at finish", () => {
-        const state = createInitialStreamingState();
+        const state = createInitialStreamingState(REQUEST_ID);
         const warnStub = sandbox.stub(StructuredLogger, "warn");
         interpretStreamEvent(toolCallDelta({ function: { arguments: '{"mode":"background"}' } }), state);
 
@@ -986,6 +1192,7 @@ suite("Dropped tool call buffer logging", () => {
 
         assert.deepStrictEqual(droppedEventFields(warnStub), [
             {
+                requestId: REQUEST_ID,
                 reason: "incomplete_at_finish",
                 index: 0,
                 finishReason: "tool_calls",
@@ -996,7 +1203,7 @@ suite("Dropped tool call buffer logging", () => {
     });
 
     test("reports a buffer with no arguments discarded at finish", () => {
-        const state = createInitialStreamingState();
+        const state = createInitialStreamingState(REQUEST_ID);
         const warnStub = sandbox.stub(StructuredLogger, "warn");
         interpretStreamEvent(
             toolCallDelta({ id: "call_empty", function: { name: "list_files", arguments: "" } }),
@@ -1007,6 +1214,7 @@ suite("Dropped tool call buffer logging", () => {
 
         assert.deepStrictEqual(droppedEventFields(warnStub), [
             {
+                requestId: REQUEST_ID,
                 reason: "incomplete_at_finish",
                 index: 0,
                 finishReason: "stop",
@@ -1017,7 +1225,7 @@ suite("Dropped tool call buffer logging", () => {
     });
 
     test("reports a complete call with invalid JSON arguments discarded at a non-tool finish", () => {
-        const state = createInitialStreamingState();
+        const state = createInitialStreamingState(REQUEST_ID);
         const warnStub = sandbox.stub(StructuredLogger, "warn");
         interpretStreamEvent(
             toolCallDelta({ id: "call_cut", function: { name: "write_file", arguments: '{"path":"a.ts","con' } }),
@@ -1028,6 +1236,7 @@ suite("Dropped tool call buffer logging", () => {
 
         assert.deepStrictEqual(droppedEventFields(warnStub), [
             {
+                requestId: REQUEST_ID,
                 reason: "invalid_json_args",
                 index: 0,
                 finishReason: "length",
@@ -1037,39 +1246,27 @@ suite("Dropped tool call buffer logging", () => {
         ]);
     });
 
-    test("reports every buffer still open when a stream ends without a finish frame", () => {
-        const state = createInitialStreamingState();
+    test("reports an id-less buffer dropped by premature-end recovery", () => {
+        const state = createInitialStreamingState(REQUEST_ID);
         const warnStub = sandbox.stub(StructuredLogger, "warn");
-        interpretStreamEvent(
-            toolCallDelta({ id: "call_open", function: { name: "read_file", arguments: '{"p":1}' } }),
-            state
-        );
-        interpretStreamEvent(
+        interpretStreamEvent(toolCallDelta({ function: { arguments: '{"mode":"background"}' } }), state);
+
+        flushPendingBuffers(state);
+
+        assert.deepStrictEqual(droppedEventFields(warnStub), [
             {
-                choices: [
-                    {
-                        delta: {
-                            tool_calls: [{ index: 1, id: "call_second", function: { name: "ls", arguments: "{}" } }],
-                        },
-                    },
-                ],
+                requestId: REQUEST_ID,
+                reason: "incomplete_at_finish",
+                index: 0,
+                finishReason: "incomplete_stream_end",
+                hasId: false,
+                argsLength: '{"mode":"background"}'.length,
             },
-            state
-        );
-
-        reportUnfinishedToolCallBuffers(state);
-
-        assert.deepStrictEqual(
-            droppedEventFields(warnStub).map((fields) => [fields.reason, fields.index]),
-            [
-                ["stream_ended_before_finish", 0],
-                ["stream_ended_before_finish", 1],
-            ]
-        );
+        ]);
     });
 
     test("reports a buffer replaced by a new call id at the same index", () => {
-        const state = createInitialStreamingState();
+        const state = createInitialStreamingState(REQUEST_ID);
         const warnStub = sandbox.stub(StructuredLogger, "warn");
         interpretStreamEvent(
             toolCallDelta({ id: "call_first", function: { name: "read_file", arguments: '{"p"' } }),
@@ -1083,6 +1280,7 @@ suite("Dropped tool call buffer logging", () => {
 
         assert.deepStrictEqual(droppedEventFields(warnStub), [
             {
+                requestId: REQUEST_ID,
                 reason: "replaced_by_new_id",
                 index: 0,
                 finishReason: undefined,
@@ -1093,7 +1291,7 @@ suite("Dropped tool call buffer logging", () => {
     });
 
     test("stays silent when the buffered tool call is emitted", () => {
-        const state = createInitialStreamingState();
+        const state = createInitialStreamingState(REQUEST_ID);
         const warnStub = sandbox.stub(StructuredLogger, "warn");
         interpretStreamEvent(
             toolCallDelta({ id: "call_ok", function: { name: "read_file", arguments: '{"p":1}' } }),
@@ -1106,7 +1304,7 @@ suite("Dropped tool call buffer logging", () => {
     });
 
     test("stays silent when invalid JSON arguments are still emitted at a tool_calls finish", () => {
-        const state = createInitialStreamingState();
+        const state = createInitialStreamingState(REQUEST_ID);
         const warnStub = sandbox.stub(StructuredLogger, "warn");
         interpretStreamEvent(
             toolCallDelta({ id: "call_cut", function: { name: "write_file", arguments: '{"path":' } }),
@@ -1119,7 +1317,7 @@ suite("Dropped tool call buffer logging", () => {
     });
 
     test("stays silent for an invalid buffer whose call id was already emitted as tagged text", () => {
-        const state = createInitialStreamingState();
+        const state = createInitialStreamingState(REQUEST_ID);
         const warnStub = sandbox.stub(StructuredLogger, "warn");
         interpretStreamEvent(
             toolCallDelta({ id: "call_dup", function: { name: "read_file", arguments: '{"p":' } }),
@@ -1136,22 +1334,8 @@ suite("Dropped tool call buffer logging", () => {
         assert.deepStrictEqual(droppedEventFields(warnStub), []);
     });
 
-    test("reports nothing unfinished after a finish frame settles every buffer", () => {
-        const state = createInitialStreamingState();
-        const warnStub = sandbox.stub(StructuredLogger, "warn");
-        interpretStreamEvent(
-            toolCallDelta({ id: "call_ok", function: { name: "read_file", arguments: '{"p":1}' } }),
-            state
-        );
-        interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
-
-        reportUnfinishedToolCallBuffers(state);
-
-        assert.deepStrictEqual(droppedEventFields(warnStub), []);
-    });
-
     test("reports a malformed buffer skipped by premature-end recovery", () => {
-        const state = createInitialStreamingState();
+        const state = createInitialStreamingState(REQUEST_ID);
         const warnStub = sandbox.stub(StructuredLogger, "warn");
         state.toolCallBuffers.set(0, { id: "call_cut", name: "write_file", args: "{invalid" });
 
@@ -1159,9 +1343,10 @@ suite("Dropped tool call buffer logging", () => {
 
         assert.deepStrictEqual(droppedEventFields(warnStub), [
             {
+                requestId: REQUEST_ID,
                 reason: "invalid_json_args",
                 index: 0,
-                finishReason: undefined,
+                finishReason: "incomplete_stream_end",
                 hasId: true,
                 argsLength: "{invalid".length,
             },

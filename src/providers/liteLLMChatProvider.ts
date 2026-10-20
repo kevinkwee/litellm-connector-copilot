@@ -29,8 +29,9 @@ import {
     createInitialStreamingState,
     interpretStreamEvent,
     flushPendingBuffers,
-    reportUnfinishedToolCallBuffers,
+    hasBufferedToolCalls,
 } from "../adapters/streaming/liteLLMStreamInterpreter";
+import type { EmittedPart } from "../adapters/streaming/liteLLMStreamInterpreter";
 import { emitPartsToVSCode } from "../adapters/streaming/vscodePartEmitter";
 import type { EffortFallbackCache } from "../utils/reasoningEffortFallback";
 import { StreamTokenCapture } from "../adapters/streaming/streamTokenCapture";
@@ -285,7 +286,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             const maxEmptyRetries = retryCfg.emptyResponseRetries ?? 2;
             const emptyBaseDelayMs = retryCfg.emptyResponseRetryDelayMs ?? 1000;
             const accumulator = new StreamedTextAccumulator();
-            const contentCounters = { sawTextPart: false, sawToolCallPart: false, sawUsagePart: false };
             const trackedProgress: vscode.Progress<vscode.LanguageModelResponsePart> = {
                 report: (part) => {
                     accumulator.add(part);
@@ -356,7 +356,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         caller,
                         modelInfo
                     );
-                    await this.processStreamingResponse(stream, trackedProgress, token, contentCounters);
+                    await this.processStreamingResponse(stream, trackedProgress, token, requestId);
 
                     // Upstream may stream no usage frame; VS Code still needs one usage report.
                     tokenCapture.flushUsage();
@@ -668,10 +668,11 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         responseBody: ReadableStream<Uint8Array>,
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
         token: vscode.CancellationToken,
-        contentCounters?: { sawTextPart: boolean; sawToolCallPart: boolean; sawUsagePart: boolean }
+        requestId: string
     ): Promise<void> {
-        Logger.info(`[processStreamingResponse] Starting stream processing`);
+        Logger.info(`[processStreamingResponse] request=${requestId} Starting stream processing`);
         StructuredLogger.info("stream.processing_start", {
+            requestId,
             timestamp: new Date().toISOString(),
         });
 
@@ -679,7 +680,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         const timeoutMs = (config.inactivityTimeout ?? 60) * 1000;
         // Scoped to one upstream attempt: a resumed retry is a new upstream
         // response, so nothing buffered by the failed attempt belongs to it.
-        const streamingState = createInitialStreamingState();
+        const streamingState = createInitialStreamingState(requestId);
         let watchdog: NodeJS.Timeout | undefined;
         let eventCount = 0;
         let wasWatchdogAbort = false;
@@ -694,15 +695,49 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         // Create an AbortController to actually cancel the stream on timeout
         const controller = new AbortController();
 
+        const emitParts = (parts: EmittedPart[]): void => {
+            for (const part of parts) {
+                if (part.type === "text") {
+                    sawTextPart = true;
+                } else if (part.type === "tool_call") {
+                    sawToolCallPart = true;
+                } else if (part.type === "data" && part.mimeType === "usage") {
+                    sawUsagePart = true;
+                } else if (part.type === "thinking") {
+                    reasoningChars += typeof part.value === "string" ? part.value.length : part.value.join("").length;
+                }
+            }
+            emitPartsToVSCode(parts, progress);
+        };
+
+        // A stream that stops without a finish frame, whether it closes cleanly
+        // or is truncated, still holds tool calls the model fully streamed.
+        // Delivering them keeps the agent loop going instead of stalling it.
+        const recoverBufferedToolCalls = (reason: "stream_completed_without_finish" | "stream_incomplete"): number => {
+            const recoveredToolCalls = flushPendingBuffers(streamingState).filter((part) => part.type === "tool_call");
+            emitParts(recoveredToolCalls);
+            Logger.info(
+                `[processStreamingResponse] request=${requestId} Recovered ${recoveredToolCalls.length} buffered tool calls (${reason})`
+            );
+            StructuredLogger.info("stream.tool_calls_recovered", {
+                requestId,
+                reason,
+                eventCount,
+                toolCallsRecovered: recoveredToolCalls.length,
+            });
+            return recoveredToolCalls.length;
+        };
+
         const resetWatchdog = () => {
             if (watchdog) {
                 clearTimeout(watchdog);
             }
             watchdog = setTimeout(() => {
                 Logger.warn(
-                    `[processStreamingResponse] Inactivity timeout after ${timeoutMs}ms (after ${eventCount} events)`
+                    `[processStreamingResponse] request=${requestId} Inactivity timeout after ${timeoutMs}ms (after ${eventCount} events)`
                 );
                 StructuredLogger.warn("stream.inactivity_timeout", {
+                    requestId,
                     timeoutMs,
                     eventCount,
                 });
@@ -718,9 +753,10 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // which the CancellationToken API itself does not expose.
             const cancellationStack = new Error().stack;
             Logger.warn(
-                `[processStreamingResponse] Cancellation requested from VS Code after ${eventCount} events (text=${sawTextPart}, toolCall=${sawToolCallPart}, usage=${sawUsagePart})`
+                `[processStreamingResponse] request=${requestId} Cancellation requested from VS Code after ${eventCount} events (text=${sawTextPart}, toolCall=${sawToolCallPart}, usage=${sawUsagePart})`
             );
             StructuredLogger.warn("stream.cancellation_requested", {
+                requestId,
                 eventCount,
                 sawTextPart,
                 sawToolCallPart,
@@ -763,28 +799,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     eventNumber: eventCount,
                     partCount: parts.length,
                 });
-                for (const part of parts) {
-                    if (part.type === "text") {
-                        sawTextPart = true;
-                        if (contentCounters) {
-                            contentCounters.sawTextPart = true;
-                        }
-                    } else if (part.type === "tool_call") {
-                        sawToolCallPart = true;
-                        if (contentCounters) {
-                            contentCounters.sawToolCallPart = true;
-                        }
-                    } else if (part.type === "data" && part.mimeType === "usage") {
-                        sawUsagePart = true;
-                        if (contentCounters) {
-                            contentCounters.sawUsagePart = true;
-                        }
-                    } else if (part.type === "thinking") {
-                        reasoningChars +=
-                            typeof part.value === "string" ? part.value.length : part.value.join("").length;
-                    }
-                }
-                emitPartsToVSCode(parts, progress);
+                emitParts(parts);
             }
 
             Logger.info(`[processStreamingResponse] Stream loop completed after ${eventCount} events`);
@@ -802,10 +817,10 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 throw new InactivityTimeoutError(timeoutMs, eventCount);
             }
 
-            // A cancelled stream drops its buffers by design, so only a stream
-            // that ended on its own reports unfinished tool calls as lost.
-            if (!token.isCancellationRequested) {
-                reportUnfinishedToolCallBuffers(streamingState);
+            // A cancelled stream's output is discarded by VS Code, so only a
+            // stream that ended on its own delivers its buffered tool calls.
+            if (!token.isCancellationRequested && hasBufferedToolCalls(streamingState)) {
+                recoverBufferedToolCalls("stream_completed_without_finish");
             }
 
             // Reasoning-only detection: a cleanly-completed stream that emitted
@@ -816,73 +831,43 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // request so the model continues its thought.
             if (eventCount > 0 && !sawTextPart && !sawToolCallPart) {
                 Logger.warn(
-                    `[processStreamingResponse] Reasoning-only stream detected (${eventCount} events, ` +
+                    `[processStreamingResponse] request=${requestId} Reasoning-only stream detected (${eventCount} events, ` +
                         `no text/tool parts); surfacing as resumable empty-content error`
                 );
                 StructuredLogger.warn("stream.reasoning_only_response", {
+                    requestId,
                     eventCount,
                     sawUsagePart,
                 });
                 throw new ReasoningOnlyError(eventCount, reasoningChars);
             }
         } catch (error: unknown) {
-            Logger.error(`[processStreamingResponse] Stream processing failed after ${eventCount} events`, {
-                error: error instanceof Error ? error.message : String(error),
-                stack: error instanceof Error ? error.stack : undefined,
-            });
+            Logger.error(
+                `[processStreamingResponse] request=${requestId} Stream processing failed after ${eventCount} events`,
+                {
+                    error: error instanceof Error ? error.message : String(error),
+                    stack: error instanceof Error ? error.stack : undefined,
+                }
+            );
             StructuredLogger.error("stream.process_failed", {
+                requestId,
                 error: error instanceof Error ? error.message : String(error),
                 eventCount,
                 stack: error instanceof Error ? error.stack : undefined,
             });
 
-            // Tier 2: Attempt recovery by flushing pending tool calls on stream error
             const isStreamEndError =
                 error instanceof Error &&
                 (error.message.includes("Stream ended before [DONE] marker") ||
                     error.message.includes("stream ended") ||
                     error.message.includes("unexpected end"));
 
-            if (isStreamEndError && eventCount > 0) {
-                Logger.info(
-                    `[processStreamingResponse] Attempting recovery: flushing ${eventCount} buffered tool calls`
-                );
-                StructuredLogger.info("stream.recovery_attempt", {
-                    reason: "stream_incomplete",
-                    eventCount,
-                    hasBufferedCalls:
-                        streamingState.responseToolCallBuffers.size > 0 || streamingState.toolCallBuffers.size > 0,
-                });
-
-                try {
-                    // Flush all pending buffers and emit them
-                    const recoveredParts = flushPendingBuffers(streamingState);
-                    // recoveredParts includes at least the finish part, so check length > 1
-                    if (recoveredParts.length > 1) {
-                        // -1 because last part is finish
-                        Logger.debug(
-                            `[processStreamingResponse] Recovery emitted ${recoveredParts.length - 1} buffered tool calls`
-                        );
-                        emitPartsToVSCode(recoveredParts, progress);
-                        StructuredLogger.info("stream.recovery_success", {
-                            toolCallsFlushed: recoveredParts.filter((p) => p.type === "tool_call").length,
-                        });
-                        // Don't re-throw after successful recovery. Partial response is better than hard failure.
-                        return;
-                    } else {
-                        // No recoverable parts (empty stream), let error through
-                        Logger.debug(
-                            `[processStreamingResponse] No buffered tool calls to recover (${eventCount} events but empty buffers)`
-                        );
-                    }
-                } catch (recoveryErr) {
-                    Logger.warn(
-                        `[processStreamingResponse] Recovery failed: ${recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr)}`
-                    );
-                    StructuredLogger.warn("stream.recovery_failed", {
-                        originalError: error instanceof Error ? error.message : String(error),
-                        recoveryError: recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr),
-                    });
+            // A partial response with its tool calls beats a hard failure, so a
+            // truncated stream that recovers any call completes normally.
+            if (isStreamEndError && hasBufferedToolCalls(streamingState)) {
+                const recoveredCount = recoverBufferedToolCalls("stream_incomplete");
+                if (recoveredCount > 0) {
+                    return;
                 }
             }
 

@@ -339,6 +339,7 @@ A given error should be logged by exactly **one** handler: the layer that **term
 
 - **NEVER** log API keys, Authorization headers, raw prompt content, user message text, or tool call payloads.
 - Approved log content: model identifiers, endpoint paths, HTTP status codes, durations, token counts, and error codes.
+- One exception: when tool call arguments fail to parse, `stream.tool_call_args_invalid_json`, `vscode.tool_call_parse_failed`, and the `[vscodePartEmitter] Part #<n>: Failed to parse tool call arguments` warning keep an `argsPreview` of at most 160 characters. Merged or truncated arguments can only be diagnosed from their content, for example two calls whose fragments share one buffer.
 - Quota errors detected in chat history trigger tool redaction before anything is logged or retried (see `disableQuotaToolRedaction`).
 - No `console.log()` with user data, since these lines go to production logs.
 
@@ -639,7 +640,7 @@ Keep this pipeline shared unless the change is intentionally protocol-specific a
 ### Chat-Specific Logic (Chat Provider)
 
 - **Request part conversion**: handle `LanguageModelTextPart` and `LanguageModelBinaryPart` (vision). Images must be encoded for OpenAI-compatible payloads. Tool result images follow the provider-specific shapes described in [Multimodal Tool Results](#multimodal-tool-results).
-- **Streaming state management**: buffer partial tool calls when SSE frames arrive fragmented.
+- **Streaming state management**: buffer partial tool calls when SSE frames arrive fragmented. When a stream ends without a finish frame, either closing cleanly or closing before `[DONE]` with an unterminated frame, its buffered chat-completions tool calls are settled by the rules of a non-`tool_calls` finish frame: complete calls reach VS Code, incomplete or invalid ones are dropped with a `stream.tool_call_buffer_dropped` warning tagged with the request id, and ids already emitted are skipped. If an unterminated-frame ending recovers no call, the retry loop resumes the request. A transport read error such as `terminated` and an inactivity abort resume the request without recovery, and a cancelled stream discards its buffers.
 - **Response emission**: emit `LanguageModelResponsePart`, `LanguageModelToolCallPart`, `LanguageModelToolResultPart` to the progress callback.
 - **Tool call parsing**: extract and validate tool calls from streaming chunks.
 - **Cost tracking**: pricing from LiteLLM `/model/info` is extracted and propagated through `StreamTokenCapture`. Request-level estimated costs are attached to usage payloads and telemetry metrics.

@@ -25,8 +25,9 @@ interface ChatToolCallBuffer {
 }
 
 export interface StreamingState {
+    /** Ties this stream's diagnostics to its request when several sessions stream at once. */
+    readonly requestId: string | undefined;
     toolCallBuffers: Map<number, ChatToolCallBuffer>;
-    completedToolCallIndices: Set<number>;
     emittedTextToolCallIds: Set<string>;
     textToolParserBuffer: string;
     responseToolCallBuffers: Map<string, { id: string; name?: string; args: string }>;
@@ -49,10 +50,10 @@ export interface StreamingState {
     currentThinkingBlockId: string | undefined;
 }
 
-export function createInitialStreamingState(): StreamingState {
+export function createInitialStreamingState(requestId?: string): StreamingState {
     return {
+        requestId,
         toolCallBuffers: new Map(),
-        completedToolCallIndices: new Set(),
         emittedTextToolCallIds: new Set(),
         textToolParserBuffer: "",
         responseToolCallBuffers: new Map(),
@@ -77,8 +78,36 @@ function ensureCurrentThinkingBlockId(state: StreamingState): string {
     return state.currentThinkingBlockId;
 }
 
-type DroppedToolCallReason =
-    "replaced_by_new_id" | "incomplete_at_finish" | "invalid_json_args" | "stream_ended_before_finish";
+/**
+ * Normalizes a streamed `function.arguments` delta to text. The OpenAI stream
+ * shape sends a JSON string fragment, but upstream payloads are external input,
+ * so an object is serialized and any other value contributes nothing.
+ */
+function toArgumentText(value: unknown): string {
+    if (typeof value === "string") {
+        return value;
+    }
+    if (value !== null && typeof value === "object") {
+        return JSON.stringify(value);
+    }
+    return "";
+}
+
+/** Finish reason recorded when a stream ends without a finish frame. */
+const INCOMPLETE_STREAM_END = "incomplete_stream_end";
+
+/**
+ * Longest slice of unparsable tool call arguments a log may carry. A merged or
+ * truncated payload is only diagnosable from its content, and the cap keeps the
+ * rest of the payload out of the logs.
+ */
+export const TOOL_ARGS_PREVIEW_MAX_CHARS = 160;
+
+function requestTag(state: StreamingState): string {
+    return `request=${state.requestId ?? "unknown"}`;
+}
+
+type DroppedToolCallReason = "replaced_by_new_id" | "incomplete_at_finish" | "invalid_json_args";
 
 /**
  * Logs a chat-completions tool call discarded before it reaches VS Code. Without
@@ -86,24 +115,88 @@ type DroppedToolCallReason =
  * misread as reasoning-only.
  */
 function logDroppedToolCallBuffer(
+    state: StreamingState,
     reason: DroppedToolCallReason,
     index: number,
     buffer: ChatToolCallBuffer,
     finishReason?: string
 ): void {
-    const fields = { reason, index, finishReason, hasId: !!buffer.id, argsLength: buffer.args.length };
-    Logger.warn(`[toolCallBuffer] Dropped buffered tool call at index ${index} (${reason})`, fields);
+    const fields = {
+        requestId: state.requestId,
+        reason,
+        index,
+        finishReason,
+        hasId: !!buffer.id,
+        argsLength: buffer.args.length,
+    };
+    Logger.warn(
+        `[toolCallBuffer] ${requestTag(state)} Dropped buffered tool call at index ${index} (${reason})`,
+        fields
+    );
     StructuredLogger.warn("stream.tool_call_buffer_dropped", fields);
 }
 
 /**
- * Logs every chat-completions tool call still buffered at the end of a stream,
- * since the stream state is discarded with it.
+ * Returns a tool call part for each deliverable chat-completions buffer, logs
+ * undeliverable ones as dropped, skips ids already emitted, and clears the
+ * buffers. A call with invalid JSON arguments is deliverable only at a
+ * `tool_calls` finish, where the model declares its calls complete.
  */
-export function reportUnfinishedToolCallBuffers(state: StreamingState): void {
+function settleChatToolCallBuffers(state: StreamingState, finishReason: string): EmittedPart[] {
+    const parts: EmittedPart[] = [];
     for (const [index, buffer] of state.toolCallBuffers) {
-        logDroppedToolCallBuffer("stream_ended_before_finish", index, buffer);
+        if (!buffer.id || !buffer.name || !buffer.args) {
+            logDroppedToolCallBuffer(state, "incomplete_at_finish", index, buffer, finishReason);
+            continue;
+        }
+        let isJsonValid = true;
+        try {
+            JSON.parse(buffer.args);
+        } catch {
+            isJsonValid = false;
+            StructuredLogger.error("stream.tool_call_args_invalid_json", {
+                requestId: state.requestId,
+                toolName: buffer.name,
+                normalizedId: buffer.id,
+                index,
+                finishReason,
+                argsLength: buffer.args.length,
+                argsPreview: buffer.args.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS),
+            });
+        }
+        if (state.emittedTextToolCallIds.has(buffer.id)) {
+            continue;
+        }
+        if (!isJsonValid && finishReason !== "tool_calls") {
+            logDroppedToolCallBuffer(state, "invalid_json_args", index, buffer, finishReason);
+            continue;
+        }
+        parts.push({ type: "tool_call", index, id: buffer.id, name: buffer.name, args: buffer.args });
+        state.emittedTextToolCallIds.add(buffer.id);
+        StructuredLogger.trace("stream.tool_call_emitted", {
+            toolName: buffer.name,
+            normalizedId: buffer.id,
+            index,
+            finishReason,
+        });
     }
+    state.toolCallBuffers.clear();
+    return parts;
+}
+
+/**
+ * True while tool call fragments remain buffered. A finish frame settles the
+ * chat-completions buffers, and output_item.done or response.completed settles
+ * keyed /responses calls. A function_call output_item.done, or the
+ * end-of-stream flush, settles an anonymous call.
+ */
+export function hasBufferedToolCalls(state: StreamingState): boolean {
+    return (
+        state.toolCallBuffers.size > 0 ||
+        state.responseToolCallOrder.length > 0 ||
+        state.anonymousResponseToolName !== undefined ||
+        state.anonymousResponseToolArgs.length > 0
+    );
 }
 
 interface RawThinkingBlock {
@@ -301,13 +394,13 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                 // Normalize incoming ID before comparison since buffer stores normalized IDs
                 const incomingId = tc.id ? normalizeToolCallId(tc.id as string) : undefined;
                 if (incomingId && buffer && buffer.id !== incomingId) {
-                    logDroppedToolCallBuffer("replaced_by_new_id", index, buffer);
+                    logDroppedToolCallBuffer(state, "replaced_by_new_id", index, buffer);
                     state.toolCallBuffers.delete(index);
                     buffer = undefined;
                 }
 
                 if (!buffer) {
-                    const fn = tc.function as Record<string, string> | undefined;
+                    const fn = tc.function as Record<string, unknown> | undefined;
                     // Normalize the tool call ID to ensure it meets OpenAI/LiteLLM requirements
                     // (starts with 'fc_' and is <= 40 chars)
                     const rawId = (tc.id as string) || "";
@@ -320,7 +413,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                     }
                     // Apply tool name sanitization for AWS Bedrock Converse API compliance (64-char limit)
                     const { name: sanitizedName } = sanitizeToolName(fn?.name || "");
-                    buffer = { id: newId, name: sanitizedName, args: fn?.arguments || "" };
+                    buffer = { id: newId, name: sanitizedName, args: toArgumentText(fn?.arguments) };
                     state.toolCallBuffers.set(index, buffer);
                     Logger.trace(`[interpretStreamEvent] Buffered new tool call: ${sanitizedName} (id: ${newId})`);
                     StructuredLogger.trace("stream.tool_call_buffered", {
@@ -340,13 +433,11 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                         });
                         buffer.id = normalizedId;
                     }
-                    const tcFn = tc.function as Record<string, string> | undefined;
-                    if (tcFn?.name) {
+                    const tcFn = tc.function as Record<string, unknown> | undefined;
+                    if (typeof tcFn?.name === "string" && tcFn.name) {
                         buffer.name = tcFn.name;
                     }
-                    if (tcFn?.arguments) {
-                        buffer.args += tcFn.arguments;
-                    }
+                    buffer.args += toArgumentText(tcFn?.arguments);
                 }
             }
         }
@@ -378,52 +469,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                 state.textToolParserBuffer = "";
             }
 
-            for (const [index, buffer] of state.toolCallBuffers) {
-                if (buffer.id && buffer.name && buffer.args) {
-                    const isDuplicate = state.emittedTextToolCallIds.has(buffer.id);
-                    const finishReason = choice.finish_reason;
-                    let isJsonValid = true;
-                    try {
-                        JSON.parse(buffer.args);
-                    } catch {
-                        isJsonValid = false;
-                        StructuredLogger.error("stream.tool_call_args_invalid_json", {
-                            toolName: buffer.name,
-                            normalizedId: buffer.id,
-                            index,
-                            finishReason,
-                            argsLength: buffer.args.length,
-                            argsPreview: buffer.args.slice(0, 160),
-                        });
-                    }
-
-                    // Only emit invalid JSON tool calls when finish_reason is tool_calls
-                    const allowEmit = isJsonValid || finishReason === "tool_calls";
-
-                    if (!isDuplicate && allowEmit) {
-                        toolCallParts.push({
-                            type: "tool_call",
-                            index,
-                            id: buffer.id,
-                            name: buffer.name,
-                            args: buffer.args,
-                        });
-                        state.emittedTextToolCallIds.add(buffer.id);
-                        StructuredLogger.trace("stream.tool_call_emitted", {
-                            toolName: buffer.name,
-                            normalizedId: buffer.id,
-                            index,
-                            finishReason,
-                        });
-                    } else if (!isDuplicate) {
-                        logDroppedToolCallBuffer("invalid_json_args", index, buffer, finishReason);
-                    }
-                    state.completedToolCallIndices.add(index);
-                } else {
-                    logDroppedToolCallBuffer("incomplete_at_finish", index, buffer, choice.finish_reason);
-                }
-            }
-            state.toolCallBuffers.clear();
+            toolCallParts.push(...settleChatToolCallBuffers(state, choice.finish_reason));
 
             finishParts.push({ type: "finish", reason: choice.finish_reason });
         }
@@ -799,13 +845,13 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
 }
 
 /**
- * Flushes all buffered tool calls and emits them without requiring
- * a response.completed or finish event. Used when stream ends prematurely.
+ * Settles every buffered tool call at a stream end that carried no
+ * response.completed or finish frame.
  *
  * Emits:
- * - All buffered /responses-format tool calls
- * - Any anonymous tool call buffering
- * - All buffered OpenAI-format tool calls
+ * - Named /responses-format tool calls with valid JSON arguments
+ * - The anonymous tool call, when it has a name and valid JSON arguments
+ * - The chat-completions tool calls a non-`tool_calls` finish frame would emit
  * - A finish part with reason "incomplete_stream_end"
  *
  * Returns an array of emitted parts in emission order.
@@ -814,29 +860,32 @@ export function flushPendingBuffers(state: StreamingState): EmittedPart[] {
     const parts: EmittedPart[] = [];
     let toolCallIndex = 0;
 
-    // 1. Flush /responses-format tool calls
+    // 1. Flush /responses-format tool calls. VS Code invokes a tool by its name,
+    // so a call that never received one cannot run.
     for (const id of state.responseToolCallOrder) {
         const buffer = state.responseToolCallBuffers.get(id);
-        if (buffer) {
-            try {
-                JSON.parse(buffer.args);
-                parts.push({
-                    type: "tool_call",
-                    index: toolCallIndex++,
-                    id: id,
-                    name: buffer.name || "unknown_tool",
-                    args: buffer.args,
-                });
-                Logger.debug(`[flushPendingBuffers] Flushed /responses tool call: ${buffer.name} (id: ${id})`);
-            } catch {
-                Logger.warn(`[flushPendingBuffers] Skipping malformed /responses tool call args (id: ${id})`);
-                StructuredLogger.error("stream.tool_call_args_invalid_json", {
-                    toolName: buffer.name || "unknown_tool",
-                    callId: id,
-                    argsLength: buffer.args.length,
-                    argsPreview: buffer.args.slice(0, 160),
-                });
-            }
+        if (!buffer) {
+            continue;
+        }
+        if (!buffer.name) {
+            Logger.warn(`[flushPendingBuffers] ${requestTag(state)} Skipping unnamed /responses tool call (id: ${id})`);
+            continue;
+        }
+        try {
+            JSON.parse(buffer.args);
+            parts.push({ type: "tool_call", index: toolCallIndex++, id, name: buffer.name, args: buffer.args });
+            Logger.debug(`[flushPendingBuffers] Flushed /responses tool call: ${buffer.name} (id: ${id})`);
+        } catch {
+            Logger.warn(
+                `[flushPendingBuffers] ${requestTag(state)} Skipping malformed /responses tool call args (id: ${id})`
+            );
+            StructuredLogger.error("stream.tool_call_args_invalid_json", {
+                requestId: state.requestId,
+                toolName: buffer.name,
+                callId: id,
+                argsLength: buffer.args.length,
+                argsPreview: buffer.args.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS),
+            });
         }
     }
     state.responseToolCallBuffers.clear();
@@ -856,46 +905,23 @@ export function flushPendingBuffers(state: StreamingState): EmittedPart[] {
             Logger.debug(`[flushPendingBuffers] Flushed anonymous tool call: ${state.anonymousResponseToolName}`);
         } catch {
             Logger.warn(
-                `[flushPendingBuffers] Skipping malformed anonymous tool call args: ${state.anonymousResponseToolArgs}`
+                `[flushPendingBuffers] ${requestTag(state)} Skipping malformed anonymous tool call args (${state.anonymousResponseToolArgs.length} chars)`
             );
             StructuredLogger.error("stream.tool_call_args_invalid_json", {
+                requestId: state.requestId,
                 toolName: state.anonymousResponseToolName,
                 argsLength: state.anonymousResponseToolArgs.length,
-                argsPreview: state.anonymousResponseToolArgs.slice(0, 160),
+                argsPreview: state.anonymousResponseToolArgs.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS),
             });
         }
     }
     state.anonymousResponseToolName = undefined;
     state.anonymousResponseToolArgs = "";
 
-    // 3. Flush OpenAI-format buffered tool calls (delta-based)
-    for (const index of state.toolCallBuffers.keys()) {
-        const buffer = state.toolCallBuffers.get(index);
-        if (buffer) {
-            try {
-                JSON.parse(buffer.args);
-                parts.push({
-                    type: "tool_call",
-                    index: toolCallIndex++,
-                    id: buffer.id || `openai_${index}`,
-                    name: buffer.name || "unknown_tool",
-                    args: buffer.args,
-                });
-                Logger.debug(`[flushPendingBuffers] Flushed OpenAI tool call: ${buffer.name} (id: ${buffer.id})`);
-            } catch {
-                logDroppedToolCallBuffer("invalid_json_args", index, buffer);
-                StructuredLogger.error("stream.tool_call_args_invalid_json", {
-                    toolName: buffer.name || "unknown_tool",
-                    callId: buffer.id,
-                    index,
-                    argsLength: buffer.args.length,
-                    argsPreview: buffer.args.slice(0, 160),
-                });
-            }
-        }
-    }
-    state.toolCallBuffers.clear();
-    state.completedToolCallIndices.clear();
+    // 3. Settle chat-completions buffers by the rules of a non-`tool_calls`
+    // finish frame, so a call is never emitted without an id or a name, or
+    // with invalid JSON arguments.
+    parts.push(...settleChatToolCallBuffers(state, INCOMPLETE_STREAM_END));
 
     // 4. Emit finish with "incomplete_stream_end" reason to signal partial response
     Logger.debug(`[flushPendingBuffers] Emitting ${parts.length} flushed parts with incomplete_stream_end signal`);
@@ -904,7 +930,7 @@ export function flushPendingBuffers(state: StreamingState): EmittedPart[] {
     });
     parts.push({
         type: "finish",
-        reason: "incomplete_stream_end",
+        reason: INCOMPLETE_STREAM_END,
     });
 
     return parts;

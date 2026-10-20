@@ -600,14 +600,16 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             processStreamingResponse: (
                 stream: AsyncIterable<string>,
                 progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-                token: vscode.CancellationToken
+                token: vscode.CancellationToken,
+                requestId: string
             ) => Promise<void>;
         };
 
         await providerTest.processStreamingResponse(
             makeStream() as unknown as AsyncIterable<string>,
             progress,
-            tokenSource.token
+            tokenSource.token,
+            "req-hello"
         );
 
         // Avoid brittle `instanceof` checks in the extension host (multiple `vscode` module instances can exist).
@@ -643,7 +645,8 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             processStreamingResponse: (
                 stream: AsyncIterable<string>,
                 progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-                token: vscode.CancellationToken
+                token: vscode.CancellationToken,
+                requestId: string
             ) => Promise<void>;
         };
         sandbox.stub(pWithConfig._configManager, "getConfig").resolves({
@@ -661,7 +664,8 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         await pWithConfig.processStreamingResponse(
             stream as unknown as AsyncIterable<string>,
             { report: () => {} },
-            token
+            token,
+            "req-dispose"
         );
 
         assert.strictEqual(disposed.length, 1, "the cancellation listener must be disposed exactly once");

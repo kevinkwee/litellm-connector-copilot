@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { Logger } from "../../utils/logger";
 import { isCacheControlMimeType } from "../../utils";
 import { StructuredLogger } from "../../observability/structuredLogger";
+import { TOOL_ARGS_PREVIEW_MAX_CHARS } from "./liteLLMStreamInterpreter";
 import type { EmittedPart } from "./liteLLMStreamInterpreter";
 
 export function emitPartsToVSCode(
@@ -136,7 +137,10 @@ export function emitPartsToVSCode(
                         Logger.warn(`[vscodePartEmitter] Part #${idx}: Failed to parse tool call arguments`, {
                             toolName: part.name,
                             id: part.id,
-                            argsPreview: typeof part.args === "string" ? part.args.slice(0, 160) : "<non-string>",
+                            argsPreview:
+                                typeof part.args === "string"
+                                    ? part.args.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS)
+                                    : "<non-string>",
                             error: parseErr instanceof Error ? parseErr.message : String(parseErr),
                         });
                         // Fallback: emit with raw string if the consumer can handle it, or empty object
@@ -146,7 +150,10 @@ export function emitPartsToVSCode(
                             toolName: part.name,
                             id: part.id,
                             argsLength: typeof part.args === "string" ? part.args.length : 0,
-                            argsPreview: typeof part.args === "string" ? part.args.slice(0, 160) : "<non-string>",
+                            argsPreview:
+                                typeof part.args === "string"
+                                    ? part.args.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS)
+                                    : "<non-string>",
                             error: parseErr instanceof Error ? parseErr.message : String(parseErr),
                         });
                     }

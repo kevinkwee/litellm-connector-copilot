@@ -7,6 +7,7 @@ import { TAGGED_CALL_CLOSER, TAGGED_CALL_OPENER } from "../../adapters/streaming
 import type { OpenAIChatCompletionRequest } from "../../types";
 import {
     collectResponseText,
+    collectToolCalls,
     createMockChatResponseOptions,
     createMockModel,
     createMockSecrets,
@@ -94,17 +95,6 @@ class ConcurrentSessionsHarness {
     }
 }
 
-interface ObservedToolCall {
-    name: string;
-    input: unknown;
-}
-
-function toolCallsOf(parts: readonly vscode.LanguageModelResponsePart[]): ObservedToolCall[] {
-    return parts
-        .filter((part): part is vscode.LanguageModelToolCallPart => part instanceof vscode.LanguageModelToolCallPart)
-        .map((part) => ({ name: part.name, input: part.input }));
-}
-
 function usagePartCountOf(parts: readonly vscode.LanguageModelResponsePart[]): number {
     return parts.filter((part) => part instanceof vscode.LanguageModelDataPart && part.mimeType === "usage").length;
 }
@@ -161,13 +151,13 @@ suite("LiteLLMChatProvider concurrent requests", () => {
     test("delivers a tool call while another request streams the same tool-call index", async () => {
         const harness = await runSameIndexToolCallSessions(sandbox);
 
-        assert.deepStrictEqual(toolCallsOf(harness.partsOf(SESSION_A)), [{ name: "task", input: TASK_ARGUMENTS }]);
+        assert.deepStrictEqual(collectToolCalls(harness.partsOf(SESSION_A)), [{ name: "task", input: TASK_ARGUMENTS }]);
     });
 
     test("keeps tool call arguments separate across concurrent requests", async () => {
         const harness = await runSameIndexToolCallSessions(sandbox);
 
-        assert.deepStrictEqual(toolCallsOf(harness.partsOf(SESSION_B)), [
+        assert.deepStrictEqual(collectToolCalls(harness.partsOf(SESSION_B)), [
             { name: "stop_powershell", input: STOP_ARGUMENTS },
         ]);
     });
@@ -203,7 +193,7 @@ suite("LiteLLMChatProvider concurrent requests", () => {
         streamA.release(2);
         await requestA;
 
-        assert.deepStrictEqual(toolCallsOf(harness.partsOf(SESSION_B)), []);
+        assert.deepStrictEqual(collectToolCalls(harness.partsOf(SESSION_B)), []);
     });
 
     test("never emits a pending tagged tool-call fragment on another request's progress", async () => {

@@ -45,6 +45,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Transport-level retry with mid-stream resume: when a stream dies mid-response, the connector rebuilds the request and resumes from the last assistant turn, appending a "Continue" nudge.
 - Reasoning-only streaming responses are retried instead of surfacing as empty replies.
 - Cancellation and watchdog aborts are surfaced correctly on clean stream completion instead of being masked by retry exhaustion.
+- Complete tool calls still buffered when a stream ends without a finish frame are delivered instead of discarded, and each concurrent session keeps its own stream state, so one session's tool calls never reach another.
 - Configurable 429 retry budget via `litellm-connector.rateLimitMaxDelaySeconds` (honors `Retry-After`); the `networkRetries` cap was removed.
 
 ### Request handling fixes

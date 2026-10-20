@@ -84,6 +84,18 @@ export function collectResponseText(parts: readonly vscode.LanguageModelResponse
         .join("");
 }
 
+export interface ReportedToolCall {
+    name: string;
+    input: unknown;
+}
+
+/** Lists the tool calls a provider reported, keeping the fields a test compares. */
+export function collectToolCalls(parts: readonly vscode.LanguageModelResponsePart[]): ReportedToolCall[] {
+    return parts
+        .filter((part): part is vscode.LanguageModelToolCallPart => part instanceof vscode.LanguageModelToolCallPart)
+        .map((part) => ({ name: part.name, input: part.input }));
+}
+
 /**
  * Creates a mock vscode.LogOutputChannel for tests.
  * All logging methods are no-ops. Useful when stubbing `vscode.window.createOutputChannel`.
