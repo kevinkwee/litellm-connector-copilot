@@ -3,7 +3,6 @@ import * as sinon from "sinon";
 import * as vscode from "vscode";
 
 import { LiteLLMChatProvider } from "../";
-import { TAGGED_CALL_CLOSER, TAGGED_CALL_OPENER } from "../../adapters/streaming/textToolCallParser";
 import type { OpenAIChatCompletionRequest } from "../../types";
 import {
     collectResponseText,
@@ -196,14 +195,9 @@ suite("LiteLLMChatProvider concurrent requests", () => {
         assert.deepStrictEqual(collectToolCalls(harness.partsOf(SESSION_B)), []);
     });
 
-    test("never emits a pending tagged tool-call fragment on another request's progress", async () => {
+    test("never emits another request's text on the wrong progress", async () => {
         const streamA = new SteppedSseStream(
-            [
-                chatTextFrame(`A calls ${TAGGED_CALL_OPENER}{"name":"task",`),
-                chatTextFrame(`"arguments":{}}${TAGGED_CALL_CLOSER}`),
-                chatFinishFrame("stop"),
-                SSE_DONE_FRAME,
-            ],
+            [chatTextFrame("A starts "), chatTextFrame("A ends"), chatFinishFrame("stop"), SSE_DONE_FRAME],
             [1]
         );
         const streamB = new SteppedSseStream(
@@ -221,6 +215,7 @@ suite("LiteLLMChatProvider concurrent requests", () => {
         streamA.release(1);
         await requestA;
 
+        assert.strictEqual(collectResponseText(harness.partsOf(SESSION_A)), "A starts A ends");
         assert.strictEqual(collectResponseText(harness.partsOf(SESSION_B)), "B starts B ends");
     });
 

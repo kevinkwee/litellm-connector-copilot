@@ -254,6 +254,160 @@ suite("GenerateCommitMessage Command Unit Tests", () => {
         assert.ok(errorStub.calledWith(sinon.match("provider fail")));
     });
 
+    test("handler restores the previous message when generation fails", async () => {
+        const registerStub = sandbox.stub(vscode.commands, "registerCommand");
+        registerGenerateCommitMessageCommand(mockProvider as unknown as LiteLLMCommitMessageProvider);
+        const handler = registerStub.firstCall.args[1] as () => Promise<void>;
+
+        mockProvider.getConfigManager.returns({
+            getConfig: async () => ({ commitModelIdOverride: "m" }),
+        } as unknown as ConfigManager);
+
+        sandbox.stub(GitUtils, "getStagedDiff").resolves("diff");
+        mockProvider.getModelInfo.returns({ max_input_tokens: 1000 } as unknown as LiteLLMModelInfo);
+        const inputBox = { value: "my draft message", placeholder: "", enabled: true };
+        sandbox.stub(GitUtils, "getGitAPI").resolves({ repositories: [{ inputBox }] } as unknown as never);
+        const model = {
+            sendRequest: sandbox.stub().rejects(vscode.LanguageModelError.Blocked("provider fail")),
+        };
+        (vscode.lm.selectChatModels as unknown as sinon.SinonStub).resolves([
+            model as unknown as vscode.LanguageModelChat,
+        ]);
+        sandbox.stub(vscode.window, "showErrorMessage");
+        sandbox.stub(vscode.window, "withProgress").callsFake(async (_o, task) => {
+            return await task(
+                { report: sandbox.stub() } as vscode.Progress<{ message?: string; increment?: number }>,
+                new vscode.CancellationTokenSource().token
+            );
+        });
+
+        await handler();
+
+        assert.strictEqual(inputBox.value, "my draft message", "a failed generation must not discard the draft");
+    });
+
+    test("handler restores the previous message when generation is cancelled", async () => {
+        const registerStub = sandbox.stub(vscode.commands, "registerCommand");
+        registerGenerateCommitMessageCommand(mockProvider as unknown as LiteLLMCommitMessageProvider);
+        const handler = registerStub.firstCall.args[1] as () => Promise<void>;
+
+        mockProvider.getConfigManager.returns({
+            getConfig: async () => ({ commitModelIdOverride: "m" }),
+        } as unknown as ConfigManager);
+
+        sandbox.stub(GitUtils, "getStagedDiff").resolves("diff");
+        mockProvider.getModelInfo.returns({ max_input_tokens: 1000 } as unknown as LiteLLMModelInfo);
+        const inputBox = { value: "my draft message", placeholder: "", enabled: true };
+        sandbox.stub(GitUtils, "getGitAPI").resolves({ repositories: [{ inputBox }] } as unknown as never);
+        const tokenSource = new vscode.CancellationTokenSource();
+        sandbox.stub(vscode.window, "showErrorMessage");
+        sandbox.stub(vscode.window, "withProgress").callsFake(async (_o, task) => {
+            return await task(
+                { report: sandbox.stub() } as vscode.Progress<{ message?: string; increment?: number }>,
+                tokenSource.token
+            );
+        });
+        const model = {
+            sendRequest: sandbox.stub().resolves({
+                stream: (async function* () {
+                    yield new vscode.LanguageModelTextPart("feat: partial");
+                    tokenSource.cancel();
+                })(),
+            }),
+        };
+        (vscode.lm.selectChatModels as unknown as sinon.SinonStub).resolves([
+            model as unknown as vscode.LanguageModelChat,
+        ]);
+
+        await handler();
+
+        assert.strictEqual(inputBox.value, "my draft message", "a cancelled generation must not discard the draft");
+    });
+
+    test("handler treats a notice after partial text as a failure, not a commit message", async () => {
+        const registerStub = sandbox.stub(vscode.commands, "registerCommand");
+        registerGenerateCommitMessageCommand(mockProvider as unknown as LiteLLMCommitMessageProvider);
+        const handler = registerStub.firstCall.args[1] as () => Promise<void>;
+
+        mockProvider.getConfigManager.returns({
+            getConfig: async () => ({ commitModelIdOverride: "m" }),
+        } as unknown as ConfigManager);
+
+        sandbox.stub(GitUtils, "getStagedDiff").resolves("diff");
+        mockProvider.getModelInfo.returns({ max_input_tokens: 1000 } as unknown as LiteLLMModelInfo);
+        const inputBox = { value: "my draft message", placeholder: "", enabled: true };
+        sandbox.stub(GitUtils, "getGitAPI").resolves({ repositories: [{ inputBox }] } as unknown as never);
+        const model = {
+            sendRequest: sandbox.stub().resolves({
+                stream: (async function* () {
+                    yield new vscode.LanguageModelTextPart("feat: partial");
+                    yield new vscode.LanguageModelTextPart(
+                        "\n\n[litellm-connector] The response stopped at the model's output token limit"
+                    );
+                })(),
+            }),
+        };
+        (vscode.lm.selectChatModels as unknown as sinon.SinonStub).resolves([
+            model as unknown as vscode.LanguageModelChat,
+        ]);
+        const errorStub = sandbox.stub(vscode.window, "showErrorMessage");
+        sandbox.stub(vscode.window, "withProgress").callsFake(async (_o, task) => {
+            return await task(
+                { report: sandbox.stub() } as vscode.Progress<{ message?: string; increment?: number }>,
+                new vscode.CancellationTokenSource().token
+            );
+        });
+
+        await handler();
+
+        assert.strictEqual(
+            inputBox.value,
+            "my draft message",
+            "a notice after partial text must never become the commit message"
+        );
+        assert.ok(errorStub.calledWith(sinon.match("output token limit")));
+    });
+
+    test("handler treats a connector notice as a failure, not a commit message", async () => {
+        const registerStub = sandbox.stub(vscode.commands, "registerCommand");
+        registerGenerateCommitMessageCommand(mockProvider as unknown as LiteLLMCommitMessageProvider);
+        const handler = registerStub.firstCall.args[1] as () => Promise<void>;
+
+        mockProvider.getConfigManager.returns({
+            getConfig: async () => ({ commitModelIdOverride: "m" }),
+        } as unknown as ConfigManager);
+
+        sandbox.stub(GitUtils, "getStagedDiff").resolves("diff");
+        mockProvider.getModelInfo.returns({ max_input_tokens: 1000 } as unknown as LiteLLMModelInfo);
+        const inputBox = { value: "my draft message", placeholder: "", enabled: true };
+        sandbox.stub(GitUtils, "getGitAPI").resolves({ repositories: [{ inputBox }] } as unknown as never);
+        // The chat provider reports its own failures as assistant notice text.
+        const model = {
+            sendRequest: sandbox.stub().resolves({
+                stream: (async function* () {
+                    yield new vscode.LanguageModelTextPart(
+                        "\n\n[litellm-connector] LiteLLM Error (m): No deployments available"
+                    );
+                })(),
+            }),
+        };
+        (vscode.lm.selectChatModels as unknown as sinon.SinonStub).resolves([
+            model as unknown as vscode.LanguageModelChat,
+        ]);
+        const errorStub = sandbox.stub(vscode.window, "showErrorMessage");
+        sandbox.stub(vscode.window, "withProgress").callsFake(async (_o, task) => {
+            return await task(
+                { report: sandbox.stub() } as vscode.Progress<{ message?: string; increment?: number }>,
+                new vscode.CancellationTokenSource().token
+            );
+        });
+
+        await handler();
+
+        assert.strictEqual(inputBox.value, "my draft message", "the notice must never become the commit message");
+        assert.ok(errorStub.calledWith(sinon.match("No deployments available")));
+    });
+
     test("handler handles missing git API or repositories", async () => {
         const registerStub = sandbox.stub(vscode.commands, "registerCommand");
         registerGenerateCommitMessageCommand(mockProvider as unknown as LiteLLMCommitMessageProvider);

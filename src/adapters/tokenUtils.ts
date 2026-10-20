@@ -371,7 +371,43 @@ export function trimMessagesToFitBudget(
         );
     }
 
+    return dropOrphanedToolResults(selected, systemMessage !== undefined);
+}
+
+/**
+ * Drops leading tool-result messages whose tool call was trimmed away.
+ *
+ * Trimming keeps a contiguous newest suffix, so a tool result can only become
+ * orphaned at the start of the conversation part: its assistant message with the
+ * matching tool call fell outside the budget. Providers reject a tool result with
+ * no matching call, so keeping it would make every later request fail.
+ *
+ * A selection that ends up with no conversation message at all is rejected
+ * instead: `[system]` alone passes validation, and the model would be asked to
+ * answer with no task in front of it.
+ */
+function dropOrphanedToolResults(
+    selected: vscode.LanguageModelChatRequestMessage[],
+    hasSystemMessage: boolean
+): vscode.LanguageModelChatRequestMessage[] {
+    const firstConversationIndex = hasSystemMessage ? 1 : 0;
+    let dropped = 0;
+    while (selected.length > firstConversationIndex && messageCarriesToolResult(selected[firstConversationIndex])) {
+        selected.splice(firstConversationIndex, 1);
+        dropped += 1;
+    }
+    if (dropped === 0) {
+        return selected;
+    }
+    if (selected.length === firstConversationIndex) {
+        throw new Error("Message exceeds token limit.");
+    }
+    Logger.warn(`[TokenTrim] Dropped ${dropped} tool result message(s) whose tool call was trimmed`);
     return selected;
+}
+
+function messageCarriesToolResult(message: vscode.LanguageModelChatRequestMessage): boolean {
+    return (message.content ?? []).some((part) => part instanceof vscode.LanguageModelToolResultPart);
 }
 
 /**
