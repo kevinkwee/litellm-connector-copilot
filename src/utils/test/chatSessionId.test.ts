@@ -5,9 +5,12 @@ import { resolveChatSessionId } from "../chatSessionId";
 /**
  * Tests for chat session id resolution.
  *
- * Two contracts are locked in here:
+ * Three contracts are locked in here:
  * - A host-provided `_conversationId` always wins, so two conversations that
  *   open with the same prompt get different ids.
+ * - The fingerprint fallback covers everything before the first assistant
+ *   message, system prompt included, so different agents get different ids
+ *   while the turns of one conversation stay together.
  * - Every resolved id is a canonical lowercase UUID, because the id names a
  *   directory under the extension's storage and is sent to LiteLLM as an
  *   opaque string.
@@ -23,6 +26,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const PYTHON_UUID5_USER_HI = "caf59339-a358-54fe-9771-59f7137e25c7"; // "user:hi"
 const PYTHON_UUID5_CONVERSATION_SESSION_7 = "f559bfcb-c68a-5396-aff9-da6c2864be24"; // "conversation:session-7"
 const PYTHON_UUID5_EMPTY = "708da911-9531-57c5-8b12-c8f0d1f6fbea"; // "empty:"
+const PYTHON_UUID5_SYSTEM_SYS_USER_HI = "c757cc18-54f7-53e5-9870-1e7f224f1c96"; // "system:sys\nuser:hi"
 
 // `LanguageModelChatMessageRole.System` is part of the `languageModelSystem`
 // proposed API; the stable enum only declares User(1) and Assistant(2).
@@ -198,7 +202,26 @@ suite("resolveChatSessionId", () => {
             assert.notStrictEqual(first.id, second.id);
         });
 
-        test("skips leading System messages", async () => {
+        test("matches Python's uuid5 for a seed that includes the system message", async () => {
+            const resolved = await resolveChatSessionId([systemMessage("sys"), userMessage("hi")], undefined);
+            assert.strictEqual(resolved.id, PYTHON_UUID5_SYSTEM_SYS_USER_HI);
+        });
+
+        test("includes the system message, so different agent instructions separate sessions", async () => {
+            // Two sessions with the same opening request but different agents
+            // must not share a folder or a LiteLLM session id.
+            const first = await resolveChatSessionId(
+                [systemMessage("You are a coding agent."), userMessage("fix the test")],
+                undefined
+            );
+            const second = await resolveChatSessionId(
+                [systemMessage("You are a planning agent."), userMessage("fix the test")],
+                undefined
+            );
+            assert.notStrictEqual(first.id, second.id, "same request under different agents must NOT collide");
+        });
+
+        test("returns different ids for different user requests under the same agent", async () => {
             const opened = (request: string) => [
                 systemMessage("You are an expert AI programming assistant."),
                 userMessage(request),
@@ -206,6 +229,18 @@ suite("resolveChatSessionId", () => {
             const first = await resolveChatSessionId(opened("request A"), undefined);
             const second = await resolveChatSessionId(opened("request B"), undefined);
             assert.notStrictEqual(first.id, second.id, "same system message + different request must NOT collide");
+        });
+
+        test("ignores System messages that follow the first assistant message", async () => {
+            const opened = [systemMessage("sys"), userMessage("hi")];
+            const withLaterSystem: vscode.LanguageModelChatRequestMessage[] = [
+                ...opened,
+                assistantMessage("answer"),
+                systemMessage("refreshed prompt"),
+            ];
+            const first = await resolveChatSessionId(opened, undefined);
+            const second = await resolveChatSessionId(withLaterSystem, undefined);
+            assert.strictEqual(first.id, second.id);
         });
 
         test("differentiates sessions with the same workspace context but different first request", async () => {
@@ -239,7 +274,7 @@ suite("resolveChatSessionId", () => {
             assert.strictEqual(first.id, second.id);
         });
 
-        test("falls back to the first message when no user message precedes the first assistant", async () => {
+        test("falls back to the first message when the request starts with an assistant message", async () => {
             const messages = [assistantMessage("calling tool")];
             const first = await resolveChatSessionId(messages, undefined);
             const second = await resolveChatSessionId(messages, undefined);

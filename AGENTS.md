@@ -676,7 +676,7 @@ Images returned by a tool (a screenshot tool, a chart renderer, an MCP server) t
 
 - **Preferred source**: the internal `options.modelOptions._conversationId` field, which VS Code forwards from the originating conversation. Copilot Chat sets it in editor windows (subagents share the parent's id); the agent host BYOK proxy sets it to the Copilot SDK session id from VS Code 1.143 on. The field is undocumented, so it is validated rather than trusted.
 - **Shape allowlist**: an already-canonical UUID passes through unchanged (so LiteLLM rows match VS Code's session id); any other non-empty string is hashed to a namespaced UUID v5. Because the id becomes a directory name, this allowlist is also what prevents path traversal.
-- **Fallback**: when the host sends no id (title generation, commit generation, other extensions calling `vscode.lm`, Agents window on VS Code before 1.143), the id is a UUID v5 of the request's opening user messages. That fingerprint is stable across turns but collides when two conversations open with the same prompt, so it must not be treated as a substitute for the host id.
+- **Fallback**: when the host sends no id (title generation, commit generation, other extensions calling `vscode.lm`, Agents window on VS Code before 1.143), the id is a UUID v5 of the conversation's opening context: every message before the first assistant reply, system prompt included. That fingerprint is stable across turns unless the system prompt is rebuilt mid-conversation, and it separates sessions running under different agents or modes. It still collides when two conversations share both the system prompt and the opening request, so it must not be treated as a substitute for the host id.
 
 ### Commit-Specific Logic (Commit Provider)
 

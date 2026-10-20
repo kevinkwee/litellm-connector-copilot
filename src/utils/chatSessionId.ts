@@ -17,10 +17,13 @@ import { lmcr_toString } from "./mapChatRoles";
  * is treated as untrusted input. Requests with no conversation behind them
  * (title generation, commit-message generation, other extensions calling
  * `vscode.lm`, and Agents window sessions on earlier VS Code builds) send
- * nothing, and the id falls back to a fingerprint of the opening messages.
- * The fingerprint is stable across the turns of one conversation but collides
- * when two conversations open with the same prompt, so it is not a substitute
- * for the host id.
+ * nothing, and the id falls back to a fingerprint of the opening context: every
+ * message before the first assistant reply, system prompt included. The
+ * fingerprint is stable across the turns of one conversation unless the system
+ * prompt is rebuilt mid-conversation, and it separates
+ * conversations that run under different agents or modes, but it still
+ * collides when two conversations share both the system prompt and the opening
+ * request, so it is not a substitute for the host id.
  *
  * Every returned id is a canonical lowercase UUID. The UUID shape is also a
  * safety allowlist: because the id becomes a directory name under the
@@ -97,11 +100,13 @@ function readConversationId(modelOptions: Readonly<Record<string, unknown>> | un
 /**
  * Picks the string to hash for the fallback fingerprint.
  *
- * The window is: the text of every `User`-role message that precedes the
- * first `Assistant` message. `System` messages are skipped wherever they
- * appear, because agent instructions are identical across sessions in the
- * same mode and add no discriminating power. Each message contributes
- * `user:<text>`, and the chunks are joined with `\n`.
+ * The window is every message that precedes the first `Assistant` message,
+ * including `System`. Each contributes `<role>:<text>`, joined with `\n`.
+ *
+ * The seed is an opaque hash input: it is rebuilt from `messages` on every
+ * request and never parsed back, so the encoding only has to be deterministic
+ * and identical across the turns of one conversation, and no count or length
+ * prefix is needed.
  *
  * ## Why this window
  *
@@ -117,38 +122,45 @@ function readConversationId(modelOptions: Readonly<Record<string, unknown>> | un
  * ```
  *
  * Hashing only the first user message (`[1]`) would collapse every session in
- * the same workspace into one folder. The window captures `[1]` and `[2]`, so
- * the fingerprint includes both the workspace context and the first real
- * request.
+ * the same workspace into one folder. The window captures `[0]`, `[1]` and
+ * `[2]`, so the fingerprint covers the agent instructions, the workspace
+ * context, and the first real request. Including `[0]` separates conversations
+ * that open with the same request under different agents or modes; it does not
+ * separate two conversations whose system prompt is also identical.
  *
  * The window is **exclusive** of the first assistant message: including it
  * would make turn 1 (no assistant yet) and turn 2 (assistant present) hash
- * differently, splitting one conversation across two folders.
+ * differently, splitting one conversation across two folders. Because a
+ * conversation only appends after that reply, the window is the whole array on
+ * turn 1 and the same set on every later turn.
+ *
+ * A consequence of including `[0]`: any mid-conversation system-prompt rebuild,
+ * such as Copilot's on a mode change, mints a new fingerprint for the remaining
+ * turns. That split is the accepted cost of separating agents.
  *
  * ## Degenerate cases
  *
- * - No user message in the window (e.g. a tool-calling sub-turn seeded only
- *   with system + assistant + tool messages): falls back to hashing the first
- *   message's role + text content so the request still gets a deterministic
- *   home. Two such sub-turns with identical first messages collide.
+ * - Nothing before the first assistant message (a request seeded with an
+ *   assistant turn only, such as a tool-calling sub-turn): falls back to
+ *   hashing the first message's role + text content so the request still gets
+ *   a deterministic home. Two such sub-turns with identical first messages
+ *   collide.
  * - Empty message array: returns a fixed fingerprint (`empty:` → hash) so the
  *   caller always has a folder to write to.
  */
 function pickFingerprintSeed(messages: readonly vscode.LanguageModelChatRequestMessage[]): string {
-    const userChunks: string[] = [];
+    const chunks: string[] = [];
     for (const msg of messages) {
         if (msg.role === vscode.LanguageModelChatMessageRole.Assistant) {
             // First assistant message ends the window; later messages belong to
             // subsequent turns and would destabilize the fingerprint.
             break;
         }
-        if (msg.role === vscode.LanguageModelChatMessageRole.User) {
-            userChunks.push(`user:${extractTextContent(msg.content)}`);
-        }
+        chunks.push(`${lmcr_toString(msg.role)}:${extractTextContent(msg.content)}`);
     }
 
-    if (userChunks.length > 0) {
-        return userChunks.join("\n");
+    if (chunks.length > 0) {
+        return chunks.join("\n");
     }
 
     const first = messages[0];
@@ -228,8 +240,8 @@ async function uuidFromSeed(seed: string): Promise<string> {
 
 /**
  * Parses a UUID string (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) into 16 bytes.
- * Throws on malformed input — the only caller passes a hardcoded constant, so
- * a malformed value is a programming error caught by the first call.
+ * Throws on malformed input. The only caller passes a hardcoded constant, so a
+ * malformed value is a programming error caught by the first call.
  */
 function uuidStringToBytes(uuid: string): Uint8Array {
     const hex = uuid.replace(/-/g, "");
