@@ -27,8 +27,8 @@ export interface FileMeta {
     mtimeMs: number;
     /** File size in bytes. */
     sizeBytes: number;
-    /** Session fingerprint (folder name) the file belongs to. */
-    sessionFingerprint: string;
+    /** Session id (folder name) the file belongs to. */
+    sessionId: string;
 }
 
 export interface CapsConfig {
@@ -58,9 +58,9 @@ export function selectFilesForDeletion(files: FileMeta[], caps: CapsConfig): Fil
             if (toDelete.has(f.uri)) {
                 continue;
             }
-            const bucket = bySession.get(f.sessionFingerprint) ?? [];
+            const bucket = bySession.get(f.sessionId) ?? [];
             bucket.push(f);
-            bySession.set(f.sessionFingerprint, bucket);
+            bySession.set(f.sessionId, bucket);
         }
         for (const bucket of bySession.values()) {
             if (bucket.length <= caps.maxFilesPerSession) {
@@ -85,9 +85,9 @@ export function selectFilesForDeletion(files: FileMeta[], caps: CapsConfig): Fil
             if (toDelete.has(f.uri)) {
                 continue;
             }
-            const current = sessionNewestMtime.get(f.sessionFingerprint) ?? -Infinity;
+            const current = sessionNewestMtime.get(f.sessionId) ?? -Infinity;
             if (f.mtimeMs > current) {
-                sessionNewestMtime.set(f.sessionFingerprint, f.mtimeMs);
+                sessionNewestMtime.set(f.sessionId, f.mtimeMs);
             }
         }
         const sortedSessions = [...sessionNewestMtime.entries()].sort((a, b) => b[1] - a[1]);
@@ -97,7 +97,7 @@ export function selectFilesForDeletion(files: FileMeta[], caps: CapsConfig): Fil
                 if (toDelete.has(f.uri)) {
                     continue;
                 }
-                if (dropped.has(f.sessionFingerprint)) {
+                if (dropped.has(f.sessionId)) {
                     toDelete.set(f.uri, f);
                 }
             }

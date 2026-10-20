@@ -8,6 +8,8 @@ import type { OpenAIChatCompletionRequest } from "../../types";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
 import { createMockSecrets } from "../../test/utils/testMocks";
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 /**
  * Seeds the per-group discovery state on a provider so the new routing path
  * (`resolveBackendForCall`) finds a backend during the request flow.
@@ -1577,7 +1579,8 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
     function runChatRequest(
         provider: LiteLLMChatProvider,
         reported: vscode.LanguageModelResponsePart[],
-        token?: vscode.CancellationToken
+        token?: vscode.CancellationToken,
+        modelOptions: Record<string, unknown> = {}
     ): Promise<void> {
         return provider.provideLanguageModelChatResponse(
             {
@@ -1598,7 +1601,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
                 },
             ],
             {
-                modelOptions: {},
+                modelOptions,
                 tools: [],
                 toolMode: vscode.LanguageModelChatToolMode.Auto,
                 requestInitiator: "test",
@@ -1610,6 +1613,27 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             { report: (part) => reported.push(part) },
             token ?? new vscode.CancellationTokenSource().token
         );
+    }
+
+    function stubConfigAndDiscovery(sandbox: sinon.SinonSandbox, provider: LiteLLMChatProvider): void {
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({ url: "http://localhost:4000" });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+    }
+
+    function stubCleanChatStream(sandbox: sinon.SinonSandbox, sent: OpenAIChatCompletionRequest[]): void {
+        const encoder = new TextEncoder();
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sent.push(request);
+            return new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                },
+            });
+        });
     }
 
     test("tool call already emitted before a transport error blocks the retry", async () => {
@@ -1923,6 +1947,12 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         assert.strictEqual(sent[1].messages.length, 3, "each resumed attempt carries exactly one nudge");
         assert.strictEqual(sent[1].messages[1].content, "Hel");
         assert.strictEqual(sent[1].messages[2].content, "Continue");
+        // Resumed attempts rebuild the body, so the session id has to be
+        // carried over explicitly; otherwise one request would span two
+        // LiteLLM sessions.
+        const sessionIds = sent.map((request) => request.metadata?.session_id);
+        assert.match(String(sessionIds[0]), UUID_PATTERN);
+        assert.strictEqual(new Set(sessionIds).size, 1, "every resumed attempt keeps the original session id");
     });
 
     test("cancellation between attempts aborts instead of sending another request", async () => {
@@ -1962,5 +1992,33 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             /Operation cancelled by user/
         );
         assert.strictEqual(sent.length, 1, "no new request after cancellation during backoff");
+    });
+
+    test("sends the host conversation id as metadata.session_id", async () => {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        stubConfigAndDiscovery(sandbox, provider);
+        const sent: OpenAIChatCompletionRequest[] = [];
+        stubCleanChatStream(sandbox, sent);
+
+        const hostConversationId = "3f8a2c94-1b7d-4e05-9c62-8d1f4a7b2e11";
+        await runChatRequest(provider, [], undefined, { _conversationId: hostConversationId });
+
+        assert.strictEqual(sent.length, 1);
+        assert.strictEqual(sent[0].metadata?.session_id, hostConversationId);
+    });
+
+    test("sends a stable fingerprint as metadata.session_id when the host sends no conversation id", async () => {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        stubConfigAndDiscovery(sandbox, provider);
+        const sent: OpenAIChatCompletionRequest[] = [];
+        stubCleanChatStream(sandbox, sent);
+
+        await runChatRequest(provider, []);
+        await runChatRequest(provider, []);
+
+        assert.strictEqual(sent.length, 2);
+        const firstSessionId = sent[0].metadata?.session_id;
+        assert.match(String(firstSessionId), UUID_PATTERN);
+        assert.strictEqual(sent[1].metadata?.session_id, firstSessionId);
     });
 });

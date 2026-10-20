@@ -1,12 +1,7 @@
 import * as vscode from "vscode";
 import { Logger } from "../utils/logger";
 import { StructuredLogger } from "./structuredLogger";
-import {
-    buildCopilotMdFilename,
-    computeSessionFingerprint,
-    renderCopilotMd,
-    type CopilotMdEntry,
-} from "./copilotMdRenderer";
+import { buildCopilotMdFilename, renderCopilotMd, type CopilotMdEntry } from "./copilotMdRenderer";
 import { selectFilesForDeletion, type CapsConfig, type FileMeta } from "./copilotMdCaps";
 
 /**
@@ -30,7 +25,7 @@ import { selectFilesForDeletion, type CapsConfig, type FileMeta } from "./copilo
  */
 export class CopilotMdWriter {
     /**
-     * @param rootFolder The folder under which `copilot-debug/{sessionFingerprint}/`
+     * @param rootFolder The folder under which `copilot-debug/{sessionId}/`
      *                    subfolders are created. Caller picks `context.storageUri`
      *                    (per-workspace extension storage, the default) or
      *                    `context.globalStorageUri` (persists across workspaces)
@@ -46,7 +41,7 @@ export class CopilotMdWriter {
 
     /**
      * Renders the entry to markdown, writes it to
-     * `{rootFolder}/copilot-debug/{sessionFingerprint}/{filename}`, then
+     * `{rootFolder}/copilot-debug/{sessionId}/{filename}`, then
      * runs caps enforcement. Resolves to the written file URI on success,
      * `undefined` on failure (errors are logged, never thrown).
      *
@@ -55,15 +50,7 @@ export class CopilotMdWriter {
      */
     async write(entry: CopilotMdEntry): Promise<vscode.Uri | undefined> {
         try {
-            // Use the pre-computed fingerprint when the caller provides one
-            // (the chat provider does, so the `.copilotmd` session folder
-            // matches the `metadata.session_id` sent to LiteLLM for spend
-            // tracking). Fall back to computing from `requestMessages` for
-            // callers that don't care (e.g. unit tests). Async because the
-            // fingerprint uses SHA-256 via Web Crypto.
-            const sessionFingerprint =
-                entry.sessionFingerprint ?? (await computeSessionFingerprint(entry.requestMessages));
-            const sessionFolder = vscode.Uri.joinPath(this.rootFolder, "copilot-debug", sessionFingerprint);
+            const sessionFolder = vscode.Uri.joinPath(this.rootFolder, "copilot-debug", entry.sessionId);
             const filename = buildCopilotMdFilename(entry);
             const fileUri = vscode.Uri.joinPath(sessionFolder, filename);
 
@@ -77,7 +64,7 @@ export class CopilotMdWriter {
 
             StructuredLogger.info("copilotmd.exported", {
                 requestId: entry.ourRequestId,
-                sessionFingerprint,
+                sessionId: entry.sessionId,
                 filename,
                 bytes: contentBytes.length,
             });
@@ -150,12 +137,12 @@ export class CopilotMdWriter {
     }
 
     /**
-     * Walks `debugRoot/{sessionFingerprint}/*.copilotmd` and builds the
+     * Walks `debugRoot/{sessionId}/*.copilotmd` and builds the
      * flat {@link FileMeta} list the caps selector needs.
      *
      * Two-level walk: list session folders, then list files in each. We
      * intentionally do NOT recurse deeper — the layout is fixed at
-     * `copilot-debug/{sessionFingerprint}/{filename}.copilotmd`.
+     * `copilot-debug/{sessionId}/{filename}.copilotmd`.
      */
     private async collectFileMetas(debugRoot: vscode.Uri): Promise<FileMeta[]> {
         const metas: FileMeta[] = [];
@@ -167,11 +154,11 @@ export class CopilotMdWriter {
             return [];
         }
         await Promise.all(
-            sessionEntries.map(async ([sessionFingerprint, type]) => {
+            sessionEntries.map(async ([sessionId, type]) => {
                 if (type !== vscode.FileType.Directory) {
                     return;
                 }
-                const sessionFolder = vscode.Uri.joinPath(debugRoot, sessionFingerprint);
+                const sessionFolder = vscode.Uri.joinPath(debugRoot, sessionId);
                 let fileEntries: [string, vscode.FileType][];
                 try {
                     fileEntries = await vscode.workspace.fs.readDirectory(sessionFolder);
@@ -193,7 +180,7 @@ export class CopilotMdWriter {
                                 uri: fileUri.toString(),
                                 mtimeMs: stat.mtime,
                                 sizeBytes: stat.size,
-                                sessionFingerprint,
+                                sessionId,
                             });
                         } catch {
                             // Stat failed (race with deletion) — skip.

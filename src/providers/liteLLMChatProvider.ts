@@ -15,8 +15,9 @@ import { Logger } from "../utils/logger";
 import { LiteLLMTelemetry } from "../utils/telemetry";
 import { LiteLLMProviderBase } from "./liteLLMProviderBase";
 import { StructuredLogger } from "../observability/structuredLogger";
-import { ResponsePartCollector, exportCopilotMdEntry, computeSessionFingerprint } from "../observability";
+import { ResponsePartCollector, exportCopilotMdEntry } from "../observability";
 import type { CopilotMdEntry } from "../observability";
+import { resolveChatSessionId } from "../utils/chatSessionId";
 import {
     countOpenAIChatMessagesTokens,
     countTokens,
@@ -160,15 +161,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         let endpointUrl: string | undefined;
         let requestBodyBuilt: OpenAIChatCompletionRequest | undefined;
         let activeMessages: readonly LanguageModelChatRequestMessage[] = messages;
-        // Session fingerprint, computed once from `messages` (the request
-        // input) at the top of the try block, then reused for two purposes:
-        //   1. Injected into `requestBody.metadata.session_id` so LiteLLM
-        //      promotes it to `litellm_session_id` for per-session spend
-        //      tracking and cache grouping.
-        //   2. Passed to `exportCopilotMdEntry` so the `.copilotmd` file
-        //      lands in the same session folder as the LiteLLM spend-log row.
-        // Hoisted so the catch-block export can reuse the same value.
-        let sessionFingerprint: string | undefined;
 
         // Extract caller/justification from options or model tags
         const telemetry = this.getTelemetryOptions(options);
@@ -203,6 +195,16 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         // truth for the response body.
         const trackingProgress = responsePartCollector.progress;
 
+        // Resolved before the `try` so the success and failure exports share
+        // the same id.
+        const resolvedSession = await resolveChatSessionId(messages, options.modelOptions);
+        const sessionId = resolvedSession.id;
+        StructuredLogger.debug(
+            "request.session_resolved",
+            { sessionId, sessionIdSource: resolvedSession.source },
+            { requestId, model: model.id, caller }
+        );
+
         try {
             // Resolve the backend baseUrl for the `.copilotmd` metadata `url:` line.
             // The registry is the single source of truth for (namespaced id → backend);
@@ -214,31 +216,12 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             const routingEntry = this._registry.lookup(model.id);
             endpointUrl = routingEntry?.baseUrl ?? "litellm-connector";
 
-            // Capability lookup goes directly to the BackendRegistry: the single
-            // source of truth. There is no per-provider mirror cache, so a stale
-            // entry from a previous backend cannot be served for a different
-            // backend's request.
-            const modelInfo = this._registry.getModelInfo(model.id);
-            // Compute the session fingerprint once from `messages` (the request
-            // input). This is the same value used for `.copilotmd` folder
-            // grouping AND for LiteLLM's `metadata.session_id` (which LiteLLM
-            // promotes to `litellm_session_id` for per-session spend tracking
-            // and cache grouping). Computing it here (before the body is
-            // built) lets us inject it into the body in the same pass.
-            // Async because the fingerprint uses SHA-256 via Web Crypto.
-            sessionFingerprint = await computeSessionFingerprint(messages);
             const requestBody = await this.buildOpenAIChatRequest(messages, model, options, modelInfo, caller);
-            // Inject the session fingerprint into the request body's metadata
-            // so LiteLLM's proxy can group spend logs and cache entries by
-            // session. LiteLLM reads `metadata.session_id` and promotes it to
-            // `litellm_session_id` (see `litellm/litellm_core_utils/get_litellm_params.py`).
-            // We always set this, even when `.copilotmd` export is disabled,
-            // because per-session spend tracking is useful independent of the
-            // debug-log export. The fingerprint is deterministic per session,
-            // so all turns of one chat session share one `litellm_session_id`.
+            // Sent even when the `.copilotmd` export is off: spend grouping is
+            // independent of debug logging.
             requestBody.metadata = {
                 ...(requestBody.metadata ?? {}),
-                session_id: sessionFingerprint,
+                session_id: sessionId,
             };
             requestBodyBuilt = requestBody;
             // The model id in `model` is the namespaced `<routing>/<raw>`
@@ -328,8 +311,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         activeMessages = resumedMessages;
                         requestBodyBuilt = resumedRequestBody;
                         // Carry over the request metadata (which holds the
-                        // session fingerprint) so resumed attempts keep
-                        // per-session spend grouping in LiteLLM.
+                        // session id) so resumed attempts keep per-session
+                        // spend grouping in LiteLLM.
                         requestBodyBuilt.metadata = { ...(requestBody.metadata ?? {}) };
                         const resumedInputTokens =
                             countOpenAIChatMessagesTokens(
@@ -555,7 +538,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 usage: snapshot,
                 responseParts: responsePartCollector.parts,
                 status: "success",
-                sessionFingerprint,
+                sessionId,
             } satisfies CopilotMdEntry);
 
             // Usage data flows through StreamTokenCapture, which intercepts
@@ -611,8 +594,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             LiteLLMTelemetry.reportMetric(metric);
 
             // Fire-and-forget `.copilotmd` export for the failure case. Only
-            // emits when the request got far enough to have a built body. A
-            // failure before `buildOpenAIChatRequest` (e.g. config error) has
+            // emits when the request got far enough to have a built body; a
+            // failure before `buildOpenAIChatRequest` (e.g. a config error) has
             // nothing meaningful to render and is skipped.
             if (requestBodyBuilt && endpointUrl) {
                 void exportCopilotMdEntry({
@@ -635,7 +618,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     responseParts: responsePartCollector.parts,
                     status: "failure",
                     statusReason: errorMessage,
-                    sessionFingerprint,
+                    sessionId,
                 } satisfies CopilotMdEntry);
             }
 

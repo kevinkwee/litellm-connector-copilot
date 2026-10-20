@@ -30,11 +30,11 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Images returned by tools count toward the token budget, and `.copilotmd` transcripts render them as a size placeholder instead of raw bytes.
 
 ### `.copilotmd` session transcripts
-- Chat requests are exported as `.copilotmd` markdown files (byte-compatible with Copilot Chat's debug view, except binary parts, which render as size placeholders instead of raw bytes) into `copilot-debug/<session fingerprint>/` under VS Code's hidden per-workspace extension storage (default) or global storage, configured via `litellm-connector.debug.copilotMdExport.*`. The export is off by default.
+- Chat requests are exported as `.copilotmd` markdown files (byte-compatible with Copilot Chat's debug view, except binary parts, which render as size placeholders instead of raw bytes) into `copilot-debug/<session id>/` under VS Code's hidden per-workspace extension storage (default) or global storage, configured via `litellm-connector.debug.copilotMdExport.*`. The export is off by default.
 - Per-session retention caps keep the export folder bounded.
 - New command: **LiteLLM: Open .copilotmd Export Folder**.
 - Reasoning/thinking parts and tool messages are rendered in transcripts; thinking parts are concatenated into continuous reasoning lines with visible separation between reasoning and text.
-- A stable per-session fingerprint (UUID v5) is attached to request metadata so transcripts group with LiteLLM spend logs.
+- The session id attached to request metadata (`metadata.session_id`, which LiteLLM promotes to `litellm_session_id`) is the same id used for the export folder, so transcripts group with LiteLLM spend logs. It is derived from the host's conversation id when VS Code provides one (Copilot Chat in editor windows, and the Agents window from VS Code 1.143 on): passed through verbatim when that id is already a UUID, hashed to a UUID v5 otherwise. Requests with no host conversation behind them (title generation, commit-message generation, other extensions, Agents window sessions on older builds) fall back to a fingerprint of the conversation's opening messages, which can collide when two conversations open with the same prompt.
 
 ### Structured log persistence
 - The "LiteLLM Structured" output channel is mirrored to daily JSONL files in extension global storage with 14-day retention (toggle via `litellm-connector.debug.structuredLogFile.enabled`), so diagnostics survive VS Code's output-channel rotation.
@@ -68,6 +68,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 ### Agents window (Copilot SDK harness) compatibility
 - The manifest declares `capabilities.agentsWindow.supported: true` plus the `agentsWindowActivation` API proposal, so the extension runs in the Agents window even when no editor window is open there.
 - Requires `chat.agentHost.byokModels.enabled` to be on (default). If it is off, re-enable it, because the Agents window loads BYOK models only through that bridge. Separately, models surface only when `extensions.experimental.enableAgentsWindowCapability` is on (default). If that setting is off, or your VS Code build predates it, add the explicit override: `"extensions.supportAgentsWindow": { "GethNet.litellm-connector-copilot": true }`.
+- Session grouping uses the Copilot SDK session id that VS Code 1.143+ forwards to BYOK providers. Older builds fall back to the message fingerprint described above.
 - Streaming limitation: in Agents window (Agent Host) sessions, responses arrive as one block after generation instead of incrementally. This is a VS Code buffering limitation, not a connector bug. The connector streams normally in editor-window chat. Tracked upstream in microsoft/vscode#339493. Related caveats: BYOK models may be rejected for subagents (microsoft/vscode#333802) and BYOK over SSH hosts is unsupported (microsoft/vscode#325738).
 
 ## Building locally
