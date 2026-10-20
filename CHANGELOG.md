@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 🐛 Fixes
+
+* **🧠 DeepSeek reasoning passback no longer fails tool loops**: DeepSeek thinking mode requires `reasoning_content` on every assistant turn in the active tool loop whenever tools are present, including turns that produced no reasoning. The converter now fills `reasoning_content: ""` on active-turn assistant turns that lack reasoning, preserves reasoning replayed by VS Code, and fixes the truthiness spread that dropped empty strings. The fill is DeepSeek-only, scoped to the active turn, and leaves completed turns and every other model unchanged. (`src/utils.ts`, `src/utils/modelUtils.ts`, `src/providers/base/requestBuilder.ts`)
+
+### 🧪 Tests
+
+* Coverage for the active-turn boundary, completed-turn isolation, reasoning preservation, hoisted tool-result image messages, the empty-string regression, and DeepSeek provider/model-id gating. (`src/utils/test/utils.test.ts`, `src/utils/test/isDeepSeekModel.test.ts`, `src/providers/test/liteLLMProviderBase.requestBuilder.test.ts`)
+
 ## [2.1.10-dev.16] - 2026-10-20
 
 ### 🐛 Fixes

@@ -3,7 +3,7 @@ import { convertMessages, convertTools, validateRequest } from "../../utils";
 import { trimMessagesToFitBudget } from "../../adapters/tokenUtils";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest, OpenAIFunctionToolDef } from "../../types";
 import { DEFAULT_ANTHROPIC_PROMPT_CACHING, resolveAnthropicCacheControl } from "../../utils/promptCaching";
-import { resolveToolResultImageMode } from "../../utils/modelUtils";
+import { isDeepSeekModel, resolveToolResultImageMode } from "../../utils/modelUtils";
 import type { RequestBuilderDeps } from "./types";
 
 export class RequestBuilder {
@@ -66,6 +66,8 @@ export class RequestBuilder {
                 : messages;
         const openaiMessages = convertMessages(messagesToUse, {
             toolResultImageMode: resolveToolResultImageMode(modelInfo),
+            ensureReasoningContentInActiveTurn:
+                (toolConfig.tools?.length ?? 0) > 0 && isDeepSeekModel(rawModelId, modelInfo),
         });
         validateRequest(messagesToUse);
 
