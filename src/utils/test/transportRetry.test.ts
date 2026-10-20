@@ -5,6 +5,7 @@ import {
     StreamedTextAccumulator,
     ReasoningOnlyError,
     InactivityTimeoutError,
+    UpstreamStreamError,
     isTransportRetriableError,
     backoffDelayMs,
     buildResumeMessages,
@@ -82,6 +83,42 @@ suite("Transport Retry Utilities", () => {
         assert.strictEqual(isTransportRetriableError(undefined), false);
         assert.strictEqual(isTransportRetriableError(null), false);
         assert.strictEqual(isTransportRetriableError(42), false);
+    });
+
+    test("isTransportRetriableError classifies in-stream upstream failures by status and code", () => {
+        // transient upstream deaths resume the request
+        assert.ok(
+            isTransportRetriableError(new UpstreamStreamError(529, "overloaded_error", "overloaded", "Overloaded"))
+        );
+        assert.ok(isTransportRetriableError(new UpstreamStreamError(429, "rate_limit_exceeded", undefined, undefined)));
+        assert.ok(isTransportRetriableError(new UpstreamStreamError(503, undefined, undefined, undefined)));
+        assert.ok(isTransportRetriableError(new UpstreamStreamError(undefined, undefined, "server_error", undefined)));
+        assert.ok(isTransportRetriableError(new UpstreamStreamError(undefined, "api_error", "timeout", undefined)));
+        // a rejected request would be rejected again
+        assert.strictEqual(
+            isTransportRetriableError(new UpstreamStreamError(400, "invalid_request_error", undefined, "bad")),
+            false
+        );
+        assert.strictEqual(
+            isTransportRetriableError(new UpstreamStreamError(undefined, undefined, undefined, "bad")),
+            false
+        );
+    });
+
+    test("UpstreamStreamError describes the failure without leaking a stack", () => {
+        assert.strictEqual(
+            new UpstreamStreamError(529, "overloaded_error", "overloaded", "Overloaded").message,
+            "Upstream stream error (overloaded_error, HTTP 529): Overloaded"
+        );
+        // LiteLLM reports the status in `code`; it must not be printed twice.
+        assert.strictEqual(
+            new UpstreamStreamError(529, "529", "overloaded_error", "Overloaded").message,
+            "Upstream stream error (overloaded_error, HTTP 529): Overloaded"
+        );
+        assert.strictEqual(
+            new UpstreamStreamError(undefined, undefined, undefined, undefined).message,
+            "Upstream stream error: the provider ended the response early"
+        );
     });
 
     test("isTransportRetriableError rejects API errors, cancellation, and reasoning-only", () => {

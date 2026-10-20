@@ -130,11 +130,10 @@ export async function* decodeSSE(
                 }
                 if (payload) {
                     payloadCount++;
-                    Logger.trace("[decodeSSE] Yield payload #" + payloadCount, payload.slice(0, 100));
+                    Logger.trace("[decodeSSE] Yield payload #" + payloadCount);
                     StructuredLogger.trace("stream.payload_yielded", {
                         payloadNumber: payloadCount,
                         payloadLength: payload.length,
-                        payloadPreview: payload.slice(0, 100),
                     });
                     yield payload;
                 }
@@ -159,7 +158,6 @@ export async function* decodeSSE(
                 StructuredLogger.trace("stream.payload_yielded", {
                     payloadNumber: payloadCount,
                     payloadLength: payload.length,
-                    payloadPreview: payload.slice(0, 100),
                     isFinalFlush: true,
                 });
                 yield payload;

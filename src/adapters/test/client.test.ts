@@ -1,5 +1,11 @@
 import * as assert from "assert";
-import { LiteLLMClient } from "../litellmClient";
+import {
+    findRejectedParameter,
+    isUnsupportedParameterError,
+    LiteLLMApiError,
+    LiteLLMClient,
+    LiteLLMDiscoveryError,
+} from "../litellmClient";
 import * as sinon from "sinon";
 import type { LiteLLMModelInfo, LiteLLMModelInfoResponse } from "../../types";
 
@@ -139,45 +145,60 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.strictEqual(secondCallHeaders["Cache-Control"], undefined);
     });
 
-    test("chat retries by stripping specific parameter mentioned in error", async () => {
+    test("chat surfaces a rejected model parameter instead of stripping and resending it", async () => {
         const client = new LiteLLMClient(config, userAgent);
 
         const errorResponse = {
             ok: false,
             status: 400,
             statusText: "Bad Request",
-            text: async () => "LiteLLM Error: unexpected keyword argument 'temperature'",
+            text: async () => "Unsupported parameter: 'temperature'",
             clone: function () {
                 return this;
             },
         };
 
-        const successResponse = {
-            ok: true,
-            status: 200,
-            body: new ReadableStream(),
-        };
+        const fetchStub = sandbox.stub(global, "fetch").resolves(errorResponse as unknown as Response);
 
-        const fetchStub = sandbox.stub(global, "fetch");
-        fetchStub.onCall(0).resolves(errorResponse as unknown as Response);
-        fetchStub.onCall(1).resolves(successResponse as unknown as Response);
+        await assert.rejects(
+            client.chat({ model: "o1-mini", messages: [], temperature: 1 }),
+            (err: unknown) => err instanceof LiteLLMApiError && err.status === 400
+        );
 
-        await client.chat({ model: "o1-mini", messages: [], temperature: 1 });
-
-        assert.strictEqual(fetchStub.callCount, 2);
-
-        const secondCallInit = fetchStub.getCall(0).args[1] as RequestInit | undefined;
-        const secondCallBodyStr = secondCallInit?.body as string | undefined;
-        const secondCallBody = secondCallBodyStr ? (JSON.parse(secondCallBodyStr) as Record<string, unknown>) : {};
-        assert.strictEqual(secondCallBody.temperature, 1);
-
-        const retryCallInit = fetchStub.getCall(1).args[1] as RequestInit | undefined;
-        const retryCallBodyStr = retryCallInit?.body as string | undefined;
-        const retryCallBody = retryCallBodyStr ? (JSON.parse(retryCallBodyStr) as Record<string, unknown>) : {};
-        assert.strictEqual(retryCallBody.temperature, undefined, "Temperature should have been stripped");
+        assert.strictEqual(fetchStub.callCount, 1, "a model parameter is never stripped and retried");
+        const init = fetchStub.getCall(0).args[1] as RequestInit | undefined;
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        assert.strictEqual(body.temperature, 1);
     });
 
-    test("chat strips cache and extra_body.cache when backend rejects unknown parameter cache", async () => {
+    test("findRejectedParameter names the parameter a 400 body rejects", () => {
+        assert.strictEqual(findRejectedParameter("Unsupported parameter: 'temperature'"), "temperature");
+        assert.strictEqual(findRejectedParameter('unknown parameter "top_p"'), "top_p");
+        assert.strictEqual(findRejectedParameter("unexpected keyword argument 'stop'"), "stop");
+        assert.strictEqual(
+            findRejectedParameter('{"error":{"message":"Unsupported parameter: temperature","param":"temperature"}}'),
+            "temperature"
+        );
+        assert.strictEqual(
+            findRejectedParameter("anthropic does not support parameters: ['reasoning_effort']"),
+            "reasoning_effort"
+        );
+        assert.strictEqual(
+            findRejectedParameter("unknown parameter: {'reasoning_effort': 'high'}"),
+            "reasoning_effort"
+        );
+        // A JSON body quotes every key, so nothing may be named from a quote alone.
+        assert.strictEqual(findRejectedParameter('{"error":{"message":"bad request"}}'), undefined);
+        assert.strictEqual(findRejectedParameter("Unsupported parameter for this model"), undefined);
+    });
+
+    test("isUnsupportedParameterError only matches parameter-rejection bodies", () => {
+        assert.strictEqual(isUnsupportedParameterError("Unsupported parameter: temperature"), true);
+        assert.strictEqual(isUnsupportedParameterError("Extra inputs are not permitted"), true);
+        assert.strictEqual(isUnsupportedParameterError("Maximum context length exceeded"), false);
+    });
+
+    test("chat strips the cache-bypass flag and header when the backend rejects them", async () => {
         const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
 
         const errorResponse = {
@@ -200,28 +221,19 @@ suite("LiteLLM Client Unit Tests", () => {
         fetchStub.onCall(0).resolves(errorResponse as unknown as Response);
         fetchStub.onCall(1).resolves(successResponse as unknown as Response);
 
-        // Include both top-level cache and extra_body.cache to ensure both are stripped.
-        await client.chat({
-            model: "gpt-4",
-            messages: [],
-            cache: { "no-cache": true },
-            extra_body: { cache: { "no-cache": true, no_cache: true } },
-        } as never);
+        // The connector adds exactly this shape when caching is disabled.
+        await client.chat({ model: "gpt-4", messages: [], extra_body: { cache: { "no-cache": true } } });
 
         assert.strictEqual(fetchStub.callCount, 2);
 
         const firstCallInit = fetchStub.getCall(0).args[1] as RequestInit | undefined;
-        const firstCallBodyStr = firstCallInit?.body as string | undefined;
-        const firstCallBody = firstCallBodyStr ? (JSON.parse(firstCallBodyStr) as Record<string, unknown>) : {};
-        // First call should still contain caching controls due to disableCaching.
+        const firstCallBody = JSON.parse(String(firstCallInit?.body)) as Record<string, unknown>;
         const firstExtraBody = firstCallBody.extra_body as Record<string, unknown> | undefined;
         const firstCache = firstExtraBody?.cache as Record<string, unknown> | undefined;
         assert.strictEqual(firstCache?.["no-cache"], true);
 
         const retryCallInit = fetchStub.getCall(1).args[1] as RequestInit | undefined;
-        const retryCallBodyStr = retryCallInit?.body as string | undefined;
-        const retryCallBody = retryCallBodyStr ? (JSON.parse(retryCallBodyStr) as Record<string, unknown>) : {};
-        assert.strictEqual(retryCallBody.cache, undefined);
+        const retryCallBody = JSON.parse(String(retryCallInit?.body)) as Record<string, unknown>;
         assert.strictEqual(retryCallBody.extra_body, undefined);
 
         const retryHeaders = (retryCallInit?.headers as Record<string, string>) ?? {};
@@ -407,11 +419,69 @@ suite("LiteLLM Client Unit Tests", () => {
         await assert.rejects(
             () => client.getModelInfo(),
             (err: unknown) =>
-                err instanceof Error &&
+                err instanceof LiteLLMDiscoveryError &&
+                err.status === 500 &&
                 err.message.includes("Failed to fetch model info") &&
-                err.message.includes("500") &&
                 err.message.includes("Internal Server Error")
         );
+    });
+
+    test("getModelInfo reports the last 404 when every fallback URL fails", async () => {
+        const client = new LiteLLMClient({ url: "http://localhost:4000/v1", key: "test-key" }, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch").resolves({
+            ok: false,
+            status: 404,
+            statusText: "Not Found",
+        } as unknown as Response);
+
+        await assert.rejects(
+            () => client.getModelInfo(),
+            (err: unknown) =>
+                err instanceof LiteLLMDiscoveryError &&
+                err.status === 404 &&
+                err.message.includes("Failed to fetch model info")
+        );
+        assert.ok(fetchStub.callCount > 1, "every candidate URL is tried before giving up");
+    });
+
+    test("chat does not resend a body when the rejection names nothing strippable", async () => {
+        const client = new LiteLLMClient(config, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch").resolves({
+            ok: false,
+            status: 400,
+            statusText: "Bad Request",
+            text: async () => "Unsupported parameter: prompt_cache_key",
+            clone: function () {
+                return this;
+            },
+        } as unknown as Response);
+
+        await assert.rejects(
+            () => client.chat({ model: "gpt-4", messages: [] }),
+            (err: unknown) => err instanceof LiteLLMApiError && err.status === 400
+        );
+        assert.strictEqual(fetchStub.callCount, 1, "an unchanged body would be rejected identically");
+    });
+
+    test("chat does not resend a body that has no cache_control marker to strip", async () => {
+        const onUnsupportedParameter = sandbox.stub();
+        const client = new LiteLLMClient({ ...config, onUnsupportedParameter }, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch").resolves({
+            ok: false,
+            status: 400,
+            statusText: "Bad Request",
+            text: async () => "Extra inputs are not permitted: cache_control",
+            clone: function () {
+                return this;
+            },
+        } as unknown as Response);
+
+        await assert.rejects(
+            () => client.chat({ model: "gpt-4", messages: [] }),
+            (err: unknown) => err instanceof LiteLLMApiError
+        );
+        assert.strictEqual(fetchStub.callCount, 1, "there was nothing to remove");
+        assert.strictEqual(onUnsupportedParameter.called, false, "no incompatibility was proven");
     });
 
     test("getModelInfo aborts fetch when cancellation token fires", async () => {

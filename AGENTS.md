@@ -257,7 +257,7 @@ Folder ownership (unit tests are co-located with the module under test in `src/*
 
 - `src/providers/`: Language Model provider implementations (`liteLLMProviderBase.ts`, `liteLLMChatProvider.ts`, `liteLLMCommitProvider.ts`, `index.ts`)
 - `src/adapters/`: HTTP clients, payload shaping, endpoint-specific parsing, SSE and streaming (`sse/`, `streaming/`), tokenizers
-- `src/utils/`: shared utilities (logging, local request metrics, model helpers, pricing, `thinkingBlocks`, `promptCaching`)
+- `src/utils/`: shared utilities (logging, local request metrics, model helpers, pricing, `thinkingBlocks`, `promptCaching`, `connectorNotice`, `transportRetry`)
 - `src/config/`: configuration and secrets
 - `src/commands/`: command registrations and UI entry points
 - `src/observability/`: structured logging, audit trail, debug export
@@ -340,6 +340,7 @@ A given error should be logged by exactly **one** handler: the layer that **term
 - **NEVER** log API keys, Authorization headers, raw prompt content, user message text, or tool call payloads.
 - Approved log content: model identifiers, endpoint paths, HTTP status codes, durations, token counts, and error codes.
 - One exception: when tool call arguments fail to parse, `stream.tool_call_args_invalid_json`, `vscode.tool_call_parse_failed`, and the `[vscodePartEmitter] Part #<n>: Failed to parse tool call arguments` warning keep an `argsPreview` of at most 160 characters. Merged or truncated arguments can only be diagnosed from their content, for example two calls whose fragments share one buffer.
+- Even at trace level, log the **length** of a payload, delta, or reasoning chunk instead of a slice of it, apart from the tool-argument preview above. The structured channel is mirrored to a file, so a `preview` field is a persisted copy of model output or tool arguments.
 - Quota errors detected in chat history trigger tool redaction before anything is logged or retried (see `disableQuotaToolRedaction`).
 - No `console.log()` with user data, since these lines go to production logs.
 
@@ -540,7 +541,8 @@ Any code you edit must be brought up to these standards:
 - [ ] New provider types extend base and reuse the pipeline (no duplication of request processing or endpoint-specific logic)
 - [ ] Configuration handling respects the VS Code per-group provider config system
   - Provider secrets handled via `languageModelChatProviders.configuration` in `package.json`
-  - Per-group `options.configuration` is read on every provider call (no global config caching)
+  - Per-group `options.configuration` is read on every discovery call (no global config caching)
+  - Response-time routing resolves the group by the model object VS Code passes back
   - Workspace settings retrieved via `vscode.workspace.getConfiguration()`
   - Use `ConfigManager.convertProviderConfiguration()` to unify config sources
 - [ ] All `LanguageModelChatInformation` entries returned from `provideLanguageModelChatInformation` set `isUserSelectable: true` so they appear in the VS Code model picker
@@ -560,7 +562,8 @@ This repository is a **VS Code extension**. Agents must follow these rules when 
 - **Engine target**: `package.json` `engines.vscode` is `^1.125.0`. All provider code must assume the VS Code 1.125 Language Model API surface.
 - **Configuration and secrets (per-group configuration)**:
   - Language model provider configuration (base URL, API key, and any per-backend settings) is declared via the `languageModelChatProviders` contribution point in `package.json`.
-  - VS Code supports **per-group configuration**: each configured provider group passes its own `options.configuration` into `provideLanguageModelChatInformation` and request methods. The provider must read configuration from `options.configuration` for every call rather than caching globally.
+  - VS Code supports **per-group configuration**: each configured provider group passes its own `options.configuration` into `provideLanguageModelChatInformation`. The provider must read configuration from `options.configuration` for every discovery call rather than caching globally.
+  - At **response time**, `options.configuration` is the per-model picker configuration (`reasoningEffort`, `temperature`), not the group's credentials. Resolve credentials by the model object VS Code passes back (`registry.lookupInfo(model)`), falling back to the id only when the object was not produced by this registry.
   - Configuration properties marked with `"secret": true` are encrypted by VS Code.
   - Use `ConfigManager.convertProviderConfiguration()` to convert VS Code's per-group config object into the internal `LiteLLMConfig` format.
   - For non-provider secrets: use `vscode.SecretStorage` via `ConfigManager`. **Never** use `globalState`.
@@ -587,7 +590,7 @@ This extension integrates LiteLLM proxies into VS Code's Language Model APIs (ch
   - One instance serves every concurrent request (chat sessions, subagents, and background requests such as title generation), so request state never lives in instance fields. Shared instance state would let one session's tool calls, text, or usage reach another session's response.
     - The stream interpreter state is created per upstream attempt in `processStreamingResponse`, because a resumed retry is a new upstream response.
     - `StreamTokenCapture` and the retry accumulators are locals of `provideLanguageModelChatResponse`, because they span every attempt of one request.
-  - Reads per-group configuration from `options.configuration` on each call (no global config caching).
+  - Reads the per-group credentials from the model object VS Code passes back (see [Configuration Flow](#configuration-flow-per-group)); the per-model picker configuration still arrives on `options.configuration`.
   - Returns `LanguageModelChatInformation` entries with `isUserSelectable: true` so models appear in the picker.
   - Reuses the base request pipeline for normalization, filtering, trimming, and routing.
 
@@ -601,7 +604,7 @@ This extension integrates LiteLLM proxies into VS Code's Language Model APIs (ch
   - Registers `LiteLLMChatProvider` with `vscode.lm.registerLanguageModelChatProvider("litellm-connector", provider)`.
   - The extension does NOT register a `LanguageModelTextCompletionProvider`. Completions are handled by VS Code's native tag-routing (the `inline-completions` tag on chat models) routed through the chat provider.
   - Both providers share the same `context.secrets` for `SecretStorage` (if needed for non-provider secrets).
-  - Both receive per-group configuration from VS Code via `options.configuration` in `provideLanguageModelChatInformation` and request methods.
+  - Both receive per-group configuration from VS Code via `options.configuration` in `provideLanguageModelChatInformation`; response-time routing follows the model object VS Code passes back.
   - The configuration schema is defined in the `package.json` `languageModelChatProviders` contribution point (VS Code per-group format).
 
 - **Adapters**:
@@ -609,7 +612,6 @@ This extension integrates LiteLLM proxies into VS Code's Language Model APIs (ch
   - `src/adapters/responsesAdapter.ts`: LiteLLM `/responses` endpoint payload translation.
   - `/responses` stream event handling (`output_item.delta`, `output_item.done`, anonymous tool buffering) lives in `src/adapters/streaming/liteLLMStreamInterpreter.ts`.
   - `src/adapters/streaming/usagePayload.ts`: normalizes LiteLLM's usage variants into the internal shape and resolves the Anthropic cache-write and cache-read counters from `prompt_tokens_details`, `input_token_details`, or the top-level mirrors (in that precedence).
-  - `src/adapters/streaming/textToolCallParser.ts`: the parser for tool calls that LiteLLM backends stream wrapped in tagged text fragments (tag constants, escape-safe patterns, stable text splitting).
   - `src/adapters/tokenUtils.ts`: token budgeting, trimming, and related helpers.
 
 - **Config**: `src/config/configManager.ts`
@@ -641,8 +643,12 @@ Keep this pipeline shared unless the change is intentionally protocol-specific a
 
 - **Request part conversion**: handle `LanguageModelTextPart` and `LanguageModelBinaryPart` (vision). Images must be encoded for OpenAI-compatible payloads. Tool result images follow the provider-specific shapes described in [Multimodal Tool Results](#multimodal-tool-results).
 - **Streaming state management**: buffer partial tool calls when SSE frames arrive fragmented. When a stream ends without a finish frame, either closing cleanly or closing before `[DONE]` with an unterminated frame, its buffered chat-completions tool calls are settled by the rules of a non-`tool_calls` finish frame: complete calls reach VS Code, incomplete or invalid ones are dropped with a `stream.tool_call_buffer_dropped` warning tagged with the request id, and ids already emitted are skipped. If an unterminated-frame ending recovers no call, the retry loop resumes the request. A transport read error such as `terminated` and an inactivity abort resume the request without recovery, and a cancelled stream discards its buffers.
+- **Upstream failures inside the stream**: the interpreter throws `UpstreamStreamError` for a chat-completions `{"error": ...}` frame (the proxy's mid-stream failure shape) and for the Responses API `error` and `response.failed` events. The retry loop treats a transient one (408, 409, 425, 429, 5xx including Anthropic's 529, or an overloaded / rate-limit / timeout / unavailable code) exactly like a dropped socket: it resumes, except when a tool call was already delivered. A rejected request surfaces the upstream message instead. Never let one of these frames fall through to the reasoning-only detector, which would retry a hard failure.
+- **Visible stop reasons**: a `length` or `content_filter` finish reason reports a `stream.stopped_early` warning and appends a connector notice text part to the response, because an incomplete answer is otherwise indistinguishable from a finished one.
+- **A response only ever ends when its body is closed**: `processStreamingResponse` cancels the upstream body in `finally`; every exit path (error frame, retry, recovered tool calls) must stop the provider from generating and billing.
 - **Response emission**: emit `LanguageModelResponsePart`, `LanguageModelToolCallPart`, `LanguageModelToolResultPart` to the progress callback.
-- **Tool call parsing**: extract and validate tool calls from streaming chunks.
+- **Tool call parsing**: extract and validate tool calls from the structured streaming fields only. Text that looks like a tool call (`<tool_call>`, `<|tool_call_begin|>`) is model output and is emitted verbatim: turning it into a `LanguageModelToolCallPart` would let a model's explanation of a tool-call format execute a real tool.
+- **Connector notices**: text the connector writes itself (failure explanations, stop notices) is `formatConnectorNotice(...)` from `src/utils/connectorNotice.ts`. A notice starts the response or a new block, so a notice appended to streamed text carries `\n\n` before the prefix; `splitConnectorNotice` only recognises the prefix at the start or after a blank line. Consumers such as commit-message generation rely on that shape and must not mistake a notice for model output.
 - **Cost tracking**: pricing from LiteLLM `/model/info` is extracted and propagated through `StreamTokenCapture`. Request-level estimated costs are attached to usage payloads and telemetry metrics.
 
 ### Anthropic Thinking Preservation (Claude)
@@ -682,12 +688,15 @@ Configuration from user settings reaches providers via VS Code's language model 
 
 1. User configures Base URL, API Key, and any other declared properties for a provider group in the language model provider settings UI.
 2. VS Code encrypts secrets (fields marked `"secret": true` in `package.json`).
-3. VS Code passes the per-group configuration to the provider via `options.configuration` on every `provideLanguageModelChatInformation` and request method invocation.
+3. VS Code passes the per-group configuration to the provider via `options.configuration` on `provideLanguageModelChatInformation`.
 4. `ConfigManager.convertProviderConfiguration()` converts the per-group object to internal `LiteLLMConfig` format.
-5. The base orchestrator uses that config for model discovery, HTTP client setup, etc., scoped to the originating group.
-6. Workspace-level settings (model overrides, caching preferences) are retrieved via `vscode.workspace.getConfiguration()`.
+5. Discovery uses that config for model discovery and records each returned model object in the registry (see [BackendRegistry Contract](#backendregistry-contract)).
+6. Response-time resolution differs by shape, and both paths must work:
+   - `options.configuration` at response time is the **per-model picker configuration** (`reasoningEffort`, `temperature`), not the group's credentials. Treat it as group credentials only when it carries both a usable `baseUrl` and `apiKey`.
+   - Otherwise resolve by the model object VS Code passed back (`lookupInfo(model)`), falling back to the id (`lookup(model.id)`). The object is the exact one this group's discovery returned, which is what distinguishes two groups on the same host.
+7. Workspace-level settings (model overrides, caching preferences) are retrieved via `vscode.workspace.getConfiguration()`.
 
-Provider code must not assume a single global configuration. Multiple groups may be active simultaneously and each call must use its own `options.configuration`.
+Provider code must not assume a single global configuration. Multiple groups may be active simultaneously and each call must use its own `options.configuration` at discovery time and its own model object at response time.
 
 ### Endpoint Agnosticism
 
@@ -719,21 +728,24 @@ The contract is **public read, internal write**:
 
 - **Public surface (read + ingress)**:
   - `discoverModels(options, token)`: the only way for VS Code (or any consumer) to fetch a model list and populate the registry. The registry owns the HTTP fetch, the namespacing (`<routing>/<rawModel>` ids), and the change detection. Consumers see a single ingress that returns the model list, updates the registry, and fires the change event as a unit. Discovery applies LiteLLM's paused-model listing rule (see `toListableDeployments`): deployments with `model_info.blocked === true` are dropped, each public `model_name` is listed once from its first live deployment, and a name whose every deployment is paused is hidden.
-  - `lookup(id)`: resolve a namespaced id to its routing entry (`{baseUrl, apiKey, rawModelName, routingIdentity}`). The response path uses this as the fallback when VS Code does not pass the per-group BYOK config on the call.
+  - `lookup(id)`: resolve a namespaced id to its routing entry (`{baseUrl, apiKey, rawModelName, routingIdentity}`). This is the fallback for a model object the registry did not produce.
+  - `lookupInfo(info)`: resolve the exact model object VS Code passes back at request time. This is the primary response-time path, because two groups on the same host produce the same namespaced ids but different credentials. The registry records each object in a `WeakMap` as it returns it from discovery.
   - `extractRawName(id)`: strip the routing prefix from a namespaced id.
-  - `getModelInfo(id)` / `getDerivedCapabilities(id)`: read the per-model capability caches populated during discovery. These are NOT a model-list cache. They cache the capability info for known models and feed the request hot path.
+  - `getModelInfo(id)` / `getDerivedCapabilities(id)`: read the per-model capability caches populated during discovery. These are NOT a model-list cache. They cache the capability info for known models and feed the request hot path. Ids are per host, so two groups on one host share these entries.
   - `size()`, `clear()`, `clearCaches()`: registration-state reads and reset. `clear()` wipes the routing table (user-initiated reload). `clearCaches()` wipes the capability caches and the backoff controller.
-  - `recordUnsupportedParameter(modelId, param)` / `getUnsupportedParameters(modelId)`: the in-session store of parameters a live 400 taught the client to strip. Keyed by the raw model name (the request body's `model` value). The transport wires the client's strip-and-retry callback into `recordUnsupportedParameter`; the request builder reads `getUnsupportedParameters` to skip re-sending what a model already rejected.
+  - `recordUnsupportedParameter(modelId, param)` / `getUnsupportedParameters(modelId)`: the in-session store of parameters a live 400 taught the client to strip. Keyed by the raw model name (the request body's `model` value). The transport wires the client's strip-and-retry callback into `recordUnsupportedParameter`; the request builder reads `getUnsupportedParameters` to skip re-sending what a model already rejected. Only connector-added parameters (the `cache_control` marker) are recorded: a model parameter the proxy's `/model/info` claimed to support is surfaced to the user instead of being stripped.
   - `onDidChange`: fires when a backend's model set has actually changed. The base provider subscribes once and forwards to VS Code's `onDidChangeLanguageModelChatInformation`.
 
 - **Internal surface (write, NOT part of the public contract)**:
-  - `setModelsForBackend(...)`, `getModelsForBackend(baseUrl)`, `getModelIdsForBackend(baseUrl)`: internal write/read, used only by `discoverModels` itself for change detection. They are TypeScript `private` and MUST NOT be called from outside the class. Tests that need to seed a known (id to backend) mapping cast via `unknown` to a typed test seam.
+  - `setModelsForBackend(backendKey, baseUrl, apiKey, routingIdentity, models)`, `getModelsForBackend(backendKey)`, `getModelIdsForBackend(backendKey)`: internal write/read, used only by `discoverModels` itself for change detection and stale fallback. They are TypeScript `private` and MUST NOT be called from outside the class. Tests that need to seed a known (id to backend) mapping cast via `unknown` to a typed test seam. `backendKey` is the backend identity: the server URL plus an API-key hash suffix, so two groups on one host keep separate change-detection state.
 
 **Why merge discovery into the registry?** The previous design kept `ModelDiscovery` as a separate class and the registry as a pure data structure. The base provider had to call `modelDiscovery.discover(...)`, then `registry.setModelsForBackend`, then check `registry.getModelIdsForBackend` for change detection, a three-step orchestration that was easy to get wrong (write-before-compare silently broke change detection). With the merge, `discoverModels` is the only call site that needs to know the write protocol exists, and consumers see a single ingress.
 
-**Short-lived discovery cache**: the registry keeps a TTL-bound response cache keyed by normalized `baseUrl` plus an API-key hash suffix (first 8 chars of SHA-256). Cache entries are invalidated by `clear()`, `clearCaches()`, and manual reloads. Set `discoveryCacheTtlMs=0` to disable caching entirely.
+**Short-lived discovery cache**: the registry keeps a TTL-bound response cache keyed by backend identity (the server URL with trailing slashes trimmed, plus a hash suffix of the API key) rather than by host alone. Cache entries are invalidated by `clear()`, `clearCaches()`, and manual reloads. Set `discoveryCacheTtlMs=0` to disable caching entirely.
 
-**Debounced outward change notifications**: the registry coalesces repeated discovery changes through a trailing-edge debounce and minimum fire interval before forwarding to VS Code. This reduces re-query amplification across configured provider groups without suppressing real model changes. Configure via `discoveryFireDebounceMs` (default 250ms) and `discoveryFireMinIntervalMs` (default 2000ms), or disable by setting to 0.
+**Stale-while-error**: a refresh that fails for a transient reason (network, timeout, 5xx, anything except a 400/401/403/404 response) returns the models this backend delivered last time, copied with a warning `statusIcon` and `warningText` so the failure stays visible in the picker. A misconfigured group (400/401/403/404) returns an empty list so the real error is not hidden, and so does a group with no prior successful discovery. Emptying a working group would otherwise drop the model choice of a running chat session.
+
+**Change notifications are immediate**: `discoverModels` fires `onDidChange` as soon as a backend's model id set differs from its prior delivery. The registry has a `DebouncedEmitter` for this purpose, but the discovery path calls `_onDidChangeEmitter` directly, so `discoveryFireDebounceMs` and `discoveryFireMinIntervalMs` are not applied on this path.
 
 ### External Dependencies
 

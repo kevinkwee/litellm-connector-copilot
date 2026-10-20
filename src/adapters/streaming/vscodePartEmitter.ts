@@ -32,7 +32,6 @@ export function emitPartsToVSCode(
                 StructuredLogger.trace("vscode.text_part_emitted", {
                     partIndex: idx,
                     length: textValue.length,
-                    preview: textValue.substring(0, 100),
                 });
                 break;
             }
@@ -104,7 +103,6 @@ export function emitPartsToVSCode(
                         partIndex: idx,
                         length: thinkingValue.length,
                         id: part.id,
-                        preview: thinkingValue.substring(0, 100),
                     });
                 } else {
                     Logger.warn(
