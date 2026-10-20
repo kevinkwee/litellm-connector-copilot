@@ -11,6 +11,7 @@ import type {
 import { LanguageModelTextPart } from "vscode";
 
 import { tryParseJSONObject } from "../utils";
+import { formatConnectorNotice } from "../utils/connectorNotice";
 import { Logger } from "../utils/logger";
 import { LiteLLMTelemetry } from "../utils/telemetry";
 import { LiteLLMProviderBase } from "./liteLLMProviderBase";
@@ -26,6 +27,7 @@ import {
     getTotalTokenLimit,
 } from "../adapters/tokenUtils";
 import { decodeSSE } from "../adapters/sse/sseDecoder";
+import { findRejectedParameter, isUnsupportedParameterError, LiteLLMApiError } from "../adapters/litellmClient";
 import {
     createInitialStreamingState,
     interpretStreamEvent,
@@ -41,12 +43,53 @@ import {
     StreamedTextAccumulator,
     InactivityTimeoutError,
     ReasoningOnlyError,
+    UpstreamStreamError,
     isTransportRetriableError,
     buildResumeMessages,
     sleepWithCancellation,
     backoffDelayMs,
     logTransportRetry,
 } from "../utils/transportRetry";
+
+/**
+ * Returns the notice for a finish reason that leaves the answer incomplete, or
+ * `undefined` for reasons that need none. The returned notice begins a new block
+ * (`\n\n`), as `splitConnectorNotice` requires for a notice after model text.
+ */
+function describeStoppedEarly(reason: string | undefined): { reason: string; notice: string } | undefined {
+    if (reason === "length") {
+        return {
+            reason,
+            notice:
+                "\n\n" +
+                formatConnectorNotice(
+                    "The response stopped at the model's output token limit, so it is incomplete. " +
+                        "Raise the model's max output tokens, or ask it to continue."
+                ),
+        };
+    }
+    if (reason === "content_filter") {
+        return {
+            reason,
+            notice:
+                "\n\n" +
+                formatConnectorNotice(
+                    "The provider's content filter ended the response early; part of the answer was withheld."
+                ),
+        };
+    }
+    return undefined;
+}
+
+/**
+ * Closes an upstream response body the stream loop may have stopped reading.
+ * `decodeSSE` releases its reader lock before returning, so this is safe for an
+ * open body (cancels the transfer), a closed one (no-op), or a locked or errored
+ * one (the rejection is ignored, because there is nothing else to do about it).
+ */
+function cancelUpstreamBody(body: ReadableStream<Uint8Array>): void {
+    void body.cancel().catch(() => undefined);
+}
 
 /**
  * Chat provider implementation for VS Code's LanguageModelChatProvider.
@@ -448,6 +491,13 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         delayMs: delay,
                         resumedTextChars: accumulator.text.length,
                         error: err instanceof Error ? err.message : String(err),
+                        ...(err instanceof UpstreamStreamError
+                            ? {
+                                  upstreamStatus: err.status,
+                                  upstreamCode: err.code,
+                                  upstreamType: err.type,
+                              }
+                            : {}),
                     });
                     // Fresh attempt: drop partial-response token accounting so
                     // the next usage snapshot reflects only the resumed stream.
@@ -555,7 +605,18 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 const errorText = errorParts.length > 1 ? errorParts.slice(1).join("\n") : "";
                 const parsedMessage = this.parseApiError(statusCode, errorText);
                 errorMessage = `LiteLLM Error (${model.id}): ${parsedMessage}`;
-                if (
+
+                // Resending the identical body would fail the same way, so the
+                // rejection is reported once with the proxy-side fix. Only
+                // parameters the connector adds itself are ever stripped.
+                const rejectionBody = err instanceof LiteLLMApiError ? err.bodyText : errorText;
+                if (isUnsupportedParameterError(rejectionBody)) {
+                    const rejectedParameter = findRejectedParameter(rejectionBody);
+                    const subject = rejectedParameter ? `"${rejectedParameter}"` : "a model parameter";
+                    errorMessage +=
+                        `. The proxy rejected ${subject}: drop it there with additional_drop_params ` +
+                        `or drop_params in the LiteLLM model config, then reload the models.`;
+                } else if (
                     parsedMessage.toLowerCase().includes("temperature") ||
                     parsedMessage.toLowerCase().includes("unsupported value")
                 ) {
@@ -636,7 +697,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // with the error as an assistant text part keeps the turn in
             // history; cancellation stays a throw because VS Code renders
             // that state itself.
-            trackingProgress.report(new LanguageModelTextPart(`[litellm-connector] ${errorMessage}`));
+            trackingProgress.report(new LanguageModelTextPart(`\n\n${formatConnectorNotice(errorMessage)}`));
             Logger.warn(`Chat request surfaced as assistant error text instead of throwing | RequestID: ${requestId}`);
         }
     }
@@ -674,6 +735,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         let sawToolCallPart = false;
         let sawUsagePart = false;
         let reasoningChars = 0;
+        // Set by a `finish` part that ends the turn without completing it.
+        let stoppedEarly: { reason: string; notice: string } | undefined;
 
         // Create an AbortController to actually cancel the stream on timeout
         const controller = new AbortController();
@@ -688,6 +751,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     sawUsagePart = true;
                 } else if (part.type === "thinking") {
                     reasoningChars += typeof part.value === "string" ? part.value.length : part.value.join("").length;
+                } else if (part.type === "finish") {
+                    stoppedEarly = describeStoppedEarly(part.reason) ?? stoppedEarly;
                 }
             }
             emitPartsToVSCode(parts, progress);
@@ -760,14 +825,14 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 resetWatchdog();
                 eventCount++;
 
-                Logger.trace(`[processStreamingResponse] Event #${eventCount} payload: ${payload.slice(0, 150)}`);
+                Logger.trace(`[processStreamingResponse] Event #${eventCount} received, length=${payload.length}`);
 
                 const jsonResult = tryParseJSONObject(payload);
                 if (!jsonResult.ok) {
                     Logger.trace(`[processStreamingResponse] Event #${eventCount}: Skipped (JSON parse failed)`);
                     StructuredLogger.trace("stream.event_parse_skipped", {
                         eventNumber: eventCount,
-                        payloadPreview: payload.slice(0, 150),
+                        payloadLength: payload.length,
                     });
                     continue;
                 }
@@ -824,6 +889,21 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 });
                 throw new ReasoningOnlyError(eventCount, reasoningChars);
             }
+
+            // Deliberately after the reasoning-only check: if the model only
+            // reasoned before hitting its limit, the retry path is the better
+            // answer than a notice about a response that never appeared.
+            if (stoppedEarly) {
+                Logger.warn(
+                    `[processStreamingResponse] request=${requestId} Stream stopped by finish reason "${stoppedEarly.reason}"`
+                );
+                StructuredLogger.warn("stream.stopped_early", {
+                    requestId,
+                    reason: stoppedEarly.reason,
+                    eventCount,
+                });
+                progress.report(new LanguageModelTextPart(stoppedEarly.notice));
+            }
         } catch (error: unknown) {
             Logger.error(
                 `[processStreamingResponse] request=${requestId} Stream processing failed after ${eventCount} events`,
@@ -840,6 +920,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             });
 
             const isStreamEndError =
+                !(error instanceof UpstreamStreamError) &&
                 error instanceof Error &&
                 (error.message.includes("Stream ended before [DONE] marker") ||
                     error.message.includes("stream ended") ||
@@ -870,6 +951,10 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             if (watchdog) {
                 clearTimeout(watchdog);
             }
+            // Every exit path releases the reader, but an early exit (error
+            // frame, reasoning-only retry, recovered tool calls) would otherwise
+            // leave the upstream generating and billing until it finishes.
+            cancelUpstreamBody(responseBody);
         }
     }
 }

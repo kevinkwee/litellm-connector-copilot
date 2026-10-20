@@ -17,6 +17,11 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Unsigned or malformed signed blocks are ignored rather than reconstructed; user and system messages never receive signatures.
 - Claude stream usage reports Anthropic prompt-cache counters separately: cache-write tokens are billed at the cache-write price and cache-read tokens at the cache-read price in the estimated request costs.
 
+### DeepSeek reasoning continuity across tool calls
+- DeepSeek thinking mode requires `reasoning_content` on every assistant turn in the active tool loop whenever the request carries tools, including turns where the model produced no reasoning. Omitting the field makes the upstream return `400 ... The reasoning_content in the thinking mode must be passed back to the API.`
+- For DeepSeek models, the connector fills `reasoning_content: ""` on active-turn assistant messages that have no reasoning part. Real reasoning replayed by VS Code is preserved.
+- The fill is DeepSeek-only and scoped to the active turn (assistant messages after the latest real user message). Completed turns and every non-DeepSeek model keep their existing payload unchanged.
+
 ### Anthropic prompt caching
 - New setting `litellm-connector.anthropicPromptCaching` (`off` | `5m` | `1h`, default `5m`) marks Claude requests with a top-level `cache_control` ephemeral CachePoint that LiteLLM forwards to the Claude API, so repeated prefixes (system prompt, tools, conversation history) are served from Anthropic's prompt cache. Unrelated to `litellm-connector.disableCaching`, which bypasses the LiteLLM proxy response cache.
 - `1h` cache writes cost 2x input tokens versus 1.25x for `5m`; cache reads cost 0.1x for both tiers. Applies only to Anthropic Claude models; commit message generation never marks its one-shot prompts.
@@ -43,10 +48,13 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 
 ### Streaming resilience
 - Transport-level retry with mid-stream resume: when a stream dies mid-response, the connector rebuilds the request and resumes from the last assistant turn, appending a "Continue" nudge.
+- Upstream failures reported *inside* the stream (LiteLLM's mid-stream `{"error": ...}` frame, and the Responses API `error` and `response.failed` events) are no longer ignored: transient ones (408, 409, 425, 429, 5xx including Anthropic's 529, overloaded, rate-limit, timeout) resume the request, and everything else surfaces the upstream message instead of ending the turn silently or being misread as an empty response.
+- A response that stops at the output-token limit (`length`) or behind a content filter (`content_filter`) ends with a visible note explaining why it is incomplete.
 - Reasoning-only streaming responses are retried instead of surfacing as empty replies.
 - Cancellation and watchdog aborts are surfaced correctly on clean stream completion instead of being masked by retry exhaustion.
 - Complete tool calls still buffered when a stream ends without a finish frame are delivered instead of discarded, and each concurrent session keeps its own stream state, so one session's tool calls never reach another.
-- Configurable 429 retry budget via `litellm-connector.rateLimitMaxDelaySeconds` (honors `Retry-After`); the `networkRetries` cap was removed.
+- An abandoned upstream response body is cancelled, so a retried or failed request stops generating and billing.
+- Configurable 429 retry budget via `litellm-connector.rateLimitMaxDelaySeconds` (honors `Retry-After`); `networkRetries` and `networkRetryDelayMs` bound the resume attempts for dropped connections and transient upstream errors.
 
 ### Request handling fixes
 - Reasoning-only assistant messages are supported (empty-string content) instead of being rejected.
@@ -54,6 +62,13 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Request errors are surfaced as response text instead of thrown exceptions, and the streaming cancellation listener is disposed when the stream ends.
 - `discoveryTimeoutMs` is passed through to per-session clients.
 - Model discovery applies LiteLLM's paused-model rule: deployments a proxy admin paused (`model_info.blocked`) are dropped during `/model/info` discovery, a public model name stays listed while at least one of its deployments is live, and each name is listed once.
+- A model-list refresh that fails for a transient reason (network, timeout, 408/409/425/429, 5xx) keeps the group's last known models, marked with a warning icon and hover text, instead of emptying the picker (and the model choice of a running session). A misconfigured group (a 400, 401, 403, or 404, or one that never discovered) still shows an empty list so the real error stays visible.
+- Requests route by the model object VS Code returns for the group, so two provider groups on the same LiteLLM host keep their own URL and API key.
+- A rejected model parameter is reported once with the proxy-side fix (`additional_drop_params` / `drop_params`) instead of being stripped and resent. Only parameters the connector adds itself (the `cache_control` prompt-caching marker and the cache-bypass flag) are removed and retried.
+- A model that rejects `stream_options.include_usage` is remembered under its raw model name, so later requests omit the flag without paying another failed round trip.
+- Tool-call-shaped text in a model's answer is delivered as text; only structured tool-call fields can trigger a tool.
+- `autoTrimMessages` never keeps a tool result whose tool call was trimmed away, which providers reject.
+- Commit-message generation treats a connector notice as a failure and restores the message the user had typed.
 
 ### New settings
 - `litellm-connector.anthropicPromptCaching` (Anthropic prompt caching, default `5m`): see the dedicated section above.

@@ -1,6 +1,7 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
 import { LiteLLMChatProvider } from "../../providers";
+import { LiteLLMApiError } from "../../adapters/litellmClient";
 import * as sinon from "sinon";
 import { createMockSecrets } from "../../test/utils/testMocks";
 
@@ -21,7 +22,7 @@ suite("LiteLLM Error Handling Unit Tests", function () {
         sandbox.restore();
     });
 
-    test("provideLanguageModelChatResponse retries without parameters on unsupported parameter error", async () => {
+    test("provideLanguageModelChatResponse reports a rejected model parameter without resending the request", async () => {
         const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
 
         interface ProviderWithConfig {
@@ -44,7 +45,7 @@ suite("LiteLLM Error Handling Unit Tests", function () {
                 type: "invalid_request_error",
             },
         });
-        const apiError = new Error(`LiteLLM API error: 400 Bad Request\n${errorText}`);
+        const apiError = new LiteLLMApiError(400, errorText, `LiteLLM API error: 400 Bad Request\n${errorText}`);
 
         // Stub `sendRequestToLiteLLM` directly (provider creates its own client instance).
         const sendStub = sandbox.stub(
@@ -57,22 +58,7 @@ suite("LiteLLM Error Handling Unit Tests", function () {
             },
             "sendRequestToLiteLLM"
         );
-        sendStub.onFirstCall().rejects(apiError);
-        const encoder = new TextEncoder();
-        // Important: `decodeSSE` splits on single newlines, so each SSE line must end with `\n`.
-        const successChunks = [
-            encoder.encode('data: {"choices":[{"delta":{"content":"Success after retry"}}]}\n'),
-            encoder.encode("data: [DONE]\n"),
-        ];
-        const successStream = new ReadableStream<Uint8Array>({
-            start(controller) {
-                for (const chunk of successChunks) {
-                    controller.enqueue(chunk);
-                }
-                controller.close();
-            },
-        });
-        sendStub.onSecondCall().callsFake(async () => successStream);
+        sendStub.rejects(apiError);
 
         const model: vscode.LanguageModelChatInformation = {
             id: "test-model",
@@ -94,26 +80,28 @@ suite("LiteLLM Error Handling Unit Tests", function () {
             requestInitiator: "test",
         };
 
-        // Validate retry behavior (request mutation) without depending on streaming emission.
-        const progress: vscode.Progress<vscode.LanguageModelResponsePart> = { report: () => {} };
-
+        const parts: vscode.LanguageModelResponsePart[] = [];
         await provider.provideLanguageModelChatResponse(
             model,
             messages,
             options,
-            progress,
+            { report: (part) => parts.push(part) },
             new vscode.CancellationTokenSource().token
         );
 
-        assert.strictEqual(sendStub.callCount, 2);
-        // Check that the second call didn't have temperature
-        const secondCallArgs = sendStub.getCall(1).args[0] as Record<string, unknown>;
-        assert.strictEqual(secondCallArgs.temperature, undefined);
-
-        // Streaming emission is covered by the dedicated streaming unit test.
+        // A model parameter the proxy said it supports is never stripped: a
+        // retry with the same body would fail the same way, so the rejection is
+        // reported once with the proxy-side fix.
+        assert.strictEqual(sendStub.callCount, 1);
+        const errorPart = parts.find(
+            (part) => part instanceof vscode.LanguageModelTextPart && part.value.includes("[litellm-connector]")
+        ) as vscode.LanguageModelTextPart | undefined;
+        assert.ok(errorPart, "expected the failure to surface as an error text part");
+        assert.ok(errorPart.value.includes("additional_drop_params"));
+        assert.ok(errorPart.value.includes('"temperature"'));
     });
 
-    test("provideLanguageModelChatResponse handles unsupported parameter error from LiteLLM (when retry also fails)", async () => {
+    test("provideLanguageModelChatResponse explains how to fix an unsupported model parameter", async () => {
         const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
 
         interface ProviderWithConfig {
@@ -135,7 +123,7 @@ suite("LiteLLM Error Handling Unit Tests", function () {
                 code: "unsupported_parameter",
             },
         });
-        const apiError = new Error(`LiteLLM API error: 400 Bad Request\n${errorText}`);
+        const apiError = new LiteLLMApiError(400, errorText, `LiteLLM API error: 400 Bad Request\n${errorText}`);
 
         // Stub `sendRequestToLiteLLM` directly. The per-group routing checks
         // `getDiscoveredModelBackend` to find a backend for the model. In the unit-test
@@ -187,12 +175,12 @@ suite("LiteLLM Error Handling Unit Tests", function () {
         const errorPart = progressParts.find(
             (part): part is vscode.LanguageModelTextPart =>
                 typeof (part as unknown as { value?: unknown })?.value === "string" &&
-                String((part as unknown as { value?: unknown }).value).startsWith("[litellm-connector]")
+                String((part as unknown as { value?: unknown }).value).includes("[litellm-connector]")
         );
         assert.ok(errorPart, "expected the failure to surface as an error text part");
         assert.ok(errorPart.value.includes("LiteLLM Error (test-model)"));
         assert.ok(errorPart.value.includes("Unsupported parameter: temperature"));
-        assert.ok(errorPart.value.includes("This model may not support certain parameters like temperature"));
+        assert.ok(errorPart.value.includes("additional_drop_params"));
     });
 
     test("provideLanguageModelChatResponse handles generic 400 error", async () => {
@@ -251,7 +239,7 @@ suite("LiteLLM Error Handling Unit Tests", function () {
         const errorPart = genericParts.find(
             (part): part is vscode.LanguageModelTextPart =>
                 typeof (part as unknown as { value?: unknown })?.value === "string" &&
-                String((part as unknown as { value?: unknown }).value).startsWith("[litellm-connector]")
+                String((part as unknown as { value?: unknown }).value).includes("[litellm-connector]")
         );
         assert.ok(errorPart, "expected the failure to surface as an error text part");
         assert.ok(errorPart.value.includes("LiteLLM Error (test-model)"));

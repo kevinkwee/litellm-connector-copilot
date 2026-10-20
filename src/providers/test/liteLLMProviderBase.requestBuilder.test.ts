@@ -474,4 +474,90 @@ suite("RequestBuilder", () => {
             assert.deepStrictEqual(req.cache_control, { type: "ephemeral" });
         });
     });
+
+    suite("DeepSeek reasoning_content fill", () => {
+        const callId = "fc_test_deepseek_123456789012345678901234567890";
+        const messages = [
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelTextPart("do the work")],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [new vscode.LanguageModelToolCallPart(callId, "run", {})],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelToolResultPart(callId, [new vscode.LanguageModelTextPart("ok")])],
+                name: undefined,
+            },
+        ] as unknown as vscode.LanguageModelChatRequestMessage[];
+        const tools = [
+            { name: "run", description: "run", inputSchema: { type: "object", properties: {} } },
+        ] as vscode.LanguageModelChatTool[];
+
+        function options(withTools: boolean): vscode.ProvideLanguageModelChatResponseOptions {
+            return {
+                modelOptions: {},
+                tools: withTools ? tools : [],
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions;
+        }
+
+        setup(() => {
+            configManager.getConfig.resolves({});
+        });
+
+        test("fills empty reasoning_content for a DeepSeek model with tools", async () => {
+            const model = {
+                id: "litellm.example/DeepSeek-V4.1-Flash",
+                maxInputTokens: 1000,
+                maxOutputTokens: 100,
+            } as vscode.LanguageModelChatInformation;
+            const modelInfo = { litellm_provider: "deepseek" } as LiteLLMModelInfo;
+
+            const req = await builder.buildOpenAIChatRequest(messages, model, options(true), modelInfo, "caller");
+
+            assert.strictEqual(req.messages[1].reasoning_content, "");
+        });
+
+        test("does not add reasoning_content for a non-DeepSeek model with tools", async () => {
+            const model = {
+                id: "litellm.example/gpt-5.4-mini",
+                maxInputTokens: 1000,
+                maxOutputTokens: 100,
+            } as vscode.LanguageModelChatInformation;
+            const modelInfo = { litellm_provider: "openai" } as LiteLLMModelInfo;
+
+            const req = await builder.buildOpenAIChatRequest(messages, model, options(true), modelInfo, "caller");
+
+            assert.strictEqual(req.messages[1].reasoning_content, undefined);
+        });
+
+        test("does not add reasoning_content for a DeepSeek model without tools", async () => {
+            const model = {
+                id: "litellm.example/DeepSeek-V4.1-Flash",
+                maxInputTokens: 1000,
+                maxOutputTokens: 100,
+            } as vscode.LanguageModelChatInformation;
+            const modelInfo = { litellm_provider: "deepseek" } as LiteLLMModelInfo;
+
+            const req = await builder.buildOpenAIChatRequest(messages, model, options(false), modelInfo, "caller");
+
+            assert.strictEqual(req.messages[1].reasoning_content, undefined);
+        });
+
+        test("detects DeepSeek from the model id when provider info is absent", async () => {
+            const model = {
+                id: "litellm.example/DeepSeek-V4.1-Flash",
+                maxInputTokens: 1000,
+                maxOutputTokens: 100,
+            } as vscode.LanguageModelChatInformation;
+
+            const req = await builder.buildOpenAIChatRequest(messages, model, options(true), undefined, "caller");
+
+            assert.strictEqual(req.messages[1].reasoning_content, "");
+        });
+    });
 });

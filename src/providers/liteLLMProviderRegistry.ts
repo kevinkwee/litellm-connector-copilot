@@ -3,13 +3,14 @@
  * associated models.
  *
  * This class owns:
- *  1. **Discovery**: a stateless per-group `/model/info` fetch that runs on
- *     every `discoverModels` call. There is no model-list cache: each call
- *     is a fresh HTTP request, and the response is namespaced into
- *     `<routingIdentity>/<rawModelName>` ids.
+ *  1. **Discovery**: a per-group `/model/info` fetch that runs on every
+ *     `discoverModels` call, behind a short TTL response cache (60 s by
+ *     default), namespaced into `<routingIdentity>/<rawModelName>` ids.
  *  2. **Storage**: an in-memory map of (namespaced id) → {baseUrl, apiKey,
- *     rawModelName, routingIdentity}, plus a per-backend view of the last
- *     delivered model list (used solely for change detection).
+ *     rawModelName, routingIdentity}, a `WeakMap` from each delivered model
+ *     object to its routing entry, plus a per-backend view of the last
+ *     delivered model list (used for change detection and for falling back to
+ *     it when a refresh fails).
  *  3. **Change detection**: emits `onDidChange` when a backend's model set
  *     actually differs from the prior delivery, so VS Code only refreshes
  *     the picker when the set has really changed.
@@ -22,6 +23,8 @@
  *  - `discoverModels(options, token)`: the only way for VS Code (or any
  *    consumer) to fetch a model list and populate the registry.
  *  - `lookup(id)`: resolve a namespaced id to its routing entry.
+ *  - `lookupInfo(info)`: resolve the exact model object VS Code passed back,
+ *    which is what distinguishes two groups on the same host.
  *  - `extractRawName(id)`: strip the routing prefix from a namespaced id.
  *  - `getModelInfo(id)` / `getDerivedCapabilities(id)`: read the
  *    capability caches populated during discovery.
@@ -33,8 +36,8 @@
  * Internal surface (write)
  *  - `setModelsForBackend(...)`: internal write, called only by
  *    `discoverInternal`. Not part of the public contract.
- *  - `getModelsForBackend(baseUrl)` / `getModelIdsForBackend(baseUrl)`:
- *    internal read, used only by `discoverInternal` for change detection.
+ *  - `getModelsForBackend(backendKey)` / `getModelIdsForBackend(backendKey)`:
+ *    internal read, used only by `discoverInternal`.
  *
  * Discovery, storage, and change detection live in one class so the
  * write-before-compare change-detection protocol has a single call site:
@@ -43,13 +46,14 @@
  * model list, updates the registry, and fires the change event as a unit.
  *
  * Per-group namespacing
- * The namespaced id format `<routingIdentity>/<rawModelName>` is the
- * keystone of multi-backend support: it lets the response path look up
- * routing in O(1) by id, with no per-backend scan and no ambiguity when
- * two backends advertise the same raw model name. The routing identity is
- * the URL hostname (with the user-entered group name as fallback); the
- * raw model name is the part after the first `/` in the id, preserved
- * unchanged from what the backend returned.
+ * The namespaced id format `<routingIdentity>/<rawModelName>` lets the response
+ * path look up routing in O(1) by id. The routing identity is the URL hostname
+ * (with the user-entered group name as fallback); the raw model name is the
+ * part after the first `/` in the id, preserved unchanged from what the backend
+ * returned. Ids are unique per host, not per group: two groups on one host
+ * produce identical ids, so response-time routing resolves the model object
+ * VS Code passed back (`lookupInfo`) first and only falls back to the id for
+ * objects this registry did not produce.
  */
 import * as vscode from "vscode";
 import type { LanguageModelChatInformation } from "vscode";
@@ -67,6 +71,7 @@ import {
 } from "../utils/modelCapabilities";
 import { deriveGroupNameFromUrl } from "../utils";
 import { sha256HexAsync } from "../utils/discoveryHash";
+import { LiteLLMDiscoveryError } from "../adapters/litellmClient";
 import type { LiteLLMConfig, LiteLLMModelInfo, LiteLLMModelInfoResponse } from "../types";
 import type { ConfigManager } from "../config/configManager";
 import type { BackendSession } from "./backendSession";
@@ -90,22 +95,43 @@ interface CachedDiscoveryResult {
 }
 
 /**
- * Computes a deterministic cache key for discovery responses.
- * Key format: normalizedBaseUrl#apiKeyHashSuffix
- * apiKey is hashed with SHA-256 and only the first 8 chars are used internally.
- * The raw API key is never logged or persisted.
+ * Hashes the API key for use in internal keys. Only the first 8 characters of
+ * the SHA-256 digest are used, so the raw key is never logged or persisted.
  */
 async function hashApiKeySuffixAsync(apiKey: string | undefined): Promise<string> {
     return apiKey ? (await sha256HexAsync(apiKey)).slice(0, 8) : "anonymous";
 }
 
-function normalizeBaseUrl(baseUrl: string): string {
-    // Remove trailing slashes and normalize https:// prefix
-    return baseUrl.replace(/\/+$/, "").replace(/^http:\/\//i, "https://");
+/**
+ * Identity of one configured provider group: its server URL plus a suffix of a
+ * hash of its API key.
+ *
+ * The same value keys the discovery response cache and the per-backend model
+ * list, so groups that differ in URL, scheme, or API key never share a cache
+ * entry. The scheme is kept as written because `http` and `https` may be
+ * different servers.
+ */
+async function toBackendIdentityKey(baseUrl: string, apiKey: string | undefined): Promise<string> {
+    return `${baseUrl.replace(/\/+$/, "")}#${await hashApiKeySuffixAsync(apiKey)}`;
 }
 
-async function toDiscoveryCacheKey(baseUrl: string, apiKey: string | undefined): Promise<string> {
-    return `${normalizeBaseUrl(baseUrl)}#${await hashApiKeySuffixAsync(apiKey)}`;
+/**
+ * Returns a short, log-safe reason for a failed discovery refresh.
+ */
+function describeDiscoveryFailure(err: unknown): string {
+    const message = err instanceof Error ? err.message : String(err);
+    const singleLine = message.replace(/\s+/g, " ").trim();
+    return singleLine.length > 120 ? `${singleLine.slice(0, 117)}...` : singleLine;
+}
+
+/**
+ * Statuses that mean this group is misconfigured rather than the endpoint
+ * being unhealthy. Serving the last known list for one of them would hide the
+ * problem behind a warning icon, so discovery returns an empty list instead.
+ */
+const NON_TRANSIENT_DISCOVERY_STATUS = new Set([400, 401, 403, 404]);
+function isTransientDiscoveryFailure(err: unknown): boolean {
+    return !(err instanceof LiteLLMDiscoveryError && NON_TRANSIENT_DISCOVERY_STATUS.has(err.status));
 }
 
 /**
@@ -223,7 +249,19 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     private readonly _userAgent: string;
 
     private readonly entries = new Map<string, RegistryEntry>();
+    /**
+     * Per-group model lists keyed by backend identity (URL + API-key hash), not
+     * by URL alone, so two groups on one host cannot overwrite each other's
+     * change-detection state and flip `onDidChange` on every refresh.
+     */
     private readonly modelsByBackend = new Map<string, LanguageModelChatInformation[]>();
+    /**
+     * The exact model objects handed to VS Code, mapped to their routing entry.
+     * VS Code calls `provideLanguageModelChatResponse` with the object it stored
+     * for that group, so object identity resolves routing exactly even when two
+     * groups share a hostname and therefore produce the same namespaced ids.
+     */
+    private entriesByInfo = new WeakMap<LanguageModelChatInformation, RegistryEntry>();
 
     /**
      * Tracks parameters that were auto-stripped after a failed request so callers
@@ -266,9 +304,9 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     /**
-     * Gets or creates the debounced change emitter. Uses workspace config if available,
-     * otherwise falls back to defaults. This is called lazily to avoid async config
-     * reads during construction.
+     * Builds the debounced emitter used by `onDidChange` coalescing. Nothing on
+     * the discovery path calls it: `discoverModels` fires the raw emitter so the
+     * picker reflects a model-set change immediately.
      */
     private async getDebouncedEmitter(): Promise<DebouncedEmitter> {
         if (!this._debouncedOnDidChange) {
@@ -303,14 +341,13 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
      *
      * - Vendor-level calls (no `options.configuration`) return `[]` and do
      *   not fire `onDidChange`.
-     * - Per-group calls perform a fresh `/model/info` fetch, namespace the
-     *   ids, record the per-backend view, and fire `onDidChange` if and
-     *   only if the model set for that baseUrl actually differs from the
-     *   prior delivery.
-     *
-     * Stateless by design: there is no model-list cache, no in-flight
-     * de-duplication, and no TTL. Every call is a single HTTP round-trip,
-     * so the picker always reflects the live state of the backend.
+     * - Per-group calls fetch `/model/info` (subject to the short response
+     *   cache), namespace the ids, record the per-backend view, and fire
+     *   `onDidChange` if and only if the model set for that backend actually
+     *   differs from the prior delivery.
+     * - A transient failure with a prior successful delivery returns that
+     *   group's last known models, marked with a warning, so a failed refresh
+     *   does not empty the picker.
      */
     public async discoverModels(
         options: {
@@ -354,6 +391,28 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             const sample = keys.slice(0, 3);
             Logger.trace(
                 `LiteLLMProviderRegistry.lookup MISS: id="${id}" entryCount=${this.entries.size} sampleKeys=[${sample.join(", ")}]`
+            );
+        }
+        return entry;
+    }
+
+    /**
+     * Resolves routing from the model object VS Code passes back at request
+     * time. This is the exact object returned from the group's discovery, so it
+     * distinguishes groups that share a hostname and therefore a model id.
+     *
+     * Returns undefined for a model object this registry did not produce (for
+     * example one built by a test or another provider), which lets callers fall
+     * back to the id-keyed lookup.
+     */
+    public lookupInfo(info: LanguageModelChatInformation | undefined): RegistryEntry | undefined {
+        if (!info) {
+            return undefined;
+        }
+        const entry = this.entriesByInfo.get(info);
+        if (entry) {
+            Logger.trace(
+                `LiteLLMProviderRegistry.lookupInfo HIT: id="${info.id}" -> baseUrl="${entry.baseUrl}" rawModelName="${entry.rawModelName}"`
             );
         }
         return entry;
@@ -421,14 +480,15 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     /**
-     * Wipes every routing entry and every per-backend model list. Call on
-     * user-initiated model reload so the next discovery pass starts from a
-     * clean slate. Does NOT touch the per-model capability caches; call
-     * `clearCaches()` for that.
+     * Wipes every routing entry, the identity map, every per-backend model list,
+     * and the discovery response cache. Call on user-initiated model reload so
+     * the next discovery pass starts from a clean slate. Does NOT touch the
+     * per-model capability caches; call `clearCaches()` for that.
      */
     public clear(): void {
         this.entries.clear();
         this.modelsByBackend.clear();
+        this.entriesByInfo = new WeakMap();
         this.discoveryResponseCache.clear();
     }
 
@@ -475,14 +535,16 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
 
     /**
      * Records the full model list returned by a single backend's discovery
-     * call. Updates both the id-keyed map (source of truth for response-time
-     * routing) and the per-backend model-list view (source of truth for
-     * change detection) atomically.
+     * call. Updates the routing table (keyed by namespaced id for the fallback
+     * lookup, and by object identity for exact per-group routing) and the
+     * per-backend model-list view (source of truth for change detection)
+     * atomically.
      *
      * INTERNAL: only `discoverInternal` calls this. Do not call from
      * outside the class.
      */
     private setModelsForBackend(
+        backendKey: string,
         baseUrl: string,
         apiKey: string,
         routingIdentity: string,
@@ -493,30 +555,59 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             `LiteLLMProviderRegistry.setModelsForBackend: baseUrl="${baseUrl}" routingIdentity="${routingIdentity}" ` +
                 `modelCount=${models.length} sampleIds=[${sample.join(", ")}] priorBackendCount=${this.modelsByBackend.size} priorEntryCount=${this.entries.size}`
         );
-        this.modelsByBackend.set(baseUrl, models);
+        this.modelsByBackend.set(backendKey, models);
         for (const model of models) {
-            this.entries.set(model.id, {
+            const entry: RegistryEntry = {
                 baseUrl,
                 apiKey,
                 rawModelName: this.extractRawName(model.id),
                 routingIdentity,
-            });
+            };
+            this.entries.set(model.id, entry);
+            this.entriesByInfo.set(model, entry);
         }
         Logger.trace(
             `LiteLLMProviderRegistry.setModelsForBackend: post-write backendCount=${this.modelsByBackend.size} entryCount=${this.entries.size}`
         );
     }
 
-    private getModelsForBackend(baseUrl: string): LanguageModelChatInformation[] | undefined {
-        return this.modelsByBackend.get(baseUrl);
+    private getModelsForBackend(backendKey: string): LanguageModelChatInformation[] | undefined {
+        return this.modelsByBackend.get(backendKey);
     }
 
-    private getModelIdsForBackend(baseUrl: string): Set<string> | undefined {
-        const models = this.modelsByBackend.get(baseUrl);
+    private getModelIdsForBackend(backendKey: string): Set<string> | undefined {
+        const models = this.modelsByBackend.get(backendKey);
         if (!models) {
             return undefined;
         }
         return new Set(models.map((m) => m.id));
+    }
+
+    /**
+     * Copies a backend's last known model list with a visible warning, so a
+     * failed refresh leaves the group usable instead of emptying the picker.
+     * The registry's stored objects are never mutated: VS Code keeps the objects
+     * it was handed, and identity is what the response path routes by. Each copy
+     * inherits the original's routing entry, so a request made with a copied
+     * model still resolves to this group's credentials.
+     */
+    private toStaleModels(
+        models: readonly LanguageModelChatInformation[],
+        reason: string
+    ): LanguageModelChatInformation[] {
+        const warningText = `Last model refresh failed: ${reason}. Showing the last known model list.`;
+        return models.map((model) => {
+            const staleModel: LanguageModelChatInformation = {
+                ...model,
+                statusIcon: new vscode.ThemeIcon("warning"),
+                warningText: { ...(model.warningText ?? {}), model_refresh: warningText },
+            };
+            const entry = this.entriesByInfo.get(model);
+            if (entry) {
+                this.entriesByInfo.set(staleModel, entry);
+            }
+            return staleModel;
+        });
     }
 
     // Discovery implementation
@@ -525,6 +616,10 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         options: { silent?: boolean; configuration?: Record<string, unknown>; groupName?: string },
         token: vscode.CancellationToken
     ): Promise<DiscoveryOutcome> {
+        // Set once the backend identity is known, so a transient failure can
+        // fall back to the models this group last delivered.
+        let backendKey: string | undefined;
+        let failureBaseUrl: string | undefined;
         try {
             if (!options.configuration) {
                 // Vendor-level call: nothing to discover. Return an empty list
@@ -535,6 +630,7 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
 
             const configuredBaseUrl =
                 typeof options.configuration.baseUrl === "string" ? options.configuration.baseUrl.trim() : "";
+            failureBaseUrl = configuredBaseUrl;
             const urlHostname = deriveGroupNameFromUrl(configuredBaseUrl).trim();
             const displayLabel = options.groupName ?? (urlHostname.length > 0 ? urlHostname : undefined) ?? "LiteLLM";
 
@@ -558,27 +654,29 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
                 );
             }
             const routingIdentity = (urlHostname.length > 0 ? urlHostname : displayLabel).replace(/\//g, "_");
+            // Identity is known before the fetch, so a failed refresh can still
+            // find the models this group delivered last time.
+            backendKey = await toBackendIdentityKey(session.baseUrl, session.apiKey);
             const models = await this.discoverFromSession(session, token, displayLabel, routingIdentity);
             Logger.trace(
                 `LiteLLMProviderRegistry.discoverModels: fetched ${models.length} models for baseUrl="${session.baseUrl}"`
             );
 
-            // Change detection: read the PRIOR id set for this baseUrl, compare
+            // Change detection: read the PRIOR id set for this backend, compare
             // to the NEW one, then write. Writing first would make the
             // comparison read "now" against "now" and never fire.
-            const baseUrl = session.baseUrl;
             const newIds = new Set(models.map((m) => m.id));
-            const previousIds = this.getModelIdsForBackend(baseUrl);
+            const previousIds = this.getModelIdsForBackend(backendKey);
             const changed = !previousIds || !setsEqual(previousIds, newIds);
             Logger.trace(
-                `LiteLLMProviderRegistry.discoverModels: baseUrl="${baseUrl}" routingIdentity="${routingIdentity}" ` +
+                `LiteLLMProviderRegistry.discoverModels: baseUrl="${session.baseUrl}" routingIdentity="${routingIdentity}" ` +
                     `modelCount=${models.length} sampleIds=[${[...newIds].slice(0, 3).join(", ")}] changed=${changed}`
             );
             if (session.apiKey) {
-                this.setModelsForBackend(baseUrl, session.apiKey, routingIdentity, models);
+                this.setModelsForBackend(backendKey, session.baseUrl, session.apiKey, routingIdentity, models);
             } else {
                 Logger.trace(
-                    `LiteLLMProviderRegistry.discoverModels: skipping registry write (no session/apiKey) baseUrl="${baseUrl}" modelCount=${models.length}`
+                    `LiteLLMProviderRegistry.discoverModels: skipping registry write (no session/apiKey) baseUrl="${session.baseUrl}" modelCount=${models.length}`
                 );
             }
             return { models, changed, session, routingIdentity };
@@ -600,6 +698,27 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
                         `The LiteLLM endpoint appears to be unhealthy. ` +
                         `Please check your configuration and retry later.`
                 );
+            }
+
+            // A refresh that fails must not empty a working group: an in-flight
+            // session would lose its model. Hand back the last known list, marked
+            // so the failure stays visible. A misconfigured group (400, 401, 403,
+            // or 404) reports the empty list instead, so the real error is not
+            // hidden behind a warning icon.
+            const lastKnown =
+                backendKey && isTransientDiscoveryFailure(err) ? this.getModelsForBackend(backendKey) : undefined;
+            if (lastKnown && lastKnown.length > 0) {
+                const reason = describeDiscoveryFailure(err);
+                Logger.warn(
+                    `LiteLLMProviderRegistry.discoverModels: refresh failed for baseUrl="${failureBaseUrl ?? "unknown"}"; serving ${lastKnown.length} last-known model(s)`
+                );
+                StructuredLogger.warn("discovery.stale_models_served", {
+                    baseUrl: failureBaseUrl,
+                    modelCount: lastKnown.length,
+                    attempt: decision.attempt,
+                    reason,
+                });
+                return { models: this.toStaleModels(lastKnown, reason), changed: false, routingIdentity: "" };
             }
             return { models: [], changed: false, routingIdentity: "" };
         }
@@ -630,7 +749,7 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         const ttlMs = config.discoveryCacheTtlMs ?? 60_000;
 
         // Check cache first
-        const cacheKey = await toDiscoveryCacheKey(session.baseUrl, session.apiKey);
+        const cacheKey = await toBackendIdentityKey(session.baseUrl, session.apiKey);
         if (ttlMs > 0) {
             const cached = this.discoveryResponseCache.get(cacheKey);
             if (cached && Date.now() - cached.fetchedAtMs < ttlMs) {

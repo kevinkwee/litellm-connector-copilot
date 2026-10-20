@@ -248,6 +248,95 @@ suite("TokenUtils Unit Tests", () => {
         assert.strictEqual(trimmed[2], continueMsg);
     });
 
+    test("trimMessagesToFitBudget rejects a session the budget cannot hold", () => {
+        const systemMsg = {
+            role: 3 as unknown as vscode.LanguageModelChatMessageRole,
+            content: [new vscode.LanguageModelTextPart("System")],
+        } as unknown as vscode.LanguageModelChatRequestMessage;
+        const requestMsg = {
+            role: vscode.LanguageModelChatMessageRole.User,
+            content: [new vscode.LanguageModelTextPart("Read the file")],
+        } as unknown as vscode.LanguageModelChatRequestMessage;
+        // Huge arguments push the assistant message past the budget, so the
+        // tool result that follows it would be orphaned.
+        const toolCallMsg = {
+            role: vscode.LanguageModelChatMessageRole.Assistant,
+            content: [new vscode.LanguageModelToolCallPart("call-1", "read_file", { path: "x".repeat(4000) })],
+        } as unknown as vscode.LanguageModelChatRequestMessage;
+        const toolResultMsg = {
+            role: vscode.LanguageModelChatMessageRole.User,
+            content: [new vscode.LanguageModelToolResultPart("call-1", [new vscode.LanguageModelTextPart("ok")])],
+        } as unknown as vscode.LanguageModelChatRequestMessage;
+        const modelInfo = {
+            id: "test",
+            maxInputTokens: 1000,
+        } as vscode.LanguageModelChatInformation;
+
+        // Only the system prompt would remain, so the request is rejected
+        // instead of asking the model to work with no task in front of it.
+        assert.throws(
+            () =>
+                trimMessagesToFitBudget(
+                    [systemMsg, requestMsg, toolCallMsg, toolResultMsg],
+                    undefined,
+                    modelInfo,
+                    undefined,
+                    30
+                ),
+            /Message exceeds token limit\./
+        );
+    });
+
+    test("trimMessagesToFitBudget rejects a tool result that cannot be paired", () => {
+        const toolCallMsg = {
+            role: vscode.LanguageModelChatMessageRole.Assistant,
+            content: [new vscode.LanguageModelToolCallPart("call-1", "read_file", { path: "x".repeat(4000) })],
+        } as unknown as vscode.LanguageModelChatRequestMessage;
+        const toolResultMsg = {
+            role: vscode.LanguageModelChatMessageRole.User,
+            content: [new vscode.LanguageModelToolResultPart("call-1", [new vscode.LanguageModelTextPart("ok")])],
+        } as unknown as vscode.LanguageModelChatRequestMessage;
+        const modelInfo = {
+            id: "test",
+            maxInputTokens: 1000,
+        } as vscode.LanguageModelChatInformation;
+
+        // No system message: dropping the orphan would leave an empty request.
+        assert.throws(
+            () => trimMessagesToFitBudget([toolCallMsg, toolResultMsg], undefined, modelInfo, undefined, 30),
+            /Message exceeds token limit\./
+        );
+    });
+
+    test("trimMessagesToFitBudget keeps a tool result paired with its call", () => {
+        const systemMsg = {
+            role: 3 as unknown as vscode.LanguageModelChatMessageRole,
+            content: [new vscode.LanguageModelTextPart("System")],
+        } as unknown as vscode.LanguageModelChatRequestMessage;
+        const toolCallMsg = {
+            role: vscode.LanguageModelChatMessageRole.Assistant,
+            content: [new vscode.LanguageModelToolCallPart("call-1", "read_file", { path: "a.ts" })],
+        } as unknown as vscode.LanguageModelChatRequestMessage;
+        const toolResultMsg = {
+            role: vscode.LanguageModelChatMessageRole.User,
+            content: [new vscode.LanguageModelToolResultPart("call-1", [new vscode.LanguageModelTextPart("ok")])],
+        } as unknown as vscode.LanguageModelChatRequestMessage;
+        const modelInfo = {
+            id: "test",
+            maxInputTokens: 1000,
+        } as vscode.LanguageModelChatInformation;
+
+        const trimmed = trimMessagesToFitBudget(
+            [systemMsg, toolCallMsg, toolResultMsg],
+            undefined,
+            modelInfo,
+            undefined,
+            1000
+        );
+
+        assert.deepStrictEqual(trimmed, [systemMsg, toolCallMsg, toolResultMsg]);
+    });
+
     test("trimMessagesToFitBudget throws when tool tokens consume entire budget", () => {
         const msg = {
             role: vscode.LanguageModelChatMessageRole.User,

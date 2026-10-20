@@ -19,6 +19,18 @@ export function isAnthropicModel(modelId: string, modelInfo?: LiteLLMModelInfo):
 }
 
 /**
+ * Determine whether a model is served by DeepSeek. DeepSeek's thinking mode
+ * requires `reasoning_content` on every assistant turn in the active tool
+ * loop, so only these models receive the empty-field fill.
+ */
+export function isDeepSeekModel(modelId: string, modelInfo?: LiteLLMModelInfo): boolean {
+    if (modelInfo?.litellm_provider && /deepseek/i.test(modelInfo.litellm_provider)) {
+        return true;
+    }
+    return /deepseek/i.test(modelId);
+}
+
+/**
  * Picks the wire shape for images that arrived inside a tool result.
  *
  * Responses API requests always hoist. Their tool output field is a plain

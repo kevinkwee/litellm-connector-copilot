@@ -294,6 +294,14 @@ export interface ConvertMessagesOptions {
      * Defaults to `"hoist"`, which is safe for every OpenAI-compatible provider.
      */
     toolResultImageMode?: ToolResultImageMode;
+    /**
+     * DeepSeek thinking mode requires `reasoning_content` on every assistant
+     * message in the active tool loop, including turns that produced no
+     * reasoning. When true, assistant messages after the latest real user
+     * message get `reasoning_content: ""` when they carry no reasoning of
+     * their own. Completed turns are left untouched.
+     */
+    ensureReasoningContentInActiveTurn?: boolean;
 }
 /** Tool result images waiting for the single follow-up user message of their run. */
 interface PendingToolResultImages {
@@ -312,6 +320,11 @@ export function convertMessages(
     options: ConvertMessagesOptions = {}
 ): OpenAIChatMessage[] {
     const toolResultImageMode = options.toolResultImageMode ?? "hoist";
+    const ensureReasoningContent = options.ensureReasoningContentInActiveTurn === true;
+    // The latest real user message bounds the active turn. Tool-result-only
+    // user messages belong to the running tool loop and must not move the
+    // boundary, or the assistant turns they answer would lose the fill.
+    const lastRealUserMessageIndex = ensureReasoningContent ? findLastRealUserMessageIndex(messages) : -1;
     const out: OpenAIChatMessage[] = [];
     let pendingToolResultImages: PendingToolResultImages[] = [];
     // Tool names resolved from the assistant tool calls, keyed by normalized id.
@@ -335,12 +348,14 @@ export function convertMessages(
         pendingToolResultImages = [];
     };
 
-    for (const m of messages) {
+    for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
+        const m = messages[messageIndex];
+        const carriesToolResults = messageCarriesToolResults(m);
         // Results for one assistant turn can arrive across consecutive messages,
         // so the flush waits until a message that adds no more tool messages.
         // Emitting earlier would place the images between tool messages and break
         // the tool-call adjacency that strict providers require.
-        if (!messageCarriesToolResults(m)) {
+        if (!carriesToolResults) {
             flushPendingToolResultImages();
         }
         // `lmcr_toString` returns "system" | "user" | "assistant" for the supported
@@ -454,14 +469,25 @@ export function convertMessages(
         }
 
         let emittedAssistantToolCall = false;
+        const inActiveAssistantTurn =
+            ensureReasoningContent &&
+            role === "assistant" &&
+            lastRealUserMessageIndex !== -1 &&
+            messageIndex >= lastRealUserMessageIndex;
         // Combine all reasoning parts into one string for the assistant message's
         // `reasoning_content` field. Only set on assistant-role messages; system
         // and user messages don't carry reasoning content. Blocks take
         // precedence: when a turn carries verifiable blocks, the reasoning text
         // path is dropped entirely because LiteLLM's Anthropic transform would
-        // ignore it next to the blocks.
+        // ignore it next to the blocks. The active-turn fill overrides that rule
+        // for DeepSeek, which reads `reasoning_content` and needs the field on
+        // every assistant turn in the running tool loop.
         const reasoningContent =
-            reasoningParts.length > 0 && sealedThinkingBlocks.length === 0 ? reasoningParts.join("\n") : undefined;
+            reasoningParts.length > 0 && (sealedThinkingBlocks.length === 0 || inActiveAssistantTurn)
+                ? reasoningParts.join("\n")
+                : inActiveAssistantTurn
+                  ? ""
+                  : undefined;
         const thinkingBlocks = sealedThinkingBlocks.length > 0 ? sealedThinkingBlocks : undefined;
 
         if (toolCalls.length > 0) {
@@ -470,7 +496,7 @@ export function convertMessages(
                 role: "assistant",
                 content: messageContent || undefined,
                 tool_calls: toolCalls,
-                ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+                ...(reasoningContent !== undefined ? { reasoning_content: reasoningContent } : {}),
                 ...(thinkingBlocks ? { thinking_blocks: thinkingBlocks } : {}),
             });
             emittedAssistantToolCall = true;
@@ -500,7 +526,9 @@ export function convertMessages(
                     out.push({
                         role: role || "user",
                         content: messageContent ?? "",
-                        ...(reasoningContent && role === "assistant" ? { reasoning_content: reasoningContent } : {}),
+                        ...(reasoningContent !== undefined && role === "assistant"
+                            ? { reasoning_content: reasoningContent }
+                            : {}),
                         ...(thinkingBlocks && role === "assistant" ? { thinking_blocks: thinkingBlocks } : {}),
                     });
                 }
@@ -690,6 +718,21 @@ export function isToolResultPart(value: unknown): value is { callId: string; con
  */
 function messageCarriesToolResults(message: vscode.LanguageModelChatRequestMessage): boolean {
     return (message.content ?? []).some((part) => isToolResultPart(part));
+}
+
+/**
+ * Index of the latest user message that is not a tool result, or -1 when the
+ * conversation has none. The active tool loop starts at this message; earlier
+ * turns are completed history and are not modified.
+ */
+function findLastRealUserMessageIndex(messages: readonly vscode.LanguageModelChatRequestMessage[]): number {
+    for (let index = messages.length - 1; index >= 0; index--) {
+        const message = messages[index];
+        if (message.role === vscode.LanguageModelChatMessageRole.User && !messageCarriesToolResults(message)) {
+            return index;
+        }
+    }
+    return -1;
 }
 
 /**
