@@ -54,7 +54,8 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Cancellation and watchdog aborts are surfaced correctly on clean stream completion instead of being masked by retry exhaustion.
 - Complete tool calls still buffered when a stream ends without a finish frame are delivered instead of discarded, and each concurrent session keeps its own stream state, so one session's tool calls never reach another.
 - An abandoned upstream response body is cancelled, so a retried or failed request stops generating and billing.
-- Configurable 429 retry budget via `litellm-connector.rateLimitMaxDelaySeconds` (honors `Retry-After`); `networkRetries` and `networkRetryDelayMs` bound the resume attempts for dropped connections and transient upstream errors.
+- Configurable 429 retry budget via `litellm-connector.rateLimitMaxDelaySeconds`, the most time one call to the proxy spends waiting between rate-limit retries (default 120s). Without `Retry-After`, waits start at 0.5s and double, each at most 60s. A `Retry-After` that fits in the time left is honored exactly, and a longer one fails that call at once with a chat notice naming the setting instead of waiting for a retry that would be refused. Each wait is logged as `[rateLimitRetry]` in the output channel and as `request.rate_limit_retry` in the structured log.
+- `networkRetries` and `networkRetryDelayMs` bound the resume attempts for dropped connections and transient upstream errors.
 
 ### Request handling fixes
 - Reasoning-only assistant messages are supported (empty-string content) instead of being rejected.

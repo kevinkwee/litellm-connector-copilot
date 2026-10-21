@@ -3,7 +3,8 @@ import * as sinon from "sinon";
 import * as vscode from "vscode";
 
 import { LiteLLMChatProvider } from "../";
-import { LiteLLMApiError, LiteLLMClient } from "../../adapters/litellmClient";
+import { LiteLLMApiError, LiteLLMClient, LiteLLMRateLimitError } from "../../adapters/litellmClient";
+import { StructuredLogger } from "../../observability/structuredLogger";
 import type { OpenAIChatCompletionRequest } from "../../types";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
 import { createMockSecrets } from "../../test/utils/testMocks";
@@ -253,6 +254,108 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             (part) => part instanceof vscode.LanguageModelTextPart && part.value.includes("additional_drop_params")
         );
         assert.ok(errorPart, "expected the rejection to surface with the proxy-side hint");
+    });
+
+    /**
+     * Runs one chat request whose client call rejects with `error`, returning the
+     * reported parts, the client call stub, and the request ids of `request.failed` logs.
+     */
+    async function respondWithClientFailure(error: Error): Promise<{
+        parts: vscode.LanguageModelResponsePart[];
+        chatStub: sinon.SinonStub;
+        failedRequestIds: unknown[];
+    }> {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<{ url: string }> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({ url: "http://localhost:4000" });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const chatStub = sandbox.stub(LiteLLMClient.prototype, "chat").rejects(error);
+        const errorLogStub = sandbox.stub(StructuredLogger, "error");
+
+        const parts: vscode.LanguageModelResponsePart[] = [];
+        await provider.provideLanguageModelChatResponse(
+            {
+                id: "model-1",
+                name: "model-1",
+                tooltip: "",
+                family: "litellm",
+                version: "1.0.0",
+                maxInputTokens: 1000,
+                maxOutputTokens: 1000,
+                capabilities: { toolCalling: true, imageInput: false },
+            },
+            [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart("hi")],
+                },
+            ],
+            {
+                modelOptions: {},
+                tools: [],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+                requestInitiator: "test",
+                configuration: { baseUrl: "http://localhost:4000", apiKey: "test-api-key" },
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            { report: (part) => parts.push(part) },
+            new vscode.CancellationTokenSource().token
+        );
+
+        const failedRequestIds = errorLogStub
+            .getCalls()
+            .filter((call) => call.args[0] === "request.failed")
+            .map((call) => (call.args[1] as { requestId?: unknown }).requestId);
+        return { parts, chatStub, failedRequestIds };
+    }
+
+    test("explains a rate-limit give-up in the error notice, naming the setting", async () => {
+        const body = JSON.stringify({ error: { message: "Rate limit reached for model-1" } });
+        const rateLimitError = new LiteLLMRateLimitError(
+            { reason: "retry_after_exceeds_budget", waitedMs: 0, budgetMs: 120_000, retryAfterMs: 300_000 },
+            "Too Many Requests",
+            body
+        );
+
+        const { parts } = await respondWithClientFailure(rateLimitError);
+
+        assert.strictEqual(
+            findErrorTextPart(parts)?.trim(),
+            `[litellm-connector] LiteLLM Error (model-1): Rate limit reached for model-1. ` +
+                `The proxy asked to retry in 300s, more than the 120s left ` +
+                `under litellm-connector.rateLimitMaxDelaySeconds, so the request was not retried. ` +
+                `Try again later, or raise the setting.`
+        );
+    });
+
+    test("does not add the rate-limit hint to other 429 errors", async () => {
+        const body = JSON.stringify({ error: { message: "Too many requests" } });
+
+        const { parts } = await respondWithClientFailure(
+            new LiteLLMApiError(429, body, `LiteLLM API error: 429 Too Many Requests\n${body}`)
+        );
+
+        assert.strictEqual(
+            findErrorTextPart(parts)?.trim(),
+            "[litellm-connector] LiteLLM Error (model-1): Too many requests"
+        );
+    });
+
+    test("passes its request id to the client, so rate-limit logs match the request logs", async () => {
+        const body = JSON.stringify({ error: { message: "Rate limit reached" } });
+        const rateLimitError = new LiteLLMRateLimitError(
+            { reason: "budget_exhausted", waitedMs: 120_000, budgetMs: 120_000 },
+            "Too Many Requests",
+            body
+        );
+
+        const { chatStub, failedRequestIds } = await respondWithClientFailure(rateLimitError);
+
+        const clientRequestId: unknown = chatStub.firstCall.args[4];
+        assert.ok(typeof clientRequestId === "string" && clientRequestId.length > 0, "client got no request id");
+        assert.deepStrictEqual(failedRequestIds, [clientRequestId]);
     });
 
     test("provideLanguageModelChatResponse uses the model VS Code selected without a settings override", async () => {

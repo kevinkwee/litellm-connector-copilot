@@ -488,9 +488,18 @@ export abstract class LiteLLMProviderBase {
         token: vscode.CancellationToken,
         caller?: string,
         modelInfo?: LiteLLMModelInfo,
-        configuration?: Record<string, unknown>
+        configuration?: Record<string, unknown>,
+        requestId?: string
     ): Promise<ReadableStream<Uint8Array>> {
-        return this._transport.sendRequestToLiteLLM(request, _progress, token, caller, modelInfo, configuration);
+        return this._transport.sendRequestToLiteLLM(
+            request,
+            _progress,
+            token,
+            caller,
+            modelInfo,
+            configuration,
+            requestId
+        );
     }
 
     /**
@@ -506,7 +515,8 @@ export abstract class LiteLLMProviderBase {
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
         token: vscode.CancellationToken,
         caller?: string,
-        modelInfo?: LiteLLMModelInfo
+        modelInfo?: LiteLLMModelInfo,
+        requestId?: string
     ): Promise<ReadableStream<Uint8Array>> {
         const modelId = request.model;
         Logger.debug(`[sendRequestWithRetry] modelId: ${modelId}, reasoning_effort: ${request.reasoning_effort}`);
@@ -534,7 +544,8 @@ export abstract class LiteLLMProviderBase {
                     progress,
                     token,
                     caller,
-                    modelInfo
+                    modelInfo,
+                    requestId
                 );
             } catch (err) {
                 this.logRequestPayloadOnFailure(request, err, {
@@ -668,7 +679,8 @@ export abstract class LiteLLMProviderBase {
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
         token: vscode.CancellationToken,
         caller?: string,
-        modelInfo?: LiteLLMModelInfo
+        modelInfo?: LiteLLMModelInfo,
+        requestId?: string
     ): Promise<ReadableStream<Uint8Array>> {
         try {
             return await this.sendRequestToLiteLLM(
@@ -677,7 +689,8 @@ export abstract class LiteLLMProviderBase {
                 token,
                 caller,
                 modelInfo,
-                await this.getCallTimeConfiguration(options, model)
+                await this.getCallTimeConfiguration(options, model),
+                requestId
             );
         } catch (err) {
             if (!isContextOverflowError(err)) {
@@ -717,7 +730,8 @@ export abstract class LiteLLMProviderBase {
                     token,
                     caller,
                     modelInfo,
-                    await this.getCallTimeConfiguration(options, model)
+                    await this.getCallTimeConfiguration(options, model),
+                    requestId
                 );
             } catch (retryErr) {
                 if (isContextOverflowError(retryErr)) {

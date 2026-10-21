@@ -1,6 +1,7 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
 
+import { LiteLLMRateLimitError } from "../../adapters/litellmClient";
 import {
     StreamedTextAccumulator,
     ReasoningOnlyError,
@@ -119,6 +120,16 @@ suite("Transport Retry Utilities", () => {
             new UpstreamStreamError(undefined, undefined, undefined, undefined).message,
             "Upstream stream error: the provider ended the response early"
         );
+    });
+
+    test("isTransportRetriableError does not classify a 429 give-up as transport-retriable", () => {
+        const rateLimitError = new LiteLLMRateLimitError(
+            { reason: "budget_exhausted", waitedMs: 120_000, budgetMs: 120_000 },
+            "Too Many Requests",
+            "Rate limit exceeded"
+        );
+
+        assert.strictEqual(isTransportRetriableError(rateLimitError), false);
     });
 
     test("isTransportRetriableError rejects API errors, cancellation, and reasoning-only", () => {

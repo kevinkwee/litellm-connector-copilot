@@ -5,9 +5,39 @@ import {
     LiteLLMApiError,
     LiteLLMClient,
     LiteLLMDiscoveryError,
+    LiteLLMRateLimitError,
 } from "../litellmClient";
 import * as sinon from "sinon";
+import * as vscode from "vscode";
+import { StructuredLogger } from "../../observability/structuredLogger";
 import type { LiteLLMModelInfo, LiteLLMModelInfoResponse } from "../../types";
+import { Logger } from "../../utils/logger";
+import type { RateLimitFailure } from "../../utils/rateLimitRetryPolicy";
+
+function createRateLimitResponse(retryAfter?: string): Response {
+    return new Response("Rate limit exceeded", {
+        status: 429,
+        statusText: "Too Many Requests",
+        headers: retryAfter === undefined ? {} : { "retry-after": retryAfter },
+    });
+}
+
+function createStreamResponse(): Response {
+    return new Response(new ReadableStream(), { status: 200, statusText: "OK" });
+}
+
+/** Runs a chat request expected to fail and returns the rate-limit facts it gave up with. */
+async function captureRateLimitFailure(client: LiteLLMClient): Promise<RateLimitFailure> {
+    try {
+        await client.chat({ model: "m", messages: [] });
+    } catch (err) {
+        if (err instanceof LiteLLMRateLimitError) {
+            return err.failure;
+        }
+        throw err;
+    }
+    throw new Error("chat resolved, but a LiteLLMRateLimitError was expected");
+}
 
 suite("LiteLLM Client Unit Tests", () => {
     const config = { url: "http://localhost:4000", key: "test-key" };
@@ -581,9 +611,179 @@ suite("LiteLLM Client Unit Tests", () => {
 
         await assert.rejects(() => client.chat({ model: "m", messages: [] }));
 
-        // rateLimitMaxDelayMs=0 means no retry budget: the first 429 must be returned
-        // (and then rejected as a non-ok response) without a second fetch.
         assert.strictEqual(fetchStub.callCount, 1);
+    });
+
+    test("reports rate-limit retries as disabled when the budget is 0", async () => {
+        const client = new LiteLLMClient({ ...config, rateLimitMaxDelayMs: 0 }, userAgent);
+        sandbox.stub(global, "fetch").callsFake(async () => createRateLimitResponse("1"));
+
+        const failure = await captureRateLimitFailure(client);
+
+        assert.deepStrictEqual(failure, {
+            reason: "retries_disabled",
+            waitedMs: 0,
+            budgetMs: 0,
+            retryAfterMs: 1_000,
+        });
+    });
+
+    test("gives up without waiting when Retry-After is longer than the budget", async () => {
+        const client = new LiteLLMClient(config, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch").callsFake(async () => createRateLimitResponse("300"));
+
+        const failure = await captureRateLimitFailure(client);
+
+        assert.deepStrictEqual(
+            { failure, fetchCount: fetchStub.callCount },
+            {
+                failure: {
+                    reason: "retry_after_exceeds_budget",
+                    waitedMs: 0,
+                    budgetMs: 120_000,
+                    retryAfterMs: 300_000,
+                },
+                fetchCount: 1,
+            }
+        );
+    });
+
+    test("gives up without waiting when a Retry-After date is beyond the budget", async () => {
+        const client = new LiteLLMClient(config, userAgent);
+        const tenMinutesAhead = new Date(Date.now() + 600_000).toUTCString();
+        sandbox.stub(global, "fetch").callsFake(async () => createRateLimitResponse(tenMinutesAhead));
+
+        const failure = await captureRateLimitFailure(client);
+
+        assert.strictEqual(failure.reason, "retry_after_exceeds_budget");
+    });
+
+    test("keeps the proxy's 429 body and status on the rate-limit error", async () => {
+        const client = new LiteLLMClient(config, userAgent);
+        sandbox.stub(global, "fetch").callsFake(async () => createRateLimitResponse("300"));
+
+        await assert.rejects(
+            () => client.chat({ model: "m", messages: [] }),
+            (err: unknown) =>
+                err instanceof LiteLLMRateLimitError &&
+                err.status === 429 &&
+                err.bodyText === "Rate limit exceeded" &&
+                err.message === "LiteLLM API error: 429 Too Many Requests\nRate limit exceeded"
+        );
+    });
+
+    test("gives up once backoff waits spend the budget", async () => {
+        const client = new LiteLLMClient({ ...config, rateLimitMaxDelayMs: 20 }, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch").callsFake(async () => createRateLimitResponse());
+
+        const failure = await captureRateLimitFailure(client);
+
+        assert.deepStrictEqual(
+            { failure, fetchCount: fetchStub.callCount },
+            {
+                failure: { reason: "budget_exhausted", waitedMs: 20, budgetMs: 20, retryAfterMs: undefined },
+                fetchCount: 2,
+            }
+        );
+    });
+
+    test("backs off instead of retrying at once on Retry-After 0", async () => {
+        const client = new LiteLLMClient({ ...config, rateLimitMaxDelayMs: 10 }, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.onCall(0).callsFake(async () => createRateLimitResponse("0"));
+        fetchStub.onCall(1).callsFake(async () => createStreamResponse());
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+
+        await client.chat({ model: "m", messages: [] });
+
+        sinon.assert.calledWith(warnStub, "request.rate_limit_retry", sinon.match({ source: "backoff", delayMs: 10 }));
+    });
+
+    test("counts a sub-millisecond Retry-After as a 1ms wait", async () => {
+        const client = new LiteLLMClient(config, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.onCall(0).callsFake(async () => createRateLimitResponse("0.0001"));
+        fetchStub.onCall(1).callsFake(async () => createStreamResponse());
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+
+        await client.chat({ model: "m", messages: [] });
+
+        sinon.assert.calledWith(
+            warnStub,
+            "request.rate_limit_retry",
+            sinon.match({ source: "retry_after", delayMs: 1 })
+        );
+    });
+
+    test("backs off on a Retry-After that is not a finite number", async () => {
+        const client = new LiteLLMClient({ ...config, rateLimitMaxDelayMs: 10 }, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.onCall(0).callsFake(async () => createRateLimitResponse("Infinity"));
+        fetchStub.onCall(1).callsFake(async () => createStreamResponse());
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+
+        await client.chat({ model: "m", messages: [] });
+
+        sinon.assert.calledWith(warnStub, "request.rate_limit_retry", sinon.match({ source: "backoff", delayMs: 10 }));
+    });
+
+    test("backs off on a Retry-After too large to express in milliseconds", async () => {
+        const client = new LiteLLMClient({ ...config, rateLimitMaxDelayMs: 10 }, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.onCall(0).callsFake(async () => createRateLimitResponse("1e306"));
+        fetchStub.onCall(1).callsFake(async () => createStreamResponse());
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+
+        await client.chat({ model: "m", messages: [] });
+
+        sinon.assert.calledWith(warnStub, "request.rate_limit_retry", sinon.match({ source: "backoff", delayMs: 10 }));
+    });
+
+    test("stops waiting out a 429 when the request is cancelled", async () => {
+        const client = new LiteLLMClient(config, userAgent);
+        const cancellation = new vscode.CancellationTokenSource();
+        const fetchStub = sandbox.stub(global, "fetch").callsFake(async () => {
+            setTimeout(() => cancellation.cancel(), 5);
+            return createRateLimitResponse("30");
+        });
+
+        await assert.rejects(
+            () => client.chat({ model: "m", messages: [] }, "chat", cancellation.token),
+            /Operation cancelled by user/
+        );
+        assert.strictEqual(fetchStub.callCount, 1);
+    });
+
+    test("logs a structured event for each 429 wait, tagged with the request id", async () => {
+        const client = new LiteLLMClient(config, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.onCall(0).callsFake(async () => createRateLimitResponse("0.01"));
+        fetchStub.onCall(1).callsFake(async () => createStreamResponse());
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+
+        await client.chat({ model: "m", messages: [] }, "chat", undefined, undefined, "req-123");
+
+        sinon.assert.calledWithExactly(
+            warnStub,
+            "request.rate_limit_retry",
+            { requestId: "req-123", attempt: 1, delayMs: 10, waitedMs: 0, budgetMs: 120_000, source: "retry_after" },
+            { requestId: "req-123", model: "m", endpoint: "/chat/completions" }
+        );
+    });
+
+    test("writes a readable warning for each 429 wait, tagged with the request id", async () => {
+        const client = new LiteLLMClient(config, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.onCall(0).callsFake(async () => createRateLimitResponse("0.01"));
+        fetchStub.onCall(1).callsFake(async () => createStreamResponse());
+        const warnStub = sandbox.stub(Logger, "warn");
+
+        await client.chat({ model: "m", messages: [] }, "chat", undefined, undefined, "req-123");
+
+        sinon.assert.calledWith(
+            warnStub,
+            "[rateLimitRetry] request=req-123 429 on /chat/completions, retry 1 in 10ms (retry_after), waited 0ms of 120000ms"
+        );
     });
 
     test("fetchWithRetry retries on 5xx", async () => {

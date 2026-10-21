@@ -9,8 +9,10 @@ import type {
     LiteLLMTokenCounterResponse,
 } from "../types";
 import { transformToResponsesFormat } from "./responsesAdapter";
+import { StructuredLogger } from "../observability/structuredLogger";
 import { Logger } from "../utils/logger";
 import { isAnthropicModel } from "../utils/modelUtils";
+import { planRateLimitRetry, type RateLimitFailure, type RateLimitWaitSource } from "../utils/rateLimitRetryPolicy";
 import { LiteLLMTelemetry } from "../utils/telemetry";
 
 /**
@@ -40,6 +42,39 @@ export class LiteLLMApiError extends Error {
         super(message);
         this.name = "LiteLLMApiError";
     }
+}
+
+/**
+ * Error thrown when the client stops retrying a 429. `failure` says why it
+ * stopped and how long it waited, so the provider can tell the user which
+ * setting bounds the wait.
+ */
+export class LiteLLMRateLimitError extends LiteLLMApiError {
+    public constructor(
+        public readonly failure: RateLimitFailure,
+        statusText: string,
+        bodyText: string
+    ) {
+        super(429, bodyText, `LiteLLM API error: 429 ${statusText}\n${bodyText}`);
+        this.name = "LiteLLMRateLimitError";
+    }
+}
+
+/** Per-call context for the 429 retry loop. */
+interface RateLimitFetchOptions {
+    readonly model: string;
+    readonly endpoint: string;
+    /** Ties the retry logs to the provider's request logs. */
+    readonly requestId?: string;
+    readonly token?: vscode.CancellationToken;
+}
+
+interface RateLimitRetryLogEntry {
+    readonly attempt: number;
+    readonly delayMs: number;
+    readonly waitedMs: number;
+    readonly budgetMs: number;
+    readonly source: RateLimitWaitSource;
 }
 
 const UNSUPPORTED_PARAMETER_PHRASES = [
@@ -238,12 +273,16 @@ export class LiteLLMClient {
 
     /**
      * Sends a chat request to the LiteLLM proxy.
+     *
+     * @throws LiteLLMRateLimitError when the client stops retrying a 429.
+     * @throws LiteLLMApiError for any other non-2xx response.
      */
     async chat(
         request: OpenAIChatCompletionRequest,
         mode?: string,
         token?: vscode.CancellationToken,
-        modelInfo?: LiteLLMModelInfo
+        modelInfo?: LiteLLMModelInfo,
+        requestId?: string
     ): Promise<ReadableStream<Uint8Array>> {
         const endpoint = this.getEndpoint(mode);
         let body: OpenAIChatCompletionRequest | LiteLLMResponsesRequest = request;
@@ -272,6 +311,7 @@ export class LiteLLMClient {
 
         Logger.trace(`Sending chat request to ${endpoint}`, { model: request.model });
         const url = `${this.config.url}${endpoint}`;
+        const rateLimitOptions: RateLimitFetchOptions = { model: request.model, endpoint, requestId, token };
         let response = await this.fetchWithRateLimit(
             url,
             {
@@ -279,7 +319,7 @@ export class LiteLLMClient {
                 headers: this.getHeaders(request.model, modelInfo),
                 body: JSON.stringify(body),
             },
-            { token }
+            rateLimitOptions
         );
 
         // Only the parameters this connector adds on its own are ever stripped
@@ -302,7 +342,7 @@ export class LiteLLMClient {
                         headers: retry.headers,
                         body: JSON.stringify(retry.body),
                     },
-                    { token }
+                    rateLimitOptions
                 );
             }
         }
@@ -495,49 +535,66 @@ export class LiteLLMClient {
     }
 
     /**
-     * Fetch with back-off for rate limiting (429), honoring the Retry-After
-     * header when present. Retries until the cumulative delay reaches the
-     * configured maximum (config `rateLimitMaxDelayMs`, default 120000 ms;
-     * 0 disables retries). For other transient errors, it delegates to
-     * {@link fetchWithRetry}.
+     * Fetches with retries on 429 rate limiting, within a total wait budget
+     * for this call. A budget of 0 disables the retries.
+     * {@link planRateLimitRetry} picks each wait. Other transient failures are
+     * retried by {@link fetchWithRetry}.
+     *
+     * @throws LiteLLMRateLimitError when the client stops retrying a 429.
      */
-    async fetchWithRateLimit(
+    private async fetchWithRateLimit(
         url: string,
         init: RequestInit,
-        options?: { maxTotalDelayMs?: number; initialDelayMs?: number; token?: vscode.CancellationToken }
+        options: RateLimitFetchOptions
     ): Promise<Response> {
-        const maxTotalDelayMs =
-            options?.maxTotalDelayMs ??
-            this.config.rateLimitMaxDelayMs ??
-            LiteLLMClient.DEFAULT_RATE_LIMIT_MAX_DELAY_MS;
-        const initialDelayMs = options?.initialDelayMs ?? 500;
-        let cumulativeDelayMs = 0;
+        const budgetMs = this.config.rateLimitMaxDelayMs ?? LiteLLMClient.DEFAULT_RATE_LIMIT_MAX_DELAY_MS;
+        let waitedMs = 0;
         let attempt = 0;
 
         while (true) {
-            if (options?.token?.isCancellationRequested) {
+            if (options.token?.isCancellationRequested) {
                 throw new Error("Operation cancelled by user");
             }
 
-            const response = await this.fetchWithRetry(url, init, { token: options?.token });
+            const response = await this.fetchWithRetry(url, init, { token: options.token });
             if (response.status !== 429) {
                 return response;
             }
 
-            const remaining = maxTotalDelayMs - cumulativeDelayMs;
-            if (remaining <= 0) {
-                return response;
+            const retryAfterMs = this.parseRetryAfterDelayMs(response);
+            const decision = planRateLimitRetry({ attempt, waitedMs, budgetMs, retryAfterMs });
+            if (decision.kind === "give_up") {
+                throw new LiteLLMRateLimitError(
+                    { reason: decision.reason, waitedMs, budgetMs, retryAfterMs },
+                    response.statusText,
+                    await response.text()
+                );
             }
 
-            const headerDelayMs = this.parseRetryAfterDelayMs(response);
-            const exponentialDelayMs = initialDelayMs * Math.pow(2, attempt);
-            const chosenDelay = headerDelayMs !== undefined ? headerDelayMs : exponentialDelayMs;
-            const nextDelayMs = Math.min(Math.max(1, chosenDelay), remaining);
-
             attempt++;
-            cumulativeDelayMs += nextDelayMs;
-            await this.sleep(nextDelayMs, options?.token);
+            this.logRateLimitRetry(options, {
+                attempt,
+                delayMs: decision.delayMs,
+                waitedMs,
+                budgetMs,
+                source: decision.source,
+            });
+            waitedMs += decision.delayMs;
+            await this.sleep(decision.delayMs, options.token);
         }
+    }
+
+    private logRateLimitRetry(options: RateLimitFetchOptions, entry: RateLimitRetryLogEntry): void {
+        Logger.warn(
+            `[rateLimitRetry] request=${options.requestId ?? "no-request"} 429 on ${options.endpoint}, ` +
+                `retry ${entry.attempt} in ${entry.delayMs}ms (${entry.source}), ` +
+                `waited ${entry.waitedMs}ms of ${entry.budgetMs}ms`
+        );
+        StructuredLogger.warn(
+            "request.rate_limit_retry",
+            { requestId: options.requestId, ...entry },
+            { requestId: options.requestId, model: options.model, endpoint: options.endpoint }
+        );
     }
 
     private sleep(ms: number, token?: vscode.CancellationToken): Promise<void> {
@@ -557,12 +614,17 @@ export class LiteLLMClient {
         });
     }
 
+    /**
+     * Reads Retry-After as seconds or an HTTP date. Seconds round up to whole
+     * milliseconds, because Node timers wait at least 1 ms and cannot sleep a
+     * fraction, and the budget must not be charged less than the wait costs.
+     */
     private parseRetryAfterDelayMs(response: Response): number | undefined {
         const retryAfter = response.headers.get("retry-after");
         if (retryAfter) {
-            const secs = Number(retryAfter);
-            if (!Number.isNaN(secs) && secs >= 0) {
-                return secs * 1000;
+            const delayMs = Math.ceil(Number(retryAfter) * 1000);
+            if (Number.isFinite(delayMs) && delayMs >= 0) {
+                return delayMs;
             }
             const asDate = Date.parse(retryAfter);
             if (!Number.isNaN(asDate)) {

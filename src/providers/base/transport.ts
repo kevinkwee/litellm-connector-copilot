@@ -47,15 +47,23 @@ export class Transport {
     }
 
     public async sendRequestWithRetry(args: SendRequestArgs): Promise<ReadableStream<Uint8Array>> {
-        const { request, progress, token, caller, modelInfo, model, configuration } = args;
+        const { request, progress, token, caller, modelInfo, model, configuration, requestId } = args;
         try {
-            return await this.sendRequestToLiteLLM(request, progress, token, caller, modelInfo, configuration);
+            return await this.sendRequestToLiteLLM(
+                request,
+                progress,
+                token,
+                caller,
+                modelInfo,
+                configuration,
+                requestId
+            );
         } catch (err) {
             if (isContextOverflowError(err) && modelInfo?.max_input_tokens) {
                 this.logger.warn("Retrying after context overflow", err);
                 const trimmed: OpenAIChatCompletionRequest = { ...request };
                 trimmed.max_tokens = Math.min(trimmed.max_tokens ?? model.maxOutputTokens, model.maxOutputTokens);
-                return this.sendRequestToLiteLLM(trimmed, progress, token, caller, modelInfo, configuration);
+                return this.sendRequestToLiteLLM(trimmed, progress, token, caller, modelInfo, configuration, requestId);
             }
             throw err;
         }
@@ -67,7 +75,8 @@ export class Transport {
         token: vscode.CancellationToken,
         caller?: string,
         modelInfo?: LiteLLMModelInfo,
-        configuration?: Record<string, unknown>
+        configuration?: Record<string, unknown>,
+        requestId?: string
     ): Promise<ReadableStream<Uint8Array>> {
         this.logger.debug(
             `[transport.sendRequestToLiteLLM] Preparing LiteLLM request for model: ${request.model} (caller: ${caller})`
@@ -152,7 +161,7 @@ export class Transport {
             configuration.allowChatCompletionsFallback === true;
 
         try {
-            const stream = await client.chat(request, modelInfo?.mode, token, modelInfo);
+            const stream = await client.chat(request, modelInfo?.mode, token, modelInfo, requestId);
             this.logger.debug(`[transport.sendRequestToLiteLLM] HTTP stream established for model: ${request.model}`);
             StructuredLogger.debug("transport.http_response_stream_open", {
                 model: request.model,
@@ -183,7 +192,7 @@ export class Transport {
                 const chatModelInfo: LiteLLMModelInfo | undefined = modelInfo
                     ? { ...modelInfo, mode: "chat" }
                     : modelInfo;
-                return client.chat(request, "chat", token, chatModelInfo);
+                return client.chat(request, "chat", token, chatModelInfo, requestId);
             }
 
             this.logger.error(`[transport.sendRequestToLiteLLM] HTTP request failed for model ${request.model}`, err);

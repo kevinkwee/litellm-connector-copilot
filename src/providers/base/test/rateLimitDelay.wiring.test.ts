@@ -4,13 +4,15 @@ import { Transport } from "../transport";
 import type { TransportDeps } from "../types";
 import type { ConfigManager } from "../../../config/configManager";
 import type { LiteLLMClient } from "../../../adapters/litellmClient";
-import type { OpenAIChatCompletionRequest } from "../../../types";
+import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../../types";
 
 /**
  * Captures the most recent backend params passed to the factory, so the
  * transport's threading of rateLimitMaxDelayMs is observable.
  */
 let lastClientParams: { url: string; key?: string; disableCaching?: boolean; rateLimitMaxDelayMs?: number } | undefined;
+/** Request id the transport handed to the most recent `chat` call. */
+let lastChatRequestId: string | undefined;
 
 class RateLimitSpyClient {
     public readonly rateLimitMaxDelayMs?: number;
@@ -20,8 +22,11 @@ class RateLimitSpyClient {
     async chat(
         _request: OpenAIChatCompletionRequest,
         _mode: string | undefined,
-        _token?: vscode.CancellationToken
+        _token?: vscode.CancellationToken,
+        _modelInfo?: LiteLLMModelInfo,
+        requestId?: string
     ): Promise<ReadableStream<Uint8Array>> {
+        lastChatRequestId = requestId;
         return new ReadableStream<Uint8Array>({
             start(c) {
                 c.close();
@@ -32,6 +37,7 @@ class RateLimitSpyClient {
 
 function makeTransport(): Transport {
     lastClientParams = undefined;
+    lastChatRequestId = undefined;
     const deps: TransportDeps = {
         configManager: { getConfig: async () => ({}) } as unknown as ConfigManager,
         userAgent: "test-ua",
@@ -80,5 +86,24 @@ suite("rateLimitMaxDelayMs wiring", () => {
         await sendWithConfiguration({ baseUrl: "https://x", apiKey: "k", rateLimitMaxDelayMs: "slow" });
         assert.ok(lastClientParams);
         assert.strictEqual(lastClientParams!.rateLimitMaxDelayMs, undefined);
+    });
+
+    test("hands the request id to the client so its retry logs match the provider's", async () => {
+        const transport = makeTransport();
+
+        await transport.sendRequestWithRetry({
+            request: req,
+            messages: [],
+            model: { maxOutputTokens: 100 } as vscode.LanguageModelChatInformation,
+            options: {} as vscode.ProvideLanguageModelChatResponseOptions,
+            progress: { report: () => {} },
+            token: new vscode.CancellationTokenSource().token,
+            caller: "chat",
+            modelInfo: { mode: "chat" },
+            configuration: { baseUrl: "https://x", apiKey: "k" },
+            requestId: "req-42",
+        });
+
+        assert.strictEqual(lastChatRequestId, "req-42");
     });
 });

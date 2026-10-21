@@ -90,4 +90,6 @@ export interface SendRequestArgs {
      * routed and the transport throws a configuration error.
      */
     configuration?: Record<string, unknown>;
+    /** Ties the client's retry logs to the provider's request logs. */
+    requestId?: string;
 }

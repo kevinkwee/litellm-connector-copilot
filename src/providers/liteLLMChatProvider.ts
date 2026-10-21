@@ -13,6 +13,7 @@ import { LanguageModelTextPart } from "vscode";
 import { tryParseJSONObject } from "../utils";
 import { formatConnectorNotice } from "../utils/connectorNotice";
 import { Logger } from "../utils/logger";
+import { appendRateLimitHint } from "../utils/rateLimitNotice";
 import { LiteLLMTelemetry } from "../utils/telemetry";
 import { LiteLLMProviderBase } from "./liteLLMProviderBase";
 import { StructuredLogger } from "../observability/structuredLogger";
@@ -27,7 +28,12 @@ import {
     getTotalTokenLimit,
 } from "../adapters/tokenUtils";
 import { decodeSSE } from "../adapters/sse/sseDecoder";
-import { findRejectedParameter, isUnsupportedParameterError, LiteLLMApiError } from "../adapters/litellmClient";
+import {
+    findRejectedParameter,
+    isUnsupportedParameterError,
+    LiteLLMApiError,
+    LiteLLMRateLimitError,
+} from "../adapters/litellmClient";
 import {
     createInitialStreamingState,
     interpretStreamEvent,
@@ -380,7 +386,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         trackedProgress,
                         token,
                         caller,
-                        modelInfo
+                        modelInfo,
+                        requestId
                     );
                     await this.processStreamingResponse(stream, trackedProgress, token, requestId);
 
@@ -606,11 +613,13 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 const parsedMessage = this.parseApiError(statusCode, errorText);
                 errorMessage = `LiteLLM Error (${model.id}): ${parsedMessage}`;
 
-                // Resending the identical body would fail the same way, so the
-                // rejection is reported once with the proxy-side fix. Only
-                // parameters the connector adds itself are ever stripped.
                 const rejectionBody = err instanceof LiteLLMApiError ? err.bodyText : errorText;
-                if (isUnsupportedParameterError(rejectionBody)) {
+                if (err instanceof LiteLLMRateLimitError) {
+                    errorMessage = appendRateLimitHint(errorMessage, err.failure);
+                } else if (isUnsupportedParameterError(rejectionBody)) {
+                    // Resending the identical body would fail the same way, so the
+                    // rejection is reported once with the proxy-side fix. Only
+                    // parameters the connector adds itself are ever stripped.
                     const rejectedParameter = findRejectedParameter(rejectionBody);
                     const subject = rejectedParameter ? `"${rejectedParameter}"` : "a model parameter";
                     errorMessage +=

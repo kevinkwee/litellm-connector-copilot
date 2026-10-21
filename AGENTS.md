@@ -257,7 +257,7 @@ Folder ownership (unit tests are co-located with the module under test in `src/*
 
 - `src/providers/`: Language Model provider implementations (`liteLLMProviderBase.ts`, `liteLLMChatProvider.ts`, `liteLLMCommitProvider.ts`, `index.ts`)
 - `src/adapters/`: HTTP clients, payload shaping, endpoint-specific parsing, SSE and streaming (`sse/`, `streaming/`), tokenizers
-- `src/utils/`: shared utilities (logging, local request metrics, model helpers, pricing, `chatSessionId`, `thinkingBlocks`, `promptCaching`, `connectorNotice`, `transportRetry`)
+- `src/utils/`: shared utilities (logging, local request metrics, model helpers, pricing, `chatSessionId`, `thinkingBlocks`, `promptCaching`, `connectorNotice`, `transportRetry`, `rateLimitRetryPolicy`, `rateLimitNotice`)
 - `src/config/`: configuration and secrets
 - `src/commands/`: command registrations and UI entry points
 - `src/observability/`: structured logging, audit trail, debug export
@@ -726,6 +726,14 @@ The ingress pipeline is agnostic to endpoint choice:
 - Responses are parsed uniformly (SSE format compatible across endpoint types).
 - Both chat and commit generation use the same routing logic transparently.
 - **Benefit**: `/responses` endpoint support benefits both chat and commit generation automatically.
+
+### Rate-Limit Retries (HTTP 429)
+
+A 429 on the HTTP response is retried inside `LiteLLMClient.fetchWithRateLimit`, within a wait budget of `litellm-connector.rateLimitMaxDelaySeconds` (default 120 s, 0 disables the retries). The budget covers one HTTP call, so every call that sends the body again (the 400 strip-and-retry, the `/responses` fallback, the provider's own retries, a `networkRetries` resume) starts with a fresh budget. A 429 that arrives as a mid-stream error frame takes a different path. It is an `UpstreamStreamError` resumed by the `networkRetries` loop.
+
+- **Wait planning**: `planRateLimitRetry` in `src/utils/rateLimitRetryPolicy.ts` is pure and owns the rules. Without `Retry-After` (or with `Retry-After: 0`) the wait starts at 500 ms and doubles, each wait capped at 60 s and clipped to the budget left. A `Retry-After` that fits in the budget left is honored exactly. A longer one gives up at once, because waiting out the budget would only buy a retry the proxy already said it would refuse.
+- **Give-up**: the client throws `LiteLLMRateLimitError` (a `LiteLLMApiError` with status 429) carrying a `RateLimitFailure` (reason, time waited, budget, `Retry-After`). Its message keeps the `LiteLLM API error: 429 ...` shape, so the transport retry loop does not resend it. The chat provider appends `appendRateLimitHint` (`src/utils/rateLimitNotice.ts`) to the connector notice so the user sees which setting bounds the wait.
+- **Logging**: each wait writes a `[rateLimitRetry] request=<id> ...` warning and a `request.rate_limit_retry` structured event. The chat provider passes its request id down through the base provider and `Transport` to `LiteLLMClient.chat`, so these entries correlate with `request.transport_retry` and `request.failed`. The client does not log the give-up. It reaches the user and the logs through the provider's `request.failed`.
 
 ### Cost Tracking Pipeline
 

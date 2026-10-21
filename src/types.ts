@@ -279,11 +279,12 @@ export interface LiteLLMConfig {
     emptyResponseRetryDelayMs?: number;
 
     /**
-     * Maximum cumulative delay in milliseconds for 429 rate-limit retries in
-     * the HTTP client. Once the cumulative backoff exceeds this, the 429
-     * response is returned as a hard failure instead of retrying. Populated
-     * from the seconds-based `litellm-connector.rateLimitMaxDelaySeconds`
-     * setting. Default: 120000. Set to 0 to disable rate-limit retries.
+     * Most time in milliseconds the HTTP client spends waiting between 429
+     * rate-limit retries of one call to the proxy, summed over all its waits.
+     * A Retry-After longer than what is left of the budget fails the call at
+     * once. The `litellm-connector.rateLimitMaxDelaySeconds` setting is in
+     * seconds and is converted to milliseconds when read. Default: 120000.
+     * Set to 0 to disable rate-limit retries.
      */
     rateLimitMaxDelayMs?: number;
 
@@ -304,8 +305,9 @@ export interface LiteLLMClientConfig {
     /** Timeout in milliseconds for /model/info discovery requests. Default: 5000. */
     discoveryTimeoutMs?: number;
     /**
-     * Maximum cumulative delay in milliseconds for 429 rate-limit retries.
-     * Default: 120000. Set to 0 to disable rate-limit retries.
+     * Most time in milliseconds spent waiting between 429 rate-limit retries
+     * of one call to the proxy, summed over all its waits. Default: 120000.
+     * Set to 0 to disable rate-limit retries.
      */
     rateLimitMaxDelayMs?: number;
     /**

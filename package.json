@@ -200,7 +200,7 @@
 					"default": 120,
 					"minimum": 0,
 					"maximum": 86400,
-					"description": "Maximum cumulative delay in seconds the client spends retrying 429 rate-limit responses (honoring Retry-After). Once exceeded, the 429 is surfaced as a hard failure. Default: 120 (2 minutes). Set to 0 to disable rate-limit retries."
+					"description": "Most time in seconds one call to the proxy spends waiting between 429 rate-limit retries. Without Retry-After, waits start at 0.5s and double, each at most 60s. A Retry-After longer than the time left fails that call at once. Default: 120 (2 minutes). Set to 0 to disable rate-limit retries."
 				},
 				"litellm-connector.disableCaching": {
 					"type": "boolean",
