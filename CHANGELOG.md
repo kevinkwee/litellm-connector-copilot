@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.10-dev.18] - 2026-10-21
+
 ### 🐛 Fixes
 
 * **⏳ Rate-limit retries stop when waiting cannot help**: a 429 whose `Retry-After` exceeds the wait left under `rateLimitMaxDelaySeconds` fails at once with a chat notice naming the setting, instead of waiting out the budget into another 429. Without `Retry-After`, each backoff wait is capped at 60s, so a large budget no longer means one wait of several minutes. `Retry-After: 0` gets the normal backoff instead of a 1ms retry loop. (`src/utils/rateLimitRetryPolicy.ts`, `src/utils/rateLimitNotice.ts`, `src/adapters/litellmClient.ts`, `src/providers/liteLLMChatProvider.ts`)
