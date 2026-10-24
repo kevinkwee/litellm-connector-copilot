@@ -693,6 +693,14 @@ Images returned by a tool (a screenshot tool, a chart renderer, an MCP server) t
 - **Preferred source**: the internal `options.modelOptions._conversationId` field, which VS Code forwards from the originating conversation. Copilot Chat sets it in editor windows (subagents share the parent's id); the agent host BYOK proxy sets it to the Copilot SDK session id from VS Code 1.143 on. The field is undocumented, so it is validated rather than trusted.
 - **Shape allowlist**: an already-canonical UUID passes through unchanged (so LiteLLM rows match VS Code's session id); any other non-empty string is hashed to a namespaced UUID v5. Because the id becomes a directory name, this allowlist is also what prevents path traversal.
 - **Fallback**: when the host sends no id (title generation, commit generation, other extensions calling `vscode.lm`, Agents window on VS Code before 1.143), the id is a UUID v5 of the conversation's opening context: every message before the first assistant reply, system prompt included. That fingerprint is stable across turns unless the system prompt is rebuilt mid-conversation, and it separates sessions running under different agents or modes. It still collides when two conversations share both the system prompt and the opening request, so it must not be treated as a substitute for the host id.
+- **Recorded source**: the resolution source (`conversation`, `conversation-hashed`, `fingerprint`) is written as `sessionIdSource` into each `.copilotmd` Metadata block and the info-level `copilotmd.exported` event, because `request.session_resolved` is debug-level and rarely reaches the log file.
+
+### `.copilotmd` Retention
+
+`selectFilesForDeletion` in `src/observability/copilotMdCaps.ts` is pure and owns the three caps; `CopilotMdWriter` runs it after every export and deletes what it selects.
+
+- **Whole-session byte eviction**: once `maxTotalBytes` is exceeded, whole sessions go, oldest first by newest-file mtime, until the total is at or under 80% of the cap or only the written session is left. An old transcript is then kept complete or removed, never stripped of its opening turns, and the old folders the byte cap keeps are not touched: deleting a file updates its folder's modified time, which would make an old session look recently active. The margin below the cap keeps later exports from triggering another deletion.
+- **Written session**: the byte cap evicts every other session before the one just written. If that session alone still exceeds the cap, its oldest files are deleted until the total fits the cap (not the 80% mark), which removes the file just written when that file alone exceeds the cap. Only the byte cap defers the written session; `maxSessions` ranks it by mtime like any other. When the written session alone is above the 80% mark, one over-cap export evicts every other session, including chats active at the same time.
 
 ### Commit-Specific Logic (Commit Provider)
 

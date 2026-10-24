@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { OpenAIChatCompletionRequest, OpenAIUsagePayload } from "../types";
 import type { TokenSnapshot } from "../adapters/streaming/streamTokenCapture";
+import type { ChatSessionIdSource } from "../utils/chatSessionId";
 
 /**
  * # `.copilotmd` request-log renderer
@@ -35,6 +36,10 @@ import type { TokenSnapshot } from "../adapters/streaming/streamTokenCapture";
  * - `requestType` line: Copilot emits this when the endpoint metadata is
  *   an object (`urlOrRequestMetadata.type`). We always have a string
  *   `baseUrl` from the LiteLLM proxy config, so we always emit `url:`.
+ * - `sessionId` / `sessionIdSource` lines: Copilot emits neither.
+ *   `sessionId` is the session folder the file sits in; `sessionIdSource`
+ *   says whether that id came from the host conversation or the message
+ *   fingerprint.
  * - Binary parts: Copilot serializes a `LanguageModelDataPart` with
  *   `JSON.stringify`, which writes the entire byte array into the file, both for
  *   request messages and for tool results. We write a `<mime, size>` placeholder
@@ -92,6 +97,8 @@ export interface CopilotMdEntry {
     statusReason?: string;
     /** Session id (canonical lowercase UUID); names the `.copilotmd` subfolder. */
     sessionId: string;
+    /** Where {@link sessionId} came from, so a transcript shows whether the host id or the fingerprint grouped it. */
+    sessionIdSource: ChatSessionIdSource;
 }
 
 const MARKDOWN_FENCE = "~~~";
@@ -150,6 +157,8 @@ export function renderCopilotMd(entry: CopilotMdEntry): string {
     out.push(`startTime        : ${entry.startTimeIso}`);
     out.push(`endTime          : ${entry.endTimeIso}`);
     out.push(`duration         : ${entry.durationMs}ms`);
+    out.push(`sessionId        : ${entry.sessionId}`);
+    out.push(`sessionIdSource  : ${entry.sessionIdSource}`);
     out.push(`ourRequestId     : ${entry.ourRequestId}`);
 
     if (entry.status === "success") {

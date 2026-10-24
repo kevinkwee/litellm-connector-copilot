@@ -1,8 +1,7 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
-import { renderCopilotMd, buildCopilotMdFilename, type CopilotMdEntry } from "../copilotMdRenderer";
-import type { OpenAIChatCompletionRequest } from "../../types";
-import type { TokenSnapshot } from "../../adapters/streaming/streamTokenCapture";
+import { renderCopilotMd, buildCopilotMdFilename } from "../copilotMdRenderer";
+import { makeMinimalBody, makeMinimalEntry, makeMinimalSnapshot } from "../../test/utils/copilotMdEntryFixtures";
 
 /**
  * Tests for the `.copilotmd` request-log renderer.
@@ -19,55 +18,6 @@ import type { TokenSnapshot } from "../../adapters/streaming/streamTokenCapture"
  * / `LanguageModelToolResultPart` constructors so the `instanceof` checks
  * inside `requestPartToMarkdown` exercise the same code path production does.
  */
-
-function makeMinimalSnapshot(): TokenSnapshot {
-    return {
-        promptTokens: 100,
-        cachedTokens: 0,
-        cacheCreationInputTokens: 0,
-        systemPromptTokens: 0,
-        completionTokens: 50,
-        reasoningTokens: 0,
-        toolTokens: 0,
-        acceptedPredictionTokens: 0,
-        rejectedPredictionTokens: 0,
-        sawUpstreamUsage: true,
-    };
-}
-
-function makeMinimalBody(): OpenAIChatCompletionRequest {
-    return {
-        model: "test-model",
-        messages: [],
-        stream: true,
-        max_tokens: 1024,
-    };
-}
-
-function makeMinimalEntry(overrides: Partial<CopilotMdEntry> = {}): CopilotMdEntry {
-    return {
-        debugName: "chat",
-        id: "abc12345",
-        model: "test-model",
-        url: "https://litellm.example.com",
-        maxPromptTokens: 8192,
-        maxResponseTokens: 1024,
-        location: 1,
-        body: makeMinimalBody(),
-        requestMessages: [],
-        startTimeIso: "2026-07-26T10:00:00.000Z",
-        endTimeIso: "2026-07-26T10:00:05.000Z",
-        durationMs: 5000,
-        ourRequestId: "req-abc12345",
-        timeToFirstTokenMs: 250,
-        resolvedModel: "test-model",
-        usage: makeMinimalSnapshot(),
-        responseParts: [new vscode.LanguageModelTextPart("Hello, world!")],
-        status: "success",
-        sessionId: "e7074038-e624-585e-bf91-fc179549e3ca",
-        ...overrides,
-    };
-}
 
 suite("renderCopilotMd", () => {
     test("renders the privacy banner and H1 header first", () => {
@@ -104,6 +54,29 @@ suite("renderCopilotMd", () => {
         assert.ok(md.includes("duration         : 5000ms"));
         assert.ok(md.includes("ourRequestId     : req-abc12345"));
         assert.ok(md.includes("</code></pre>"));
+    });
+
+    test("renders the session id and its source inside the Metadata block", () => {
+        const entry = makeMinimalEntry({
+            sessionId: "3f2b8c1e-9a4d-4e7f-8b6a-1c2d3e4f5a6b",
+            sessionIdSource: "conversation",
+        });
+        const metadata = renderCopilotMd(entry).split("## Metadata")[1].split("</code></pre>")[0];
+        assert.ok(
+            metadata.includes(
+                "sessionId        : 3f2b8c1e-9a4d-4e7f-8b6a-1c2d3e4f5a6b\nsessionIdSource  : conversation\n"
+            )
+        );
+    });
+
+    test("renders the session id source on a failed request", () => {
+        const entry = makeMinimalEntry({
+            status: "failure",
+            statusReason: "upstream 500",
+            responseParts: [],
+            sessionIdSource: "conversation-hashed",
+        });
+        assert.ok(renderCopilotMd(entry).includes("sessionIdSource  : conversation-hashed"));
     });
 
     test("omits the reasoning line when reasoning_effort is not set", () => {

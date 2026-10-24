@@ -304,7 +304,7 @@
 					"type": "number",
 					"default": 1073741824,
 					"minimum": 0,
-					"description": "Hard ceiling on total `.copilotmd` bytes across all sessions. Oldest files (globally, by mtime) are deleted when exceeded. 0 = unlimited. Default: 1073741824 (1 GiB)."
+					"description": "Hard ceiling on total `.copilotmd` bytes across all sessions. When exceeded, whole session folders are deleted, oldest first (by newest-file mtime), until the total is at or under 80% of this value or only the session being written is left, so old transcripts are kept complete or removed instead of losing their first turns. Every other session is deleted before the one being written; if that session alone still exceeds the ceiling, its oldest files are deleted until the total fits, including the file just written when that file alone exceeds the ceiling. 0 = unlimited. Default: 1073741824 (1 GiB)."
 				},
 				"litellm-connector.debug.structuredLogFile.enabled": {
 					"type": "boolean",

@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 🐛 Fixes
+
+* **🗂️ The `.copilotmd` byte cap deletes whole old sessions**: past `maxTotalBytes`, the oldest whole session folders go until the total is at or under 80% of the cap or only the session being written is left, instead of the globally oldest files on every export. The byte cap keeps old transcripts complete or removes them, and the old folders it keeps stop getting a fresh modified time from a deleted file, which made old fingerprint sessions look recently active. The first export into a folder already over the cap deletes the oldest sessions in one sweep. (`src/observability/copilotMdCaps.ts`, `src/observability/copilotMdWriter.ts`)
+
+### ✨ Features
+
+* **🔎 Transcripts show where their session id came from**: each `.copilotmd` Metadata block gains `sessionId` and `sessionIdSource` (`conversation`, `conversation-hashed`, or `fingerprint`), and the `copilotmd.exported` structured event carries `sessionIdSource`, so a transcript or log line shows whether VS Code's conversation id or the message fingerprint grouped it. (`src/observability/copilotMdRenderer.ts`, `src/observability/copilotMdWriter.ts`, `src/providers/liteLLMChatProvider.ts`)
+
+### 🧪 Tests
+
+* Whole-session byte eviction (the 80% mark, newest-file ordering, the one-byte-over and exactly-at-cap boundaries, written-session ordering and its trim back to the cap, a written session with no files, interplay with the per-session and session-count caps), the writer on a real temp folder (folder pruning, written-session wiring, entries that are not transcripts, `sessionIdSource` on `copilotmd.exported`, write failure), and the new Metadata lines. Shared `.copilotmd` entry fixtures move to `src/test/utils/copilotMdEntryFixtures.ts`. (`src/observability/test/copilotMdCaps.test.ts`, `src/observability/test/copilotMdWriter.test.ts`, `src/observability/test/copilotMdRenderer.test.ts`)
+
 ## [2.1.10-dev.18] - 2026-10-21
 
 ### 🐛 Fixes
