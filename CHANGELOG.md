@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.10-dev.19] - 2026-10-24
+
 ### 🐛 Fixes
 
 * **🗂️ The `.copilotmd` byte cap deletes whole old sessions**: past `maxTotalBytes`, the oldest whole session folders go until the total is at or under 80% of the cap or only the session being written is left, instead of the globally oldest files on every export. The byte cap keeps old transcripts complete or removes them, and the old folders it keeps stop getting a fresh modified time from a deleted file, which made old fingerprint sessions look recently active. The first export into a folder already over the cap deletes the oldest sessions in one sweep. (`src/observability/copilotMdCaps.ts`, `src/observability/copilotMdWriter.ts`)
