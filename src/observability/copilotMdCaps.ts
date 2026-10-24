@@ -1,129 +1,167 @@
 /**
  * # Caps enforcement for `.copilotmd` exports
  *
- * Pure functions for deciding which files/folders to delete to honor the
- * three user-configured caps:
+ * Pure functions that pick the files to delete so the export folder honors
+ * the three user-configured caps. `0` disables a cap.
  *
- * 1. `maxFilesPerSession` — oldest files in a single session folder beyond
- *    this count are deleted. `0` = unlimited.
- * 2. `maxSessions` — oldest session folders (by newest-file mtime) beyond
- *    this count are deleted. `0` = unlimited.
- * 3. `maxTotalBytes` — oldest files across all sessions (by mtime) beyond
- *    this total size are deleted. `0` = unlimited.
+ * 1. `maxFilesPerSession`: the oldest files of a session folder beyond this
+ *    count. Only that session is trimmed.
+ * 2. `maxSessions`: whole session folders beyond this count, oldest first
+ *    by newest-file mtime.
+ * 3. `maxTotalBytes`: once the total exceeds the cap, whole session folders,
+ *    oldest first by newest-file mtime, until the total falls to
+ *    {@link TOTAL_BYTES_LOW_WATER_RATIO} of the cap or only the written
+ *    session is left.
  *
- * "Oldest" is determined by file mtime. Per-session and per-session-folder
- * sweeps delete the oldest *within that scope*, never globally — confirmed
- * with the user: per-session cap deletes oldest in that session, not across
- * all sessions.
+ * The byte cap deletes whole sessions so an old transcript is either kept
+ * complete or removed, never stripped of its opening turns. Deleting a file
+ * also updates its folder's modified time, so trimming files out of an old
+ * session would make it look recently active. The margin below the cap
+ * keeps later exports from triggering another deletion.
  *
- * Split out from `copilotMdWriter.ts` so the selection logic is unit-testable
- * without touching the filesystem.
+ * The byte cap evicts every other session before the one being written. If
+ * that session alone still exceeds the cap, its oldest files are deleted
+ * until the total fits, which removes the file just written when that file
+ * alone exceeds the cap. When the written session alone is above the
+ * low-water mark, the mark is out of reach, so one over-cap export evicts
+ * every other session.
+ *
+ * Kept apart from `copilotMdWriter.ts` so the selection logic is
+ * unit-testable without touching the filesystem.
  */
 
 export interface FileMeta {
     /** URI of the file, used by the writer to actually delete it. */
-    uri: string;
+    readonly uri: string;
     /** File mtime in milliseconds since epoch. */
-    mtimeMs: number;
+    readonly mtimeMs: number;
     /** File size in bytes. */
-    sizeBytes: number;
+    readonly sizeBytes: number;
     /** Session id (folder name) the file belongs to. */
-    sessionId: string;
+    readonly sessionId: string;
 }
 
 export interface CapsConfig {
-    maxFilesPerSession: number;
-    maxSessions: number;
-    maxTotalBytes: number;
+    readonly maxFilesPerSession: number;
+    readonly maxSessions: number;
+    readonly maxTotalBytes: number;
 }
 
+/** Fraction of `maxTotalBytes` at which whole-session eviction stops. */
+const TOTAL_BYTES_LOW_WATER_RATIO = 0.8;
+
 /**
- * Returns the set of files to delete to bring the current file set into
- * compliance with all three caps. The writer applies the deletions.
+ * Returns the files to delete so the remaining set honors every cap.
  *
- * Order of enforcement matters: per-session cap first (cheapest, walks one
- * folder), then session-count cap (walks all session folders), then total-
- * bytes cap (walks all files). Each pass operates on the survivors of the
- * previous one so we never re-delete.
+ * The caps run in order (per-session, session count, total bytes), each on
+ * the files the previous ones kept, so no file is selected twice.
+ *
+ * @param writtenSessionId the session of the file just exported, which the
+ *   byte cap evicts only after every other session.
  */
-export function selectFilesForDeletion(files: FileMeta[], caps: CapsConfig): FileMeta[] {
+export function selectFilesForDeletion(
+    files: readonly FileMeta[],
+    caps: CapsConfig,
+    writtenSessionId: string
+): FileMeta[] {
     const toDelete = new Map<string, FileMeta>();
+    const markForDeletion = (selected: readonly FileMeta[]): void => {
+        for (const file of selected) {
+            toDelete.set(file.uri, file);
+        }
+    };
+    const keptFiles = (): FileMeta[] => files.filter((file) => !toDelete.has(file.uri));
 
-    // Pass 1: per-session cap
-    // Group survivors by session, then within each session sort by mtime asc
-    // and mark the oldest beyond the cap for deletion.
     if (caps.maxFilesPerSession > 0) {
-        const bySession = new Map<string, FileMeta[]>();
-        for (const f of files) {
-            if (toDelete.has(f.uri)) {
-                continue;
-            }
-            const bucket = bySession.get(f.sessionId) ?? [];
-            bucket.push(f);
-            bySession.set(f.sessionId, bucket);
-        }
-        for (const bucket of bySession.values()) {
-            if (bucket.length <= caps.maxFilesPerSession) {
-                continue;
-            }
-            // Sort oldest first; delete the leading overflow.
-            bucket.sort(byMtimeAsc);
-            const overflow = bucket.length - caps.maxFilesPerSession;
-            for (let i = 0; i < overflow; i++) {
-                toDelete.set(bucket[i].uri, bucket[i]);
-            }
-        }
+        markForDeletion(selectPerSessionOverflow(keptFiles(), caps.maxFilesPerSession));
     }
-
-    // Pass 2: session-count cap
-    // Order sessions by their newest surviving file's mtime (desc), keep the
-    // top `maxSessions`, mark every surviving file in the dropped sessions
-    // for deletion.
     if (caps.maxSessions > 0) {
-        const sessionNewestMtime = new Map<string, number>();
-        for (const f of files) {
-            if (toDelete.has(f.uri)) {
-                continue;
-            }
-            const current = sessionNewestMtime.get(f.sessionId) ?? -Infinity;
-            if (f.mtimeMs > current) {
-                sessionNewestMtime.set(f.sessionId, f.mtimeMs);
-            }
-        }
-        const sortedSessions = [...sessionNewestMtime.entries()].sort((a, b) => b[1] - a[1]);
-        if (sortedSessions.length > caps.maxSessions) {
-            const dropped = new Set(sortedSessions.slice(caps.maxSessions).map(([fp]) => fp));
-            for (const f of files) {
-                if (toDelete.has(f.uri)) {
-                    continue;
-                }
-                if (dropped.has(f.sessionId)) {
-                    toDelete.set(f.uri, f);
-                }
-            }
-        }
+        markForDeletion(selectSessionCountOverflow(keptFiles(), caps.maxSessions));
     }
-
-    // Pass 3: total-bytes cap
-    // Sum sizes of all surviving files; if over budget, delete oldest-first
-    // (across all sessions) until under.
     if (caps.maxTotalBytes > 0) {
-        const survivors = files.filter((f) => !toDelete.has(f.uri));
-        const totalBytes = survivors.reduce((sum, f) => sum + f.sizeBytes, 0);
-        if (totalBytes > caps.maxTotalBytes) {
-            survivors.sort(byMtimeAsc);
-            let remaining = totalBytes;
-            for (const f of survivors) {
-                if (remaining <= caps.maxTotalBytes) {
-                    break;
-                }
-                toDelete.set(f.uri, f);
-                remaining -= f.sizeBytes;
-            }
-        }
+        markForDeletion(selectTotalBytesOverflow(keptFiles(), caps.maxTotalBytes, writtenSessionId));
     }
 
     return [...toDelete.values()];
+}
+
+function selectPerSessionOverflow(files: readonly FileMeta[], maxFilesPerSession: number): FileMeta[] {
+    const overflow: FileMeta[] = [];
+    for (const sessionFiles of groupBySession(files).values()) {
+        if (sessionFiles.length <= maxFilesPerSession) {
+            continue;
+        }
+        const oldestFirst = [...sessionFiles].sort(byMtimeAsc);
+        overflow.push(...oldestFirst.slice(0, sessionFiles.length - maxFilesPerSession));
+    }
+    return overflow;
+}
+
+function selectSessionCountOverflow(files: readonly FileMeta[], maxSessions: number): FileMeta[] {
+    const newestSessionsFirst = [...groupBySession(files).values()].sort((a, b) => newestMtime(b) - newestMtime(a));
+    return newestSessionsFirst.slice(maxSessions).flat();
+}
+
+function selectTotalBytesOverflow(
+    files: readonly FileMeta[],
+    maxTotalBytes: number,
+    writtenSessionId: string
+): FileMeta[] {
+    let totalBytes = sumSizes(files);
+    if (totalBytes <= maxTotalBytes) {
+        return [];
+    }
+
+    const lowWaterBytes = Math.floor(maxTotalBytes * TOTAL_BYTES_LOW_WATER_RATIO);
+    const sessions = groupBySession(files);
+    const otherSessionsOldestFirst = [...sessions.entries()]
+        .filter(([sessionId]) => sessionId !== writtenSessionId)
+        .map(([, sessionFiles]) => sessionFiles)
+        .sort((a, b) => newestMtime(a) - newestMtime(b));
+
+    const overflow: FileMeta[] = [];
+    for (const sessionFiles of otherSessionsOldestFirst) {
+        if (totalBytes <= lowWaterBytes) {
+            return overflow;
+        }
+        overflow.push(...sessionFiles);
+        totalBytes -= sumSizes(sessionFiles);
+    }
+
+    // Every other session is gone. The written session is trimmed to the cap
+    // rather than the low-water mark, so the file just written, normally its
+    // newest, survives unless it alone exceeds the cap.
+    const writtenOldestFirst = [...(sessions.get(writtenSessionId) ?? [])].sort(byMtimeAsc);
+    for (const file of writtenOldestFirst) {
+        if (totalBytes <= maxTotalBytes) {
+            break;
+        }
+        overflow.push(file);
+        totalBytes -= file.sizeBytes;
+    }
+    return overflow;
+}
+
+/** Groups files by session, keeping each session's first-seen order. */
+function groupBySession(files: readonly FileMeta[]): Map<string, FileMeta[]> {
+    const sessions = new Map<string, FileMeta[]>();
+    for (const file of files) {
+        const sessionFiles = sessions.get(file.sessionId);
+        if (sessionFiles) {
+            sessionFiles.push(file);
+        } else {
+            sessions.set(file.sessionId, [file]);
+        }
+    }
+    return sessions;
+}
+
+function newestMtime(sessionFiles: readonly FileMeta[]): number {
+    return sessionFiles.reduce((newest, file) => Math.max(newest, file.mtimeMs), -Infinity);
+}
+
+function sumSizes(files: readonly FileMeta[]): number {
+    return files.reduce((sum, file) => sum + file.sizeBytes, 0);
 }
 
 function byMtimeAsc(a: FileMeta, b: FileMeta): number {

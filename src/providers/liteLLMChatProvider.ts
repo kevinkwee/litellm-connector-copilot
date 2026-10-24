@@ -596,6 +596,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 responseParts: responsePartCollector.parts,
                 status: "success",
                 sessionId,
+                sessionIdSource: resolvedSession.source,
             } satisfies CopilotMdEntry);
 
             // Usage data flows through StreamTokenCapture, which intercepts
@@ -689,6 +690,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     status: "failure",
                     statusReason: errorMessage,
                     sessionId,
+                    sessionIdSource: resolvedSession.source,
                 } satisfies CopilotMdEntry);
             }
 

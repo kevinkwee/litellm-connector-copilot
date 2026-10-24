@@ -10,8 +10,8 @@ import { selectFilesForDeletion, type CapsConfig, type FileMeta } from "./copilo
  * Side-effectful layer over {@link renderCopilotMd}: takes a finished
  * `CopilotMdEntry`, writes the rendered markdown to the configured
  * destination, and enforces the three user-configured caps (per-session
- * file count, session count, total bytes) by deleting the oldest files
- * that overflow.
+ * file count, session count, total bytes) by deleting what
+ * {@link selectFilesForDeletion} selects.
  *
  * All filesystem work goes through `vscode.workspace.fs` so remote/WSL
  * workspaces work correctly and writes don't block the request hot path
@@ -65,6 +65,7 @@ export class CopilotMdWriter {
             StructuredLogger.info("copilotmd.exported", {
                 requestId: entry.ourRequestId,
                 sessionId: entry.sessionId,
+                sessionIdSource: entry.sessionIdSource,
                 filename,
                 bytes: contentBytes.length,
             });
@@ -73,7 +74,7 @@ export class CopilotMdWriter {
             // Failures here are logged but do not propagate — the write already
             // succeeded, and a failed cleanup shouldn't make the export "fail".
             try {
-                await this.enforceCaps();
+                await this.enforceCaps(entry.sessionId);
             } catch (cleanupErr) {
                 StructuredLogger.warn("copilotmd.caps_failed", {
                     error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
@@ -96,17 +97,16 @@ export class CopilotMdWriter {
      * Walks the `copilot-debug/` tree, builds a {@link FileMeta} list, asks
      * {@link selectFilesForDeletion} which files to drop, and deletes them.
      *
-     * Exposed `protected` so tests can drive it with a stubbed `vscode.workspace.fs`.
-     * Production callers go through {@link write} which invokes this once per
-     * exported file.
+     * @param writtenSessionId the session of the file just written, which the
+     *   byte cap evicts only after every other session.
      */
-    protected async enforceCaps(): Promise<void> {
+    private async enforceCaps(writtenSessionId: string): Promise<void> {
         const debugRoot = vscode.Uri.joinPath(this.rootFolder, "copilot-debug");
         const files = await this.collectFileMetas(debugRoot);
         if (files.length === 0) {
             return;
         }
-        const toDelete = selectFilesForDeletion(files, this.caps);
+        const toDelete = selectFilesForDeletion(files, this.caps, writtenSessionId);
         if (toDelete.length === 0) {
             return;
         }
@@ -193,10 +193,9 @@ export class CopilotMdWriter {
     }
 
     /**
-     * Removes session folders that no longer contain any `.copilotmd` files.
-     * Called after caps enforcement deletes files, so empty folders are
-     * expected as a normal byproduct of the per-session and session-count
-     * caps.
+     * Removes session folders left empty by caps enforcement, which deletes
+     * whole sessions under the session-count and byte caps. A folder still
+     * holding any entry, transcript or not, is kept.
      */
     private async pruneEmptySessionFolders(debugRoot: vscode.Uri): Promise<void> {
         let sessionEntries: [string, vscode.FileType][];
