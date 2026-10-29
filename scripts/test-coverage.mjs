@@ -8,8 +8,11 @@ import console from "node:console";
 // Exit code for test timeout (unique identifier for timeout-related failures)
 const TIMEOUT_EXIT_CODE = 124; // Traditional timeout command uses 124
 
-// Maximum time to allow the test process to run (in milliseconds)
-const TEST_TIMEOUT_MS = 60000; // 60 seconds
+// Maximum time to allow the test process to run (in milliseconds).
+// The suite itself runs for about 45 s, and VS Code takes several seconds to
+// launch and exit on Windows, so the default leaves headroom instead of
+// killing a green run. Override with TEST_TIMEOUT_MS when needed.
+const TEST_TIMEOUT_MS = Number(process.env.TEST_TIMEOUT_MS ?? 300000);
 
 /**
  * Remove directory contents without removing the directory itself.

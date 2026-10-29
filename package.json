@@ -36,9 +36,9 @@
 	"browser": "./dist/web/extension.js",
 	"scripts": {
 		"bump-version": "node scripts/bump-version.js",
-		"clean": "find ./dist ./out ./coverage ./test-results -delete || true",
-		"clean:build": "find ./dist ./out -delete || true",
-		"clean:tests": "find ./coverage ./test-results -delete || true",
+		"clean": "node scripts/clean.mjs dist out coverage test-results",
+		"clean:build": "node scripts/clean.mjs dist out",
+		"clean:tests": "node scripts/clean.mjs coverage test-results",
 		"precompile": "npm run clean",
 		"compile": "tsc -p ./",
 		"coverage:serve": "npx serve coverage -p 8080",
