@@ -13,7 +13,6 @@ export class ConfigManager {
     private static readonly DISABLE_QUOTA_TOOL_REDACTION_KEY = "litellm-connector.disableQuotaToolRedaction";
     private static readonly KEY_MODEL_OVERRIDES_ENABLE = "litellm-connector.enableModelOverrides";
     private static readonly MODEL_CAPABILITIES_OVERRIDES_KEY = "litellm-connector.modelCapabilitiesOverrides";
-    private static readonly SCM_COMMIT_MSG_MODEL_ID_KEY = "litellm-connector.commitModelIdOverride";
     private static readonly FORCE_RESPONSES_ENDPOINT_KEY = "litellm-connector.forceResponsesEndpoint";
     private static readonly ALLOW_CHAT_COMPLETIONS_FALLBACK_KEY = "litellm-connector.allowChatCompletionsFallback";
     private static readonly DISPLAY_PRICING_IN_PICKER_KEY = "litellm-connector.displayPricingInPicker";
@@ -202,9 +201,6 @@ export class ConfigManager {
             }
         }
 
-        const scmGitCompletionsModelId = workspaceConfig
-            .get<string>(ConfigManager.SCM_COMMIT_MSG_MODEL_ID_KEY, "")
-            .trim();
         const forceResponsesEndpoint = workspaceConfig.get<boolean>(ConfigManager.FORCE_RESPONSES_ENDPOINT_KEY, false);
         const allowChatCompletionsFallback = workspaceConfig.get<boolean>(
             ConfigManager.ALLOW_CHAT_COMPLETIONS_FALLBACK_KEY,
@@ -274,7 +270,6 @@ export class ConfigManager {
             disableQuotaToolRedaction,
             enableModelOverrides,
             modelCapabilitiesOverrides,
-            commitModelIdOverride: `${scmGitCompletionsModelId}`,
             forceResponsesEndpoint,
             allowChatCompletionsFallback,
             displayPricingInPicker,
@@ -359,38 +354,5 @@ export class ConfigManager {
      */
     async dispose(): Promise<void> {
         this._lastConfig = undefined;
-    }
-
-    /**
-     * Resets all LiteLLM connector configuration.
-     * Clears SecretStorage keys and triggers a provider refresh.
-     * This is a destructive operation intended for troubleshooting and complete re-configuration.
-     * Note: globalState metadata (migration notices, config flags) and VS Code's native
-     * provider configuration are NOT cleared, as they are extension state, not user configuration.
-     */
-    public async resetConfiguration(): Promise<void> {
-        Logger.info("ConfigManager: Starting configuration reset...");
-
-        // 1. Clear all SecretStorage keys that start with "litellm-connector"
-        try {
-            const allKeys = await this.secrets.keys();
-            const litellmKeys = allKeys.filter((key) => key.startsWith("litellm-connector"));
-
-            for (const key of litellmKeys) {
-                Logger.debug(`Deleting secret key: ${key}`);
-                await this.secrets.delete(key);
-            }
-            Logger.info(`ConfigManager: Cleared ${litellmKeys.length} secret(s)`);
-        } catch (err: unknown) {
-            Logger.error("ConfigManager: Failed to clear secrets", err);
-            // Continue with reset even if secrets clear fails
-        }
-
-        // 2. Trigger a provider refresh to reflect cleaned state
-        // In a full implementation, this would notify the provider to reload models.
-        // However, since ConfigManager doesn't have direct access to the provider,
-        // the command handler should trigger this after reset.
-
-        Logger.info("ConfigManager: Configuration reset complete");
     }
 }

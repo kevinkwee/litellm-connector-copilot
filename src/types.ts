@@ -213,9 +213,6 @@ export interface LiteLLMConfig {
      */
     modelCapabilitiesOverrides?: Record<string, ModelCapabilityOverride>;
 
-    /** Model id to use for LiteLLM commit message generation. */
-    commitModelIdOverride?: string;
-
     /**
      * When true, forces all models to use the `/responses` endpoint instead of per-model mode selection.
      * This ensures consistent behavior across models, especially for those that require reasoning support.
@@ -287,8 +284,6 @@ export interface LiteLLMConfig {
      * Set to 0 to disable rate-limit retries.
      */
     rateLimitMaxDelayMs?: number;
-
-    // sendDefaultParameters was removed in v2.2.0 (deprecated v1.5.0). Use individual modelOptions instead.
 }
 
 /**
@@ -392,23 +387,6 @@ export interface LiteLLMModelInfoResponse {
         model_name?: string;
         model_info?: LiteLLMModelInfo;
     }[];
-}
-
-/**
- * Request for LiteLLM token counter endpoint.
- */
-export interface LiteLLMTokenCounterRequest {
-    model: string;
-    prompt?: string;
-    messages?: OpenAIChatMessage[];
-    contents?: Record<string, unknown>[];
-}
-
-/**
- * Response from LiteLLM token counter endpoint.
- */
-export interface LiteLLMTokenCounterResponse {
-    token_count: number;
 }
 
 /**

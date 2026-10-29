@@ -15,15 +15,14 @@ import { lmcr_toString } from "./mapChatRoles";
  * Copilot Chat in editor windows and by the agent host BYOK proxy in the
  * Agents window (VS Code 1.143 and later). That field is undocumented, so it
  * is treated as untrusted input. Requests with no conversation behind them
- * (title generation, commit-message generation, other extensions calling
- * `vscode.lm`, and Agents window sessions on earlier VS Code builds) send
- * nothing, and the id falls back to a fingerprint of the opening context: every
- * message before the first assistant reply, system prompt included. The
- * fingerprint is stable across the turns of one conversation unless the system
- * prompt is rebuilt mid-conversation, and it separates
- * conversations that run under different agents or modes, but it still
- * collides when two conversations share both the system prompt and the opening
- * request, so it is not a substitute for the host id.
+ * (title generation, other extensions calling `vscode.lm`, and Agents window
+ * sessions on earlier VS Code builds) send nothing, and the id falls back to a
+ * fingerprint of the opening context: every message before the first assistant
+ * reply, system prompt included. The fingerprint is stable across the turns of
+ * one conversation unless the system prompt is rebuilt mid-conversation, and it
+ * separates conversations that run under different agents or modes, but it
+ * still collides when two conversations share both the system prompt and the
+ * opening request, so it is not a substitute for the host id.
  *
  * Every returned id is a canonical lowercase UUID. The UUID shape is also a
  * safety allowlist: because the id becomes a directory name under the

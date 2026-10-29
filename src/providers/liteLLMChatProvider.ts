@@ -59,8 +59,8 @@ import {
 
 /**
  * Returns the notice for a finish reason that leaves the answer incomplete, or
- * `undefined` for reasons that need none. The returned notice begins a new block
- * (`\n\n`), as `splitConnectorNotice` requires for a notice after model text.
+ * `undefined` for reasons that need none. The notice starts with a blank line so
+ * it begins its own block.
  */
 function describeStoppedEarly(reason: string | undefined): { reason: string; notice: string } | undefined {
     if (reason === "length") {
@@ -174,15 +174,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             },
             token
         );
-    }
-
-    async provideTokenCount(
-        model: LanguageModelChatInformation,
-        text: string | LanguageModelChatRequestMessage,
-        token: CancellationToken,
-        configuration?: Record<string, unknown>
-    ): Promise<number> {
-        return super.provideTokenCount(model, text, token, configuration);
     }
 
     async provideLanguageModelChatResponse(

@@ -136,7 +136,7 @@ function apiError(message: string, status: number): Error & { status: number } {
 }
 
 /**
- * Helper: seeds the discovery layer so `resolveBackendForCall` returns a known
+ * Stubs the config manager so `convertProviderConfiguration` returns a known
  * session for the given configuration. Use this when a test exercises the
  * chat flow and we don't want to stub an HTTP fetch.
  */
@@ -174,9 +174,6 @@ suite("LiteLLMProviderBase", () => {
     teardown(() => {
         sandbox.restore();
     });
-
-    // buildOpenAIChatRequest default-parameters tests removed in v2.2.0
-    // (sendDefaultParameters was deprecated in v1.5.0 and removed per plan).
 
     suite("reasoning effort handling", () => {
         const model: vscode.LanguageModelChatInformation = {
@@ -1589,17 +1586,17 @@ suite("LiteLLMProviderBase", () => {
             capabilities: { toolCalling: true, imageInput: false },
         };
 
-        test("uses local counting for small strings", async () => {
+        test("returns the local estimate for small strings", async () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
             const tokenSource = new vscode.CancellationTokenSource();
             const count = await provider.provideTokenCount(model, "hi", tokenSource.token, {
                 baseUrl: "https://wolfram.example",
                 apiKey: "k",
             });
-            assert.ok(count >= 0);
+            assert.strictEqual(count, 2);
         });
 
-        test("returns local estimate when cancellation is already requested", async () => {
+        test("returns the same local estimate when cancellation is already requested", async () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
             const tokenSource = new vscode.CancellationTokenSource();
             tokenSource.cancel();
@@ -1607,19 +1604,18 @@ suite("LiteLLMProviderBase", () => {
                 baseUrl: "https://wolfram.example",
                 apiKey: "k",
             });
-            assert.ok(count >= 0);
+            assert.strictEqual(count, 2);
         });
 
-        test("kicks off background refinement for large strings", async () => {
+        test("estimates a large string from its character count", async () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
             const tokenSource = new vscode.CancellationTokenSource();
 
-            await provider.provideTokenCount(model, "x".repeat(1000), tokenSource.token, {
+            const count = await provider.provideTokenCount(model, "x".repeat(1000), tokenSource.token, {
                 baseUrl: "https://wolfram.example",
                 apiKey: "k",
             });
-            // No assertion — the test verifies the path doesn't throw and returns a number.
-            assert.ok(true);
+            assert.strictEqual(count, 286);
         });
     });
 
@@ -1643,11 +1639,12 @@ suite("LiteLLMProviderBase", () => {
         });
     });
 
-    suite("Logger usage", () => {
-        test("Logger.info is used at startup", () => {
-            // Smoke test: constructor doesn't throw.
-            new LiteLLMChatProvider(mockSecrets, userAgent);
-            assert.ok(true);
+    suite("constructor", () => {
+        test("constructing a provider creates its registry and transport", () => {
+            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+
+            assert.ok(access(provider)._registry);
+            assert.ok(access(provider)._transport);
         });
     });
 

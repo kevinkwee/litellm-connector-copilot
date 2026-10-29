@@ -48,7 +48,6 @@
 		"postinstall": "npm run download-api",
 		"lint": "eslint",
 		"lint:fix": "eslint --fix",
-		"memory-profile": "npm run compile && node scripts/run-memory-profile.mjs",
 		"pretest:coverage": "npm run compile",
 		"test:coverage": "node scripts/test-coverage.mjs",
 		"test:scripts": "node --test scripts/versionUtils.test.mjs scripts/bump-version.test.mjs",
@@ -71,15 +70,6 @@
 				"title": "LiteLLM: Manage Configuration"
 			},
 			{
-				"command": "litellm-connector.resetConfiguration",
-				"title": "LiteLLM: Reset All Configuration"
-			},
-			{
-				"command": "litellm-connector.generateCommitMessage",
-				"title": "Generate Commit Message",
-				"icon": "$(sparkle)"
-			},
-			{
 				"command": "litellm-connector.openCopilotMdFolder",
 				"title": "LiteLLM: Open .copilotmd Export Folder"
 			}
@@ -87,12 +77,6 @@
 		"configuration": {
 			"title": "LiteLLM Connector",
 			"properties": {
-				"litellm-connector.commitModelIdOverride": {
-					"type": "string",
-					"default": "",
-					"description": "Override the model ID for git commit message generation. If empty, the feature is disabled.",
-					"markdownDescription": "Override the model ID for git commit message generation. If empty, the feature is disabled."
-				},
 				"litellm-connector.disableQuotaToolRedaction": {
 					"type": "boolean",
 					"default": false,
@@ -218,7 +202,7 @@
 						"1h"
 					],
 					"default": "5m",
-					"description": "Anthropic prompt-caching TTL for Claude requests sent through LiteLLM. Unrelated to disableCaching, which bypasses the proxy response cache. 5m marks requests with a 5 minute CachePoint (cache writes cost 1.25x input tokens). 1h uses a 1 hour CachePoint (cache writes cost 2x input tokens). off never marks. Only applied to Anthropic Claude models; commit message generation never marks."
+					"description": "Anthropic prompt-caching TTL for Claude requests sent through LiteLLM. Unrelated to disableCaching, which bypasses the proxy response cache. 5m marks requests with a 5 minute CachePoint (cache writes cost 1.25x input tokens). 1h uses a 1 hour CachePoint (cache writes cost 2x input tokens). off never marks. Only applied to Anthropic Claude models."
 				},
 				"litellm-connector.enableModelOverrides": {
 					"type": "boolean",
@@ -342,16 +326,7 @@
 					]
 				}
 			}
-		],
-		"menus": {
-			"scm/title": [
-				{
-					"command": "litellm-connector.generateCommitMessage",
-					"group": "navigation",
-					"when": "config.litellm-connector.commitModelIdOverride != ''"
-				}
-			]
-		}
+		]
 	},
 	"activationEvents": [
 		"onLanguageModelChatProvider:litellm-connector",

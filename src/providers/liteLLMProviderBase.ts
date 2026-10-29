@@ -7,7 +7,7 @@ import type {
 } from "vscode";
 
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../types";
-import { convertMessages, convertTools } from "../utils";
+import { convertTools } from "../utils";
 import {
     trimMessagesToFitBudget,
     estimateToolTokens,
@@ -25,13 +25,10 @@ import {
     isReasoningError,
     markReasoningFallbackNotified,
 } from "../utils/reasoningEffortFallback";
-import type { BackendSession } from "./backendSession";
 import { RequestBuilder } from "./base/requestBuilder";
 import { Transport } from "./base/transport";
 import type { RequestBuilderDeps, TransportDeps } from "./base/types";
 import { LiteLLMProviderRegistry } from "./liteLLMProviderRegistry";
-import { LRUCache } from "../utils/lruCache";
-import { AuditTrail } from "../observability/auditTrail";
 
 /**
  * Shared orchestration base for all LiteLLM-backed VS Code language model providers.
@@ -162,37 +159,18 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Clears all session-scoped caches to free memory on extension deactivation.
-     * Called from extension.ts in the deactivate hook.
-     *
-     * Clears:
-     * - Token count cache (LRU, but still freed for clean shutdown)
-     * - Pending token count requests
-     * - Effort fallback cache (reasoning effort fallback state)
-     * - Audit trail events (all request history)
+     * Clears the reasoning-effort fallback cache on extension deactivation.
      */
     public clearSessionCaches(): void {
-        Logger.info("Clearing session-scoped caches");
-        // Note: Token count cache and pending requests maps are module-level static collections
-        // They are cleared implicitly when the provider instance is destroyed and garbage collected.
-        // Explicit clearing here is for documentation and future refactoring.
-
-        // Clear the effort fallback cache
+        Logger.info("Clearing reasoning-effort fallback cache");
         this._effortFallbackCache.clear();
-        Logger.debug("clearSessionCaches", "Effort fallback cache cleared");
-
-        // Clear audit trail
-        AuditTrail.clear();
-        Logger.debug("clearSessionCaches", "Audit trail cleared");
-
-        Logger.info("Session caches cleared");
+        Logger.info("Reasoning-effort fallback cache cleared");
     }
 
     /**
-     * Returns the registry's current, deduplicated model list. The
-     * registry is populated by discovery calls; before any discovery
-     * this is empty, and callers such as the model-picker commands
-     * surface a "reload models" prompt in that case.
+     * Returns the registry's current, deduplicated model list. The registry is
+     * populated by discovery calls, so before any discovery this is empty and
+     * the show-models command points the user at a reload.
      */
     public getLastKnownModels(): LanguageModelChatInformation[] {
         return this._registry.getAllModels();
@@ -206,134 +184,25 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Resolves the active backend session for a request by honoring the
-     * per-group configuration passed on the call. The completion and commit
-     * paths (which don't receive `options.configuration` from VS Code) MUST
-     * pass `undefined` and we return `undefined` — those paths surface a
-     * configuration-required error to the user instead of silently
-     * mis-routing to a stale global state.
+     * Estimates the token count for a prompt, message, or attachment.
      *
-     * `groupName` is the user-entered label from VS Code's 1.120 group picker.
-     * It is optional and is used only for the picker's display label; routing
-     * is URL-driven.
-     */
-    protected resolveBackendForCall(
-        configuration: Record<string, unknown> | undefined,
-        groupName?: string
-    ): BackendSession | undefined {
-        if (!configuration) {
-            return undefined;
-        }
-        return this._configManager.convertProviderConfiguration(groupName ?? "", configuration);
-    }
-
-    /**
-     * Provides a best-effort token count for small inputs and optionally refines large inputs
-     * in the background using the LiteLLM remote counter.
+     * VS Code calls this while building each prompt, before any request is
+     * sent, so it must answer immediately from the local tokenizer. The
+     * upstream usage report that arrives with the reply remains the
+     * authoritative count.
      */
     public async provideTokenCount(
         model: LanguageModelChatInformation,
         text: string | LanguageModelChatRequestMessage,
-        token: vscode.CancellationToken,
-        configuration?: Record<string, unknown>
+        _token: vscode.CancellationToken,
+        _configuration?: Record<string, unknown>
     ): Promise<number> {
         // `model.id` is the namespaced `<routing>/<raw>` form. The capability
-        // cache, the tokenizer heuristics, and the LiteLLM request body all
-        // need the raw model name. The modelInfoCache is keyed by namespaced
-        // id, so we look it up with the namespaced id; everything else uses
-        // the raw name.
+        // cache is keyed by the namespaced id, while the tokenizer heuristics
+        // key off the raw model family.
         const modelInfo = this._registry.getModelInfo(model.id);
         const rawModelId = this.getRawModelName(model.id);
-        const localCount = countTokens(text, rawModelId, modelInfo);
-
-        if (token.isCancellationRequested) {
-            return localCount;
-        }
-
-        const cacheKey = `${model.id}:${typeof text === "string" ? text.length : JSON.stringify(text)}`;
-        const cached = tokenCountCache.get(cacheKey);
-        if (cached !== undefined) {
-            return cached;
-        }
-
-        if (typeof text === "string" && text.length < 500) {
-            return localCount;
-        }
-
-        if (pendingRequests.has(cacheKey)) {
-            return localCount;
-        }
-
-        const request =
-            typeof text === "string"
-                ? { model: rawModelId, prompt: text }
-                : { model: rawModelId, messages: convertMessages([text]) };
-
-        const countPromise = (async (): Promise<number> => {
-            // Timeout guard: if the promise takes longer than 5 seconds, force cleanup
-            // This prevents accumulation of orphaned promises in long-running sessions
-            const orphanTimeoutMs = 5000;
-            let timeoutHandle: NodeJS.Timeout | undefined;
-
-            try {
-                if (token.isCancellationRequested) {
-                    return localCount;
-                }
-
-                const backend = this.resolveBackendForCall(configuration);
-                if (!backend) {
-                    return localCount;
-                }
-
-                // Thread disableCaching for cache-bypass consistency on the
-                // countTokens path. Fetch the workspace config once; the cost
-                // is negligible next to the HTTP round-trip. Without this the
-                // token-counting requests bypass the cache-bypass that the
-                // request hot path now applies (Step 2 of the original plan).
-                const countCfg = await this._configManager.getConfig();
-                const singleClient = new LiteLLMClient(
-                    { url: backend.baseUrl, key: backend.apiKey, disableCaching: countCfg.disableCaching },
-                    this.userAgent
-                );
-
-                // Set up orphan cleanup timeout (will delete from pendingRequests if exceeded)
-                timeoutHandle = setTimeout(() => {
-                    if (pendingRequests.has(cacheKey)) {
-                        Logger.debug(
-                            "countTokens",
-                            `Cleaning up orphaned token count request after ${orphanTimeoutMs}ms`,
-                            {
-                                cacheKey,
-                            }
-                        );
-                        pendingRequests.delete(cacheKey);
-                    }
-                }, orphanTimeoutMs);
-
-                const result = await singleClient.countTokens({ ...request, model: rawModelId }, token);
-                if (
-                    result?.token_count !== undefined &&
-                    result.token_count !== null &&
-                    !token.isCancellationRequested
-                ) {
-                    tokenCountCache.set(cacheKey, result.token_count);
-                    return result.token_count;
-                }
-                return localCount;
-            } catch {
-                return localCount;
-            } finally {
-                // Always clear the timeout and the pending entry
-                if (timeoutHandle !== undefined) {
-                    clearTimeout(timeoutHandle);
-                }
-                pendingRequests.delete(cacheKey);
-            }
-        })();
-
-        pendingRequests.set(cacheKey, countPromise);
-        void countPromise;
-        return localCount;
+        return countTokens(text, rawModelId, modelInfo);
     }
 
     /**
@@ -1300,23 +1169,3 @@ export abstract class LiteLLMProviderBase {
         return `API request failed with status ${statusCode}`;
     }
 }
-
-/**
- * LRU cache for token counts to avoid redundant network calls.
- * Capped at 100 entries to prevent unbounded memory growth in long-running sessions.
- * When the cache exceeds capacity, the least recently used entry is evicted.
- *
- * Rationale: Token count requests can be expensive HTTP calls. Caching responses
- * avoids redundant network traffic. LRU eviction ensures memory usage is bounded
- * even for extended sessions (100+ turns).
- */
-const tokenCountCache = new LRUCache<string, number>(100);
-
-/**
- * Tracks pending background token count requests to avoid redundant network calls.
- *
- * Protected by timeout guards in countPromise: if a request exceeds 5 seconds,
- * it is automatically removed from this map to prevent accumulation of orphaned
- * promises in long-running agentic sessions.
- */
-const pendingRequests = new Map<string, Promise<number>>();

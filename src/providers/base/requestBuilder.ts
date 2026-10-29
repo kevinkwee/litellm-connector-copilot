@@ -124,14 +124,12 @@ export class RequestBuilder {
 
         // Anthropic prompt caching: LiteLLM forwards a top-level `cache_control`
         // directive to the Claude API for automatic prompt caching. Gated on the
-        // workspace TTL setting, provider support, the per-request opt-out
-        // (commit generation has no reusable prefix worth caching), and what a
-        // previous request learned live about the model's acceptance of the marker.
+        // workspace TTL setting, provider support, and what a previous request
+        // learned live about the model's acceptance of the marker.
         const cacheControl = resolveAnthropicCacheControl({
             mode: config.anthropicPromptCaching ?? DEFAULT_ANTHROPIC_PROMPT_CACHING,
             modelId: rawModelId,
             modelInfo,
-            requestOptOut: mo.promptCaching === false,
         });
         if (
             cacheControl &&

@@ -6,7 +6,7 @@ This file provides guidance to AI coding agents when working with code in this r
 
 ## Project Overview
 
-`litellm-connector-copilot` is a VS Code extension that integrates a LiteLLM proxy into VS Code's Language Model APIs. It exposes the proxy's models as user-selectable chat models for GitHub Copilot Chat, streams chat responses and tool calls, reports per-model pricing and estimated request costs, and adds LiteLLM-backed git commit message generation. The codebase is TypeScript, bundled with esbuild, and targets the VS Code 1.125 Language Model API surface with per-group provider configuration.
+`litellm-connector-copilot` is a VS Code extension that integrates a LiteLLM proxy into VS Code's Language Model APIs. It exposes the proxy's models as user-selectable chat models for GitHub Copilot Chat, streams chat responses and tool calls, and reports per-model pricing and estimated request costs. The codebase is TypeScript, bundled with esbuild, and targets the VS Code 1.125 Language Model API surface with per-group provider configuration.
 
 ## Prerequisites
 
@@ -199,7 +199,7 @@ src/
 ├── adapters/            # HTTP client, payload shaping, SSE and stream parsing, tokenizers
 ├── config/              # configuration and secrets
 ├── commands/            # command registrations and UI entry points
-├── observability/       # structured logging, audit trail, debug export
+├── observability/       # structured logging, .copilotmd debug export
 ├── utils/               # shared utilities (logging, model helpers, pricing)
 └── test/                # integration tests and shared test utilities
 ```
@@ -255,12 +255,12 @@ This structure can be updated as the project evolves. If you add new files or mo
 
 Folder ownership (unit tests are co-located with the module under test in `src/**/test/`):
 
-- `src/providers/`: Language Model provider implementations (`liteLLMProviderBase.ts`, `liteLLMChatProvider.ts`, `liteLLMCommitProvider.ts`, `index.ts`)
+- `src/providers/`: Language Model provider implementations (`liteLLMProviderBase.ts`, `liteLLMChatProvider.ts`, `index.ts`)
 - `src/adapters/`: HTTP clients, payload shaping, endpoint-specific parsing, SSE and streaming (`sse/`, `streaming/`), tokenizers
 - `src/utils/`: shared utilities (logging, local request metrics, model helpers, pricing, `chatSessionId`, `thinkingBlocks`, `promptCaching`, `connectorNotice`, `transportRetry`, `rateLimitRetryPolicy`, `rateLimitNotice`)
 - `src/config/`: configuration and secrets
 - `src/commands/`: command registrations and UI entry points
-- `src/observability/`: structured logging, audit trail, debug export
+- `src/observability/`: structured logging and the `.copilotmd` debug export
 - `src/test/`: integration tests (`integration/`) and shared test utilities (`utils/`)
 
 ## Error Handling
@@ -535,9 +535,9 @@ Any code you edit must be brought up to these standards:
 ### Provider-Specific Requirements (if working on `src/providers/`)
 
 - [ ] Base class changes benefit all derived providers automatically (shared orchestration)
-- [ ] Protocol-specific code stays in derived classes only (chat protocol, commit protocol, etc.)
+- [ ] Protocol-specific code stays in derived classes only (chat protocol)
 - [ ] Shared request pipeline (message normalization, parameter filtering, token trimming) unchanged unless fixing a bug that affects all providers
-- [ ] Both the chat and commit providers are tested for any base class changes
+- [ ] The chat provider is tested for any base class change
 - [ ] New provider types extend base and reuse the pipeline (no duplication of request processing or endpoint-specific logic)
 - [ ] Configuration handling respects the VS Code per-group provider config system
   - Provider secrets handled via `languageModelChatProviders.configuration` in `package.json`
@@ -573,7 +573,7 @@ This repository is a **VS Code extension**. Agents must follow these rules when 
 
 ### Architecture and Data Flow
 
-This extension integrates LiteLLM proxies into VS Code's Language Model APIs (chat and commit generation). It uses a **shared orchestration plus specialized protocol handlers** pattern, with exactly **one** chat provider and one commit provider, and no version-suffixed variants.
+This extension integrates LiteLLM proxies into VS Code's Language Model APIs. It uses a **shared orchestration plus protocol handler** pattern: exactly **one** chat provider, and no version-suffixed variants.
 
 - **Base Orchestrator**: `src/providers/liteLLMProviderBase.ts`
   - Owns the shared request lifecycle used by provider implementations.
@@ -595,17 +595,12 @@ This extension integrates LiteLLM proxies into VS Code's Language Model APIs (ch
   - Returns `LanguageModelChatInformation` entries with `isUserSelectable: true` so models appear in the picker.
   - Reuses the base request pipeline for normalization, filtering, trimming, and routing.
 
-- **Commit provider**: `src/providers/liteLLMCommitProvider.ts`
-  - Implements commit-message generation only (not a `LanguageModelTextCompletionProvider`).
-  - Reuses the shared base lifecycle for LiteLLM-backed request orchestration.
-  - Avoids re-implementing shared request preparation, endpoint selection, or quota/error logic.
-
 - **Entry Point**: `src/extension.ts`
-  - Activates the extension and instantiates exactly one `LiteLLMChatProvider` and one `LiteLLMCommitMessageProvider`.
+  - Activates the extension and instantiates exactly one `LiteLLMChatProvider`.
   - Registers `LiteLLMChatProvider` with `vscode.lm.registerLanguageModelChatProvider("litellm-connector", provider)`.
   - The extension does NOT register a `LanguageModelTextCompletionProvider`. Completions are handled by VS Code's native tag-routing (the `inline-completions` tag on chat models) routed through the chat provider.
-  - Both providers share the same `context.secrets` for `SecretStorage` (if needed for non-provider secrets).
-  - Both receive per-group configuration from VS Code via `options.configuration` in `provideLanguageModelChatInformation`; response-time routing follows the model object VS Code passes back.
+  - Holds `context.secrets` for `SecretStorage` (if needed for non-provider secrets).
+  - Receives per-group configuration from VS Code via `options.configuration` in `provideLanguageModelChatInformation`; response-time routing follows the model object VS Code passes back.
   - The configuration schema is defined in the `package.json` `languageModelChatProviders` contribution point (VS Code per-group format).
 
 - **Adapters**:
@@ -620,7 +615,7 @@ This extension integrates LiteLLM proxies into VS Code's Language Model APIs (ch
   - Also manages workspace settings via `vscode.workspace.getConfiguration()` (model overrides, caching, etc.).
   - `convertProviderConfiguration()` converts the per-group VS Code provider config into the internal `LiteLLMConfig` format.
 
-**Key design principle**: There is exactly one chat provider and one commit provider. Both reuse the same message ingress pipeline in the base orchestrator. This eliminates code duplication, ensures consistent behavior, and avoids version-suffixed provider sprawl. Adding new provider types requires minimal code (a protocol wrapper only).
+**Key design principle**: There is exactly one chat provider. It reuses the shared message ingress pipeline owned by the base orchestrator. This eliminates code duplication, ensures consistent behavior, and avoids version-suffixed provider sprawl.
 
 **Structural rule of thumb**: shared cross-provider behavior belongs in the base class or adapters. VS Code protocol specifics belong in the single derived provider that owns that protocol. Do not fork chat-protocol logic into version-suffixed siblings.
 
@@ -628,9 +623,9 @@ When architecture changes, update this section in the same change so the documen
 
 ### Shared Message Ingress Pipeline (Base Orchestrator)
 
-All incoming requests (chat or commit generation) flow through this pipeline:
+All incoming requests flow through this pipeline:
 
-1. **Normalize**: Convert to `OpenAIChatCompletionRequest` format. Chat: messages already in correct format. Commit generation and completion-style prompts: wrap the prompt string as a user message.
+1. **Normalize**: Convert to `OpenAIChatCompletionRequest` format. Chat messages are already in the correct format.
 2. **Validate**: Get model info, check if model exists and is configured.
 3. **Filter parameters**: Strip unsupported params via `KNOWN_PARAMETER_LIMITATIONS`.
 4. **Trim**: Ensure messages fit within `model.maxInputTokens` budget.
@@ -649,7 +644,7 @@ Keep this pipeline shared unless the change is intentionally protocol-specific a
 - **A response only ever ends when its body is closed**: `processStreamingResponse` cancels the upstream body in `finally`; every exit path (error frame, retry, recovered tool calls) must stop the provider from generating and billing.
 - **Response emission**: emit `LanguageModelResponsePart`, `LanguageModelToolCallPart`, `LanguageModelToolResultPart` to the progress callback.
 - **Tool call parsing**: extract and validate tool calls from the structured streaming fields only. Text that looks like a tool call (`<tool_call>`, `<|tool_call_begin|>`) is model output and is emitted verbatim: turning it into a `LanguageModelToolCallPart` would let a model's explanation of a tool-call format execute a real tool.
-- **Connector notices**: text the connector writes itself (failure explanations, stop notices) is `formatConnectorNotice(...)` from `src/utils/connectorNotice.ts`. A notice starts the response or a new block, so a notice appended to streamed text carries `\n\n` before the prefix; `splitConnectorNotice` only recognises the prefix at the start or after a blank line. Consumers such as commit-message generation rely on that shape and must not mistake a notice for model output.
+- **Connector notices**: text the connector writes itself (failure explanations, stop notices) is `formatConnectorNotice(...)` from `src/utils/connectorNotice.ts`. A notice starts the response or a new block, so a notice appended to streamed text carries `\n\n` before the prefix.
 - **Cost tracking**: pricing from LiteLLM `/model/info` is extracted and propagated through `StreamTokenCapture`. Request-level estimated costs are attached to usage payloads and telemetry metrics.
 
 ### Anthropic Thinking Preservation (Claude)
@@ -683,7 +678,7 @@ Images returned by a tool (a screenshot tool, a chart renderer, an MCP server) t
 ### Anthropic Prompt Caching
 
 - `litellm-connector.anthropicPromptCaching` (`off` | `5m` | `1h`, default `5m`) adds a top-level `cache_control: {type: "ephemeral"}` directive (plus `ttl: "1h"` on the higher tier) to chat requests; LiteLLM forwards it to the Claude API as the automatic prompt-caching marker. Unrelated to `disableCaching`, which bypasses the proxy response cache.
-- **Gating**: `src/utils/promptCaching.ts` allows the marker only for Anthropic-family requests where `modelInfo.litellm_provider` is authoritative, `supports_prompt_caching` is not explicitly false, and `options.modelOptions.promptCaching` is not false. Commit generation opts out: its prompts are one-shot messages with no reusable prefix, so the cache-write premium never pays off.
+- **Gating**: `src/utils/promptCaching.ts` allows the marker only for Anthropic-family requests where `modelInfo.litellm_provider` is authoritative and `supports_prompt_caching` is not explicitly false.
 - **Live learning**: when a 400 names `cache_control`, `litellmClient.chat` strips it and retries once, then notifies the transport, which records it through the registry (`recordUnsupportedParameter`). The request builder consults `getUnsupportedParameters`, so later requests omit the marker without paying a failed round trip. The learned key is the raw model name (the request body's `model` value).
 
 ### Session Identity
@@ -692,7 +687,7 @@ Images returned by a tool (a screenshot tool, a chart renderer, an MCP server) t
 
 - **Preferred source**: the internal `options.modelOptions._conversationId` field, which VS Code forwards from the originating conversation. Copilot Chat sets it in editor windows (subagents share the parent's id); the agent host BYOK proxy sets it to the Copilot SDK session id from VS Code 1.143 on. The field is undocumented, so it is validated rather than trusted.
 - **Shape allowlist**: an already-canonical UUID passes through unchanged (so LiteLLM rows match VS Code's session id); any other non-empty string is hashed to a namespaced UUID v5. Because the id becomes a directory name, this allowlist is also what prevents path traversal.
-- **Fallback**: when the host sends no id (title generation, commit generation, other extensions calling `vscode.lm`, Agents window on VS Code before 1.143), the id is a UUID v5 of the conversation's opening context: every message before the first assistant reply, system prompt included. That fingerprint is stable across turns unless the system prompt is rebuilt mid-conversation, and it separates sessions running under different agents or modes. It still collides when two conversations share both the system prompt and the opening request, so it must not be treated as a substitute for the host id.
+- **Fallback**: when the host sends no id (title generation, other extensions calling `vscode.lm`, Agents window on VS Code before 1.143), the id is a UUID v5 of the conversation's opening context: every message before the first assistant reply, system prompt included. That fingerprint is stable across turns unless the system prompt is rebuilt mid-conversation, and it separates sessions running under different agents or modes. It still collides when two conversations share both the system prompt and the opening request, so it must not be treated as a substitute for the host id.
 - **Recorded source**: the resolution source (`conversation`, `conversation-hashed`, `fingerprint`) is written as `sessionIdSource` into each `.copilotmd` Metadata block and the info-level `copilotmd.exported` event, because `request.session_resolved` is debug-level and rarely reaches the log file.
 
 ### `.copilotmd` Retention
@@ -701,13 +696,6 @@ Images returned by a tool (a screenshot tool, a chart renderer, an MCP server) t
 
 - **Whole-session byte eviction**: once `maxTotalBytes` is exceeded, whole sessions go, oldest first by newest-file mtime, until the total is at or under 80% of the cap or only the written session is left. An old transcript is then kept complete or removed, never stripped of its opening turns, and the old folders the byte cap keeps are not touched: deleting a file updates its folder's modified time, which would make an old session look recently active. The margin below the cap keeps later exports from triggering another deletion.
 - **Written session**: the byte cap evicts every other session before the one just written. If that session alone still exceeds the cap, its oldest files are deleted until the total fits the cap (not the 80% mark), which removes the file just written when that file alone exceeds the cap. Only the byte cap defers the written session; `maxSessions` ranks it by mtime like any other. When the written session alone is above the 80% mark, one over-cap export evicts every other session, including chats active at the same time.
-
-### Commit-Specific Logic (Commit Provider)
-
-- **Prompt wrapping**: convert a simple `string` prompt to `LanguageModelChatRequestMessage` for the base pipeline.
-- **Stream text extraction**: parse SSE chunks and accumulate completion text.
-- **Model selection**: resolve the model using the `commitModelIdOverride` setting. Commit generation routes through `vscode.lm.selectChatModels()`.
-- **Cost tracking**: commit generation reuses the same pricing and token snapshot pipeline so estimated request costs are reported consistently with chat.
 
 ### Configuration Flow (per-group)
 
@@ -732,8 +720,7 @@ The ingress pipeline is agnostic to endpoint choice:
 - `LiteLLMClient.getEndpoint()` decides routing based on model info and endpoint availability.
 - Request building happens once in base, regardless of endpoint choice.
 - Responses are parsed uniformly (SSE format compatible across endpoint types).
-- Both chat and commit generation use the same routing logic transparently.
-- **Benefit**: `/responses` endpoint support benefits both chat and commit generation automatically.
+- **Benefit**: `/responses` endpoint support is uniform across all models.
 
 ### Rate-Limit Retries (HTTP 429)
 
@@ -742,6 +729,12 @@ A 429 on the HTTP response is retried inside `LiteLLMClient.fetchWithRateLimit`,
 - **Wait planning**: `planRateLimitRetry` in `src/utils/rateLimitRetryPolicy.ts` is pure and owns the rules. Without `Retry-After` (or with `Retry-After: 0`) the wait starts at 500 ms and doubles, each wait capped at 60 s and clipped to the budget left. A `Retry-After` that fits in the budget left is honored exactly. A longer one gives up at once, because waiting out the budget would only buy a retry the proxy already said it would refuse.
 - **Give-up**: the client throws `LiteLLMRateLimitError` (a `LiteLLMApiError` with status 429) carrying a `RateLimitFailure` (reason, time waited, budget, `Retry-After`). Its message keeps the `LiteLLM API error: 429 ...` shape, so the transport retry loop does not resend it. The chat provider appends `appendRateLimitHint` (`src/utils/rateLimitNotice.ts`) to the connector notice so the user sees which setting bounds the wait.
 - **Logging**: each wait writes a `[rateLimitRetry] request=<id> ...` warning and a `request.rate_limit_retry` structured event. The chat provider passes its request id down through the base provider and `Transport` to `LiteLLMClient.chat`, so these entries correlate with `request.transport_retry` and `request.failed`. The client does not log the give-up. It reaches the user and the logs through the provider's `request.failed`.
+
+### Token Counting
+
+`provideTokenCount` must answer before a request is sent, while Copilot assembles the prompt to decide what fits, so it returns a local estimate and never calls the proxy. `selectTokenizer` (in `src/adapters/tokenizers/`) currently resolves to `HeuristicTokenizer` for every model: `max(ceil(chars / 3.5), ceil(words * 1.3))` for text, the same formula over `name + JSON(input)` for tool-call parts, and a byte-size estimate for images and PDFs. `HeuristicTokenizer` deliberately overestimates, so a prompt errs toward fitting.
+
+The authoritative counts are the upstream usage numbers reported with each reply, which flow through `StreamTokenCapture` into telemetry and the estimated request cost. Do not reintroduce a per-message cache or a server round trip in `provideTokenCount`: VS Code calls it without the group configuration, so a remote count cannot be routed, and a per-message cache would hold up to 100 full message payloads, image bytes included, for the life of the process.
 
 ### Cost Tracking Pipeline
 

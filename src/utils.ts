@@ -185,39 +185,6 @@ function pruneUnknownSchemaKeywords(schema: unknown): Record<string, unknown> {
     return out;
 }
 
-/**
- * Strips Markdown code blocks from a string.
- * If the string contains triple backticks, it extracts the content inside them.
- * If multiple code blocks exist, it joins them.
- * If no code blocks exist, it returns the original string trimmed.
- */
-export function stripMarkdownCodeBlocks(text: string): string {
-    const trimmed = text.trim();
-    if (!trimmed.includes("```")) {
-        return trimmed;
-    }
-
-    // Regex to match code blocks: ```[lang]\n(content)\n```
-    // Supports optional language tag and handles non-greedy matching for content.
-    const codeBlockRegex = /```(?:\w+)?\s*([\s\S]*?)\s*```/g;
-    const matches = [...trimmed.matchAll(codeBlockRegex)];
-
-    if (matches.length > 0) {
-        return matches
-            .map((m) => m[1].trim())
-            .filter((content) => content.length > 0)
-            .join("\n\n");
-    }
-
-    // Fallback: if there are TRIPLE backticks but no complete block match,
-    // just strip the backticks themselves as a safety measure.
-    if (trimmed.includes("```")) {
-        return trimmed.replace(/```/g, "").trim();
-    }
-
-    return trimmed;
-}
-
 function sanitizeSchema(input: unknown, propName?: string): Record<string, unknown> {
     if (!input || typeof input !== "object" || Array.isArray(input)) {
         return { type: "object", properties: {} } as Record<string, unknown>;

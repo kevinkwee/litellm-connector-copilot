@@ -839,18 +839,6 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.deepStrictEqual(res.sampleModelIds, ["k1", "m2", "unknown"]);
     });
 
-    test("countTokens handles non-OK response", async () => {
-        const client = new LiteLLMClient(config, userAgent);
-        sandbox.stub(global, "fetch").resolves({
-            ok: false,
-            status: 400,
-            statusText: "Bad Request",
-            text: async () => "detailed error",
-        } as Response);
-
-        await assert.rejects(() => client.countTokens({ model: "m", prompt: "p" }), /Failed to count tokens/);
-    });
-
     test("chat handles missing response body", async () => {
         const client = new LiteLLMClient(config, userAgent);
         sandbox.stub(global, "fetch").resolves({

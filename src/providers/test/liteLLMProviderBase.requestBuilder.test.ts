@@ -360,8 +360,6 @@ suite("RequestBuilder", () => {
         }
 
         setup(() => {
-            // getTelemetryOptions receives the full VS Code options object here
-            // because `modelOptions` is the per-request opt-out channel.
             configManager.getConfig.resolves({});
         });
 
@@ -402,18 +400,6 @@ suite("RequestBuilder", () => {
             } as LiteLLMModelInfo;
 
             const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), noCachingInfo, "call");
-
-            assert.strictEqual(req.cache_control, undefined);
-        });
-
-        test("omits the marker when the caller opts out via modelOptions", async () => {
-            const req = await builder.buildOpenAIChatRequest(
-                messages,
-                claudeModel,
-                options({ promptCaching: false }),
-                anthropicInfo,
-                "call"
-            );
 
             assert.strictEqual(req.cache_control, undefined);
         });

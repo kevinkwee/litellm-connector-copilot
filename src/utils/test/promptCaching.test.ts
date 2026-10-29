@@ -50,10 +50,6 @@ suite("promptCaching", () => {
             assert.strictEqual(resolveAnthropicCacheControl(input({ mode: "off" })), undefined);
         });
 
-        test("per-request opt-out wins over a non-off setting", () => {
-            assert.strictEqual(resolveAnthropicCacheControl(input({ requestOptOut: true })), undefined);
-        });
-
         test("non-Anthropic models are never marked", () => {
             assert.strictEqual(
                 resolveAnthropicCacheControl(input({ modelInfo: anthropicInfo({ litellm_provider: "openai" }) })),

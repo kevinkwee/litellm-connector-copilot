@@ -4,21 +4,15 @@ import * as sinon from "sinon";
 import {
     registerManageConfigCommand,
     registerReloadModelsCommand,
-    registerResetConfigurationCommand,
     registerShowModelsCommand,
 } from "../../commands/manageConfig";
-import { ConfigManager } from "../../config/configManager";
 import type { LiteLLMChatProvider } from "../../providers";
 
 suite("ManageConfig Command Unit Tests", () => {
     let sandbox: sinon.SinonSandbox;
-    let mockConfigManager: sinon.SinonStubbedInstance<ConfigManager>;
-    let mockContext: vscode.ExtensionContext;
 
     setup(() => {
         sandbox = sinon.createSandbox();
-        mockConfigManager = sandbox.createStubInstance(ConfigManager);
-        mockContext = { subscriptions: [] } as unknown as vscode.ExtensionContext;
     });
 
     teardown(() => {
@@ -27,7 +21,7 @@ suite("ManageConfig Command Unit Tests", () => {
 
     test("registers command correctly", () => {
         const registerStub = sandbox.stub(vscode.commands, "registerCommand");
-        registerManageConfigCommand(mockContext, mockConfigManager as unknown as ConfigManager);
+        registerManageConfigCommand();
         assert.strictEqual(registerStub.calledWith("litellm-connector.manage"), true);
     });
 
@@ -46,7 +40,7 @@ suite("ManageConfig Command Unit Tests", () => {
             return { dispose: sandbox.stub() } as vscode.Disposable;
         });
 
-        registerManageConfigCommand(mockContext, mockConfigManager as unknown as ConfigManager);
+        registerManageConfigCommand();
         await commandHandler?.();
 
         assert.strictEqual(executeCommandStub.called, true);
@@ -73,63 +67,6 @@ suite("ManageConfig Command Unit Tests", () => {
         await handler?.();
 
         assert.ok(infoStub.calledOnce);
-    });
-
-    test("resetConfiguration command shows confirmation dialog and resets on confirmation", async () => {
-        const warningStub = sandbox
-            .stub(vscode.window, "showWarningMessage")
-            .resolves("Reset Configuration" as unknown as vscode.MessageItem);
-        const infoStub = sandbox.stub(vscode.window, "showInformationMessage");
-
-        mockConfigManager.resetConfiguration.resolves(undefined);
-
-        let handler: (() => Promise<void>) | undefined;
-        sandbox.stub(vscode.commands, "registerCommand").callsFake((id, cb) => {
-            if (id === "litellm-connector.resetConfiguration") {
-                handler = cb as () => Promise<void>;
-            }
-            return { dispose: sandbox.stub() } as vscode.Disposable;
-        });
-
-        registerResetConfigurationCommand(
-            mockContext as unknown as vscode.ExtensionContext,
-            mockConfigManager as unknown as ConfigManager
-        );
-
-        await handler?.();
-
-        sinon.assert.calledOnce(warningStub);
-        sinon.assert.calledOnceWithExactly(mockConfigManager.resetConfiguration);
-        assert.strictEqual(infoStub.callCount, 1);
-        assert.ok(
-            infoStub.calledWith(
-                "LiteLLM configuration has been reset. Use 'LiteLLM: Manage Configuration' to re-configure providers."
-            )
-        );
-    });
-
-    test("resetConfiguration command cancels when user declines confirmation", async () => {
-        const warningStub = sandbox
-            .stub(vscode.window, "showWarningMessage")
-            .resolves("Cancel" as unknown as vscode.MessageItem);
-
-        let handler: (() => Promise<void>) | undefined;
-        sandbox.stub(vscode.commands, "registerCommand").callsFake((id, cb) => {
-            if (id === "litellm-connector.resetConfiguration") {
-                handler = cb as () => Promise<void>;
-            }
-            return { dispose: sandbox.stub() } as vscode.Disposable;
-        });
-
-        registerResetConfigurationCommand(
-            mockContext as unknown as vscode.ExtensionContext,
-            mockConfigManager as unknown as ConfigManager
-        );
-
-        await handler?.();
-
-        sinon.assert.notCalled(mockConfigManager.resetConfiguration);
-        assert.strictEqual(warningStub.callCount, 1);
     });
 });
 

@@ -57,45 +57,6 @@ interface OutputReservationOptions {
 }
 
 /**
- * Cache for static prompt token counts to avoid redundant calculations.
- */
-const staticPromptTokenCache = new Map<string, number>();
-
-/**
- * Calculates and caches the token count for static prompt strings.
- */
-export function getStaticPromptTokenCount(prompt: string, modelId?: string, modelInfo?: LiteLLMModelInfo): number {
-    const cacheKey = `${modelId || "default"}-${prompt.length}`;
-    if (staticPromptTokenCache.has(cacheKey)) {
-        return staticPromptTokenCache.get(cacheKey)!;
-    }
-    const count = countTokens(prompt, modelId, modelInfo);
-    staticPromptTokenCache.set(cacheKey, count);
-    return count;
-}
-
-/**
- * Calculates the available context window for a specific task.
- * Formula: Context Window = Max Input - Max Output - System Prompts - Safety Buffer
- */
-export function calculateAvailableContext(
-    maxInput: number,
-    maxOutput: number,
-    staticPrompts: string[],
-    modelId?: string,
-    modelInfo?: LiteLLMModelInfo,
-    safetyBuffer = 0.05 // 5% default safety buffer
-): number {
-    let totalStaticTokens = 0;
-    for (const prompt of staticPrompts) {
-        totalStaticTokens += getStaticPromptTokenCount(prompt, modelId, modelInfo);
-    }
-
-    const available = maxInput - maxOutput - totalStaticTokens;
-    return Math.max(0, Math.floor(available * (1 - safetyBuffer)));
-}
-
-/**
  * Centralized token counting utility.
  */
 export function countTokens(

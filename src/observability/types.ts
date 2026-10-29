@@ -1,8 +1,8 @@
 /**
  * Type definitions for the observability layer.
  *
- * These types define the structured logging, telemetry, and auditing contracts
- * used throughout the provider request pipeline.
+ * These types define the structured logging contracts used throughout the
+ * provider request pipeline.
  */
 
 /**
@@ -59,34 +59,4 @@ export interface LogEvent {
     endpoint?: string;
     /** Caller context (e.g., "inline-completions", "terminal-chat", "chat") */
     caller?: string;
-}
-
-/**
- * Audit summary for a completed request.
- */
-export interface AuditSummary {
-    /** Stable request ID */
-    requestId: string;
-    /** Model ID */
-    modelId: string;
-    /** Endpoint used */
-    endpoint: string;
-    /** Caller context */
-    caller: string;
-    /** Total duration in milliseconds */
-    durationMs: number;
-    /** Input token count */
-    tokensIn?: number;
-    /** Output token count */
-    tokensOut?: number;
-    /** Total message count */
-    messageCount: number;
-    /** Tool calls made */
-    toolCalls: string[];
-    /** Errors encountered */
-    errors: string[];
-    /** Warnings encountered */
-    warnings: string[];
-    /** All events for this request */
-    events: LogEvent[];
 }

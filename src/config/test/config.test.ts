@@ -28,11 +28,8 @@ suite("ConfigManager Unit Tests", () => {
         // Stub workspace configuration reads so tests are deterministic and don't depend on VS Code defaults.
         // We return explicit values for the keys ConfigManager reads.
         configGetStub = sinon.stub();
-        // Note: legacy `litellm-connector.baseUrl`, `.apiKeySecretRef`, and
-        // `.emitUsageData` settings are no longer read by ConfigManager
-        // (VS Code 1.120+ per-group configuration). Stubs for them have been
-        // removed; tests that previously relied on these returns are covered
-        // by the per-test `configGetStub.callsFake(...)` overrides below.
+        // `litellm-connector.baseUrl`, `.apiKeySecretRef`, and `.emitUsageData`
+        // are not read under VS Code's per-group provider configuration.
         configGetStub.callsFake((key: string, defaultValue?: unknown) => {
             if (settingsMap.has(key)) {
                 return settingsMap.get(key);
@@ -46,8 +43,6 @@ suite("ConfigManager Unit Tests", () => {
                     return false;
                 case "litellm-connector.modelOverrides":
                     return [];
-                case "litellm-connector.commitModelIdOverride":
-                    return "";
                 case "litellm-connector.modelCapabilitiesOverrides":
                     return {};
                 default:
@@ -78,7 +73,6 @@ suite("ConfigManager Unit Tests", () => {
         const config = await manager.getConfig();
         // url and key are not part of LiteLLMConfig; backends are configured
         // per provider group in VS Code's Language Models settings.
-        assert.strictEqual(config.commitModelIdOverride, "");
         assert.deepStrictEqual(config.modelCapabilitiesOverrides, {});
     });
 
@@ -278,7 +272,6 @@ suite("ConfigManager Unit Tests", () => {
             "disableQuotaToolRedaction",
             "enableModelOverrides",
             "modelCapabilitiesOverrides",
-            "commitModelIdOverride",
             "forceResponsesEndpoint",
             "allowChatCompletionsFallback",
             "rateLimitMaxDelayMs",

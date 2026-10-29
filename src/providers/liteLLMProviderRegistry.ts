@@ -419,9 +419,9 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     /**
-     * Aggregated, deduplicated model list across all registered backends. Intended
-     * for read-only access (e.g., commit provider) without introducing secondary
-     * caches.
+     * Aggregated, deduplicated model list across all registered backends.
+     * Intended for read-only access from the show-models and reload-models
+     * commands, without introducing secondary caches.
      */
     public getAllModels(): LanguageModelChatInformation[] {
         const seen = new Set<string>();
@@ -978,24 +978,4 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     private sleep(ms: number, _token?: vscode.CancellationToken): Promise<void> {
         return new Promise((resolve) => setTimeout(resolve, ms));
     }
-}
-
-let sharedRegistry: LiteLLMProviderRegistry | undefined;
-
-export function getOrCreateBackendRegistry(deps: RegistryDeps): LiteLLMProviderRegistry {
-    if (!sharedRegistry) {
-        sharedRegistry = new LiteLLMProviderRegistry(deps);
-        return sharedRegistry;
-    }
-
-    return sharedRegistry;
-}
-
-/**
- * Test-only helper to reset the singleton instance. Do not call in production
- * paths.
- */
-export function resetBackendRegistry(): void {
-    sharedRegistry?.dispose();
-    sharedRegistry = undefined;
 }

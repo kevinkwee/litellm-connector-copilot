@@ -1,7 +1,6 @@
 import * as assert from "assert";
 
 import type {
-    LiteLLMConfig,
     LiteLLMModelInfo,
     LiteLLMResponseInputItem,
     OpenAIChatCompletionRequest,
@@ -10,14 +9,6 @@ import type {
 } from "../../types";
 
 suite("Types Unit Tests", () => {
-    test("LiteLLMConfig supports commit model id override", () => {
-        const cfg: LiteLLMConfig = {
-            commitModelIdOverride: "gpt-4",
-        };
-
-        assert.strictEqual(cfg.commitModelIdOverride, "gpt-4");
-    });
-
     test("OpenAIChatCompletionRequest shape is assignable", () => {
         const msg: OpenAIChatMessage = { role: "user", content: "hi" };
         const req: OpenAIChatCompletionRequest = {

@@ -24,7 +24,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 
 ### Anthropic prompt caching
 - New setting `litellm-connector.anthropicPromptCaching` (`off` | `5m` | `1h`, default `5m`) marks Claude requests with a top-level `cache_control` ephemeral CachePoint that LiteLLM forwards to the Claude API, so repeated prefixes (system prompt, tools, conversation history) are served from Anthropic's prompt cache. Unrelated to `litellm-connector.disableCaching`, which bypasses the LiteLLM proxy response cache.
-- `1h` cache writes cost 2x input tokens versus 1.25x for `5m`; cache reads cost 0.1x for both tiers. Applies only to Anthropic Claude models; commit message generation never marks its one-shot prompts.
+- `1h` cache writes cost 2x input tokens versus 1.25x for `5m`; cache reads cost 0.1x for both tiers. Applies only to Anthropic Claude models.
 - If a model rejects the marker, the connector strips it, retries the request, and remembers the rejection for the rest of the session (no repeat failure cost).
 
 ### Multimodal tool results
@@ -39,7 +39,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Retention caps keep the export folder bounded: `maxFilesPerSession` trims the oldest files within each session, `maxSessions` deletes whole sessions beyond the count, and `maxTotalBytes` deletes whole sessions, oldest first, until the total is at or under 80% of the cap or only the session being written is left. The byte cap evicts every other session before the one being written; if that session alone still exceeds `maxTotalBytes`, its oldest files go until the total fits, including the file just written when that file alone exceeds the cap. Deleting a file updates its folder's modified time, so a folder can show a recent date without a new transcript.
 - New command: **LiteLLM: Open .copilotmd Export Folder**.
 - Reasoning/thinking parts and tool messages are rendered in transcripts; thinking parts are concatenated into continuous reasoning lines with visible separation between reasoning and text.
-- The session id attached to request metadata (`metadata.session_id`, which LiteLLM promotes to `litellm_session_id`) is the same id used for the export folder, so transcripts group with LiteLLM spend logs. It is derived from the host's conversation id when VS Code provides one (Copilot Chat in editor windows, and the Agents window from VS Code 1.143 on): passed through verbatim when that id is already a UUID, hashed to a UUID v5 otherwise. Requests with no host conversation behind them (title generation, commit-message generation, other extensions, Agents window sessions on older builds) fall back to a fingerprint of the conversation's opening context: every message before the first assistant reply, system prompt included. The fingerprint separates sessions running under different agents or modes, and still collides when two conversations share both the system prompt and the opening request. Because the system prompt is part of the fingerprint, a mid-conversation system-prompt rebuild, such as a mode change, starts a new id for the turns that follow.
+- The session id attached to request metadata (`metadata.session_id`, which LiteLLM promotes to `litellm_session_id`) is the same id used for the export folder, so transcripts group with LiteLLM spend logs. It is derived from the host's conversation id when VS Code provides one (Copilot Chat in editor windows, and the Agents window from VS Code 1.143 on): passed through verbatim when that id is already a UUID, hashed to a UUID v5 otherwise. Requests with no host conversation behind them (title generation, other extensions, Agents window sessions on older builds) fall back to a fingerprint of the conversation's opening context: every message before the first assistant reply, system prompt included. The fingerprint separates sessions running under different agents or modes, and still collides when two conversations share both the system prompt and the opening request. Because the system prompt is part of the fingerprint, a mid-conversation system-prompt rebuild, such as a mode change, starts a new id for the turns that follow.
 - Each transcript's Metadata block shows `sessionId` and `sessionIdSource` (`conversation` for a host UUID, `conversation-hashed` for a hashed host id, `fingerprint` for the fallback), and the `copilotmd.exported` structured log event carries the same source. `sessionIdSource` is the authoritative answer. As a quick hint from the folder name alone: fingerprints and hashed host ids are UUID v5 (`5` as the first character of the third group), while the host conversation ids seen so far have been UUID v4.
 
 ### Structured log persistence
@@ -70,7 +70,6 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - A model that rejects `stream_options.include_usage` is remembered under its raw model name, so later requests omit the flag without paying another failed round trip.
 - Tool-call-shaped text in a model's answer is delivered as text; only structured tool-call fields can trigger a tool.
 - `autoTrimMessages` never keeps a tool result whose tool call was trimmed away, which providers reject.
-- Commit-message generation treats a connector notice as a failure and restores the message the user had typed.
 
 ### New settings
 - `litellm-connector.anthropicPromptCaching` (Anthropic prompt caching, default `5m`): see the dedicated section above.
@@ -78,6 +77,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Per-model temperature: a `temperature` configuration property is exposed per model in VS Code's model settings (only for models that support the parameter) and sent with every request.
 
 ### Internal cleanup
+- Removed the git commit-message feature (its command, SCM title button, `litellm-connector.commitModelIdOverride` setting, and provider), the unused `AuditTrail`, the "LiteLLM: Reset All Configuration" command, and the server-side token-counter request. Token counts now come from the local estimator only.
 - Removed legacy and deprecated code paths, the unused v2 message pipeline, the legacy config migration, and the old Set Log Level command; inlined language model provider registration.
 - Removed upstream's PostHog telemetry pipeline, marketplace packaging, CI/CD, and community scaffolding. Local metric logging and structured logging remain.
 - `npm run bump-version dev` now emits semver-correct dotted prerelease tags (e.g. `2.1.10-dev.11`).
@@ -90,7 +90,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 
 ## Building locally
 
-On Windows, run npm scripts from Git Bash because the `clean` scripts use Unix `find`.
+Run npm scripts from any shell: the `clean` scripts are cross-platform Node scripts.
 
 ```bash
 npm install

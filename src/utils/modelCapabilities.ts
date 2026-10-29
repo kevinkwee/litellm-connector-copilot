@@ -276,39 +276,16 @@ const DEFAULT_REASONING_EFFORTS: readonly SupportedReasoningEffort[] = [
 ];
 
 /**
- * Type definition for extended properties on LanguageModelChatInformation.
- */
-export type ExtendedModelInformation = vscode.LanguageModelChatInformation & {
-    vendor?: string;
-    backendName?: string;
-    tags?: string[];
-    detail?: string;
-    tooltip?: string;
-};
-
-/**
- * Determine supported reasoning efforts for a model based on its LiteLLM model info.
- *
- * Returns an array of supported effort values (strings) that can be exposed in the
- * VS Code model picker UI. Mappings support both standard and alias variants.
- *
- * Priority order for determining effort levels:
- * 1. Explicit level fields (supports_minimal_reasoning_effort, supports_low_reasoning_effort, etc.)
- * 2. General reasoning support (supports_reasoning: true) → ["low", "medium", "high"]
- * 3. No reasoning support → empty array
- *
- * @param modelInfo LiteLLM model information with reasoning capabilities
- * @returns Array of supported reasoning effort strings
+ * True when the model declares reasoning support, either through the general
+ * `supports_reasoning` flag or through an explicit effort-level field.
  */
 function hasReasoningSignal(modelInfo?: LiteLLMModelInfo): boolean {
     if (!modelInfo) {
         return false;
     }
-    // Direct support flag
     if (modelInfo.supports_reasoning === true) {
         return true;
     }
-    // Check for explicit reasoning effort level fields
     return Object.keys(LITELLM_REASONING_EFFORT_MAPPING).some(
         (key) => modelInfo[key as keyof LiteLLMModelInfo] === true
     );
@@ -340,6 +317,14 @@ function reasoningEffortParamStatus(modelInfo?: LiteLLMModelInfo): boolean | nul
     return null;
 }
 
+/**
+ * Resolves the reasoning effort levels to expose for a model in the picker.
+ *
+ * The explicit `supports_<level>_reasoning_effort` fields are the base set, a
+ * non-empty `modelOverrides` entry replaces it, and a model that reports only
+ * `supports_reasoning` gets `DEFAULT_REASONING_EFFORTS`. An empty result means
+ * no effort picker.
+ */
 export function getSupportedReasoningEfforts(
     modelInfo?: LiteLLMModelInfo,
     modelId?: string,
@@ -539,12 +524,6 @@ export function buildReasoningEffortConfigurationSchema(
                 // VS Code's `getModelConfigurationDescription` uses `currentConfig[key] ?? propSchema.default`
                 // to render the current effort label next to the model name (e.g. "claude-sonnet-4-6 · Medium").
                 // Without a `default`, no label is shown until the user makes an explicit selection.
-                //
-                // Previously this caused effort resets because provideLanguageModelChatInformation was
-                // called before every chat turn (returning new object instances), which caused VS Code to
-                // re-initialize model state and apply the schema default. That root cause has been fixed
-                // by the TTL cache and non-destructive merge changes — the schema default is now safe to
-                // restore so the model name label reflects the active effort level correctly.
                 default: defaultEffort,
                 group: "navigation",
             },
@@ -628,23 +607,6 @@ export function mergeConfigurationSchemas(
 export function resolveReasoningEffort(modelInfo?: LiteLLMModelInfo): SupportedReasoningEffort | undefined {
     const supports = getSupportedReasoningEfforts(modelInfo);
     return getDefaultReasoningEffort(supports);
-}
-
-/**
- * Centralized helper to format how a model is displayed in UI surfaces.
- * Uses raw string values.
- *
- * @param modelOrName The extended model information object, or the raw model name string.
- * @param vendor Optional raw provider/vendor name (used only if modelOrName is a string).
- * @returns A consistent UI label
- */
-export function formatModelDisplayLabel(modelOrName: ExtendedModelInformation | string, vendor?: string): string {
-    if (typeof modelOrName === "string") {
-        return vendor ? `[${vendor}] ${modelOrName}` : modelOrName;
-    }
-
-    const modelVendor = modelOrName.vendor;
-    return modelVendor ? `[${modelVendor}] ${modelOrName.name}` : modelOrName.name;
 }
 
 /**

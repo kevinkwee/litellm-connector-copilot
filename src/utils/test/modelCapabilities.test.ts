@@ -2,7 +2,6 @@ import * as assert from "assert";
 import {
     capabilitiesToVSCode,
     getModelTags,
-    formatModelDisplayLabel,
     getSupportedReasoningEfforts,
     getDefaultReasoningEffort,
     buildReasoningEffortConfigurationSchema,
@@ -10,7 +9,6 @@ import {
     mergeConfigurationSchemas,
     derivePickerCategory,
     type DerivedModelCapabilities,
-    type ExtendedModelInformation,
 } from "../modelCapabilities";
 import type { LiteLLMModelInfo, ModelCapabilityOverride, SupportedReasoningEffort } from "../../types";
 
@@ -344,22 +342,6 @@ suite("modelCapabilities", () => {
             const tags = getModelTags("gpt-4o", derived, tagOverrides, capabilityOverrides);
             assert.ok(tags.includes("tools"), "Should include tools tag from capability override");
             assert.ok(tags.includes("custom-tag"), "Should include custom tag from tag overrides");
-        });
-    });
-
-    suite("formatModelDisplayLabel", () => {
-        test("formats strings correctly", () => {
-            assert.strictEqual(formatModelDisplayLabel("gpt-4o", "openai"), "[openai] gpt-4o");
-            assert.strictEqual(formatModelDisplayLabel("gpt-4o"), "gpt-4o");
-            assert.strictEqual(formatModelDisplayLabel("gpt-4o", ""), "gpt-4o");
-        });
-
-        test("formats model objects correctly", () => {
-            const mockModel = { name: "gpt-4o", vendor: "openai" } as unknown as ExtendedModelInformation;
-            assert.strictEqual(formatModelDisplayLabel(mockModel), "[openai] gpt-4o");
-
-            const mockModelNoVendor = { name: "gpt-4o" } as unknown as ExtendedModelInformation;
-            assert.strictEqual(formatModelDisplayLabel(mockModelNoVendor), "gpt-4o");
         });
     });
 

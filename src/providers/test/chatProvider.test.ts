@@ -13,13 +13,8 @@ import { createMockSSEStream } from "../../test/utils/testStreamUtils";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
- * Seeds the per-group discovery state on a provider so the new routing path
- * (`resolveBackendForCall`) finds a backend during the request flow.
- *
- * The single-provider architecture moved routing identity from a global model
- * list keyed by hostname-namespaced IDs to call-time configuration. Tests
- * pre-dating the migration stub `getConfig().url` only; this helper bridges
- * them by stubbing `resolveBackendForCall` to return a known session.
+ * Seeds a provider with a known backend and configuration session so the
+ * routing path resolves during a request flow without an HTTP discovery call.
  */
 function seedDiscoveredBackend(sandbox: sinon.SinonSandbox, provider: LiteLLMChatProvider, modelId: string): void {
     const seededModel = {

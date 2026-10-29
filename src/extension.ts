@@ -4,11 +4,8 @@ import { ConfigManager } from "./config/configManager";
 import {
     registerManageConfigCommand,
     registerReloadModelsCommand,
-    registerResetConfigurationCommand,
     registerShowModelsCommand,
 } from "./commands/manageConfig";
-import { registerGenerateCommitMessageCommand } from "./commands/generateCommitMessage";
-import { LiteLLMCommitMessageProvider } from "./providers/liteLLMCommitProvider";
 import { Logger } from "./utils/logger";
 import { StructuredLogger, CopilotMdManager } from "./observability";
 import { EffortFallbackCache } from "./utils/reasoningEffortFallback";
@@ -49,17 +46,11 @@ export function activate(context: vscode.ExtensionContext): void {
     Logger.info(`UA: ${ua}`);
 
     configManagerInstance = new ConfigManager(context.secrets);
-    const configManager = configManagerInstance;
 
     const effortFallbackCache = new EffortFallbackCache();
 
-    // VS Code 1.120+ uses the unified chat provider with per-group configuration support.
-
     const activeProvider = new LiteLLMChatProvider(context.secrets, ua, effortFallbackCache);
     activeChatProviderInstance = activeProvider; // Store for cleanup on deactivation
-
-    // Commit message provider (version-agnostic)
-    const commitProvider = new LiteLLMCommitMessageProvider(context.secrets, ua, effortFallbackCache);
 
     // Register provider immediately (do not await config)
     try {
@@ -123,11 +114,9 @@ export function activate(context: vscode.ExtensionContext): void {
     });
 
     try {
-        context.subscriptions.push(registerManageConfigCommand(context, configManager, activeProvider));
-        context.subscriptions.push(registerResetConfigurationCommand(context, configManager));
+        context.subscriptions.push(registerManageConfigCommand());
         context.subscriptions.push(registerShowModelsCommand(activeProvider));
         context.subscriptions.push(registerReloadModelsCommand(activeProvider));
-        context.subscriptions.push(registerGenerateCommitMessageCommand(commitProvider));
         context.subscriptions.push(registerOpenCopilotMdFolderCommand());
         Logger.info("Config command registered.");
     } catch (cmdErr) {
@@ -136,7 +125,6 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export async function deactivate(): Promise<void> {
-    // Clean up session-scoped caches to free memory
     if (activeChatProviderInstance) {
         activeChatProviderInstance.clearSessionCaches();
     }

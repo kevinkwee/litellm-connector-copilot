@@ -6,7 +6,6 @@ import {
     deriveGroupNameFromUrl,
     isToolResultPart,
     normalizeToolCallId,
-    stripMarkdownCodeBlocks,
     tryParseJSONObject,
     validateRequest,
     validateTools,
@@ -119,16 +118,6 @@ suite("Utility Unit Tests", () => {
             const once = normalizeToolCallId(raw);
             assert.strictEqual(normalizeToolCallId(once), once, `must be idempotent for: ${raw}`);
         }
-    });
-
-    test("stripMarkdownCodeBlocks handles various formats", () => {
-        assert.strictEqual(stripMarkdownCodeBlocks("just text"), "just text");
-        assert.strictEqual(stripMarkdownCodeBlocks("```\ncontent\n```"), "content");
-        assert.strictEqual(stripMarkdownCodeBlocks("```python\nprint(1)\n```"), "print(1)");
-        assert.strictEqual(stripMarkdownCodeBlocks("```\na\n```\n\n```\nb\n```"), "a\n\nb");
-
-        // Backticks but no complete block
-        assert.strictEqual(stripMarkdownCodeBlocks("text with `backticks`"), "text with `backticks`");
     });
 
     test("convertMessages handles text and images", () => {

@@ -8,8 +8,6 @@ import {
     trimMessagesToFitBudget,
     countTokens,
     countOpenAIChatMessagesTokens,
-    calculateAvailableContext,
-    getStaticPromptTokenCount,
     getReservedOutputTokens,
     isContextOverflowError,
 } from "../tokenUtils";
@@ -380,21 +378,6 @@ suite("TokenUtils Unit Tests", () => {
             () => trimMessagesToFitBudget([systemMsg], undefined, modelInfo),
             /Message exceeds token limit\./
         );
-    });
-
-    test("calculateAvailableContext computes correctly with buffer", () => {
-        // Mock getStaticPromptTokenCount or use values from selectTokenizer (default)
-        const available = calculateAvailableContext(1000, 200, ["static"], "m");
-        // "static" is 6 chars -> 2 tokens. Total static: 2.
-        // 1000 - 200 - 2 = 798. Buffer 0.05 -> 798 * 0.95 = 758.1 -> 758.
-        assert.strictEqual(available, 758);
-    });
-
-    test("getStaticPromptTokenCount uses cache", () => {
-        const p = "unique-prompt-" + Math.random();
-        const count1 = getStaticPromptTokenCount(p, "m");
-        const count2 = getStaticPromptTokenCount(p, "m");
-        assert.strictEqual(count1, count2);
     });
 
     test("countOpenAIChatMessagesTokens counts transport tool calls and tool results", () => {

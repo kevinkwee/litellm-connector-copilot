@@ -12,7 +12,10 @@ const TIMEOUT_EXIT_CODE = 124; // Traditional timeout command uses 124
 // The suite itself runs for about 45 s, and VS Code takes several seconds to
 // launch and exit on Windows, so the default leaves headroom instead of
 // killing a green run. Override with TEST_TIMEOUT_MS when needed.
-const TEST_TIMEOUT_MS = Number(process.env.TEST_TIMEOUT_MS ?? 300000);
+const TEST_TIMEOUT_MS = (() => {
+    const configured = Number(process.env.TEST_TIMEOUT_MS);
+    return Number.isFinite(configured) && configured > 0 ? configured : 300000;
+})();
 
 /**
  * Remove directory contents without removing the directory itself.

@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Bug Fixes
+
+* **Token counting no longer leaks memory**: `provideTokenCount` returns the local estimator's count and nothing else. VS Code calls it without the provider-group configuration, so the background LiteLLM count never ran, while its cache kept up to 100 full messages, image bytes included, for the whole session. The unused `/utils/token_counter` client method and its types are gone. (`src/providers/liteLLMProviderBase.ts`, `src/adapters/litellmClient.ts`, `src/types.ts`)
+* **Cross-platform build scripts**: `npm run clean` no longer relies on a POSIX `find`, so `npm run compile` and `npm run test:coverage` work on Windows. The coverage runner no longer kills a green run at 60 seconds. (`scripts/clean.mjs`, `scripts/test-coverage.mjs`, `package.json`)
+
+### Breaking Changes
+
+* **Git commit-message generation removed**: the `litellm-connector.generateCommitMessage` command, its Source Control title button, the `litellm-connector.commitModelIdOverride` setting, and the `LiteLLMCommitMessageProvider` class are gone. Use Copilot's own commit-message generation with a LiteLLM-selected model instead. (`src/providers/liteLLMCommitProvider.ts`, `src/commands/generateCommitMessage.ts`)
+* **"LiteLLM: Reset All Configuration" removed**: the command promised to remove provider groups, keys, and settings, but provider groups live in VS Code's Language Models view, which the connector cannot modify. (`src/commands/manageConfig.ts`, `src/config/configManager.ts`)
+
+### Internal Cleanup
+
+* Deleted the unused `AuditTrail` (it was never fed, and production only cleared it), the `splitConnectorNotice` helper, and the per-request `promptCaching` opt-out that only commit generation used, plus the unused backend-registry singleton helpers.
+* Deleted the `memory-profile` harness, the `LRUCache` utility, and the self-contained `MockLiteLLMBackend` mock, which had no consumer left outside its own tests.
+
 ## [2.1.10-dev.19] - 2026-10-24
 
 ### 🐛 Fixes

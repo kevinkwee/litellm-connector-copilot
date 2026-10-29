@@ -46,7 +46,7 @@ suite("ConfigManager", () => {
         assert.strictEqual(session?.backendName, "llmapi.wolfram.com");
     });
 
-    test("getConfig no longer exposes legacy url/key/backends", async () => {
+    test("getConfig returns only supported keys", async () => {
         const secrets = {
             get: async () => undefined,
             store: async () => {},
@@ -60,10 +60,9 @@ suite("ConfigManager", () => {
 
         // url, key, and backends are not part of LiteLLMConfig; backends are
         // configured per provider group in VS Code's Language Models settings.
-        assert.strictEqual(config.commitModelIdOverride, "");
+        const legacyKeys = Object.keys(config).filter((key) => ["url", "key", "backends", "apiKey"].includes(key));
+        assert.deepStrictEqual(legacyKeys, []);
     });
-
-    // resolveBackends test removed - method no longer exists (VS Code 1.120+ per-group configuration)
 
     test("convertProviderConfiguration accepts an empty groupName when baseUrl is set", async () => {
         const secrets = {
