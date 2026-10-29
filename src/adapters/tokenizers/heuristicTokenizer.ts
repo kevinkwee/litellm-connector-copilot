@@ -2,6 +2,7 @@ import type { LanguageModelChatRequestMessage } from "vscode";
 import type { Tokenizer, TokenizationResult } from "./types";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import { estimateMediaTokenCost } from "../tokenUtils";
+import { decodeUtf8 } from "../../utils/byteEncoding";
 
 export class HeuristicTokenizer implements Tokenizer {
     static STRUCTURED_LOGGER_ENABLED = true;
@@ -108,7 +109,7 @@ export class HeuristicTokenizer implements Tokenizer {
                 }
                 // Count text and JSON data
                 if (mimeType.startsWith("text/") || mimeType.includes("json") || mimeType === "usage") {
-                    const textContent = Buffer.from(data).toString("utf-8");
+                    const textContent = decodeUtf8(data);
                     const tokens = this.countTokens(textContent).tokens;
                     StructuredLogger.trace("Counting text/json data part tokens", {
                         mimeType,

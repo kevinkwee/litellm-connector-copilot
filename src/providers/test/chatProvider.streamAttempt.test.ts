@@ -154,6 +154,37 @@ suite("LiteLLMChatProvider stream attempt", () => {
         );
     });
 
+    test("emits the declared tool name when the advertised name had to change", async () => {
+        const { provider, seams } = createProvider(sandbox);
+        sandbox
+            .stub(seams, "sendRequestWithRetry")
+            .resolves(
+                new SteppedSseStream(
+                    [
+                        chatToolCallHeaderFrame("call_renamed", "search_files"),
+                        chatToolCallArgumentsFrame('{"q":"x"}'),
+                        SSE_DONE_FRAME,
+                    ],
+                    []
+                ).body
+            );
+        const recorder = createPartRecorder();
+        const options = {
+            ...createMockChatResponseOptions(),
+            tools: [{ name: "search files", description: "", inputSchema: {} }],
+        } as unknown as vscode.ProvideLanguageModelChatResponseOptions;
+
+        await provider.provideLanguageModelChatResponse(
+            MODEL,
+            [createMockUserMessage("find it")],
+            options,
+            recorder.progress,
+            new vscode.CancellationTokenSource().token
+        );
+
+        assert.deepStrictEqual(collectToolCalls(recorder.parts), [{ name: "search files", input: { q: "x" } }]);
+    });
+
     test("tags a tool call dropped at stream end with its request id", async () => {
         const { seams } = createProvider(sandbox);
         const warnStub = sandbox.stub(StructuredLogger, "warn");

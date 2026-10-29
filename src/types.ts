@@ -39,6 +39,17 @@ export interface OpenAIChatMessageContentItem {
 export type ToolResultImageMode = "native" | "hoist";
 
 /**
+ * Wire shape used to carry the separate text parts a tool result contains.
+ *
+ * - `separate`: one text item per part, so boundaries survive. Correct for
+ *   provider families whose LiteLLM transform keeps list items apart
+ *   (Anthropic, Bedrock).
+ * - `joined`: the parts joined with a blank line and sent as one string, for
+ *   providers whose transform concatenates list items with no separator.
+ */
+export type ToolResultTextMode = "separate" | "joined";
+
+/**
  * Anthropic thinking block carried on assistant messages. Only signed or
  * safety-redacted blocks are sent; unsigned reasoning text travels via
  * `reasoning_content`, which LiteLLM maps for reasoning-native providers.
@@ -67,7 +78,7 @@ export interface OpenAIChatMessage {
      * Reasoning/thinking content from the model's internal reasoning process.
      * LiteLLM passes this through to upstream providers that support it
      * (GLM-5.2, DeepSeek, Qwen, etc.) and also accepts it on assistant
-     * messages sent back as conversation history — so the model can see
+     * messages sent back as conversation history, so the model can see
      * its own prior reasoning on subsequent turns. This is separate from
      * `content` (the model's visible response text) to match the
      * `reasoning_content` field that LiteLLM and reasoning-native providers
@@ -362,7 +373,7 @@ export interface LiteLLMModelInfo {
     supports_high_reasoning_effort?: boolean | null;
     supports_xhigh_reasoning_effort?: boolean | null;
     supports_max_reasoning_effort?: boolean | null;
-    // Supported parameters array - must be validated before API calls
+    // Supported parameters array, validated before API calls
     supported_openai_params?: string[] | null;
     // Modalities for advanced capability detection
     modalities?: string[];
@@ -506,16 +517,16 @@ export interface LiteLLMResponsesRequest {
     tools?: LiteLLMResponseTool[];
     tool_choice?: LiteLLMResponsesToolChoice;
     /**
-     * Mirror of `OpenAIChatCompletionRequest.reasoning_effort` — LiteLLM accepts the
+     * Mirror of `OpenAIChatCompletionRequest.reasoning_effort`. LiteLLM accepts the
      * same flat snake_case key on `/responses`, so we propagate it unchanged from
      * the canonical chat-shaped request body during transformation. Accepts the
-     * same string-or-object shape as the chat-shaped request — see that field for
+     * same string-or-object shape as the chat-shaped request. See that field for
      * details.
      */
     reasoning_effort?: string | { effort: string; summary?: string };
     stream_options?: { include_usage?: boolean };
     /**
-     * LiteLLM proxy metadata — same shape and purpose as
+     * LiteLLM proxy metadata, the same shape and purpose as
      * `OpenAIChatCompletionRequest.metadata`. The responses adapter
      * propagates it from the chat-shaped request body during transformation.
      */

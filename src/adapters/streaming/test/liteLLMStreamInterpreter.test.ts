@@ -13,7 +13,7 @@ import { UpstreamStreamError } from "../../../utils/transportRetry";
 declare const suite: (name: string, fn: () => void) => void;
 declare const test: (name: string, fn: () => void) => void;
 
-suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
+suite("LiteLLMStreamInterpreter: Tool Call Regressions", () => {
     test("should clear buffered tool calls when stream aborts before finish", () => {
         const state = createInitialStreamingState();
 
@@ -231,7 +231,7 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
     test("should buffer response.output_item.delta with call_id and emit on output_item.done", () => {
         const state = createInitialStreamingState();
 
-        // Delta 1 — name + partial args, with call_id
+        // Delta 1: name and partial args, with call_id
         let parts = interpretStreamEvent(
             {
                 type: "response.output_item.delta",
@@ -241,7 +241,7 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
         );
         assert.strictEqual(parts.length, 0, "should buffer, not emit yet");
 
-        // Delta 2 — remaining args, same call_id
+        // Delta 2: remaining args, same call_id
         parts = interpretStreamEvent(
             {
                 type: "response.output_item.delta",
@@ -251,7 +251,7 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
         );
         assert.strictEqual(parts.length, 0, "still buffered");
 
-        // Done — should emit the specific call
+        // Done: should emit the specific call
         parts = interpretStreamEvent(
             {
                 type: "response.output_item.done",
@@ -279,7 +279,7 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
     test("should buffer anonymous output_item.delta (no call_id) and emit on done", () => {
         const state = createInitialStreamingState();
 
-        // Delta without call_id — anonymous buffering
+        // Delta without call_id, so buffer anonymously
         let parts = interpretStreamEvent(
             {
                 type: "response.output_item.delta",
@@ -289,7 +289,7 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
         );
         assert.strictEqual(parts.length, 0, "buffered anonymously");
 
-        // Done without call_id — emit from anonymous buffer
+        // Done without call_id: emit from the anonymous buffer
         parts = interpretStreamEvent(
             {
                 type: "response.output_item.done",
@@ -321,7 +321,7 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
             state
         );
 
-        // Flush via output_item.done — removes from responseToolCallOrder
+        // Flush via output_item.done, which removes it from responseToolCallOrder
         interpretStreamEvent(
             {
                 type: "response.output_item.done",
@@ -1603,6 +1603,181 @@ suite("response.incomplete", () => {
         assert.strictEqual(usage.prompt_tokens_details?.cached_tokens, 70);
         assert.strictEqual(usage.prompt_tokens_details?.cache_creation_input_tokens, 10);
         assert.strictEqual(usage.completion_tokens_details?.reasoning_tokens, 8);
+    });
+});
+
+suite("Declared tool name mapping", () => {
+    test("emits the declared name when the wire name was sanitized", () => {
+        const state = createInitialStreamingState("req-names", new Map([["search_files", "search files"]]));
+
+        const parts = interpretStreamEvent(
+            {
+                choices: [
+                    {
+                        delta: {
+                            tool_calls: [
+                                { index: 0, id: "call-1", function: { name: "search_files", arguments: "{}" } },
+                            ],
+                        },
+                        finish_reason: "tool_calls",
+                    },
+                ],
+            },
+            state
+        );
+
+        const toolCall = parts.find((part) => part.type === "tool_call");
+        assert.ok(toolCall && toolCall.type === "tool_call");
+        assert.strictEqual(toolCall.name, "search files");
+    });
+
+    test("leaves an ordinary name unchanged when the map has no entry for it", () => {
+        const state = createInitialStreamingState("req-names", new Map([["search_files", "search files"]]));
+
+        const parts = interpretStreamEvent(
+            {
+                choices: [
+                    {
+                        delta: {
+                            tool_calls: [{ index: 0, id: "call-2", function: { name: "read_file", arguments: "{}" } }],
+                        },
+                        finish_reason: "tool_calls",
+                    },
+                ],
+            },
+            state
+        );
+
+        const toolCall = parts.find((part) => part.type === "tool_call");
+        assert.ok(toolCall && toolCall.type === "tool_call");
+        assert.strictEqual(toolCall.name, "read_file");
+    });
+
+    test("resolves the name on a keyed /responses flush that repeats the wire name", () => {
+        const state = createInitialStreamingState("req-names", new Map([["search_files", "search files"]]));
+
+        interpretStreamEvent(
+            {
+                type: "response.output_item.delta",
+                item: { type: "function_call", call_id: "call-3", name: "search_files", arguments: "{}" },
+            },
+            state
+        );
+
+        const parts = interpretStreamEvent(
+            {
+                type: "response.output_item.done",
+                item: { type: "function_call", call_id: "call-3", name: "search_files", arguments: "{}" },
+            },
+            state
+        );
+
+        const toolCall = parts.find((part) => part.type === "tool_call");
+        assert.ok(toolCall && toolCall.type === "tool_call");
+        assert.strictEqual(toolCall.name, "search files");
+    });
+
+    test("keeps the resolved name when a chat delta repeats the wire name", () => {
+        const state = createInitialStreamingState("req-names", new Map([["search_files", "search files"]]));
+
+        interpretStreamEvent(
+            {
+                choices: [
+                    {
+                        delta: {
+                            tool_calls: [{ index: 0, id: "call-4", function: { name: "search_files", arguments: "" } }],
+                        },
+                    },
+                ],
+            },
+            state
+        );
+        const parts = interpretStreamEvent(
+            {
+                choices: [
+                    {
+                        delta: {
+                            tool_calls: [{ index: 0, function: { name: "search_files", arguments: "{}" } }],
+                        },
+                        finish_reason: "tool_calls",
+                    },
+                ],
+            },
+            state
+        );
+
+        const toolCall = parts.find((part) => part.type === "tool_call");
+        assert.ok(toolCall && toolCall.type === "tool_call");
+        assert.strictEqual(toolCall.name, "search files");
+    });
+
+    test("resolves the name on an anonymous /responses flush that repeats the wire name", () => {
+        const state = createInitialStreamingState("req-names", new Map([["search_files", "search files"]]));
+
+        interpretStreamEvent(
+            {
+                type: "response.output_item.delta",
+                item: { type: "function_call", name: "search_files", arguments: "{}" },
+            },
+            state
+        );
+
+        const parts = interpretStreamEvent(
+            {
+                type: "response.output_item.done",
+                item: { type: "function_call", name: "search_files", arguments: "{}" },
+            },
+            state
+        );
+
+        const toolCall = parts.find((part) => part.type === "tool_call");
+        assert.ok(toolCall && toolCall.type === "tool_call");
+        assert.strictEqual(toolCall.name, "search files");
+    });
+
+    test("keeps the buffered name when a done frame carries an empty name", () => {
+        const state = createInitialStreamingState("req-names", new Map([["search_files", "search files"]]));
+
+        interpretStreamEvent(
+            {
+                type: "response.output_item.delta",
+                item: { type: "function_call", call_id: "call-5", name: "search_files", arguments: "{}" },
+            },
+            state
+        );
+
+        const parts = interpretStreamEvent(
+            {
+                type: "response.output_item.done",
+                item: { type: "function_call", call_id: "call-5", name: "", arguments: "{}" },
+            },
+            state
+        );
+
+        const toolCall = parts.find((part) => part.type === "tool_call");
+        assert.ok(toolCall && toolCall.type === "tool_call");
+        assert.strictEqual(toolCall.name, "search files");
+    });
+
+    test("resolves the name of a Gemini function call", () => {
+        const state = createInitialStreamingState("req-names", new Map([["search_files", "search files"]]));
+
+        const parts = interpretStreamEvent(
+            {
+                candidates: [
+                    {
+                        content: {
+                            parts: [{ functionCall: { name: "search_files", args: { q: "x" } } }],
+                        },
+                    },
+                ],
+            },
+            state
+        );
+
+        const toolCall = parts.find((part) => part.type === "tool_call");
+        assert.ok(toolCall && toolCall.type === "tool_call");
+        assert.strictEqual(toolCall.name, "search files");
     });
 });
 

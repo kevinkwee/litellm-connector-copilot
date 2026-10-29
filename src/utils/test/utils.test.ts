@@ -8,9 +8,24 @@ import {
     normalizeToolCallId,
     tryParseJSONObject,
     validateRequest,
-    validateTools,
 } from "../../utils";
 import type { OpenAIChatMessage, OpenAIChatMessageContentItem } from "../../types";
+
+/** Builds an assistant tool call plus its tool result message, for conversion tests. */
+function buildToolResultMessage(callId: string, resultParts: readonly unknown[]): vscode.LanguageModelChatMessage[] {
+    return [
+        {
+            role: vscode.LanguageModelChatMessageRole.Assistant,
+            content: [new vscode.LanguageModelToolCallPart(callId, "run", {})],
+            name: undefined,
+        },
+        {
+            role: vscode.LanguageModelChatMessageRole.User,
+            content: [new vscode.LanguageModelToolResultPart(callId, resultParts as vscode.LanguageModelTextPart[])],
+            name: undefined,
+        },
+    ];
+}
 
 suite("Utility Unit Tests", () => {
     test("normalizeToolCallId handles edge cases", () => {
@@ -187,7 +202,73 @@ suite("Utility Unit Tests", () => {
         assert.strictEqual(toolResult.role, "tool");
         // The tool_call_id should match the normalized ID from the assistant message
         assert.strictEqual(toolResult.tool_call_id, assistant.tool_calls[0].id);
-        assert.strictEqual(toolResult.content, 'ok{"a":2}');
+        assert.strictEqual(toolResult.content, 'ok\n\n{"a":2}');
+    });
+
+    test("convertMessages joins tool result text parts with a blank line by default", () => {
+        const messages = buildToolResultMessage("call-join", [
+            new vscode.LanguageModelTextPart("first"),
+            new vscode.LanguageModelTextPart("second"),
+            new vscode.LanguageModelTextPart("third"),
+        ]);
+
+        const out = convertMessages(messages) as { role: string; content: unknown }[];
+
+        assert.strictEqual(out[1].content, "first\n\nsecond\n\nthird");
+    });
+
+    test("convertMessages keeps one text item per part for a provider that preserves items", () => {
+        const messages = buildToolResultMessage("call-separate", [
+            new vscode.LanguageModelTextPart("first"),
+            new vscode.LanguageModelTextPart("second"),
+            new vscode.LanguageModelTextPart("third"),
+        ]);
+
+        const out = convertMessages(messages, { toolResultTextMode: "separate" }) as {
+            role: string;
+            content: unknown;
+        }[];
+
+        assert.deepStrictEqual(out[1].content, [
+            { type: "text", text: "first" },
+            { type: "text", text: "second" },
+            { type: "text", text: "third" },
+        ]);
+    });
+
+    test("convertMessages sends a single tool result part as a plain string in either mode", () => {
+        const messages = buildToolResultMessage("call-single", [new vscode.LanguageModelTextPart("only")]);
+
+        for (const toolResultTextMode of ["joined", "separate"] as const) {
+            const out = convertMessages(messages, { toolResultTextMode }) as { role: string; content: unknown }[];
+
+            assert.strictEqual(out[1].content, "only", toolResultTextMode);
+        }
+    });
+
+    test("convertMessages carries tool result images natively in both text modes", () => {
+        const messages = buildToolResultMessage("call-images", [
+            new vscode.LanguageModelTextPart("chart"),
+            new vscode.LanguageModelTextPart("legend"),
+            vscode.LanguageModelDataPart.image(new Uint8Array([1, 2, 3]), "image/png"),
+        ]);
+
+        for (const toolResultTextMode of ["joined", "separate"] as const) {
+            const out = convertMessages(messages, {
+                toolResultImageMode: "native",
+                toolResultTextMode,
+            }) as { role: string; content: unknown }[];
+
+            const content = out[1].content as { type: string; text?: string }[];
+            assert.ok(Array.isArray(content), toolResultTextMode);
+            assert.strictEqual(content[0].type, "text");
+            assert.strictEqual(content[content.length - 1].type, "image_url");
+            assert.strictEqual(
+                content.filter((item) => item.type === "text").length,
+                toolResultTextMode === "separate" ? 2 : 1,
+                toolResultTextMode
+            );
+        }
     });
 
     test("convertMessages maps user/assistant text", () => {
@@ -612,11 +693,6 @@ suite("Utility Unit Tests", () => {
         assert.deepEqual(tryParseJSONObject("not json"), { ok: false });
     });
 
-    test("validateTools rejects invalid names", () => {
-        const badTools: vscode.LanguageModelChatTool[] = [{ name: "bad name!", description: "", inputSchema: {} }];
-        assert.throws(() => validateTools(badTools));
-    });
-
     test("validateRequest enforces tool result pairing", () => {
         const callId = "xyz";
         const toolCall = new vscode.LanguageModelToolCallPart(callId, "toolA", { q: 1 });
@@ -687,7 +763,7 @@ suite("Utility Unit Tests", () => {
             required: string[];
         };
         const userId = params.properties.user_id;
-        assert.strictEqual(userId.type, "integer");
+        assert.strictEqual(userId.type, "number");
         assert.deepStrictEqual(params.required, ["user_id"]);
         const choice = params.properties.choice;
         assert.strictEqual(choice.type, "string");
@@ -696,6 +772,314 @@ suite("Utility Unit Tests", () => {
         assert.deepStrictEqual(extra.required, ["a"]);
         assert.ok(res.tool_choice && typeof res.tool_choice !== "string");
         assert.strictEqual(res.tool_choice?.function.name, "tool_-bad_name");
+    });
+
+    test("convertTools keeps a composite schema's own keys and the branch's type", () => {
+        const tools: vscode.LanguageModelChatTool[] = [
+            {
+                name: "lookup",
+                description: "",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        // pydantic optional: description and default sit beside anyOf
+                        query: {
+                            anyOf: [{ type: "string" }, { type: "null" }],
+                            description: "what to look up",
+                            default: "",
+                        },
+                        filter: {
+                            type: "object",
+                            properties: { owner: { type: "string" } },
+                            anyOf: [{ required: ["owner"] }, { required: ["team"] }],
+                        },
+                    },
+                },
+            },
+        ];
+
+        const params = convertTools({
+            tools,
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+            requestInitiator: "test",
+        }).tools?.[0].function.parameters as {
+            properties: Record<string, Record<string, unknown>>;
+        };
+
+        assert.deepStrictEqual(params.properties.query, {
+            type: "string",
+            description: "what to look up",
+            default: "",
+        });
+        assert.strictEqual(params.properties.filter.type, "object");
+        assert.deepStrictEqual(params.properties.filter.properties, { owner: { type: "string" } });
+        // A branch's required list never describes the merged value.
+        assert.strictEqual(params.properties.filter.required, undefined);
+    });
+
+    test("convertTools resolves a nested composite inside items", () => {
+        const tools: vscode.LanguageModelChatTool[] = [
+            {
+                name: "batch",
+                description: "",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        rows: { type: "array", items: { anyOf: [{ type: "integer" }, { type: "null" }] } },
+                    },
+                },
+            },
+        ];
+
+        const params = convertTools({
+            tools,
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+            requestInitiator: "test",
+        }).tools?.[0].function.parameters as {
+            properties: Record<string, Record<string, unknown>>;
+        };
+
+        assert.deepStrictEqual(params.properties.rows, { type: "array", items: { type: "integer" } });
+    });
+
+    test("convertTools turns a schema with properties but no type into an object", () => {
+        const tools: vscode.LanguageModelChatTool[] = [
+            {
+                name: "loose",
+                description: "",
+                inputSchema: { properties: { value: { type: "string" } } },
+            },
+        ];
+
+        const params = convertTools({
+            tools,
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+            requestInitiator: "test",
+        }).tools?.[0].function.parameters as {
+            type?: string;
+            properties: Record<string, Record<string, unknown>>;
+        };
+
+        assert.strictEqual(params.type, "object");
+        assert.deepStrictEqual(params.properties, { value: { type: "string" } });
+    });
+
+    test("convertTools guarantees an object schema at the top level", () => {
+        const tools: vscode.LanguageModelChatTool[] = [
+            { name: "primitive", description: "", inputSchema: { type: "string" } },
+        ];
+
+        const params = convertTools({
+            tools,
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+            requestInitiator: "test",
+        }).tools?.[0].function.parameters as { type?: string; properties?: Record<string, unknown> };
+
+        assert.strictEqual(params.type, "object");
+        assert.deepStrictEqual(params.properties, {});
+    });
+
+    test("convertTools keeps a numeric property numeric", () => {
+        const tools: vscode.LanguageModelChatTool[] = [
+            {
+                name: "measure",
+                description: "",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        confidence: { type: "number" },
+                        width: { type: "number" },
+                        count: { type: "integer" },
+                    },
+                },
+            },
+        ];
+
+        const params = convertTools({
+            tools,
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+            requestInitiator: "test",
+        }).tools?.[0].function.parameters as {
+            properties: Record<string, Record<string, unknown>>;
+        };
+
+        assert.strictEqual(params.properties.confidence.type, "number");
+        assert.strictEqual(params.properties.width.type, "number");
+        assert.strictEqual(params.properties.count.type, "integer");
+    });
+
+    test("convertTools keeps the outer required list when a composite is present", () => {
+        const tools: vscode.LanguageModelChatTool[] = [
+            {
+                name: "mixed",
+                description: "",
+                inputSchema: {
+                    type: "object",
+                    properties: { a: { type: "string" }, c: { type: "string" } },
+                    required: ["a"],
+                    anyOf: [{ required: ["c"] }, { required: ["a", "c"] }],
+                },
+            },
+        ];
+
+        const params = convertTools({
+            tools,
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+            requestInitiator: "test",
+        }).tools?.[0].function.parameters as { required?: string[] };
+
+        assert.deepStrictEqual(params.required, ["a"]);
+    });
+
+    test("convertTools resolves a composite nested directly inside a composite", () => {
+        const tools: vscode.LanguageModelChatTool[] = [
+            {
+                name: "nested",
+                description: "",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        value: { anyOf: [{ anyOf: [{ type: "number" }, { type: "null" }] }] },
+                    },
+                },
+            },
+        ];
+
+        const params = convertTools({
+            tools,
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+            requestInitiator: "test",
+        }).tools?.[0].function.parameters as {
+            properties: Record<string, Record<string, unknown>>;
+        };
+
+        assert.strictEqual(params.properties.value.type, "number");
+    });
+
+    test("convertTools suffixes a tool name that collides with an earlier one", () => {
+        const tools: vscode.LanguageModelChatTool[] = [
+            { name: "github.create_issue", description: "", inputSchema: {} },
+            { name: "github_create_issue", description: "", inputSchema: {} },
+        ];
+
+        const names = convertTools({
+            tools,
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+            requestInitiator: "test",
+        }).tools?.map((tool) => tool.function.name);
+
+        assert.deepStrictEqual(names, ["github_create_issue", "github_create_issue_2"]);
+    });
+
+    test("convertTools keeps a repeated-underscore name and leaves ordinary names alone", () => {
+        const tools: vscode.LanguageModelChatTool[] = [
+            { name: "github__create_issue", description: "", inputSchema: {} },
+            { name: "github_create_issue", description: "", inputSchema: {} },
+        ];
+
+        const names = convertTools({
+            tools,
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+            requestInitiator: "test",
+        }).tools?.map((tool) => tool.function.name);
+
+        assert.deepStrictEqual(names, ["github__create_issue", "github_create_issue"]);
+    });
+
+    test("convertTools sanitizes a name with invalid characters for the wire", () => {
+        const tools: vscode.LanguageModelChatTool[] = [{ name: "search files", description: "", inputSchema: {} }];
+
+        const names = convertTools({
+            tools,
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+            requestInitiator: "test",
+        }).tools?.map((tool) => tool.function.name);
+
+        assert.deepStrictEqual(names, ["search_files"]);
+    });
+
+    test("convertMessages sanitizes a replayed tool call when no wire-name map is supplied", () => {
+        const messages: vscode.LanguageModelChatMessage[] = [
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [new vscode.LanguageModelToolCallPart("call-1", "search files", {})],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelToolResultPart("call-1", [new vscode.LanguageModelTextPart("ok")])],
+                name: undefined,
+            },
+        ];
+
+        const out = convertMessages(messages) as {
+            tool_calls?: { function: { name: string } }[];
+        }[];
+
+        assert.strictEqual(out[0].tool_calls?.[0].function.name, "search_files");
+    });
+
+    test("convertMessages sends a replayed tool call under the advertised wire name", () => {
+        const messages: vscode.LanguageModelChatMessage[] = [
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                content: [
+                    new vscode.LanguageModelToolCallPart("call-1", "github_create_issue", {}),
+                    new vscode.LanguageModelToolCallPart("call-2", "search files", {}),
+                ],
+                name: undefined,
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [
+                    new vscode.LanguageModelToolResultPart("call-1", [new vscode.LanguageModelTextPart("ok")]),
+                    new vscode.LanguageModelToolResultPart("call-2", [new vscode.LanguageModelTextPart("ok")]),
+                ],
+                name: undefined,
+            },
+        ];
+
+        const out = convertMessages(messages, {
+            wireToolNames: new Map([
+                ["github_create_issue", "github_create_issue_2"],
+                ["search files", "search_files"],
+            ]),
+        }) as { tool_calls?: { function: { name: string } }[] }[];
+
+        assert.deepStrictEqual(
+            out[0].tool_calls?.map((call) => call.function.name),
+            ["github_create_issue_2", "search_files"]
+        );
+    });
+
+    test("convertTools returns the mapping the request advertised", () => {
+        const result = convertTools({
+            tools: [
+                { name: "github.create_issue", description: "", inputSchema: {} },
+                { name: "github_create_issue", description: "", inputSchema: {} },
+            ],
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+            requestInitiator: "test",
+        });
+
+        assert.deepStrictEqual(
+            result.tools?.map((tool) => tool.function.name),
+            ["github_create_issue", "github_create_issue_2"]
+        );
+        assert.strictEqual(result.toolNames?.wireToDeclared.get("github_create_issue_2"), "github_create_issue");
+        assert.strictEqual(result.toolNames?.declaredToWire.get("github_create_issue"), "github_create_issue_2");
+    });
+
+    test("convertTools returns no tools and no tool_choice for a null entry in Required mode", () => {
+        const result = convertTools({
+            tools: [null] as unknown as vscode.LanguageModelChatTool[],
+            toolMode: vscode.LanguageModelChatToolMode.Required,
+            requestInitiator: "test",
+        });
+
+        assert.strictEqual(result.tools, undefined);
+        assert.strictEqual(result.tool_choice, undefined);
+        assert.strictEqual(result.toolNames.wireNames.length, 0);
     });
 
     test("convertTools should NOT return tool_choice when toolMode is Auto/undefined", () => {
@@ -710,13 +1094,16 @@ suite("Utility Unit Tests", () => {
         assert.strictEqual(res.tool_choice, undefined, "tool_choice should be undefined when toolMode is Auto");
     });
 
-    test("convertTools returns empty when no tools", () => {
+    test("convertTools returns no tools when none are declared", () => {
         const res = convertTools({
             tools: [],
             toolMode: vscode.LanguageModelChatToolMode.Auto,
             requestInitiator: "test",
         });
-        assert.deepStrictEqual(res, {});
+
+        assert.strictEqual(res.tools, undefined);
+        assert.strictEqual(res.tool_choice, undefined);
+        assert.strictEqual(res.toolNames.wireNames.length, 0);
     });
 
     test("isToolResultPart type guard", () => {
@@ -1062,7 +1449,7 @@ suite("Utility Unit Tests", () => {
                     ])
                 );
 
-                assert.strictEqual(out[1].content, "model noteshared note");
+                assert.strictEqual(out[1].content, "model note\n\nshared note");
             });
 
             test("drops a tool result part with an empty audience list", () => {

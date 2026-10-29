@@ -3,7 +3,8 @@ import { convertMessages, convertTools, validateRequest } from "../../utils";
 import { trimMessagesToFitBudget } from "../../adapters/tokenUtils";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest, OpenAIFunctionToolDef } from "../../types";
 import { DEFAULT_ANTHROPIC_PROMPT_CACHING, resolveAnthropicCacheControl } from "../../utils/promptCaching";
-import { isDeepSeekModel, resolveToolResultImageMode } from "../../utils/modelUtils";
+import { isDeepSeekModel, resolveToolResultImageMode, resolveToolResultTextMode } from "../../utils/modelUtils";
+import type { ToolNameMapping } from "../../utils/toolNameUtils";
 import type { RequestBuilderDeps } from "./types";
 
 export class RequestBuilder {
@@ -29,13 +30,20 @@ export class RequestBuilder {
         this.extractRawModelName = deps.extractRawModelName;
     }
 
+    /**
+     * Builds the chat-completions body for one request.
+     *
+     * Returns the body with the tool-name mapping it advertised, because the
+     * response path and history replay both need to agree with exactly the tool
+     * list this build sent (after quota redaction and null filtering).
+     */
     public async buildOpenAIChatRequest(
         messages: readonly vscode.LanguageModelChatRequestMessage[],
         model: vscode.LanguageModelChatInformation,
         options: vscode.ProvideLanguageModelChatResponseOptions,
         modelInfo?: LiteLLMModelInfo,
         _caller?: string
-    ): Promise<OpenAIChatCompletionRequest> {
+    ): Promise<{ request: OpenAIChatCompletionRequest; toolNames: ToolNameMapping }> {
         const config = await this.configManager.getConfig();
 
         // `model.id` is the namespaced `<routing>/<raw>` form VS Code hands
@@ -52,10 +60,8 @@ export class RequestBuilder {
             config.disableQuotaToolRedaction === true,
             _caller
         );
-        // `confidence` is intentionally not threaded into the request body
-        // today. It is consumed by the base for logging/telemetry already;
-        // this call site only needs the (possibly redacted) tool list.
         const toolConfig = convertTools({ ...options, tools: toolRedaction.tools });
+        const toolNames = toolConfig.toolNames;
         // Silently dropping older turns is surprising, so trimming
         // (`litellm-connector.autoTrimMessages`) stays off by default. The
         // overflow-recovery retry in the provider base is gated on the same
@@ -66,6 +72,8 @@ export class RequestBuilder {
                 : messages;
         const openaiMessages = convertMessages(messagesToUse, {
             toolResultImageMode: resolveToolResultImageMode(modelInfo),
+            toolResultTextMode: resolveToolResultTextMode(modelInfo),
+            wireToolNames: toolNames.declaredToWire,
             ensureReasoningContentInActiveTurn:
                 (toolConfig.tools?.length ?? 0) > 0 && isDeepSeekModel(rawModelId, modelInfo),
         });
@@ -147,7 +155,7 @@ export class RequestBuilder {
         // 1. Model supports tool_choice (per isParameterSupported), AND
         // 2. Tools are present, AND
         //    a. Explicitly required by toolMode (toolConfig.tool_choice is set), OR
-        //    b. Model supports it - default to "auto" for backward compatibility
+        //    b. Model supports it, so default to "auto" for backward compatibility
         if (toolConfig.tools && toolConfig.tools.length > 0) {
             if (this.isParameterSupported("tool_choice", modelInfo, rawModelId)) {
                 if (toolConfig.tool_choice) {
@@ -167,6 +175,6 @@ export class RequestBuilder {
             modelInfo,
             rawModelId
         );
-        return requestBody;
+        return { request: requestBody, toolNames };
     }
 }

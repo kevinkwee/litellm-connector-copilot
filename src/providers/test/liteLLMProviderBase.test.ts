@@ -4,6 +4,7 @@ import * as sinon from "sinon";
 import { LiteLLMChatProvider } from "../";
 import type { ConfigManager } from "../../config/configManager";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types";
+import type { ToolNameMapping } from "../../utils/toolNameUtils";
 import { createMockSecrets } from "../../test/utils/testMocks";
 import { EffortFallbackCache } from "../../utils/reasoningEffortFallback";
 import { getModelTags } from "../../utils/modelCapabilities";
@@ -72,7 +73,7 @@ interface BaseTestAccess {
         options: vscode.ProvideLanguageModelChatResponseOptions,
         modelInfo?: LiteLLMModelInfo,
         caller?: string
-    ) => Promise<OpenAIChatCompletionRequest>;
+    ) => Promise<{ request: OpenAIChatCompletionRequest; toolNames: ToolNameMapping }>;
     buildCapabilities: (modelInfo: LiteLLMModelInfo | undefined) => vscode.LanguageModelChatCapabilities;
     parseApiError: (statusCode: number, errorText: string) => string;
     getModelTags: (modelId: string, modelInfo?: LiteLLMModelInfo, overrides?: Record<string, string[]>) => string[];
@@ -211,21 +212,23 @@ suite("LiteLLMProviderBase", () => {
 
         test("applies reasoning effort from modelConfiguration", async () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const request = await access(provider).buildOpenAIChatRequest(
-                [
+            const request = (
+                await access(provider).buildOpenAIChatRequest(
+                    [
+                        {
+                            role: vscode.LanguageModelChatMessageRole.User,
+                            name: undefined,
+                            content: [new vscode.LanguageModelTextPart("hi")],
+                        },
+                    ],
+                    model,
                     {
-                        role: vscode.LanguageModelChatMessageRole.User,
-                        name: undefined,
-                        content: [new vscode.LanguageModelTextPart("hi")],
-                    },
-                ],
-                model,
-                {
-                    configuration: { baseUrl: "https://wolfram.example", apiKey: "k", reasoningEffort: "medium" },
-                } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                undefined,
-                "test"
-            );
+                        configuration: { baseUrl: "https://wolfram.example", apiKey: "k", reasoningEffort: "medium" },
+                    } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+                    undefined,
+                    "test"
+                )
+            ).request;
 
             assert.strictEqual(request.reasoning_effort, "medium");
         });
@@ -237,67 +240,73 @@ suite("LiteLLMProviderBase", () => {
                 supports_reasoning: true,
                 supports_reasoning_effort: true,
             };
-            const request = await access(provider).buildOpenAIChatRequest(
-                [
+            const request = (
+                await access(provider).buildOpenAIChatRequest(
+                    [
+                        {
+                            role: vscode.LanguageModelChatMessageRole.User,
+                            name: undefined,
+                            content: [new vscode.LanguageModelTextPart("hi")],
+                        },
+                    ],
+                    model,
                     {
-                        role: vscode.LanguageModelChatMessageRole.User,
-                        name: undefined,
-                        content: [new vscode.LanguageModelTextPart("hi")],
-                    },
-                ],
-                model,
-                {
-                    configuration: { baseUrl: "https://wolfram.example", apiKey: "k", reasoningEffort: "xhigh" },
-                } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                modelInfo,
-                "test"
-            );
+                        configuration: { baseUrl: "https://wolfram.example", apiKey: "k", reasoningEffort: "xhigh" },
+                    } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+                    modelInfo,
+                    "test"
+                )
+            ).request;
 
             assert.strictEqual(request.reasoning_effort, "xhigh");
         });
 
         test("omits reasoning_effort when user has not picked one", async () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const request = await access(provider).buildOpenAIChatRequest(
-                [
+            const request = (
+                await access(provider).buildOpenAIChatRequest(
+                    [
+                        {
+                            role: vscode.LanguageModelChatMessageRole.User,
+                            name: undefined,
+                            content: [new vscode.LanguageModelTextPart("hi")],
+                        },
+                    ],
+                    model,
                     {
-                        role: vscode.LanguageModelChatMessageRole.User,
-                        name: undefined,
-                        content: [new vscode.LanguageModelTextPart("hi")],
-                    },
-                ],
-                model,
-                {
-                    configuration: { baseUrl: "https://wolfram.example", apiKey: "k" },
-                } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                undefined,
-                "test"
-            );
+                        configuration: { baseUrl: "https://wolfram.example", apiKey: "k" },
+                    } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+                    undefined,
+                    "test"
+                )
+            ).request;
             assert.strictEqual(request.reasoning_effort, undefined);
         });
 
         test("sends picker 'none' as reasoning_effort value", async () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const request = await access(provider).buildOpenAIChatRequest(
-                [
+            const request = (
+                await access(provider).buildOpenAIChatRequest(
+                    [
+                        {
+                            role: vscode.LanguageModelChatMessageRole.User,
+                            name: undefined,
+                            content: [new vscode.LanguageModelTextPart("hi")],
+                        },
+                    ],
+                    model,
                     {
-                        role: vscode.LanguageModelChatMessageRole.User,
-                        name: undefined,
-                        content: [new vscode.LanguageModelTextPart("hi")],
-                    },
-                ],
-                model,
-                {
-                    configuration: { baseUrl: "https://wolfram.example", apiKey: "k", reasoningEffort: "none" },
-                } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                undefined,
-                "test"
-            );
+                        configuration: { baseUrl: "https://wolfram.example", apiKey: "k", reasoningEffort: "none" },
+                    } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+                    undefined,
+                    "test"
+                )
+            ).request;
             assert.strictEqual(request.reasoning_effort, "none");
         });
     });
 
-    suite("sendRequestWithRetry — reasoning fallback", () => {
+    suite("sendRequestWithRetry: reasoning fallback", () => {
         const model: vscode.LanguageModelChatInformation = {
             id: "model-reasoning",
             name: "model-reasoning",
@@ -980,7 +989,7 @@ suite("LiteLLMProviderBase", () => {
             );
         });
 
-        test("per-group model lists are isolated — one group refresh does not trample another", async () => {
+        test("per-group model lists are isolated: one group refresh does not trample another", async () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
             const configManager = access(provider)._configManager;
             const wolframConfig: Record<string, unknown> = {
@@ -1048,7 +1057,7 @@ suite("LiteLLMProviderBase", () => {
             const configManager = access(provider)._configManager;
             const mockSession = makeMockSession();
             sandbox.stub(configManager, "convertProviderConfiguration").returns(mockSession);
-            // Disable discovery caching for this test - we want to verify the HTTP client
+            // Disable discovery caching for this test, because the test verifies the HTTP client
             // is called again (not that the response cache is disabled)
             sandbox.stub(configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
 
@@ -1075,7 +1084,7 @@ suite("LiteLLMProviderBase", () => {
             // routing. After a successful discovery, the registry's
             // `lookup(modelId)` MUST resolve to the same `baseUrl` /
             // `apiKey` that was passed in on the originating call. The
-            // model object on the wire no longer needs to carry
+            // model object on the wire does not need to carry
             // `configuration` because the registry is the source of truth.
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
             const configManager = access(provider)._configManager;
@@ -1096,7 +1105,7 @@ suite("LiteLLMProviderBase", () => {
         });
     });
 
-    suite("discoverModels — change detection (no discovery loop)", () => {
+    suite("discoverModels: change detection (no discovery loop)", () => {
         // VS Code re-queries provideLanguageModelChatInformation on every
         // onDidChangeLanguageModelChatInformation event. Firing the event
         // unconditionally from discoverModels caused an infinite loop:
@@ -1200,7 +1209,7 @@ suite("LiteLLMProviderBase", () => {
                 await provider.discoverModels({ silent: true, configuration: cfg }, token);
                 assert.strictEqual(fired.length, 2, "second call with different ids must fire");
 
-                // Same ids again — no fire.
+                // Same ids again, so no fire.
                 await provider.discoverModels({ silent: true, configuration: cfg }, token);
                 assert.strictEqual(fired.length, 2);
             } finally {
@@ -1279,7 +1288,7 @@ suite("LiteLLMProviderBase", () => {
             assert.strictEqual(registry.size(), 0);
 
             // clearModelCache must clear the registry. The base
-            // provider has no separate model-info cache to clear — the
+            // provider has no separate model-info cache to clear, because the
             // registry is the single source of truth.
             provider.clearModelCache();
             assert.strictEqual(registry.size(), 0);
@@ -1321,7 +1330,7 @@ suite("LiteLLMProviderBase", () => {
         });
     });
 
-    suite("getCallTimeConfiguration — per-group config at response time", () => {
+    suite("getCallTimeConfiguration: per-group config at response time", () => {
         test("prefers options.configuration when present", async () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
             const optionsConfig = { baseUrl: "https://from-options", apiKey: "k-options" };
@@ -1732,7 +1741,7 @@ suite("LiteLLMProviderBase", () => {
 
         test("does not redact when reminderInstructions body mentions both patterns", () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            // A plausible <reminderInstructions> body — text content only, no tool parts.
+            // A plausible <reminderInstructions> body: text content only, no tool parts.
             const reminder =
                 "If a tool returns 429 / rate limit exceeded / quota exceeded when calling " +
                 "tools like insert_edit_into_file or replace_string_in_file, do not retry.";

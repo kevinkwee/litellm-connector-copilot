@@ -9,8 +9,16 @@ import type {
     OpenAIToolCall,
     OpenAIChatMessageContentItem,
     ToolResultImageMode,
+    ToolResultTextMode,
 } from "./types";
 import { Logger } from "./utils/logger";
+import {
+    buildToolNameMapping,
+    EMPTY_TOOL_NAME_MAPPING,
+    sanitizeToolName,
+    type ToolNameMapping,
+} from "./utils/toolNameUtils";
+import { decodeUtf8, encodeBase64 } from "./utils/byteEncoding";
 import {
     buildThinkingBlocks,
     readRedactedData,
@@ -122,39 +130,62 @@ function hashOfLength(input: string, length: number): string {
     return out.slice(0, length);
 }
 
-// Tool calling sanitization helpers
-
-function isIntegerLikePropertyName(propertyName: string | undefined): boolean {
-    if (!propertyName) {
-        return false;
+/**
+ * Merges a composite (`anyOf` / `oneOf` / `allOf`) schema into one flat schema.
+ *
+ * The outer schema describes the value the endpoint validates against, so its
+ * own keys win: a pydantic optional keeps its `description` and `default`, and
+ * an object that constrains a property through `anyOf` keeps its `type` and
+ * `properties`. The preferred branch, the string branch when there is one and
+ * otherwise the first, only fills the keys the outer schema leaves out.
+ * `required` is never taken from a branch, because a branch's required list
+ * describes that branch, not the merged value.
+ *
+ * A preferred branch that is itself a composite is merged the same way, up to
+ * `MAX_COMPOSITE_DEPTH` levels, so ordinary nesting cannot leave a composite key
+ * behind for `pruneUnknownSchemaKeywords` to drop.
+ */
+function mergeCompositeSchema(schema: Record<string, unknown>): Record<string, unknown> {
+    let current = schema;
+    for (let depth = 0; depth < MAX_COMPOSITE_DEPTH; depth++) {
+        const merged = mergeOneCompositeLevel(current);
+        if (merged === current) {
+            return current;
+        }
+        current = merged;
     }
-    const lowered = propertyName.toLowerCase();
-    const integerMarkers = [
-        "id",
-        "limit",
-        "count",
-        "index",
-        "size",
-        "offset",
-        "length",
-        "results_limit",
-        "maxresults",
-        "debugsessionid",
-        "cellid",
-    ];
-    return integerMarkers.some((m) => lowered.includes(m)) || lowered.endsWith("_id");
+    return current;
 }
 
-function sanitizeFunctionName(name: unknown): string {
-    if (typeof name !== "string" || !name) {
-        return "tool";
+/** Longest chain of composites the sanitizer resolves. Deeper nesting keeps its last merge. */
+const MAX_COMPOSITE_DEPTH = 4;
+
+/**
+ * Resolves the first composite the schema carries, one level deep, and returns
+ * the input unchanged when it carries none.
+ */
+function mergeOneCompositeLevel(schema: Record<string, unknown>): Record<string, unknown> {
+    for (const composite of ["anyOf", "oneOf", "allOf"]) {
+        const branches = schema[composite];
+        if (!Array.isArray(branches) || branches.length === 0) {
+            continue;
+        }
+        const candidates = branches.filter(
+            (branch): branch is Record<string, unknown> =>
+                !!branch && typeof branch === "object" && !Array.isArray(branch)
+        );
+        const preferred = candidates.find((branch) => branch.type === "string") ?? candidates[0] ?? {};
+
+        const { [composite]: _composite, required: ownRequired, ...ownKeys } = schema;
+        const merged: Record<string, unknown> = { ...preferred, ...ownKeys };
+        if (ownRequired === undefined) {
+            delete merged.required;
+        } else {
+            merged.required = ownRequired;
+        }
+        return merged;
     }
-    let sanitized = name.replace(/[^a-zA-Z0-9_-]/g, "_");
-    if (!/^[a-zA-Z]/.test(sanitized)) {
-        sanitized = `tool_${sanitized}`;
-    }
-    sanitized = sanitized.replace(/_+/g, "_");
-    return sanitized.slice(0, 64);
+    return schema;
 }
 
 function pruneUnknownSchemaKeywords(schema: unknown): Record<string, unknown> {
@@ -186,39 +217,21 @@ function pruneUnknownSchemaKeywords(schema: unknown): Record<string, unknown> {
     return out;
 }
 
-function sanitizeSchema(input: unknown, propName?: string): Record<string, unknown> {
+/**
+ * Normalizes one JSON schema node: merges a composite, drops keywords the
+ * endpoints do not accept, and recurses into `properties` and `items`.
+ */
+function sanitizeSchema(input: unknown): Record<string, unknown> {
     if (!input || typeof input !== "object" || Array.isArray(input)) {
         return { type: "object", properties: {} } as Record<string, unknown>;
     }
 
-    let schema = input as Record<string, unknown>;
-
-    for (const composite of ["anyOf", "oneOf", "allOf"]) {
-        const branch = (schema as Record<string, unknown>)[composite] as unknown;
-        if (Array.isArray(branch) && branch.length > 0) {
-            let preferred: Record<string, unknown> | undefined;
-            for (const b of branch) {
-                if (b && typeof b === "object" && (b as Record<string, unknown>).type === "string") {
-                    preferred = b as Record<string, unknown>;
-                    break;
-                }
-            }
-            schema = { ...(preferred ?? (branch[0] as Record<string, unknown>)) };
-            break;
-        }
-    }
-
-    schema = pruneUnknownSchemaKeywords(schema);
+    const schema = pruneUnknownSchemaKeywords(mergeCompositeSchema(input as Record<string, unknown>));
 
     let t = schema.type as string | undefined;
-    if (t === null) {
+    if (t === null || (t === undefined && schema.properties !== undefined)) {
         t = "object";
         schema.type = t;
-    }
-
-    if (t === "number" && propName && isIntegerLikePropertyName(propName)) {
-        schema.type = "integer";
-        t = "integer";
     }
 
     if (t === "object") {
@@ -226,7 +239,7 @@ function sanitizeSchema(input: unknown, propName?: string): Record<string, unkno
         const newProps: Record<string, unknown> = {};
         if (props && typeof props === "object") {
             for (const [k, v] of Object.entries(props)) {
-                newProps[k] = sanitizeSchema(v, k);
+                newProps[k] = sanitizeSchema(v);
             }
         }
         schema.properties = newProps;
@@ -263,6 +276,19 @@ export interface ConvertMessagesOptions {
      */
     toolResultImageMode?: ToolResultImageMode;
     /**
+     * Defaults to `"joined"`, the shape every provider transform preserves. A
+     * provider whose transform keeps list items apart receives one text item per
+     * part instead.
+     */
+    toolResultTextMode?: ToolResultTextMode;
+    /**
+     * Declared tool name to the wire name the same request advertised, so a
+     * replayed tool call carries the name the model was given. Names outside the
+     * map fall back to the sanitizer, which is what the request used when the
+     * name did not change.
+     */
+    wireToolNames?: ReadonlyMap<string, string>;
+    /**
      * DeepSeek thinking mode requires `reasoning_content` on every assistant
      * message in the active tool loop, including turns that produced no
      * reasoning. When true, assistant messages after the latest real user
@@ -288,6 +314,7 @@ export function convertMessages(
     options: ConvertMessagesOptions = {}
 ): OpenAIChatMessage[] {
     const toolResultImageMode = options.toolResultImageMode ?? "hoist";
+    const toolResultTextMode = options.toolResultTextMode ?? "joined";
     const ensureReasoningContent = options.ensureReasoningContentInActiveTurn === true;
     // The latest real user message bounds the active turn. Tool-result-only
     // user messages belong to the running tool loop and must not move the
@@ -335,7 +362,7 @@ export function convertMessages(
         const toolCalls: OpenAIToolCall[] = [];
         const toolResults: {
             callId: string;
-            content: string;
+            textParts: string[];
             images: readonly OpenAIChatMessageContentItem[];
         }[] = [];
         const reasoningParts: string[] = [];
@@ -360,12 +387,10 @@ export function convertMessages(
                     contentItems.push(toImageContentItem(part.mimeType, part.data));
                 } else if (part.mimeType.startsWith("application/json")) {
                     // Handle JSON data parts by decoding and appending as text
-                    const jsonStr = Buffer.from(part.data).toString("utf-8");
-                    textParts.push(jsonStr);
+                    textParts.push(decodeUtf8(part.data));
                 } else if (part.mimeType.startsWith("text/")) {
                     // Handle explicit text data parts
-                    const textStr = Buffer.from(part.data).toString("utf-8");
-                    textParts.push(textStr);
+                    textParts.push(decodeUtf8(part.data));
                 }
             } else if (part instanceof vscode.LanguageModelToolCallPart) {
                 const id = normalizeToolCallId(
@@ -378,8 +403,11 @@ export function convertMessages(
                 } catch {
                     // Fallback to empty JSON if stringify fails
                 }
-                toolCalls.push({ id, type: "function", function: { name: part.name, arguments: args } });
-                toolNamesByCallId.set(id, part.name);
+                // The request advertises the wire-safe spelling of each tool
+                // name, so a replayed call must carry the same spelling back.
+                const wireName = options.wireToolNames?.get(part.name) ?? sanitizeToolName(part.name);
+                toolCalls.push({ id, type: "function", function: { name: wireName, arguments: args } });
+                toolNamesByCallId.set(id, wireName);
             } else if (isToolResultPart(part)) {
                 const callId = normalizeToolCallId((part as { callId?: string }).callId ?? "");
                 Logger.trace(
@@ -394,14 +422,14 @@ export function convertMessages(
                     const notice = toolResultImageFollowUpNotice(collected.images.length);
                     toolResults.push({
                         callId,
-                        content: collected.text.length > 0 ? `${collected.text}\n${notice}` : notice,
+                        textParts: [...collected.textParts, notice],
                         images: [],
                     });
                     Logger.trace(
                         `[convertMessages] Hoisted ${collected.images.length} tool result image(s) into the run's follow-up user message`
                     );
                 } else {
-                    toolResults.push({ callId, content: collected.text, images: collected.images });
+                    toolResults.push({ callId, textParts: collected.textParts, images: collected.images });
                 }
             } else if (isThinkingPart(part)) {
                 // LanguageModelThinkingPart: the model's internal reasoning
@@ -474,7 +502,7 @@ export function convertMessages(
             out.push({
                 role: "tool",
                 tool_call_id: tr.callId,
-                content: buildToolResultMessageContent(tr.content, tr.images),
+                content: buildToolResultMessageContent(tr.textParts, tr.images, toolResultTextMode),
             });
         }
 
@@ -510,10 +538,10 @@ export function convertMessages(
 /**
  * Returns true for any MIME type that represents opaque prompt-caching metadata
  * rather than message content. These parts must be silently dropped at the
- * transport layer — decoding them produces strings like "ephemeral" or a raw
- * {"$mid":...,"mimeType":"cache_control",...} carrier object that, once injected
- * into user/assistant content, causes LLMs to fixate on the stray fragment and
- * abandon the active task.
+ * transport layer, because decoding them produces strings like "ephemeral" or a
+ * raw {"$mid":...,"mimeType":"cache_control",...} carrier object that, once
+ * injected into user/assistant content, causes LLMs to fixate on the stray
+ * fragment and abandon the active task.
  */
 export function isCacheControlMimeType(mimeType: string): boolean {
     if (mimeType === "cache_control") {
@@ -549,66 +577,68 @@ function buildMessageContent(
 }
 
 /**
+ * Builds the top-level parameter schema for one tool definition.
+ *
+ * Every endpoint validates tool parameters as an object, so a schema that
+ * declares another type is sent as an empty object schema instead of a schema
+ * the endpoint rejects.
+ */
+function toToolParameterSchema(input: unknown): Record<string, unknown> {
+    const schema = sanitizeSchema(input);
+    if (schema.type === "object") {
+        return schema;
+    }
+    return { type: "object", properties: {} };
+}
+
+/**
  * Convert VS Code tool definitions to OpenAI function tool definitions.
  *
  * A forced tool call names the tool only when exactly one is offered. VS Code's
  * `Required` mode lets the model pick any of the tools it was given, so several
  * tools send `tool_choice: "required"`.
  *
+ * Returns the tool definitions with the name mapping that describes the wire
+ * names they advertise.
+ *
  * @param options Request options containing tools and toolMode.
  */
 export function convertTools(options: vscode.ProvideLanguageModelChatResponseOptions): {
     tools?: OpenAIFunctionToolDef[];
     tool_choice?: OpenAIChatToolChoice;
+    toolNames: ToolNameMapping;
 } {
-    const tools = options.tools ?? [];
-    if (!tools || tools.length === 0) {
-        return {};
+    const declaredTools = (options.tools ?? []).filter(
+        (tool): tool is vscode.LanguageModelChatTool => !!tool && typeof tool === "object"
+    );
+    if (declaredTools.length === 0) {
+        return { toolNames: EMPTY_TOOL_NAME_MAPPING };
     }
 
-    const toolDefs: OpenAIFunctionToolDef[] = tools
-        .filter((t): t is vscode.LanguageModelChatTool => t && typeof t === "object")
-        .map((t: vscode.LanguageModelChatTool) => {
-            const name = sanitizeFunctionName(t.name);
-            const description = typeof t.description === "string" ? t.description : "";
-            const params = sanitizeSchema(t.inputSchema ?? { type: "object", properties: {} });
-            return {
-                type: "function" as const,
-                function: {
-                    name,
-                    description,
-                    parameters: params,
-                },
-            } satisfies OpenAIFunctionToolDef;
-        });
+    const toolNames = buildToolNameMapping(declaredTools);
+    const wireNames = toolNames.wireNames;
+    const toolDefs: OpenAIFunctionToolDef[] = declaredTools.map((tool, index) => {
+        const description = typeof tool.description === "string" ? tool.description : "";
+        const params = toToolParameterSchema(tool.inputSchema ?? { type: "object", properties: {} });
+        return {
+            type: "function" as const,
+            function: {
+                name: wireNames[index],
+                description,
+                parameters: params,
+            },
+        } satisfies OpenAIFunctionToolDef;
+    });
 
     let tool_choice: OpenAIChatToolChoice | undefined = undefined;
     if (options.toolMode === vscode.LanguageModelChatToolMode.Required) {
-        tool_choice =
-            tools.length === 1
-                ? { type: "function", function: { name: sanitizeFunctionName(tools[0].name) } }
-                : "required";
+        tool_choice = wireNames.length === 1 ? { type: "function", function: { name: wireNames[0] } } : "required";
     }
     // tool_choice stays unset unless the caller forces a tool call. The request
     // builder adds "auto" when tools are present and the model declares support,
     // so models such as GPT-5.6 Azure that reject the parameter never receive it.
 
-    return { tools: toolDefs, ...(tool_choice !== undefined && { tool_choice }) };
-}
-
-/**
- * Validate tool names to ensure they contain only word chars, hyphens, or underscores.
- * @param tools Tools to validate.
- */
-export function validateTools(tools: readonly vscode.LanguageModelChatTool[]): void {
-    for (const tool of tools) {
-        if (!tool.name.match(/^[\w-]+$/)) {
-            Logger.error("Invalid tool name detected:", tool.name);
-            throw new Error(
-                `Invalid tool name "${tool.name}": only alphanumeric characters, hyphens, and underscores are allowed.`
-            );
-        }
-    }
+    return { tools: toolDefs, toolNames, ...(tool_choice !== undefined && { tool_choice }) };
 }
 
 /**
@@ -768,18 +798,18 @@ const TOOL_RESULT_IMAGE_BOUNDARY_TEXT =
 /**
  * Collects the model-visible content of a tool result.
  *
- * Text, JSON and stringifiable values collapse into `text`, while image data
- * parts become `image_url` items so they survive as vision input. Parts tagged
- * with an audience that excludes the model are skipped, as are cache_control
- * carriers.
+ * Text, JSON and stringifiable values become one `textParts` entry per non-empty
+ * part, so a caller can keep the boundaries or join them. Image data parts
+ * become `image_url` items so they survive as vision input. Parts tagged with
+ * an audience that excludes the model are skipped, as are cache_control carriers.
  *
  * @param pr Tool result-like object with content array.
  */
 function collectToolResultContent(pr: { content?: readonly unknown[] }): {
-    text: string;
+    textParts: string[];
     images: OpenAIChatMessageContentItem[];
 } {
-    let text = "";
+    const textParts: string[] = [];
     const images: OpenAIChatMessageContentItem[] = [];
     for (const part of pr.content ?? []) {
         if (!isPartVisibleToModel(part)) {
@@ -787,26 +817,26 @@ function collectToolResultContent(pr: { content?: readonly unknown[] }): {
             continue;
         }
         if (part instanceof vscode.LanguageModelTextPart) {
-            text += part.value;
+            textParts.push(part.value);
         } else if (part instanceof vscode.LanguageModelDataPart) {
             if (isCacheControlMimeType(part.mimeType)) {
                 Logger.trace(`[collectToolResultContent] Dropping cache_control part (mimeType: ${part.mimeType})`);
             } else if (TOOL_RESULT_IMAGE_MIME_TYPES.has(part.mimeType.toLowerCase())) {
                 images.push(toImageContentItem(part.mimeType, part.data));
             } else if (part.mimeType.startsWith("text/") || part.mimeType.includes("json")) {
-                text += Buffer.from(part.data).toString("utf-8");
+                textParts.push(decodeUtf8(part.data));
             }
         } else if (typeof part === "string") {
-            text += part;
+            textParts.push(part);
         } else {
             try {
-                text += JSON.stringify(part);
+                textParts.push(JSON.stringify(part));
             } catch {
                 // A value that cannot be serialized carries no model-visible content.
             }
         }
     }
-    return { text, images };
+    return { textParts: textParts.filter((text) => text.length > 0), images };
 }
 
 /**
@@ -832,15 +862,14 @@ function isPartVisibleToModel(part: unknown): boolean {
  * @param mimeType The image MIME type.
  * @param data The image bytes.
  */
-function toImageContentItem(mimeType: string, data: Uint8Array | string): OpenAIChatMessageContentItem {
-    const bytes = typeof data === "string" ? Buffer.from(data, "utf-8") : Buffer.from(data);
+function toImageContentItem(mimeType: string, data: Uint8Array): OpenAIChatMessageContentItem {
     // MIME types are case-insensitive, and the token estimator matches on a
     // lowercase prefix, so the data URI carries the canonical form.
     const normalizedMimeType = mimeType.toLowerCase();
     return {
         type: "image_url",
         image_url: {
-            url: `data:${normalizedMimeType};base64,${bytes.toString("base64")}`,
+            url: `data:${normalizedMimeType};base64,${encodeBase64(data)}`,
         },
     };
 }
@@ -876,19 +905,37 @@ function toolResultImagesAttribution(toolName: string | undefined): string {
 /**
  * Builds the `content` of a `role: "tool"` message.
  *
- * Images travel inside the message when native mode collected them, otherwise
- * the placeholder text alone is sent and the images follow in a user message.
- * @param text Collected tool result text.
+ * Text without images leaves as a plain string, joined with a blank line in
+ * `joined` mode, with `"Success"` standing in for empty text. Several parts in
+ * `separate` mode, and any text beside natively carried images, leave as `text`
+ * items, and natively carried images follow them. An image-only result carries
+ * the image-only notice as its text item.
+ *
+ * @param textParts Collected tool result text, one entry per non-empty content part.
  * @param images Images to carry natively, empty when they were hoisted.
+ * @param textMode Whether the provider's transform keeps separate text items apart.
  */
 function buildToolResultMessageContent(
-    text: string,
-    images: readonly OpenAIChatMessageContentItem[]
+    textParts: readonly string[],
+    images: readonly OpenAIChatMessageContentItem[],
+    textMode: ToolResultTextMode
 ): string | OpenAIChatMessageContentItem[] {
-    if (images.length === 0) {
-        return text || "Success";
+    if (images.length === 0 && textMode === "joined") {
+        return textParts.join("\n\n") || "Success";
     }
-    return buildMessageContent([text || toolResultImageOnlyNotice(images.length)], images) ?? "Success";
+    if (images.length === 0 && textParts.length <= 1) {
+        return textParts[0] || "Success";
+    }
+    const textItems: OpenAIChatMessageContentItem[] =
+        textMode === "separate"
+            ? textParts.map((text) => ({ type: "text", text }))
+            : [{ type: "text", text: textParts.join("\n\n") }];
+    if (images.length === 0) {
+        return textItems;
+    }
+    const textItemsToSend =
+        textParts.length > 0 ? textItems : [{ type: "text" as const, text: toolResultImageOnlyNotice(images.length) }];
+    return [...textItemsToSend, ...images];
 }
 
 /**

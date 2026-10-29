@@ -29,6 +29,7 @@ import {
 import { RequestBuilder } from "./base/requestBuilder";
 import { Transport } from "./base/transport";
 import type { RequestBuilderDeps, TransportDeps } from "./base/types";
+import type { ToolNameMapping } from "../utils/toolNameUtils";
 import { LiteLLMProviderRegistry } from "./liteLLMProviderRegistry";
 
 /**
@@ -50,7 +51,7 @@ import { LiteLLMProviderRegistry } from "./liteLLMProviderRegistry";
  * - Shared quota/tool-redaction heuristics
  *
  * Non-responsibilities:
- * - Model discovery (lives in the BackendRegistry — see
+ * - Model discovery (lives in the BackendRegistry, see
  *   `LiteLLMProviderRegistry.discoverModels`).
  * - VS Code protocol specifics (stream parsing, response part emission)
  * - Cross-backend routing (handled by VS Code 1.120 per-group config)
@@ -61,7 +62,7 @@ export abstract class LiteLLMProviderBase {
     readonly onDidChangeLanguageModelChatInformation = this._onDidChangeLanguageModelChatInformationEmitter.event;
 
     /**
-     * The BackendRegistry — single source of truth for backends and their
+     * The BackendRegistry is the single source of truth for backends and their
      * associated models. The base provider subscribes to its `onDidChange`
      * event and forwards it to VS Code. The provider does NOT have a
      * separate discovery class; the registry owns discovery, namespacing,
@@ -239,7 +240,7 @@ export abstract class LiteLLMProviderBase {
         // It also fires its `onDidChange` event when the model set for a
         // given baseUrl actually changes; we subscribed in the constructor
         // and forward that to VS Code. There is no mirror cache on the base
-        // provider — every `getModelInfo` call goes straight to the registry.
+        // provider, so every `getModelInfo` call goes straight to the registry.
         return await this._registry.discoverModels(options, token);
     }
 
@@ -261,8 +262,8 @@ export abstract class LiteLLMProviderBase {
         };
 
         // The two configuration objects serve different purposes:
-        //   opt.configuration      — provider group config (baseUrl, apiKey) — always present when using 1.120 BYOK
-        //   opt.modelConfiguration — per-model picker selections (reasoningEffort) — present when user changes effort
+        //   opt.configuration:      provider group config (baseUrl, apiKey), always present when using 1.120 BYOK
+        //   opt.modelConfiguration: per-model picker selections (reasoningEffort), present when user changes effort
         const modelConfig: Record<string, unknown> = {
             ...(opt.configuration ?? {}),
             ...(opt.modelConfiguration ?? {}),
@@ -335,7 +336,9 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Shared request builder used by all providers.
+     * Shared request builder used by all providers. Returns the body together
+     * with the tool-name mapping that body advertised, which the response path
+     * needs to translate a model's tool call back to the declared name.
      */
     protected async buildOpenAIChatRequest(
         messages: readonly LanguageModelChatRequestMessage[],
@@ -343,13 +346,13 @@ export abstract class LiteLLMProviderBase {
         options: ProvideLanguageModelChatResponseOptions,
         modelInfo?: LiteLLMModelInfo,
         caller?: string
-    ): Promise<OpenAIChatCompletionRequest> {
+    ): Promise<{ request: OpenAIChatCompletionRequest; toolNames: ToolNameMapping }> {
         return this._requestBuilder.buildOpenAIChatRequest(messages, model, options, modelInfo, caller);
     }
 
     /**
      * Sends a request to LiteLLM. Honors the per-group `options.configuration`
-     * passed by VS Code — baseUrl/apiKey are read from there, NEVER from
+     * passed by VS Code: baseUrl/apiKey are read from there, NEVER from
      * global state. If `configuration` is missing, the request fails with a
      * configuration-required error rather than silently mis-routing.
      */
@@ -588,13 +591,20 @@ export abstract class LiteLLMProviderBase {
             const toolConfig = convertTools(options);
             const hardBudget = Math.max(1, model.maxInputTokens - estimateToolTokens(toolConfig.tools));
             const trimmedMessages = trimMessagesToFitBudget(messages, toolConfig.tools, model, modelInfo, hardBudget);
-            const retrimmedRequest = await this.buildOpenAIChatRequest(
+            const retrimmedBuild = await this.buildOpenAIChatRequest(
                 trimmedMessages,
                 model,
                 options,
                 modelInfo,
                 caller
             );
+            const retrimmedRequest = retrimmedBuild.request;
+            // The trimmed body can advertise a different tool set than the one
+            // the caller's mapping describes, because redaction reads the
+            // messages and trimming removes them. The retry returns only a
+            // stream, so the mapping stays with the original body. A name the
+            // trimmed body changed then reaches VS Code untranslated, which
+            // loses that call rather than running a different tool.
             // Rebuilding from scratch drops the two fields the request gains
             // after it is built: the in-effect reasoning effort and the session
             // metadata the provider attaches. Carry them over so the trimmed
@@ -680,9 +690,8 @@ export abstract class LiteLLMProviderBase {
             };
         }
         if (opt.configuration) {
-            // Object is present but malformed (empty / missing fields).
-            // This is the case we need to escape from — VS Code passed an
-            // empty object and we must not trust it.
+            // Object is present but malformed (empty or missing fields), so it
+            // cannot be trusted.
             Logger.trace(
                 `getCallTimeConfiguration: options.configuration present but invalid (empty baseUrl or apiKey) modelId="${model.id}"; falling back to registry`
             );
@@ -710,7 +719,7 @@ export abstract class LiteLLMProviderBase {
             };
         }
         Logger.warn(
-            `getCallTimeConfiguration: registry MISS modelId="${model.id}" modelName="${model.name}" — request will fail with configuration error`
+            `getCallTimeConfiguration: registry MISS modelId="${model.id}" modelName="${model.name}", so the request will fail with a configuration error`
         );
         return undefined;
     }
@@ -721,8 +730,8 @@ export abstract class LiteLLMProviderBase {
      * otherwise returns the id unchanged.
      *
      * Used by the request building and transport paths so that
-     * `request.model` in the OpenAI-compatible body is always the raw name
-     * — LiteLLM does NOT understand the namespaced id format that VS Code
+     * `request.model` in the OpenAI-compatible body is always the raw name.
+     * LiteLLM does NOT understand the namespaced id format that VS Code
      * sees in the picker.
      */
     protected getRawModelName(modelId: string): string {
@@ -740,7 +749,7 @@ export abstract class LiteLLMProviderBase {
      *
      * Source of truth: the `supported_openai_params` array on the model's
      * `LiteLLMModelInfo` (delivered by the registry). There is no probe
-     * cache here — the registry's per-model capability data is authoritative
+     * cache here, because the registry's per-model capability data is authoritative
      * and re-validated on every discovery call, so a stale cache layer
      * would only ever shadow correct information and (as observed in
      * production) cause a model to silently drop parameters it actually
@@ -964,7 +973,7 @@ export abstract class LiteLLMProviderBase {
             // Check if there's also a tool name in the text
             const toolMatch = stripped.match(toolRegex);
             if (!toolMatch) {
-                // Quota phrase found but no tool name - not actionable
+                // Quota phrase found but no tool name, so nothing is actionable
                 continue;
             }
             return {

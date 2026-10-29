@@ -27,6 +27,14 @@ interface ChatToolCallBuffer {
 export interface StreamingState {
     /** Ties this stream's diagnostics to its request when several sessions stream at once. */
     readonly requestId: string | undefined;
+    /**
+     * Advertised tool name to the name VS Code declared, for every tool whose
+     * advertised name differs from its declared spelling, whether the sanitizer
+     * or the collision suffix changed it. Tool calls carry the wire name the
+     * request advertised, and VS Code resolves a call by the name it declared,
+     * so the emission path translates back through this map.
+     */
+    readonly wireToDeclaredNames: ReadonlyMap<string, string> | undefined;
     toolCallBuffers: Map<number, ChatToolCallBuffer>;
     /** Call ids already delivered, so a repeated id cannot execute a tool twice. */
     emittedToolCallIds: Set<string>;
@@ -50,9 +58,13 @@ export interface StreamingState {
     currentThinkingBlockId: string | undefined;
 }
 
-export function createInitialStreamingState(requestId?: string): StreamingState {
+export function createInitialStreamingState(
+    requestId?: string,
+    wireToDeclaredNames?: ReadonlyMap<string, string>
+): StreamingState {
     return {
         requestId,
+        wireToDeclaredNames,
         toolCallBuffers: new Map(),
         emittedToolCallIds: new Set(),
         responseToolCallBuffers: new Map(),
@@ -75,6 +87,19 @@ function ensureCurrentThinkingBlockId(state: StreamingState): string {
         state.currentThinkingBlockId = nextThinkingBlockId(state);
     }
     return state.currentThinkingBlockId;
+}
+
+/**
+ * Translates a tool name the model sent into the name VS Code declared for it.
+ *
+ * The request advertised sanitized, deduplicated names, so the model's call
+ * carries a wire name. A model-invented or mangled name is normalized again so
+ * it stays wire-safe, and the per-request map then recovers the declared
+ * spelling.
+ */
+function resolveToolCallName(state: StreamingState, modelName: string): string {
+    const wireName = sanitizeToolName(modelName);
+    return state.wireToDeclaredNames?.get(wireName) ?? wireName;
 }
 
 /**
@@ -589,8 +614,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                         StructuredLogger.trace("stream.tool_call_skipped_duplicate", { id: newId });
                         continue;
                     }
-                    // Apply tool name sanitization for AWS Bedrock Converse API compliance (64-char limit)
-                    const { name: sanitizedName } = sanitizeToolName(fn?.name || "");
+                    const sanitizedName = resolveToolCallName(state, typeof fn?.name === "string" ? fn.name : "");
                     buffer = { id: newId, name: sanitizedName, args: toArgumentText(fn?.arguments) };
                     state.toolCallBuffers.set(index, buffer);
                     Logger.trace(`[interpretStreamEvent] Buffered new tool call: ${sanitizedName} (id: ${newId})`);
@@ -613,7 +637,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                     }
                     const tcFn = tc.function as Record<string, unknown> | undefined;
                     if (typeof tcFn?.name === "string" && tcFn.name) {
-                        buffer.name = tcFn.name;
+                        buffer.name = resolveToolCallName(state, tcFn.name);
                     }
                     buffer.args += toArgumentText(tcFn?.arguments);
                 }
@@ -665,8 +689,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
             if (callId) {
                 const existing = state.responseToolCallBuffers.get(callId) ?? { id: callId, name: undefined, args: "" };
                 if (name) {
-                    // Apply tool name sanitization for AWS Bedrock Converse API compliance (64-char limit)
-                    const { name: sanitizedName } = sanitizeToolName(name);
+                    const sanitizedName = resolveToolCallName(state, name);
                     existing.name = sanitizedName;
                     Logger.trace(`[interpretStreamEvent] /responses output_item.delta tool name: ${sanitizedName}`);
                 }
@@ -688,8 +711,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
             } else {
                 // No call_id yet, so buffer anonymously for providers that stream args before the id.
                 if (name) {
-                    // Apply tool name sanitization for AWS Bedrock Converse API compliance (64-char limit)
-                    const { name: sanitizedName } = sanitizeToolName(name);
+                    const sanitizedName = resolveToolCallName(state, name);
                     state.anonymousResponseToolName = sanitizedName;
                     Logger.trace(
                         `[interpretStreamEvent] /responses output_item.delta anonymous tool name: ${sanitizedName}`
@@ -716,8 +738,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
             Logger.trace(`[interpretStreamEvent] /responses legacy output_tool_call.* delta for id: ${id}`);
             const existing = state.responseToolCallBuffers.get(id) ?? { id, name: undefined, args: "" };
             if (typeof delta?.name === "string") {
-                // Apply tool name sanitization for AWS Bedrock Converse API compliance (64-char limit)
-                const { name: sanitizedName } = sanitizeToolName(delta.name);
+                const sanitizedName = resolveToolCallName(state, delta.name);
                 existing.name = sanitizedName;
                 Logger.trace(`[interpretStreamEvent] /responses legacy tool name: ${sanitizedName}`);
             }
@@ -776,7 +797,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                 // Per-callId flush: emit the specific buffered call and remove it from the order
                 // list so a later `response.completed` or `response.incomplete` does not double-emit it.
                 const buffer = state.responseToolCallBuffers.get(callId);
-                const name = nameFromDone ?? buffer?.name;
+                const name = nameFromDone ? resolveToolCallName(state, nameFromDone) : buffer?.name;
                 const args = argsFromDone ?? buffer?.args;
                 Logger.trace(
                     `[interpretStreamEvent] Flushing keyed tool call on output_item.done: ${name} (id: ${callId})`
@@ -806,7 +827,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
             } else {
                 // Anonymous tool call (no stable call_id), emitted best-effort from the
                 // anonymous buffer for providers that never emit a call_id.
-                const name = nameFromDone ?? state.anonymousResponseToolName;
+                const name = nameFromDone ? resolveToolCallName(state, nameFromDone) : state.anonymousResponseToolName;
                 const args = argsFromDone ?? state.anonymousResponseToolArgs;
                 Logger.trace(`[interpretStreamEvent] Flushing anonymous tool call on output_item.done: ${name}`);
                 if (name && args) {
@@ -866,16 +887,17 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
             const functionCall = part.functionCall as { name?: string; args?: unknown; id?: string } | undefined;
             if (functionCall?.name) {
                 const argsJson = JSON.stringify(functionCall.args ?? {});
-                Logger.trace(`[interpretStreamEvent] Gemini function call: ${functionCall.name}`);
+                const resolvedName = resolveToolCallName(state, functionCall.name);
+                Logger.trace(`[interpretStreamEvent] Gemini function call: ${resolvedName}`);
                 toolCallParts.push({
                     type: "tool_call",
                     index: 0,
                     id: functionCall.id,
-                    name: functionCall.name,
+                    name: resolvedName,
                     args: argsJson,
                 });
                 StructuredLogger.trace("stream.gemini_function_call", {
-                    name: functionCall.name,
+                    name: resolvedName,
                     id: functionCall.id,
                     argsLength: argsJson.length,
                 });

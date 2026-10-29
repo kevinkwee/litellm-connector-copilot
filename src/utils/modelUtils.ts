@@ -1,4 +1,4 @@
-import type { LiteLLMModelInfo, ToolResultImageMode } from "../types";
+import type { LiteLLMModelInfo, ToolResultImageMode, ToolResultTextMode } from "../types";
 
 /**
  * Provider families whose LiteLLM transforms read `image_url` parts from a
@@ -6,6 +6,37 @@ import type { LiteLLMModelInfo, ToolResultImageMode } from "../types";
  * and keep only the text, so images sent natively would be dropped.
  */
 const NATIVE_TOOL_RESULT_IMAGE_PROVIDERS: readonly RegExp[] = [/anthropic/i, /gemini/i, /vertex/i, /bedrock/i];
+
+/**
+ * Provider families whose LiteLLM transforms keep the text items of a tool
+ * result apart instead of concatenating them. Anthropic turns each item into its
+ * own content block, and Bedrock keeps the items as separate entries.
+ */
+const SEPARATE_TOOL_RESULT_TEXT_PROVIDERS: readonly RegExp[] = [/anthropic/i, /bedrock/i];
+
+/**
+ * Picks the wire shape for the text parts of a tool result.
+ *
+ * Providers that keep the items apart receive one item per part, so two parts
+ * never read as one run-on string. Every other provider, Gemini included, glues
+ * list items together with no separator, so the parts are joined with a blank
+ * line before sending. An unknown or missing provider joins, the shape every
+ * OpenAI-compatible transform preserves.
+ *
+ * Responses API requests join as well: their tool output is a plain string, so
+ * the adapter flattens any content array with no separator and separate items
+ * would arrive run together.
+ */
+export function resolveToolResultTextMode(modelInfo?: LiteLLMModelInfo): ToolResultTextMode {
+    if (modelInfo?.mode === "responses") {
+        return "joined";
+    }
+    const provider = modelInfo?.litellm_provider;
+    if (typeof provider === "string" && SEPARATE_TOOL_RESULT_TEXT_PROVIDERS.some((pattern) => pattern.test(provider))) {
+        return "separate";
+    }
+    return "joined";
+}
 
 /**
  * Determine whether a model is an Anthropic/Claude model (provider or ID match).

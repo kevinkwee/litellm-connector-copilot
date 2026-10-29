@@ -3,7 +3,15 @@ import * as sinon from "sinon";
 import * as assert from "assert";
 import { RequestBuilder } from "../base/requestBuilder";
 import { ConfigManager } from "../../config/configManager";
-import type { LiteLLMModelInfo } from "../../types";
+import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types";
+
+/** Builds one request body, discarding the tool-name mapping the test does not read. */
+async function buildRequest(
+    builder: RequestBuilder,
+    ...args: Parameters<RequestBuilder["buildOpenAIChatRequest"]>
+): Promise<OpenAIChatCompletionRequest> {
+    return (await builder.buildOpenAIChatRequest(...args)).request;
+}
 
 suite("RequestBuilder", () => {
     let sandbox: sinon.SinonSandbox;
@@ -51,7 +59,8 @@ suite("RequestBuilder", () => {
             },
         ];
 
-        const req = await builder.buildOpenAIChatRequest(
+        const req = await buildRequest(
+            builder,
             messages,
             model,
             { modelOptions: {} } as vscode.ProvideLanguageModelChatResponseOptions,
@@ -77,7 +86,8 @@ suite("RequestBuilder", () => {
         });
 
         test("applies per-model temperature set in the VS Code model configuration", async () => {
-            const req = await builder.buildOpenAIChatRequest(
+            const req = await buildRequest(
+                builder,
                 messages,
                 model,
                 {
@@ -92,7 +102,8 @@ suite("RequestBuilder", () => {
         });
 
         test("caller-supplied modelOptions.temperature wins over per-model configuration", async () => {
-            const req = await builder.buildOpenAIChatRequest(
+            const req = await buildRequest(
+                builder,
                 messages,
                 model,
                 {
@@ -107,7 +118,8 @@ suite("RequestBuilder", () => {
         });
 
         test("omits temperature when no explicit value is configured", async () => {
-            const req = await builder.buildOpenAIChatRequest(
+            const req = await buildRequest(
+                builder,
                 messages,
                 model,
                 { modelOptions: {} } as vscode.ProvideLanguageModelChatResponseOptions,
@@ -143,7 +155,8 @@ suite("RequestBuilder", () => {
             });
             const modelInfo = { supported_openai_params: ["stream", "tools"] } as LiteLLMModelInfo;
 
-            const req = await gatedBuilder.buildOpenAIChatRequest(
+            const req = await buildRequest(
+                gatedBuilder,
                 messages,
                 model,
                 {
@@ -170,7 +183,8 @@ suite("RequestBuilder", () => {
         ];
         const modelInfo = { mode: "chat" } as LiteLLMModelInfo;
 
-        const req = await builder.buildOpenAIChatRequest(
+        const req = await buildRequest(
+            builder,
             messages,
             model,
             {
@@ -220,7 +234,8 @@ suite("RequestBuilder", () => {
         ];
         const modelInfo = { model: "gpt-5.6", supported_openai_params: ["tools"] } as LiteLLMModelInfo;
 
-        const req = await builderWithGating.buildOpenAIChatRequest(
+        const req = await buildRequest(
+            builderWithGating,
             messages,
             model,
             {
@@ -253,7 +268,8 @@ suite("RequestBuilder", () => {
         ];
         const modelInfo = { model: "gpt-4", supported_openai_params: ["tools", "tool_choice"] } as LiteLLMModelInfo;
 
-        const req = await builder.buildOpenAIChatRequest(
+        const req = await buildRequest(
+            builder,
             messages,
             model,
             {
@@ -291,7 +307,8 @@ suite("RequestBuilder", () => {
             },
         ];
 
-        const req = await builder.buildOpenAIChatRequest(
+        const req = await buildRequest(
+            builder,
             messages,
             model,
             { modelOptions: {} } as vscode.ProvideLanguageModelChatResponseOptions,
@@ -324,7 +341,8 @@ suite("RequestBuilder", () => {
             },
         ];
 
-        const req = await builder.buildOpenAIChatRequest(
+        const req = await buildRequest(
+            builder,
             messages,
             model,
             { modelOptions: {} } as vscode.ProvideLanguageModelChatResponseOptions,
@@ -364,7 +382,7 @@ suite("RequestBuilder", () => {
         });
 
         test("marks Anthropic requests with the default 5m ephemeral CachePoint", async () => {
-            const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), anthropicInfo, "call");
+            const req = await buildRequest(builder, messages, claudeModel, options({}), anthropicInfo, "call");
 
             assert.deepStrictEqual(req.cache_control, { type: "ephemeral" });
         });
@@ -372,7 +390,7 @@ suite("RequestBuilder", () => {
         test("adds ttl 1h when the setting requests the 1-hour tier", async () => {
             configManager.getConfig.resolves({ anthropicPromptCaching: "1h" });
 
-            const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), anthropicInfo, "call");
+            const req = await buildRequest(builder, messages, claudeModel, options({}), anthropicInfo, "call");
 
             assert.deepStrictEqual(req.cache_control, { type: "ephemeral", ttl: "1h" });
         });
@@ -380,7 +398,7 @@ suite("RequestBuilder", () => {
         test("omits the marker when the setting is off", async () => {
             configManager.getConfig.resolves({ anthropicPromptCaching: "off" });
 
-            const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), anthropicInfo, "call");
+            const req = await buildRequest(builder, messages, claudeModel, options({}), anthropicInfo, "call");
 
             assert.strictEqual(req.cache_control, undefined);
         });
@@ -388,7 +406,7 @@ suite("RequestBuilder", () => {
         test("omits the marker for non-Anthropic models", async () => {
             const openaiInfo = { litellm_provider: "openai" } as LiteLLMModelInfo;
 
-            const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), openaiInfo, "call");
+            const req = await buildRequest(builder, messages, claudeModel, options({}), openaiInfo, "call");
 
             assert.strictEqual(req.cache_control, undefined);
         });
@@ -399,7 +417,7 @@ suite("RequestBuilder", () => {
                 supports_prompt_caching: false,
             } as LiteLLMModelInfo;
 
-            const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), noCachingInfo, "call");
+            const req = await buildRequest(builder, messages, claudeModel, options({}), noCachingInfo, "call");
 
             assert.strictEqual(req.cache_control, undefined);
         });
@@ -421,13 +439,7 @@ suite("RequestBuilder", () => {
                 },
             });
 
-            const req = await learnedBuilder.buildOpenAIChatRequest(
-                messages,
-                claudeModel,
-                options({}),
-                anthropicInfo,
-                "call"
-            );
+            const req = await buildRequest(learnedBuilder, messages, claudeModel, options({}), anthropicInfo, "call");
 
             assert.strictEqual(req.cache_control, undefined);
         });
@@ -449,13 +461,7 @@ suite("RequestBuilder", () => {
                 },
             });
 
-            const req = await learnedBuilder.buildOpenAIChatRequest(
-                messages,
-                claudeModel,
-                options({}),
-                anthropicInfo,
-                "call"
-            );
+            const req = await buildRequest(learnedBuilder, messages, claudeModel, options({}), anthropicInfo, "call");
 
             assert.deepStrictEqual(req.cache_control, { type: "ephemeral" });
         });
@@ -503,7 +509,7 @@ suite("RequestBuilder", () => {
             } as vscode.LanguageModelChatInformation;
             const modelInfo = { litellm_provider: "deepseek" } as LiteLLMModelInfo;
 
-            const req = await builder.buildOpenAIChatRequest(messages, model, options(true), modelInfo, "caller");
+            const req = await buildRequest(builder, messages, model, options(true), modelInfo, "caller");
 
             assert.strictEqual(req.messages[1].reasoning_content, "");
         });
@@ -516,7 +522,7 @@ suite("RequestBuilder", () => {
             } as vscode.LanguageModelChatInformation;
             const modelInfo = { litellm_provider: "openai" } as LiteLLMModelInfo;
 
-            const req = await builder.buildOpenAIChatRequest(messages, model, options(true), modelInfo, "caller");
+            const req = await buildRequest(builder, messages, model, options(true), modelInfo, "caller");
 
             assert.strictEqual(req.messages[1].reasoning_content, undefined);
         });
@@ -529,7 +535,7 @@ suite("RequestBuilder", () => {
             } as vscode.LanguageModelChatInformation;
             const modelInfo = { litellm_provider: "deepseek" } as LiteLLMModelInfo;
 
-            const req = await builder.buildOpenAIChatRequest(messages, model, options(false), modelInfo, "caller");
+            const req = await buildRequest(builder, messages, model, options(false), modelInfo, "caller");
 
             assert.strictEqual(req.messages[1].reasoning_content, undefined);
         });
@@ -541,7 +547,7 @@ suite("RequestBuilder", () => {
                 maxOutputTokens: 100,
             } as vscode.LanguageModelChatInformation;
 
-            const req = await builder.buildOpenAIChatRequest(messages, model, options(true), undefined, "caller");
+            const req = await buildRequest(builder, messages, model, options(true), undefined, "caller");
 
             assert.strictEqual(req.messages[1].reasoning_content, "");
         });

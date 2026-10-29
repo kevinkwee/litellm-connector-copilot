@@ -74,6 +74,8 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - A rejected model parameter is reported once with the proxy-side fix (`additional_drop_params` / `drop_params`) instead of being stripped and resent. Only parameters the connector adds itself (the `cache_control` prompt-caching marker and the cache-bypass flag) are removed and retried.
 - A model that rejects `stream_options.include_usage` is remembered under its raw model name, so later requests omit the flag without paying another failed round trip.
 - Tool-call-shaped text in a model's answer is delivered as text; only structured tool-call fields can trigger a tool.
+- A tool keeps the name the caller declared. A name the wire already accepts is sent unchanged, so `github__create_issue` no longer collapses into `github_create_issue`. A name that had to change for the wire is translated back to the declared spelling before VS Code sees the call, and two names that would still collide are given distinct wire names. Composite schemas (`anyOf` / `oneOf` / `allOf`) keep the outer schema's `required`, `description`, `default`, and `properties`, and a numeric property is no longer rewritten to `integer`.
+- The separate text parts of one tool result stay distinguishable: Claude and Bedrock receive one text item per part, and every other provider receives the parts joined with a blank line instead of running together.
 - `autoTrimMessages` never keeps a tool result whose tool call was trimmed away, which providers reject.
 
 ### New settings

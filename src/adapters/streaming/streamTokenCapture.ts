@@ -7,6 +7,7 @@ import type {
     OpenAIUsagePromptTokenDetails,
 } from "../../types";
 import { calculateRequestCost, extractPricing, type RequestCost } from "../../utils/pricingCalculator";
+import { decodeUtf8 } from "../../utils/byteEncoding";
 
 /**
  * Snapshot of all tracked token counts for a single request.
@@ -301,7 +302,7 @@ export class StreamTokenCapture {
 
     private _handleUsageDataPart(part: vscode.LanguageModelDataPart): void {
         try {
-            const parsed = JSON.parse(Buffer.from(part.data).toString("utf-8")) as OpenAIUsagePayload;
+            const parsed = JSON.parse(decodeUtf8(part.data)) as OpenAIUsagePayload;
             this._sawUpstreamUsage = true;
 
             // Monotonic merge: when upstream sends multiple usage frames (e.g. mid-stream

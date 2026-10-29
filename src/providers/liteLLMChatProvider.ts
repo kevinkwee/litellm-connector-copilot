@@ -14,6 +14,7 @@ import { tryParseJSONObject } from "../utils";
 import { formatConnectorNotice } from "../utils/connectorNotice";
 import { Logger } from "../utils/logger";
 import { appendRateLimitHint } from "../utils/rateLimitNotice";
+import type { ToolNameMapping } from "../utils/toolNameUtils";
 import { LiteLLMTelemetry } from "../utils/telemetry";
 import { LiteLLMProviderBase } from "./liteLLMProviderBase";
 import { StructuredLogger } from "../observability/structuredLogger";
@@ -256,7 +257,12 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             const routingEntry = this._registry.lookup(model.id);
             endpointUrl = routingEntry?.baseUrl ?? "litellm-connector";
 
-            const requestBody = await this.buildOpenAIChatRequest(messages, model, options, modelInfo, caller);
+            const requestBuild = await this.buildOpenAIChatRequest(messages, model, options, modelInfo, caller);
+            const requestBody = requestBuild.request;
+            // A resume rebuilds the body, and a rebuild can redact a different
+            // tool, so the mapping is replaced with the one the rebuilt body
+            // advertised.
+            let toolNames: ToolNameMapping = requestBuild.toolNames;
             // Sent even when the `.copilotmd` export is off: spend grouping is
             // independent of debug logging.
             requestBody.metadata = {
@@ -349,7 +355,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                             caller
                         );
                         activeMessages = resumedMessages;
-                        requestBodyBuilt = resumedRequestBody;
+                        requestBodyBuilt = resumedRequestBody.request;
+                        toolNames = resumedRequestBody.toolNames;
                         // Carry over the request metadata (which holds the
                         // session id) so resumed attempts keep per-session
                         // spend grouping in LiteLLM.
@@ -380,7 +387,13 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         modelInfo,
                         requestId
                     );
-                    await this.processStreamingResponse(stream, trackedProgress, token, requestId);
+                    await this.processStreamingResponse(
+                        stream,
+                        trackedProgress,
+                        token,
+                        requestId,
+                        toolNames.wireToDeclared
+                    );
 
                     // Upstream may stream no usage frame; VS Code still needs one usage report.
                     tokenCapture.flushUsage();
@@ -772,7 +785,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         responseBody: ReadableStream<Uint8Array>,
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
         token: vscode.CancellationToken,
-        requestId: string
+        requestId: string,
+        wireToDeclaredNames?: ReadonlyMap<string, string>
     ): Promise<void> {
         Logger.info(`[processStreamingResponse] request=${requestId} Starting stream processing`);
         StructuredLogger.info("stream.processing_start", {
@@ -784,7 +798,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         const timeoutMs = (config.inactivityTimeout ?? 60) * 1000;
         // Scoped to one upstream attempt: a resumed retry is a new upstream
         // response, so nothing buffered by the failed attempt belongs to it.
-        const streamingState = createInitialStreamingState(requestId);
+        const streamingState = createInitialStreamingState(requestId, wireToDeclaredNames);
         let watchdog: NodeJS.Timeout | undefined;
         let eventCount = 0;
         let wasWatchdogAbort = false;

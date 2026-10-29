@@ -2,125 +2,131 @@ import { Logger } from "./logger";
 import { StructuredLogger } from "../observability/structuredLogger";
 
 /**
- * Maximum allowed length for tool function names in the Bedrock Converse API.
+ * Maximum length of a tool function name on the wire.
  *
- * AWS Bedrock enforces a 64-character limit on the toolUse.name field.
- * This constant is exposed for use at the outbound boundary where tool names
- * are emitted: the streaming interpreter.
+ * AWS Bedrock enforces a 64-character limit on the `toolUse.name` field, so
+ * every name this module produces fits within it.
  */
 export const TOOL_NAME_MAX_LENGTH = 64;
 
+/** Names the wire accepts unchanged: a letter, then up to 63 letters, digits, hyphens, or underscores. */
+const VALID_TOOL_NAME = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/;
+
 /**
- * Result of sanitizing a tool function name to comply with Bedrock's 64-char limit.
+ * How the declared tool names relate to the names the request advertises.
  *
- * Only locally named tools (caller-declared) should use this during the `tools`
- * schema conversion in `convertTools`.
+ * A request advertises sanitized, deduplicated names, so a model's call carries
+ * a wire name while VS Code resolves the call by the name it declared. The
+ * response path needs wire to declared, and history replay needs declared to wire.
+ * Both directions come from one list so they cannot disagree.
  */
-export interface SanitizedToolName {
-    /**
-     * The sanitized name, guaranteed to be ≤64 characters.
-     */
-    name: string;
-    /**
-     * Whether the name was actually changed due to exceeding the length limit.
-     * True only when `originalLength > TOOL_NAME_MAX_LENGTH`.
-     */
-    wasTruncated: boolean;
+export interface ToolNameMapping {
+    /** The advertised name of every declared tool, in declaration order. */
+    readonly wireNames: readonly string[];
+    /** Wire names that differ from the declared spelling, keyed by wire name. */
+    readonly wireToDeclared: ReadonlyMap<string, string>;
+    /** Every declared name that travels under a different wire name. */
+    readonly declaredToWire: ReadonlyMap<string, string>;
 }
 
+export const EMPTY_TOOL_NAME_MAPPING: ToolNameMapping = {
+    wireNames: [],
+    wireToDeclared: new Map(),
+    declaredToWire: new Map(),
+};
+
 /**
- * Sanitizes and truncates a tool function name to comply with AWS Bedrock's 64-character limit.
+ * Sanitizes a tool function name so every endpoint accepts it.
  *
- * This function is applied at the outbound boundary where tool names are emitted:
- * **streaming interpreter** (`src/adapters/streaming/liteLLMStreamInterpreter.ts`):
- *    - `state.toolCallBuffers` initialization (OpenAI format)
- *    - `state.responseToolCallBuffers` updates (output_item.delta)
- *    - `state.responseToolCallBuffers` updates (output_tool_call.*)
- *    - `state.anonymousResponseToolName` updates
+ * A name the wire already accepts passes through unchanged, which keeps names
+ * such as `github__create_issue` distinct from `github_create_issue`. Any other
+ * name has its invalid characters replaced with `_`, gains a `tool_` prefix when
+ * it does not start with a letter, and is truncated to the Bedrock Converse API
+ * limit of 64 characters. Repeated underscores are preserved: collapsing them
+ * would merge two declared tools into one name.
  *
- * **Goal**: Prevent `litellm.BadRequestError` for Bedrock Converse API failures when
- *       a tool name exceeds the 64-character limit.
+ * Applied wherever a declared or model-supplied name becomes a wire name: the
+ * `tools` schema conversion, the streaming interpreter's read of a model's call,
+ * and the replay of a tool call the map does not name.
  *
- * **Side Effects**: Emits a structured warning log so that we can diagnose
- *       whether the long name originated from the model or from caller-declared `tools`.
- *
- * @param name - Tool function name to sanitize. Must be a string; non-string values
- *        are normalized to `"tool"` and treated as not truncated.
- * @returns A `SanitizedToolName` with the length-bounded name and an indicator
- *        of whether truncation actually occurred.
- *
- * **Logging**: When `name` is a string longer than 64 characters, a warning is emitted
- *       via `StructuredLogger.warn` with key `stream.tool_name_truncated` and a
- *       structured payload including `originalLength`, `sanitizedLength`, and `source`.
+ * @param name Tool function name to sanitize. Non-string values and the empty
+ *        string become `"tool"`.
  */
-export function sanitizeToolName(name: unknown): SanitizedToolName {
+export function sanitizeToolName(name: unknown): string {
     if (typeof name !== "string" || !name) {
-        return { name: "tool", wasTruncated: false };
+        return "tool";
     }
 
-    const originalLength = name.length;
+    if (VALID_TOOL_NAME.test(name)) {
+        Logger.trace("[sanitizeToolName]", { name, length: name.length });
+        return name;
+    }
+
     let sanitized = name.replace(/[^a-zA-Z0-9_-]/g, "_");
     if (!/^[a-zA-Z]/.test(sanitized)) {
         sanitized = `tool_${sanitized}`;
     }
-    sanitized = sanitized.replace(/_+/g, "_");
 
-    // Always enforce the 64-char limit; the Bedrock Converse API will reject longer names.
-    const matched = sanitized.match(/^.{1,64}$/);
-    if (!matched) {
-        // Name exceeds limit: truncate to exactly 64 characters.
+    if (sanitized.length > TOOL_NAME_MAX_LENGTH) {
         const truncated = sanitized.slice(0, TOOL_NAME_MAX_LENGTH);
-
-        // Emit a structured warning with diagnostic context on truncation origin.
-        logToolNameTruncationStructured({
-            originalName: name,
-            source: "unknown",
-            data: {
-                originalLength,
-                sanitizedLength: truncated.length,
-                endpoint: undefined,
-            },
+        StructuredLogger.warn("stream.tool_name_truncated", {
+            name,
+            originalLength: name.length,
+            sanitizedLength: truncated.length,
         });
-
-        // Return a truncated result; the log above provides diagnostic context.
-        return { name: truncated, wasTruncated: true };
+        return truncated;
     }
 
-    // Name is within limit: no truncation needed.
-    // Emit a trace-level log to confirm we passed through this boundary without issues.
-    Logger.trace("[sanitizeToolName]", { name, length: originalLength });
-
-    return { name: sanitized, wasTruncated: false };
+    Logger.trace("[sanitizeToolName]", { name, sanitized, length: name.length });
+    return sanitized;
 }
 
 /**
- * Structured logging for tool name truncation.
+ * Derives the advertised name of every declared tool, in declaration order.
  *
- * Uses the `StructuredLogger.warn` API, which emits a JSONL entry with log key `stream.tool_name_truncated`
- * on the "LiteLLM Structured" output channel.
+ * Two declared names can sanitize to the same wire name, either because their
+ * differing characters were both replaced or because both truncate to the same
+ * 64 characters. A duplicate would let a model call resolve to whichever tool
+ * came last, so the later tool receives a numeric suffix and the collision is
+ * logged.
  */
-export function logToolNameTruncationStructured(args: {
-    originalName: string;
-    /** Override/confirm the origin label recorded in the log payload */
-    source: string;
-    /** Optional: Additional context structure (recommended over arbitrary extra logs) */
-    data?: {
-        originalLength: number;
-        sanitizedLength: number;
-        endpoint?: string;
-    };
-}): void {
-    if (!args.data) {
-        args.data = {
-            originalLength: args.originalName.length,
-            sanitizedLength: 0,
-            endpoint: undefined,
-        };
+export function deriveWireToolNames(declaredTools: readonly { name: string }[]): string[] {
+    const used = new Set<string>();
+    const wireNames: string[] = [];
+    for (const tool of declaredTools) {
+        const sanitized = sanitizeToolName(tool.name);
+        let candidate = sanitized;
+        let suffix = 2;
+        while (used.has(candidate)) {
+            const suffixText = `_${suffix}`;
+            candidate = `${sanitized.slice(0, TOOL_NAME_MAX_LENGTH - suffixText.length)}${suffixText}`;
+            suffix += 1;
+        }
+        if (candidate !== sanitized) {
+            StructuredLogger.warn("tools.name_collision", { wireName: candidate, sanitizedName: sanitized });
+        }
+        used.add(candidate);
+        wireNames.push(candidate);
     }
+    return wireNames;
+}
 
-    StructuredLogger.warn("stream.tool_name_truncated", {
-        name: args.originalName,
-        source: args.source,
-        ...args.data,
+/**
+ * Builds both directions of the declared-to-wire mapping for one request.
+ *
+ * Only names the sanitation or the dedupe changed are recorded, so a lookup
+ * falls through to the model's own spelling for every ordinary tool.
+ */
+export function buildToolNameMapping(declaredTools: readonly { name: string }[]): ToolNameMapping {
+    const wireNames = deriveWireToolNames(declaredTools);
+    const wireToDeclared = new Map<string, string>();
+    const declaredToWire = new Map<string, string>();
+    declaredTools.forEach((tool, index) => {
+        const wireName = wireNames[index];
+        if (wireName !== tool.name) {
+            wireToDeclared.set(wireName, tool.name);
+            declaredToWire.set(tool.name, wireName);
+        }
     });
+    return { wireNames, wireToDeclared, declaredToWire };
 }

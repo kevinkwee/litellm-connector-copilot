@@ -875,13 +875,9 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             >,
         } as unknown as vscode.ProvideLanguageModelChatResponseOptions;
 
-        const requestBody = await providerAny.buildOpenAIChatRequest(
-            messages,
-            model,
-            requestOptions,
-            undefined,
-            "chat"
-        );
+        const requestBody = (
+            await providerAny.buildOpenAIChatRequest(messages, model, requestOptions, undefined, "chat")
+        ).request;
         assert.deepStrictEqual(requestBody.stream_options, { include_usage: true });
 
         // Exercise the real retry path: the rejection must make the retry drop
