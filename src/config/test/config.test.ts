@@ -76,6 +76,42 @@ suite("ConfigManager Unit Tests", () => {
         assert.deepStrictEqual(config.modelCapabilitiesOverrides, {});
     });
 
+    test("getConfig clamps an inactivityTimeout below the minimum", async () => {
+        settingsMap.set("litellm-connector.inactivityTimeout", 0);
+
+        const manager = new ConfigManager(mockSecrets);
+        const cfg = await manager.getConfig();
+
+        assert.strictEqual(cfg.inactivityTimeout, 1);
+    });
+
+    test("getConfig clamps an inactivityTimeout above the maximum", async () => {
+        settingsMap.set("litellm-connector.inactivityTimeout", 1_000_000);
+
+        const manager = new ConfigManager(mockSecrets);
+        const cfg = await manager.getConfig();
+
+        assert.strictEqual(cfg.inactivityTimeout, 3600);
+    });
+
+    test("getConfig falls back to the default for a non-numeric inactivityTimeout", async () => {
+        settingsMap.set("litellm-connector.inactivityTimeout", "soon");
+
+        const manager = new ConfigManager(mockSecrets);
+        const cfg = await manager.getConfig();
+
+        assert.strictEqual(cfg.inactivityTimeout, 60);
+    });
+
+    test("getConfig keeps an in-range inactivityTimeout", async () => {
+        settingsMap.set("litellm-connector.inactivityTimeout", 90);
+
+        const manager = new ConfigManager(mockSecrets);
+        const cfg = await manager.getConfig();
+
+        assert.strictEqual(cfg.inactivityTimeout, 90);
+    });
+
     test("getConfig reads modelCapabilitiesOverrides", async () => {
         settingsMap.set("litellm-connector.modelCapabilitiesOverrides", {
             "gpt-4o": "toolCalling, imageInput",

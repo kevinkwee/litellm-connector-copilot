@@ -61,7 +61,9 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 ### Request handling fixes
 - Reasoning-only assistant messages are supported (empty-string content) instead of being rejected.
 - `normalizeToolCallId` only treats a leading `fc_` as a provider prefix and varies the padding filler, preventing dropped or duplicated tool call ids on repeated runs.
-- Request errors are surfaced as response text instead of thrown exceptions, and the streaming cancellation listener is disposed when the stream ends.
+- Request errors are surfaced as response text instead of thrown exceptions, so the failed turn stays in history. Each occurrence writes a `request.error_surfaced_as_text` entry with the caller and justification, so a failure from a background caller (for example a summarization request) still leaves a trace.
+- The streaming cancellation listener is disposed when the stream ends, and a cancelled request is reported as `cancelled` rather than as a failure.
+- `litellm-connector.inactivityTimeout` is clamped to 1 to 3600 seconds. A value of 0 or less would otherwise abort every response as soon as it starts.
 - `discoveryTimeoutMs` is passed through to per-session clients.
 - Model discovery applies LiteLLM's paused-model rule: deployments a proxy admin paused (`model_info.blocked`) are dropped during `/model/info` discovery, a public model name stays listed while at least one of its deployments is live, and each name is listed once.
 - A model-list refresh that fails for a transient reason (network, timeout, 408/409/425/429, 5xx) keeps the group's last known models, marked with a warning icon and hover text, instead of emptying the picker (and the model choice of a running session). A misconfigured group (a 400, 401, 403, or 404, or one that never discovered) still shows an empty list so the real error stays visible.

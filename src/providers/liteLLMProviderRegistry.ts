@@ -30,7 +30,9 @@
  *    capability caches populated during discovery.
  *  - `size()`: number of distinct backends currently registered.
  *  - `clear()`: wipe the routing table (call on user-initiated reload).
- *  - `clearCaches()`: wipe the capability caches + backoff controller.
+ *  - `clearCaches()`: wipe the per-model caches (model info, derived
+ *    capabilities, unsupported parameters), the discovery response cache, and
+ *    every backend's backoff history.
  *  - `onDidChange`: fires when a backend's model set changes.
  *
  * Internal surface (write)
@@ -70,6 +72,7 @@ import {
     derivePickerCategory,
 } from "../utils/modelCapabilities";
 import { deriveGroupNameFromUrl } from "../utils";
+import { sleepWithCancellation } from "../utils/transportRetry";
 import { sha256HexAsync } from "../utils/discoveryHash";
 import { LiteLLMDiscoveryError } from "../adapters/litellmClient";
 import type { LiteLLMConfig, LiteLLMModelInfo, LiteLLMModelInfoResponse } from "../types";
@@ -493,8 +496,9 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     /**
-     * Wipes the per-model capability caches and the shared backoff
-     * controller. Does NOT touch the routing table.
+     * Wipes the per-model caches (model info, derived capabilities, unsupported
+     * parameters), the discovery response cache, and every backend's backoff
+     * history. Does NOT touch the routing table.
      */
     public clearCaches(): void {
         this.modelInfoCache.clear();
@@ -658,6 +662,9 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             // find the models this group delivered last time.
             backendKey = await toBackendIdentityKey(session.baseUrl, session.apiKey);
             const models = await this.discoverFromSession(session, token, displayLabel, routingIdentity);
+            // A successful discovery clears the failure history, so the next
+            // transient failure starts from a clean slate.
+            sharedDiscoveryBackoff.reset(backendKey);
             Logger.trace(
                 `LiteLLMProviderRegistry.discoverModels: fetched ${models.length} models for baseUrl="${session.baseUrl}"`
             );
@@ -688,16 +695,10 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             if (err instanceof vscode.LanguageModelError) {
                 throw err;
             }
-            const decision = sharedDiscoveryBackoff.recordFailure(Date.now());
+            const backoffKey = backendKey ?? failureBaseUrl ?? "unknown";
+            const decision = sharedDiscoveryBackoff.recordFailure(backoffKey, Date.now());
             if (decision.delayMs > 0) {
-                await this.sleep(decision.delayMs, token);
-            }
-            if (decision.shouldBlock) {
-                throw vscode.LanguageModelError.Blocked(
-                    `Discovery blocked after ${decision.attempt} consecutive failures. ` +
-                        `The LiteLLM endpoint appears to be unhealthy. ` +
-                        `Please check your configuration and retry later.`
-                );
+                await sleepWithCancellation(decision.delayMs, token);
             }
 
             // A refresh that fails must not empty a working group: an in-flight
@@ -720,6 +721,24 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
                 });
                 return { models: this.toStaleModels(lastKnown, reason), changed: false, routingIdentity: "" };
             }
+
+            // Blocking only matters when there is nothing to serve, so the
+            // stale-while-error contract above always wins.
+            if (decision.shouldBlock) {
+                throw vscode.LanguageModelError.Blocked(
+                    `Discovery blocked after ${decision.attempt} consecutive failures. ` +
+                        `The LiteLLM endpoint appears to be unhealthy. ` +
+                        `Please check your configuration and retry later.`
+                );
+            }
+            Logger.warn(
+                `LiteLLMProviderRegistry.discoverModels: discovery failed with no last-known models for baseUrl="${failureBaseUrl ?? "unknown"}"`
+            );
+            StructuredLogger.warn("discovery.failed_without_last_known", {
+                baseUrl: failureBaseUrl,
+                reason: describeDiscoveryFailure(err),
+                attempt: decision.attempt,
+            });
             return { models: [], changed: false, routingIdentity: "" };
         }
     }
@@ -973,9 +992,5 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         }
 
         return info;
-    }
-
-    private sleep(ms: number, _token?: vscode.CancellationToken): Promise<void> {
-        return new Promise((resolve) => setTimeout(resolve, ms));
     }
 }

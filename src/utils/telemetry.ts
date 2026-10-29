@@ -18,7 +18,7 @@ export interface IMetrics {
     estimatedInputCost?: number;
     estimatedOutputCost?: number;
     estimatedTotalCost?: number;
-    status: "success" | "failure" | "caching_bypassed";
+    status: "success" | "failure" | "cancelled" | "caching_bypassed";
     error?: string;
     caller?: string;
 }

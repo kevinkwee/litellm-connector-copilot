@@ -2,19 +2,21 @@ import * as assert from "assert";
 import * as sinon from "sinon";
 import * as vscode from "vscode";
 import { ConfigManager } from "../../../config/configManager";
+import { StructuredLogger } from "../../../observability/structuredLogger";
 import { DiscoveryBackoffController, sharedDiscoveryBackoff, type DiscoveryBackoffDecision } from "../discoveryBackoff";
 import { LiteLLMProviderRegistry } from "../../liteLLMProviderRegistry";
 
 /**
- * Tests for the shared discovery backoff controller and its integration
- * with the BackendRegistry. The backoff lives at the discovery boundary:
- * when an HTTP `/model/info` request fails, the registry consults
- * `sharedDiscoveryBackoff.recordFailure(...)` and either sleeps for the
- * computed delay or surfaces a `vscode.LanguageModelError.Blocked` once
- * the failure threshold is exceeded.
+ * Tests for `DiscoveryBackoffController`, the `DiscoveryBackoffRegistry` that
+ * keeps one controller per backend, and the registry's discovery integration.
+ * When an HTTP `/model/info` request fails, the registry consults
+ * `sharedDiscoveryBackoff.recordFailure(...)` and waits for the computed
+ * delay. It then serves the backend's last-known models. With none to serve it
+ * returns an empty list, until the failure threshold is exceeded and a
+ * `vscode.LanguageModelError.Blocked` is thrown.
  *
- * The `clearCaches()` method on the registry resets the shared controller
- * so a user-initiated reload starts from a clean slate.
+ * `clearCaches()` clears every backend's history so a user-initiated reload
+ * starts from a clean slate.
  */
 suite("Discovery backoff", () => {
     let sandbox: sinon.SinonSandbox;
@@ -72,10 +74,9 @@ suite("Discovery backoff", () => {
         assert.strictEqual(resetDecision.shouldBlock, false);
     });
 
-    test("LiteLLMProviderRegistry shares the process-global backoff controller", async () => {
-        // This test verifies that when multiple discovery attempts fail,
-        // they share a global backoff controller that eventually blocks
-        // further discovery attempts.
+    test("turns a blocked decision into a Blocked error when the group has no models", async () => {
+        // The shared backoff reports the backend as blocked, so discovery must
+        // reject instead of returning an empty list.
 
         const recordFailureStub = sandbox.stub(sharedDiscoveryBackoff, "recordFailure").callsFake(() => ({
             attempt: 1,
@@ -123,26 +124,184 @@ suite("Discovery backoff", () => {
             userAgent: "test",
         });
 
-        sharedDiscoveryBackoff.recordFailure(0);
-        sharedDiscoveryBackoff.recordFailure(1_000);
+        sharedDiscoveryBackoff.recordFailure("backend", 0);
+        sharedDiscoveryBackoff.recordFailure("backend", 1_000);
 
         registry.clearCaches();
 
-        const decision = sharedDiscoveryBackoff.recordFailure(0);
+        const decision = sharedDiscoveryBackoff.recordFailure("backend", 0);
         assert.strictEqual(decision.attempt, 1);
         assert.strictEqual(decision.delayMs, 500);
         assert.strictEqual(decision.shouldBlock, false);
     });
 
-    test("controller resets after 5 seconds without a new failure (regression)", () => {
-        const backoff = new DiscoveryBackoffController();
+    test("keeps one failure history per backend", () => {
+        for (let i = 0; i < 9; i++) {
+            sharedDiscoveryBackoff.recordFailure("backend-a", i * 1_000);
+        }
 
-        backoff.recordFailure(0);
-        backoff.recordFailure(1_000);
+        const otherBackend = sharedDiscoveryBackoff.recordFailure("backend-b", 9_500);
 
-        const resetDecision = backoff.recordFailure(6_001);
-        assert.strictEqual(resetDecision.attempt, 1);
-        assert.strictEqual(resetDecision.delayMs, 500);
-        assert.strictEqual(resetDecision.shouldBlock, false);
+        assert.strictEqual(otherBackend.attempt, 1);
+        assert.strictEqual(otherBackend.delayMs, 500);
+        assert.strictEqual(otherBackend.shouldBlock, false);
+    });
+
+    test("a successful discovery clears that backend's failure history", async () => {
+        const stubClient = {
+            getModelInfo: sandbox
+                .stub()
+                .onFirstCall()
+                .rejects(new Error("HTTP request failed"))
+                .onSecondCall()
+                .resolves({ data: [{ model_name: "model", model_info: { key: "model" } }] }),
+            getEndpoint: sandbox.stub().returns("http://localhost:4000/v1/chat/completions"),
+        };
+        (configManager.convertProviderConfiguration as sinon.SinonStub).returns({
+            backendName: "test-backend",
+            baseUrl: "http://localhost:4000",
+            apiKey: "test-key",
+            client: stubClient,
+        });
+        configManager.getConfig.resolves({ discoveryCacheTtlMs: 0 } as never);
+        const resetSpy = sandbox.spy(sharedDiscoveryBackoff, "reset");
+        const recordFailureSpy = sandbox.spy(sharedDiscoveryBackoff, "recordFailure");
+
+        const registry = new LiteLLMProviderRegistry({
+            configManager: configManager as unknown as ConfigManager,
+            userAgent: "test",
+        });
+        const configuration = { baseUrl: "http://localhost:4000", apiKey: "test-key" };
+        const token = new vscode.CancellationTokenSource().token;
+
+        // First fetch fails, second succeeds. A second backend accumulates a
+        // failure in between, so a reset that cleared every history would be
+        // detected.
+        await registry.discoverModels({ configuration }, token);
+        assert.strictEqual(resetSpy.called, false);
+        sharedDiscoveryBackoff.recordFailure("other-backend", Date.now());
+        await registry.discoverModels({ configuration }, token);
+
+        assert.strictEqual(resetSpy.callCount, 1);
+        const key = resetSpy.firstCall.args[0];
+        assert.strictEqual(typeof key, "string");
+        assert.ok((key as string).length > 0);
+        assert.strictEqual(key, recordFailureSpy.firstCall.args[0]);
+        assert.strictEqual(sharedDiscoveryBackoff.recordFailure(key as string, Date.now()).attempt, 1);
+        assert.strictEqual(sharedDiscoveryBackoff.recordFailure("other-backend", Date.now()).attempt, 2);
+    });
+
+    test("serves last-known models instead of blocking a group that still has them", async () => {
+        const stubClient = {
+            getModelInfo: sandbox
+                .stub()
+                .onFirstCall()
+                .resolves({ data: [{ model_name: "model", model_info: { key: "model" } }] })
+                .rejects(new Error("HTTP request failed")),
+            getEndpoint: sandbox.stub().returns("http://localhost:4000/v1/chat/completions"),
+        };
+        (configManager.convertProviderConfiguration as sinon.SinonStub).returns({
+            backendName: "test-backend",
+            baseUrl: "http://localhost:4000",
+            apiKey: "test-key",
+            client: stubClient,
+        });
+        configManager.getConfig.resolves({ discoveryCacheTtlMs: 0 } as never);
+
+        const registry = new LiteLLMProviderRegistry({
+            configManager: configManager as unknown as ConfigManager,
+            userAgent: "test",
+        });
+
+        const configuration = { baseUrl: "http://localhost:4000", apiKey: "test-key" };
+        const token = new vscode.CancellationTokenSource().token;
+
+        const seeded = await registry.discoverModels({ configuration }, token);
+        assert.strictEqual(seeded.length, 1);
+
+        // The endpoint has crossed the block threshold, but the group still has
+        // a list to serve, so the stale list must win over the Blocked error.
+        sandbox.stub(sharedDiscoveryBackoff, "recordFailure").returns({
+            attempt: 10,
+            delayMs: 0,
+            shouldBlock: true,
+        });
+
+        const served = await registry.discoverModels({ configuration }, token);
+
+        assert.strictEqual(served.length, 1);
+        assert.ok(served[0].statusIcon !== undefined);
+    });
+
+    test("a cancelled discovery does not wait out the backoff delay", async () => {
+        const stubClient = {
+            getModelInfo: sandbox.stub().rejects(new Error("HTTP request failed")),
+            getEndpoint: sandbox.stub().returns("http://localhost:4000/v1/chat/completions"),
+        };
+        (configManager.convertProviderConfiguration as sinon.SinonStub).returns({
+            backendName: "test-backend",
+            baseUrl: "http://localhost:4000",
+            apiKey: "test-key",
+            client: stubClient,
+        });
+        configManager.getConfig.resolves({ discoveryCacheTtlMs: 0 } as never);
+        sandbox.stub(sharedDiscoveryBackoff, "recordFailure").returns({
+            attempt: 9,
+            delayMs: 5_000,
+            shouldBlock: false,
+        });
+
+        const registry = new LiteLLMProviderRegistry({
+            configManager: configManager as unknown as ConfigManager,
+            userAgent: "test",
+        });
+        const tokenSource = new vscode.CancellationTokenSource();
+        tokenSource.cancel();
+
+        const startedAt = Date.now();
+        const models = await registry.discoverModels(
+            { configuration: { baseUrl: "http://localhost:4000", apiKey: "test-key" } },
+            tokenSource.token
+        );
+
+        assert.deepStrictEqual(models, []);
+        assert.ok(Date.now() - startedAt < 1_000, "the cancelled wait must not sleep the full delay");
+    });
+
+    test("logs a discovery failure that has no last-known models", async () => {
+        const stubClient = {
+            getModelInfo: sandbox.stub().rejects(new Error("HTTP request failed")),
+            getEndpoint: sandbox.stub().returns("http://localhost:4000/v1/chat/completions"),
+        };
+        (configManager.convertProviderConfiguration as sinon.SinonStub).returns({
+            backendName: "test-backend",
+            baseUrl: "http://localhost:4000",
+            apiKey: "test-key",
+            client: stubClient,
+        });
+        configManager.getConfig.resolves({ discoveryCacheTtlMs: 0 } as never);
+        sandbox.stub(sharedDiscoveryBackoff, "recordFailure").returns({
+            attempt: 1,
+            delayMs: 0,
+            shouldBlock: false,
+        });
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+
+        const registry = new LiteLLMProviderRegistry({
+            configManager: configManager as unknown as ConfigManager,
+            userAgent: "test",
+        });
+        await registry.discoverModels(
+            { configuration: { baseUrl: "http://localhost:4000", apiKey: "test-key" } },
+            new vscode.CancellationTokenSource().token
+        );
+
+        const events = warnStub
+            .getCalls()
+            .filter((call) => call.args[0] === "discovery.failed_without_last_known")
+            .map((call) => call.args[1] as Record<string, unknown>);
+        assert.strictEqual(events.length, 1);
+        assert.strictEqual(events[0].baseUrl, "http://localhost:4000");
+        assert.strictEqual(typeof events[0].reason, "string");
     });
 });

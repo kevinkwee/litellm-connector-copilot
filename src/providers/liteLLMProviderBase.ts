@@ -20,6 +20,7 @@ import { LiteLLMTelemetry } from "../utils/telemetry";
 import { getSupportedReasoningEfforts, isOpenAIParamSupported } from "../utils/modelCapabilities";
 import type { SupportedReasoningEffort } from "../types";
 import {
+    EFFORT_LADDER_LENGTH,
     EffortFallbackCache,
     hasShownReasoningFallbackNotification,
     isReasoningError,
@@ -145,10 +146,11 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Clears the registry's routing table and capability caches, then
-     * refreshes the VS Code picker. There is no other model-info cache on
-     * the base provider — capability lookups always go through the
-     * registry, which is the single source of truth.
+     * Clears the registry's routing table and every per-model cache, the
+     * discovery response cache, and the backoff histories, then refreshes the
+     * VS Code picker. There is no other model-info cache on the base provider,
+     * because capability lookups always go through the registry, which is
+     * the single source of truth.
      */
     public clearModelCache(): void {
         Logger.info("Clearing model discovery cache");
@@ -403,7 +405,9 @@ export abstract class LiteLLMProviderBase {
             delete (request as { stream_options?: { include_usage?: boolean } }).stream_options;
         };
 
-        while (attempts < 6) {
+        // One attempt per ladder step plus the final omitted-parameter attempt.
+        // The give-up check below ends the walk on the last of those.
+        while (attempts <= EFFORT_LADDER_LENGTH) {
             try {
                 return await this.sendOnceWithOverflow(
                     request,
@@ -455,7 +459,7 @@ export abstract class LiteLLMProviderBase {
                     `[sendRequestWithRetry] After recordFailure: nextEffort: ${nextEffort}, attempts: ${attempts}`
                 );
 
-                if (nextEffort === effectiveEffort || attempts >= 5) {
+                if (nextEffort === effectiveEffort || attempts > EFFORT_LADDER_LENGTH) {
                     Logger.debug("[sendRequestWithRetry] Condition met - throwing toMeaningfulError");
                     throw this.toMeaningfulError(err, "Reasoning effort fallback exhausted");
                 }
@@ -591,6 +595,19 @@ export abstract class LiteLLMProviderBase {
                 modelInfo,
                 caller
             );
+            // Rebuilding from scratch drops the two fields the request gains
+            // after it is built: the in-effect reasoning effort and the session
+            // metadata the provider attaches. Carry them over so the trimmed
+            // attempt keeps per-session spend grouping and does not resend a
+            // rejected effort.
+            if (request.metadata !== undefined) {
+                retrimmedRequest.metadata = { ...request.metadata };
+            }
+            if (request.reasoning_effort === undefined) {
+                delete retrimmedRequest.reasoning_effort;
+            } else {
+                retrimmedRequest.reasoning_effort = request.reasoning_effort;
+            }
 
             try {
                 return await this.sendRequestToLiteLLM(
@@ -797,7 +814,7 @@ export abstract class LiteLLMProviderBase {
             return { tools, confidence: "none" };
         }
 
-        const { toolName, errorText, turnIndex, confidence } = quotaMatch;
+        const { toolName, errorTextLength, turnIndex, confidence } = quotaMatch;
 
         // Low-confidence matches (e.g. a quota phrase mentioned in
         // <reminderInstructions> or a user prompt about quotas) are logged
@@ -812,6 +829,7 @@ export abstract class LiteLLMProviderBase {
             const reportedConfidence = hasRedactableTool ? confidence : "none";
             Logger.debug("Quota phrase detected in non-tool-result text; not redacting", {
                 toolName,
+                errorTextLength,
                 modelId,
                 requestId,
                 turnIndex,
@@ -822,14 +840,20 @@ export abstract class LiteLLMProviderBase {
 
         const toolNames = new Set(tools.map((tool) => tool.name));
         if (!toolNames.has(toolName)) {
-            Logger.debug("Quota error detected, but tool not present", { toolName, requestId, modelId, turnIndex });
+            Logger.debug("Quota error detected, but tool not present", {
+                toolName,
+                errorTextLength,
+                requestId,
+                modelId,
+                turnIndex,
+            });
             return { tools, confidence };
         }
 
         const filteredTools = tools.filter((tool) => tool.name !== toolName);
         Logger.warn("Quota error detected; redacting tool for current turn", {
             toolName,
-            errorText,
+            errorTextLength,
             modelId,
             requestId,
             turnIndex,
@@ -857,8 +881,15 @@ export abstract class LiteLLMProviderBase {
         "replace_string_in_file",
     ] as const;
 
+    /**
+     * Quota wording that identifies a provider-side rate limit or quota
+     * failure. A bare `429` is not enough: an edit result can mention a
+     * diagnostic on line 429 or a file named after it, and the redaction would
+     * then remove the edit tool for the rest of the conversation. The number
+     * only counts with status wording around it.
+     */
     private static readonly QUOTA_PHRASE_REGEX =
-        /(\b429\b|rate\s*limit\s*exceeded|rate\s*limited|too\s*many\s*requests|insufficient\s*quota|quota\s*exceeded|exceeded\s*your\s*current\s*quota)/i;
+        /(\b(?:http|status|status\s*code|error|code)[\s:=#-]+429\b|\b429\s+too\s+many\s+requests\b|rate\s*limit\s*exceeded|rate\s*limited|too\s*many\s*requests|insufficient\s*quota|quota\s*exceeded|exceeded\s*your\s*current\s*quota)/i;
 
     /**
      * Detects whether the conversation history contains a real provider-side
@@ -870,15 +901,16 @@ export abstract class LiteLLMProviderBase {
      * reverse to find the matching `LanguageModelToolCallPart`).
      *
      * Low-confidence match: a quota phrase appearing in any other text
-     * content. This is returned for observability (DEBUG log, telemetry
-     * counter) but does NOT trigger redaction.
+     * content. This is returned for observability (DEBUG log only) but does
+     * NOT trigger redaction.
      *
      * None: no quota phrase anywhere in the message text.
      */
     private findQuotaErrorInMessages(messages: readonly LanguageModelChatRequestMessage[]):
         | {
               toolName: string;
-              errorText: string;
+              /** Length of the matched text, which is safe to log. The text itself is not. */
+              errorTextLength: number;
               turnIndex: number;
               confidence: "none" | "low" | "high";
           }
@@ -893,7 +925,7 @@ export abstract class LiteLLMProviderBase {
                 if (owningToolName && LiteLLMProviderBase.REDACTABLE_TOOL_NAMES.includes(owningToolName)) {
                     return {
                         toolName: owningToolName,
-                        errorText: this.sanitizeErrorTextForLogs(toolResultHit.text),
+                        errorTextLength: toolResultHit.text.length,
                         turnIndex: i,
                         confidence: "high",
                     };
@@ -902,7 +934,7 @@ export abstract class LiteLLMProviderBase {
                 // low-confidence (observability only) and keep walking.
                 return {
                     toolName: owningToolName ?? toolResultHit.callId,
-                    errorText: this.sanitizeErrorTextForLogs(toolResultHit.text),
+                    errorTextLength: toolResultHit.text.length,
                     turnIndex: i,
                     confidence: "low",
                 };
@@ -937,7 +969,7 @@ export abstract class LiteLLMProviderBase {
             }
             return {
                 toolName: "",
-                errorText: this.sanitizeErrorTextForLogs(text),
+                errorTextLength: text.length,
                 turnIndex: i,
                 confidence: "low",
             };

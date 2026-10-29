@@ -631,6 +631,58 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // see the real reason (e.g. ECONNREFUSED) rather than a generic label.
             const rootCause = err instanceof Error && err.cause instanceof Error ? err.cause.message : undefined;
 
+            if (token.isCancellationRequested) {
+                Logger.info(
+                    `Chat request cancelled | RequestID: ${requestId} | Model: ${model.id} | Caller: ${caller}`
+                );
+                StructuredLogger.info("request.cancelled", {
+                    requestId,
+                    model: model.id,
+                    caller,
+                    stage: "provideLanguageModelChatResponse",
+                });
+                // Cancellation is not a failure: no failure metric and no
+                // "FAILED" transcript. VS Code renders the cancelled state.
+                const cancelledDurationMs = LiteLLMTelemetry.endTimer(startTime);
+                LiteLLMTelemetry.reportMetric({
+                    requestId,
+                    model: model.id,
+                    durationMs: cancelledDurationMs,
+                    tokensIn,
+                    status: "cancelled",
+                    caller,
+                });
+                if (requestBodyBuilt && endpointUrl) {
+                    void exportCopilotMdEntry({
+                        debugName: caller,
+                        id: requestId.slice(0, 8),
+                        model: model.id,
+                        url: endpointUrl,
+                        maxPromptTokens: model.maxInputTokens,
+                        maxResponseTokens: requestBodyBuilt.max_tokens,
+                        location: undefined,
+                        body: requestBodyBuilt,
+                        requestMessages: activeMessages,
+                        startTimeIso: requestStartDate.toISOString(),
+                        endTimeIso: new Date().toISOString(),
+                        durationMs: cancelledDurationMs,
+                        ourRequestId: requestId,
+                        timeToFirstTokenMs: undefined,
+                        resolvedModel: model.id,
+                        usage: tokenCapture.getSnapshot(),
+                        responseParts: responsePartCollector.parts,
+                        status: "canceled",
+                        statusReason: "Cancelled by the user",
+                        sessionId,
+                        sessionIdSource: resolvedSession.source,
+                    } satisfies CopilotMdEntry);
+                }
+                throw Object.assign(new Error("Operation cancelled by user"), {
+                    name: "CancellationError",
+                    cause: err,
+                });
+            }
+
             // Log full error details to both Logger and StructuredLogger
             Logger.error("Chat request failed", err);
             StructuredLogger.error("request.failed", {
@@ -664,7 +716,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     debugName: caller,
                     id: requestId.slice(0, 8),
                     model: model.id,
-                    url: endpointUrl ?? "litellm-connector",
+                    url: endpointUrl,
                     maxPromptTokens: model.maxInputTokens,
                     maxResponseTokens: requestBodyBuilt.max_tokens,
                     location: undefined,
@@ -685,13 +737,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 } satisfies CopilotMdEntry);
             }
 
-            if (token.isCancellationRequested) {
-                throw Object.assign(new Error("Operation cancelled by user"), {
-                    name: "CancellationError",
-                    cause: err,
-                });
-            }
-
             // VS Code excludes an errored turn from the conversation history
             // sent upstream, so a thrown error would erase everything the
             // model already said this turn; on the next turn the model would
@@ -700,7 +745,20 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // history; cancellation stays a throw because VS Code renders
             // that state itself.
             trackingProgress.report(new LanguageModelTextPart(`\n\n${formatConnectorNotice(errorMessage)}`));
+            // The turn completes as a normal assistant message, so the reply
+            // itself looks like model output. Record that the failure was
+            // surfaced as text, with the caller and justification, so a
+            // background caller's failure stays traceable.
             Logger.warn(`Chat request surfaced as assistant error text instead of throwing | RequestID: ${requestId}`);
+            StructuredLogger.warn("request.error_surfaced_as_text", {
+                requestId,
+                model: model.id,
+                caller,
+                justification,
+                errorName,
+                errorSummary: errorMessage.slice(0, 200),
+                stage: "provideLanguageModelChatResponse",
+            });
         }
     }
 
@@ -907,14 +965,18 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 progress.report(new LanguageModelTextPart(stoppedEarly.notice));
             }
         } catch (error: unknown) {
-            Logger.error(
-                `[processStreamingResponse] request=${requestId} Stream processing failed after ${eventCount} events`,
+            // Every error leaving this method is handled by the caller, which
+            // retries the recoverable sentinels and logs the final outcome. Log
+            // the attempt at warn so a recovered retry does not read as a
+            // failure in the channel.
+            Logger.warn(
+                `[processStreamingResponse] request=${requestId} Stream attempt failed after ${eventCount} events`,
                 {
                     error: error instanceof Error ? error.message : String(error),
                     stack: error instanceof Error ? error.stack : undefined,
                 }
             );
-            StructuredLogger.error("stream.process_failed", {
+            StructuredLogger.warn("stream.attempt_failed", {
                 requestId,
                 error: error instanceof Error ? error.message : String(error),
                 eventCount,

@@ -4,6 +4,12 @@ import { Logger } from "./logger";
 // Reasoning effort ladder from most to least capable. `undefined` means omit the parameter entirely.
 const EFFORT_LADDER: readonly SupportedReasoningEffort[] = ["max", "xhigh", "high", "medium", "low", "minimal", "none"];
 
+/**
+ * Length of the reasoning-effort ladder. A retry loop must allow this many
+ * rejections plus the final attempt with the parameter omitted.
+ */
+export const EFFORT_LADDER_LENGTH = EFFORT_LADDER.length;
+
 function nextLowerEffort(effort: SupportedReasoningEffort): SupportedReasoningEffort | undefined {
     const index = EFFORT_LADDER.indexOf(effort);
     if (index === -1) {

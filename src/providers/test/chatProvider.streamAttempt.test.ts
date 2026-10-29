@@ -5,6 +5,8 @@ import * as vscode from "vscode";
 import { LiteLLMChatProvider } from "../";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import type { OpenAIChatCompletionRequest } from "../../types";
+import { Logger } from "../../utils/logger";
+import { LiteLLMTelemetry } from "../../utils/telemetry";
 import { ReasoningOnlyError, UpstreamStreamError } from "../../utils/transportRetry";
 import {
     collectResponseText,
@@ -281,6 +283,94 @@ suite("LiteLLMChatProvider stream attempt", () => {
         );
 
         assert.deepStrictEqual(collectToolCalls(recorder.parts), [{ name: "view", input: { path: "README.md" } }]);
+    });
+
+    test("logs a failed attempt at warn", async () => {
+        const { seams } = createProvider(sandbox);
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        const errorStub = sandbox.stub(StructuredLogger, "error");
+        const loggerErrorStub = sandbox.stub(Logger, "error");
+        const stream = createSeveredSseStream([chatTextFrame("partial")], new TypeError("terminated"));
+
+        await assert.rejects(() =>
+            seams.processStreamingResponse(
+                stream,
+                IGNORE_PROGRESS,
+                new vscode.CancellationTokenSource().token,
+                REQUEST_ID
+            )
+        );
+
+        const attempts = warnStub
+            .getCalls()
+            .filter((call) => call.args[0] === "stream.attempt_failed")
+            .map((call) => call.args[1] as Record<string, unknown>);
+        assert.strictEqual(attempts.length, 1);
+        assert.strictEqual(attempts[0].requestId, REQUEST_ID);
+        assert.strictEqual(errorStub.called, false);
+        assert.strictEqual(loggerErrorStub.called, false);
+    });
+
+    test("logs a failure that is surfaced as chat text", async () => {
+        const { provider, seams } = createProvider(sandbox);
+        sandbox.stub(seams, "sendRequestWithRetry").rejects(new Error("LiteLLM API error: 500 upstream exploded"));
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        const recorder = createPartRecorder();
+        const options = {
+            ...createMockChatResponseOptions(),
+            caller: "background-summarizer",
+            justification: "compact the conversation",
+        } as unknown as vscode.ProvideLanguageModelChatResponseOptions;
+
+        await provider.provideLanguageModelChatResponse(
+            MODEL,
+            [createMockUserMessage("summarize")],
+            options,
+            recorder.progress,
+            new vscode.CancellationTokenSource().token
+        );
+
+        const surfaced = warnStub
+            .getCalls()
+            .filter((call) => call.args[0] === "request.error_surfaced_as_text")
+            .map((call) => call.args[1] as Record<string, unknown>);
+        assert.strictEqual(surfaced.length, 1);
+        assert.strictEqual(surfaced[0].caller, "background-summarizer");
+        assert.strictEqual(surfaced[0].justification, "compact the conversation");
+        assert.strictEqual(typeof surfaced[0].errorSummary, "string");
+        // The turn still completes as an assistant message.
+        assert.ok(collectResponseText(recorder.parts).includes("[litellm-connector]"));
+    });
+
+    test("reports a cancelled request as cancelled instead of failed", async () => {
+        const { provider, seams } = createProvider(sandbox);
+        sandbox.stub(seams, "sendRequestWithRetry").rejects(new Error("LiteLLM API error: 500 upstream exploded"));
+        const errorStub = sandbox.stub(Logger, "error");
+        const structuredErrorStub = sandbox.stub(StructuredLogger, "error");
+        const infoStub = sandbox.stub(StructuredLogger, "info");
+        const reportMetric = sandbox.stub(LiteLLMTelemetry, "reportMetric");
+        const tokenSource = new vscode.CancellationTokenSource();
+        tokenSource.cancel();
+
+        await assert.rejects(
+            () =>
+                provider.provideLanguageModelChatResponse(
+                    MODEL,
+                    [createMockUserMessage("hi")],
+                    createMockChatResponseOptions(),
+                    createPartRecorder().progress,
+                    tokenSource.token
+                ),
+            (err: Error) => err.name === "CancellationError"
+        );
+
+        const statuses = reportMetric.getCalls().map((call) => call.args[0].status);
+        assert.deepStrictEqual(statuses, ["cancelled"]);
+        assert.strictEqual(errorStub.called, false);
+
+        const cancelledEvents = infoStub.getCalls().filter((call) => call.args[0] === "request.cancelled");
+        assert.strictEqual(cancelledEvents.length, 1);
+        assert.strictEqual(structuredErrorStub.called, false);
     });
 
     test("resumes after a transient upstream error frame instead of failing the turn", async () => {

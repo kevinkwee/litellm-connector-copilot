@@ -8,6 +8,11 @@ import { deriveGroupNameFromUrl } from "../utils";
 
 export class ConfigManager {
     private static readonly INACTIVITY_TIMEOUT_KEY = "litellm-connector.inactivityTimeout";
+    private static readonly DEFAULT_INACTIVITY_TIMEOUT_SECONDS = 60;
+    private static readonly MIN_INACTIVITY_TIMEOUT_SECONDS = 1;
+    private static readonly MAX_INACTIVITY_TIMEOUT_SECONDS = 3600;
+    // getConfig() runs several times per request, so warn once per rejected value.
+    private static lastInactivityTimeoutWarning: string | undefined;
     private static readonly DISABLE_CACHING_KEY = "litellm-connector.disableCaching";
     private static readonly ANTHROPIC_PROMPT_CACHING_KEY = "litellm-connector.anthropicPromptCaching";
     private static readonly DISABLE_QUOTA_TOOL_REDACTION_KEY = "litellm-connector.disableQuotaToolRedaction";
@@ -104,6 +109,41 @@ export class ConfigManager {
     }
 
     /**
+     * Clamps the inactivity timeout to the range the manifest declares. A value
+     * of 0 or less would otherwise fire the stream watchdog as soon as a
+     * response starts and abort every response.
+     */
+    private static clampInactivityTimeoutSeconds(value: number | undefined): number {
+        const fallback = ConfigManager.DEFAULT_INACTIVITY_TIMEOUT_SECONDS;
+        if (typeof value !== "number" || !Number.isFinite(value)) {
+            ConfigManager.warnAboutInactivityTimeout(String(value), fallback);
+            return fallback;
+        }
+        const clamped = Math.min(
+            ConfigManager.MAX_INACTIVITY_TIMEOUT_SECONDS,
+            Math.max(ConfigManager.MIN_INACTIVITY_TIMEOUT_SECONDS, value)
+        );
+        if (clamped !== value) {
+            ConfigManager.warnAboutInactivityTimeout(String(value), clamped);
+        } else {
+            ConfigManager.lastInactivityTimeoutWarning = undefined;
+        }
+        return clamped;
+    }
+
+    private static warnAboutInactivityTimeout(rejected: string, used: number): void {
+        if (ConfigManager.lastInactivityTimeoutWarning === rejected) {
+            return;
+        }
+        ConfigManager.lastInactivityTimeoutWarning = rejected;
+        Logger.warn(
+            `litellm-connector.inactivityTimeout is ${rejected}, which is not a number between ` +
+                `${ConfigManager.MIN_INACTIVITY_TIMEOUT_SECONDS} and ` +
+                `${ConfigManager.MAX_INACTIVITY_TIMEOUT_SECONDS} seconds; using ${used}s`
+        );
+    }
+
+    /**
      * Clamps a discovery timeout value to valid bounds.
      */
     private clampDiscoveryTimeoutMs(value: number | undefined): number {
@@ -153,7 +193,12 @@ export class ConfigManager {
     async getConfig(): Promise<LiteLLMConfig> {
         const workspaceConfig = vscode.workspace.getConfiguration();
 
-        const inactivityTimeout = workspaceConfig.get<number>(ConfigManager.INACTIVITY_TIMEOUT_KEY, 60);
+        const inactivityTimeout = ConfigManager.clampInactivityTimeoutSeconds(
+            workspaceConfig.get<number>(
+                ConfigManager.INACTIVITY_TIMEOUT_KEY,
+                ConfigManager.DEFAULT_INACTIVITY_TIMEOUT_SECONDS
+            )
+        );
         const disableCaching = workspaceConfig.get<boolean>(ConfigManager.DISABLE_CACHING_KEY, true);
         const anthropicPromptCaching = normalizeAnthropicPromptCachingMode(
             workspaceConfig.get<unknown>(ConfigManager.ANTHROPIC_PROMPT_CACHING_KEY)

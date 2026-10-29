@@ -53,4 +53,32 @@ export class DiscoveryBackoffController {
     }
 }
 
-export const sharedDiscoveryBackoff = new DiscoveryBackoffController();
+/**
+ * Keeps one backoff per backend identity. `key` is the identity the discovery
+ * response cache uses (server URL plus an API-key hash), so two groups with
+ * different keys keep separate histories. Without that split, one dead group's
+ * failures would delay, and eventually block, every other group's discovery.
+ */
+export class DiscoveryBackoffRegistry {
+    private readonly controllers = new Map<string, DiscoveryBackoffController>();
+
+    public recordFailure(key: string, nowMs = Date.now()): DiscoveryBackoffDecision {
+        const controller = this.controllers.get(key) ?? new DiscoveryBackoffController();
+        this.controllers.set(key, controller);
+        return controller.recordFailure(nowMs);
+    }
+
+    /**
+     * Clears one backend's history after a successful discovery. Call with no
+     * key when the user reloads the configuration.
+     */
+    public reset(key?: string): void {
+        if (key === undefined) {
+            this.controllers.clear();
+            return;
+        }
+        this.controllers.delete(key);
+    }
+}
+
+export const sharedDiscoveryBackoff = new DiscoveryBackoffRegistry();
