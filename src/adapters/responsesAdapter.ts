@@ -1,5 +1,7 @@
 import type {
+    LiteLLMResponsesToolChoice,
     OpenAIChatCompletionRequest,
+    OpenAIChatToolChoice,
     LiteLLMResponsesRequest,
     LiteLLMResponseInputItem,
     LiteLLMResponseTool,
@@ -61,6 +63,27 @@ function toToolOutputText(content: unknown): string {
     } catch {
         return String(content);
     }
+}
+
+/**
+ * Translates a chat-completions `tool_choice` into the `/responses` shape,
+ * where a named tool carries `name` at the top level instead of nesting under
+ * `function`. A named tool the sent tools array does not carry is dropped,
+ * because the endpoint rejects a choice that points at a missing tool.
+ */
+function toResponsesToolChoice(
+    toolChoice: OpenAIChatToolChoice,
+    tools: readonly LiteLLMResponseTool[]
+): LiteLLMResponsesToolChoice | undefined {
+    if (typeof toolChoice === "string") {
+        return toolChoice;
+    }
+    const name = toolChoice.function.name;
+    if (!tools.some((tool) => tool.name === name)) {
+        Logger.warn(`[responsesAdapter] Dropping tool_choice for tool ${name}, which is not in the request tools`);
+        return undefined;
+    }
+    return { type: "function", name };
 }
 
 /**
@@ -280,7 +303,7 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
         input: finalInputArray,
         stream: requestBody.stream,
         instructions,
-        max_tokens: requestBody.max_tokens,
+        max_output_tokens: requestBody.max_tokens,
         temperature: requestBody.temperature,
         top_p: requestBody.top_p,
         frequency_penalty: requestBody.frequency_penalty,
@@ -319,7 +342,7 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
     }
 
     if (requestBody.tool_choice && responsesBody.tools) {
-        responsesBody.tool_choice = requestBody.tool_choice;
+        responsesBody.tool_choice = toResponsesToolChoice(requestBody.tool_choice, responsesBody.tools);
     }
 
     return responsesBody;

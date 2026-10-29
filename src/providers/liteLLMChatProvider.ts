@@ -506,7 +506,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
 
             const snapshot = tokenCapture.getSnapshot();
 
-            const tokensOut = Math.max(snapshot.completionTokens, snapshot.toolTokens);
+            const tokensOut = snapshot.outputTokens;
             const tokensInForTelemetry = snapshot.promptTokens ?? tokensIn;
             const reasoningTokens = snapshot.reasoningTokens || undefined;
             const cachedTokens = snapshot.cachedTokens || undefined;

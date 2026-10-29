@@ -149,11 +149,9 @@ export class LiteLLMClient {
         const timeoutMs = this.config.discoveryTimeoutMs ?? LiteLLMClient.DEFAULT_DISCOVERY_TIMEOUT_MS;
         const timer = setTimeout(() => controller.abort(new DiscoveryTimeoutError(timeoutMs)), timeoutMs);
 
-        if (token) {
-            token.onCancellationRequested(() => controller.abort());
-        }
-
         const urls = this.getModelInfoUrls();
+        const registration = token?.onCancellationRequested(() => controller.abort());
+
         Logger.trace(`Fetching model info from ${urls[0]}`);
         try {
             let lastResponse: Response | undefined;
@@ -163,7 +161,9 @@ export class LiteLLMClient {
                     signal: controller.signal,
                 });
                 if (resp.ok) {
-                    return resp.json() as Promise<LiteLLMModelInfoResponse>;
+                    // Awaited inside the try so the timeout and the cancellation
+                    // signal also cover a body that stalls after the headers.
+                    return (await resp.json()) as LiteLLMModelInfoResponse;
                 }
 
                 lastResponse = resp;
@@ -190,6 +190,7 @@ export class LiteLLMClient {
             throw err;
         } finally {
             clearTimeout(timer);
+            registration?.dispose();
         }
     }
 

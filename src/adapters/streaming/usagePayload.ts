@@ -3,11 +3,13 @@ import type { OpenAIUsageCompletionTokenDetails, OpenAIUsagePayload, OpenAIUsage
 /**
  * Usage shapes LiteLLM forwards on the wire. LiteLLM normalizes provider usage
  * into the OpenAI field names (`prompt_tokens_details`, `completion_tokens_details`),
- * while /responses `response.completed` payloads keep the Responses names
- * (`input_token_details`, `output_token_details`). LiteLLM additionally carries
- * Anthropic prompt-cache counters both on the top level (`cache_creation_input_tokens`,
- * `cache_read_input_tokens`) and inside `prompt_tokens_details`
- * (`cache_creation_tokens`, `cached_tokens`).
+ * while /responses `response.completed` and `response.incomplete` payloads keep
+ * the Responses names. LiteLLM's `ResponseAPIUsage` spells the Responses detail
+ * objects `input_tokens_details` and `output_tokens_details`, and older gateways
+ * send the singular `input_token_details` and `output_token_details`, so both are
+ * read. LiteLLM additionally carries Anthropic prompt-cache counters both on
+ * the top level (`cache_creation_input_tokens`, `cache_read_input_tokens`) and
+ * inside `prompt_tokens_details` (`cache_creation_tokens`, `cached_tokens`).
  */
 export interface RawUsagePayload {
     prompt_tokens?: number;
@@ -19,6 +21,13 @@ export interface RawUsagePayload {
         cache_creation_input_tokens?: number;
     };
     completion_tokens_details?: {
+        reasoning_tokens?: number;
+        tool_tokens?: number;
+        accepted_prediction_tokens?: number;
+        rejected_prediction_tokens?: number;
+    };
+    input_tokens_details?: { cached_tokens?: number; cache_creation_input_tokens?: number };
+    output_tokens_details?: {
         reasoning_tokens?: number;
         tool_tokens?: number;
         accepted_prediction_tokens?: number;
@@ -37,21 +46,21 @@ export interface RawUsagePayload {
 
 /**
  * Maps a raw usage payload onto the normalized OpenAI field names the
- * snapshot tracker and telemetry consume. Token details that arrive in either
- * naming convention are preserved; absent details are omitted so downstream
- * code never has to distinguish "not provided" from "provided as 0" except
- * for cached_tokens, where an explicit 0 is emitted when the provider sent an
- * empty prompt-token-details object.
+ * snapshot tracker and telemetry consume. Token details that arrive in any of
+ * LiteLLM's spellings are preserved. A detail object that carries no counts
+ * contributes nothing, except a prompt-detail object, which still reports
+ * `cached_tokens: 0`.
  */
 export function normalizeUsagePayload(usage: RawUsagePayload): OpenAIUsagePayload {
     const promptTokenDetails: OpenAIUsagePromptTokenDetails = {};
     // Cache-write precedence, most to least specific: LiteLLM's Anthropic
     // prompt_tokens_details spelling, the OpenAI-style detected variant, the
-    // /responses input_token_details variant, and the top-level counter
+    // /responses detail objects in both spellings, and the top-level counter
     // Anthropic emits through LiteLLM stream frames.
     const cacheCreationTokens =
         usage.prompt_tokens_details?.cache_creation_tokens ??
         usage.prompt_tokens_details?.cache_creation_input_tokens ??
+        usage.input_tokens_details?.cache_creation_input_tokens ??
         usage.input_token_details?.cache_creation_input_tokens ??
         usage.cache_creation_input_tokens;
     if (typeof cacheCreationTokens === "number") {
@@ -60,32 +69,44 @@ export function normalizeUsagePayload(usage: RawUsagePayload): OpenAIUsagePayloa
 
     const cachedTokens =
         usage.prompt_tokens_details?.cached_tokens ??
+        usage.input_tokens_details?.cached_tokens ??
         usage.input_token_details?.cached_tokens ??
         usage.cache_read_input_tokens;
     if (typeof cachedTokens === "number") {
         promptTokenDetails.cached_tokens = cachedTokens;
-    } else if (usage.input_token_details !== undefined || usage.prompt_tokens_details !== undefined) {
+    } else if (
+        usage.input_tokens_details !== undefined ||
+        usage.input_token_details !== undefined ||
+        usage.prompt_tokens_details !== undefined
+    ) {
         promptTokenDetails.cached_tokens = 0;
     }
 
     const completionTokenDetails: OpenAIUsageCompletionTokenDetails = {};
     const reasoningTokens =
-        usage.completion_tokens_details?.reasoning_tokens ?? usage.output_token_details?.reasoning_tokens;
+        usage.completion_tokens_details?.reasoning_tokens ??
+        usage.output_tokens_details?.reasoning_tokens ??
+        usage.output_token_details?.reasoning_tokens;
     if (typeof reasoningTokens === "number") {
         completionTokenDetails.reasoning_tokens = reasoningTokens;
     }
-    const toolTokens = usage.completion_tokens_details?.tool_tokens ?? usage.output_token_details?.tool_tokens;
+    const toolTokens =
+        usage.completion_tokens_details?.tool_tokens ??
+        usage.output_tokens_details?.tool_tokens ??
+        usage.output_token_details?.tool_tokens;
     if (typeof toolTokens === "number") {
         completionTokenDetails.tool_tokens = toolTokens;
     }
     const acceptedPredictionTokens =
         usage.completion_tokens_details?.accepted_prediction_tokens ??
+        usage.output_tokens_details?.accepted_prediction_tokens ??
         usage.output_token_details?.accepted_prediction_tokens;
     if (typeof acceptedPredictionTokens === "number") {
         completionTokenDetails.accepted_prediction_tokens = acceptedPredictionTokens;
     }
     const rejectedPredictionTokens =
         usage.completion_tokens_details?.rejected_prediction_tokens ??
+        usage.output_tokens_details?.rejected_prediction_tokens ??
         usage.output_token_details?.rejected_prediction_tokens;
     if (typeof rejectedPredictionTokens === "number") {
         completionTokenDetails.rejected_prediction_tokens = rejectedPredictionTokens;

@@ -3,6 +3,7 @@ import { lmcr_toString } from "./utils/mapChatRoles";
 import type {
     OpenAIChatMessage,
     OpenAIChatRole,
+    OpenAIChatToolChoice,
     OpenAIFunctionToolDef,
     OpenAIThinkingBlock,
     OpenAIToolCall,
@@ -549,11 +550,16 @@ function buildMessageContent(
 
 /**
  * Convert VS Code tool definitions to OpenAI function tool definitions.
+ *
+ * A forced tool call names the tool only when exactly one is offered. VS Code's
+ * `Required` mode lets the model pick any of the tools it was given, so several
+ * tools send `tool_choice: "required"`.
+ *
  * @param options Request options containing tools and toolMode.
  */
 export function convertTools(options: vscode.ProvideLanguageModelChatResponseOptions): {
     tools?: OpenAIFunctionToolDef[];
-    tool_choice?: "auto" | { type: "function"; function: { name: string } };
+    tool_choice?: OpenAIChatToolChoice;
 } {
     const tools = options.tools ?? [];
     if (!tools || tools.length === 0) {
@@ -576,18 +582,16 @@ export function convertTools(options: vscode.ProvideLanguageModelChatResponseOpt
             } satisfies OpenAIFunctionToolDef;
         });
 
-    let tool_choice: "auto" | { type: "function"; function: { name: string } } | undefined = undefined;
+    let tool_choice: OpenAIChatToolChoice | undefined = undefined;
     if (options.toolMode === vscode.LanguageModelChatToolMode.Required) {
-        if (tools.length !== 1) {
-            Logger.error("ToolMode.Required but multiple tools:", tools.length);
-            throw new Error("LanguageModelChatToolMode.Required is not supported with more than one tool");
-        }
-        tool_choice = { type: "function", function: { name: sanitizeFunctionName(tools[0].name) } };
+        tool_choice =
+            tools.length === 1
+                ? { type: "function", function: { name: sanitizeFunctionName(tools[0].name) } }
+                : "required";
     }
-    // Note: tool_choice is NOT set to "auto" by default - only when explicitly Required.
-    // The request builder will add tool_choice: "auto" if tools are present AND the model
-    // supports tool_choice per its capabilities. This prevents passing unsupported tool_choice
-    // to models like GPT-5.6 Azure that don't support the parameter.
+    // tool_choice stays unset unless the caller forces a tool call. The request
+    // builder adds "auto" when tools are present and the model declares support,
+    // so models such as GPT-5.6 Azure that reject the parameter never receive it.
 
     return { tools: toolDefs, ...(tool_choice !== undefined && { tool_choice }) };
 }

@@ -50,7 +50,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 ### Streaming resilience
 - Transport-level retry with mid-stream resume: when a stream dies mid-response, the connector rebuilds the request and resumes from the last assistant turn, appending a "Continue" nudge.
 - Upstream failures reported *inside* the stream (LiteLLM's mid-stream `{"error": ...}` frame, and the Responses API `error` and `response.failed` events) are no longer ignored: transient ones (408, 409, 425, 429, 5xx including Anthropic's 529, overloaded, rate-limit, timeout) resume the request, and everything else surfaces the upstream message instead of ending the turn silently or being misread as an empty response.
-- A response that stops at the output-token limit (`length`) or behind a content filter (`content_filter`) ends with a visible note explaining why it is incomplete.
+- A response that stops at the output-token limit (`length`) or behind a content filter (`content_filter`) ends with a visible note explaining why it is incomplete. On the `/responses` endpoint the same note appears when the turn ends with `response.incomplete`: `max_output_tokens` maps to `length`, and `content_filter` stays `content_filter`.
 - Reasoning-only streaming responses are retried instead of surfacing as empty replies.
 - Cancellation and watchdog aborts are surfaced correctly on clean stream completion instead of being masked by retry exhaustion.
 - Complete tool calls still buffered when a stream ends without a finish frame are delivered instead of discarded, and each concurrent session keeps its own stream state, so one session's tool calls never reach another.
@@ -64,7 +64,10 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Request errors are surfaced as response text instead of thrown exceptions, so the failed turn stays in history. Each occurrence writes a `request.error_surfaced_as_text` entry with the caller and justification, so a failure from a background caller (for example a summarization request) still leaves a trace.
 - The streaming cancellation listener is disposed when the stream ends, and a cancelled request is reported as `cancelled` rather than as a failure.
 - `litellm-connector.inactivityTimeout` is clamped to 1 to 3600 seconds. A value of 0 or less would otherwise abort every response as soon as it starts.
-- `discoveryTimeoutMs` is passed through to per-session clients.
+- `discoveryTimeoutMs` is passed through to per-session clients and applies to reading the model-list body as well as the response headers.
+- A caller that forces a tool call (`LanguageModelChatToolMode.Required`) sends `tool_choice: "required"` when it offers several tools, and names the single tool when it offers one, which `/responses` carries as a top-level `{ type: "function", name }` choice.
+- `/responses` requests send their output-token cap as `max_output_tokens`, and usage detail objects are read under both LiteLLM's plural `input_tokens_details` / `output_tokens_details` names and the singular `input_token_details` / `output_token_details`.
+- A tool-only reply counts its tool-call tokens as output, and the transcript usage line and the estimated cost include them.
 - Model discovery applies LiteLLM's paused-model rule: deployments a proxy admin paused (`model_info.blocked`) are dropped during `/model/info` discovery, a public model name stays listed while at least one of its deployments is live, and each name is listed once.
 - A model-list refresh that fails for a transient reason (network, timeout, 408/409/425/429, 5xx) keeps the group's last known models, marked with a warning icon and hover text, instead of emptying the picker (and the model choice of a running session). A misconfigured group (a 400, 401, 403, or 404, or one that never discovered) still shows an empty list so the real error stays visible.
 - Requests route by the model object VS Code returns for the group, so two provider groups on the same LiteLLM host keep their own URL and API key.

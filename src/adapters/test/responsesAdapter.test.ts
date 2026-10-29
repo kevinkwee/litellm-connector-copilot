@@ -489,6 +489,57 @@ suite("Responses Adapter Unit Tests", () => {
         assert.strictEqual(body.reasoning_effort, undefined);
     });
 
+    test("transformToResponsesFormat sends max_output_tokens and no max_tokens", () => {
+        const body = transformToResponsesFormat({
+            model: "m",
+            messages: [{ role: "user", content: "hi" }],
+            max_tokens: 2048,
+        });
+
+        assert.strictEqual(body.max_output_tokens, 2048);
+        assert.strictEqual("max_tokens" in body, false);
+    });
+
+    test("transformToResponsesFormat converts a named tool choice to the top-level name shape", () => {
+        const body = transformToResponsesFormat({
+            model: "m",
+            messages: [{ role: "user", content: "hi" }],
+            tools: [{ type: "function", function: { name: "read_file", parameters: { type: "object" } } }],
+            tool_choice: { type: "function", function: { name: "read_file" } },
+        });
+
+        assert.deepStrictEqual(body.tool_choice, { type: "function", name: "read_file" });
+    });
+
+    test("transformToResponsesFormat passes the required and auto modes through", () => {
+        const tools = [
+            { type: "function" as const, function: { name: "a", parameters: { type: "object" } } },
+            { type: "function" as const, function: { name: "b", parameters: { type: "object" } } },
+        ];
+        for (const mode of ["required", "auto"] as const) {
+            const body = transformToResponsesFormat({
+                model: "m",
+                messages: [{ role: "user", content: "hi" }],
+                tools,
+                tool_choice: mode,
+            });
+
+            assert.strictEqual(body.tool_choice, mode);
+        }
+    });
+
+    test("transformToResponsesFormat drops a named tool choice whose tool was filtered out", () => {
+        const body = transformToResponsesFormat({
+            model: "m",
+            messages: [{ role: "user", content: "hi" }],
+            // The only declared tool is filtered out for having no parameters.
+            tools: [{ type: "function", function: { name: "kept", parameters: undefined as never } }],
+            tool_choice: { type: "function", function: { name: "kept" } },
+        });
+
+        assert.strictEqual(body.tool_choice, undefined);
+    });
+
     // Regression: bug #98 — inline-edit caller with image content sent to /responses endpoint.
     //
     // The inline-edit workflow produces large multi-turn conversations that include

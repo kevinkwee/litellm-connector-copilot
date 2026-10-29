@@ -553,8 +553,8 @@ function snapshotToUsagePayload(snapshot: TokenSnapshot): OpenAIUsagePayload {
     };
     return {
         prompt_tokens: snapshot.promptTokens,
-        completion_tokens: snapshot.completionTokens,
-        total_tokens: snapshot.promptTokens + snapshot.completionTokens,
+        completion_tokens: snapshot.outputTokens,
+        total_tokens: snapshot.promptTokens + snapshot.outputTokens,
         ...(Object.keys(promptDetails).length > 0 ? { prompt_tokens_details: promptDetails } : {}),
         ...(Object.keys(completionDetails).length > 0 ? { completion_tokens_details: completionDetails } : {}),
         ...(snapshot.systemPromptTokens ? { system_prompt_tokens: snapshot.systemPromptTokens } : {}),

@@ -396,6 +396,19 @@ export interface LiteLLMModelInfoResponse {
 export type AnthropicPromptCachingMode = "off" | "5m" | "1h";
 
 /**
+ * Tool-selection mode shared by both endpoints. `required` asks for at least
+ * one tool call without naming it: LiteLLM forwards it unchanged to OpenAI and
+ * maps it onto Anthropic's `any`.
+ */
+export type OpenAIToolChoiceMode = "auto" | "required";
+
+/** Tool selection on `/chat/completions`, where a named tool nests under `function`. */
+export type OpenAIChatToolChoice = OpenAIToolChoiceMode | { type: "function"; function: { name: string } };
+
+/** Tool selection on `/responses`, where a named tool carries `name` at the top level. */
+export type LiteLLMResponsesToolChoice = OpenAIToolChoiceMode | { type: "function"; name: string };
+
+/**
  * Anthropic CachePoint directive. `ttl` is omitted for the 5-minute tier
  * (the API default); the 1-hour tier must be declared explicitly.
  */
@@ -418,7 +431,7 @@ export interface OpenAIChatCompletionRequest {
     presence_penalty?: number;
     stop?: string | string[];
     tools?: OpenAIFunctionToolDef[];
-    tool_choice?: string | object;
+    tool_choice?: OpenAIChatToolChoice;
     stream_options?: { include_usage?: boolean };
     /**
      * Anthropic prompt-caching directive forwarded by LiteLLM to the Claude
@@ -483,14 +496,15 @@ export interface LiteLLMResponsesRequest {
     input: (OpenAIChatMessageContentItem | LiteLLMResponseInputItem)[];
     instructions?: string;
     stream?: boolean;
-    max_tokens?: number;
+    /** Output-token cap. The Responses API has no `max_tokens` parameter. */
+    max_output_tokens?: number;
     temperature?: number;
     top_p?: number;
     frequency_penalty?: number;
     presence_penalty?: number;
     stop?: string | string[];
     tools?: LiteLLMResponseTool[];
-    tool_choice?: string | object;
+    tool_choice?: LiteLLMResponsesToolChoice;
     /**
      * Mirror of `OpenAIChatCompletionRequest.reasoning_effort` — LiteLLM accepts the
      * same flat snake_case key on `/responses`, so we propagate it unchanged from

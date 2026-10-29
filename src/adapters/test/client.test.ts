@@ -550,6 +550,42 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.strictEqual(abortSignal?.aborted, true);
     });
 
+    test("getModelInfo rejects with the discovery timeout when the body stalls after the headers", async () => {
+        const client = new LiteLLMClient({ ...config, discoveryTimeoutMs: 10 }, userAgent);
+        sandbox.stub(global, "fetch").callsFake(async (_input: string | URL | Request, init?: RequestInit) => {
+            const signal = init?.signal as AbortSignal | undefined;
+            const body = new ReadableStream({
+                start(controller) {
+                    // Abort reaches the body only through the signal, exactly as a
+                    // real fetch streams it, so the read stays pending until it fires.
+                    signal?.addEventListener("abort", () => controller.error(new Error("aborted")));
+                },
+            });
+            return new Response(body, { status: 200, statusText: "OK" });
+        });
+
+        await assert.rejects(() => client.getModelInfo(), /discovery timeout after 10ms/);
+    });
+
+    test("getModelInfo disposes its cancellation registration when the request settles", async () => {
+        const dispose = sinon.spy();
+        const token = {
+            onCancellationRequested: () => ({ dispose }),
+        } as unknown as vscode.CancellationToken;
+        const client = new LiteLLMClient(config, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch");
+
+        fetchStub.resolves(new Response(JSON.stringify({ data: [] }), { status: 200, statusText: "OK" }));
+        await client.getModelInfo(token);
+
+        assert.strictEqual(dispose.callCount, 1);
+
+        fetchStub.resolves(new Response("boom", { status: 500, statusText: "Internal Server Error" }));
+        await assert.rejects(() => client.getModelInfo(token));
+
+        assert.strictEqual(dispose.callCount, 2);
+    });
+
     test("fetchWithRetry retries on 429 with backoff", async () => {
         const client = new LiteLLMClient(config, userAgent);
         const fetchStub = sandbox.stub(global, "fetch");

@@ -93,6 +93,10 @@ export async function* decodeSSE(
 
             const { done, value } = await reader.read();
             if (done) {
+                // Flush before the trailing event is parsed. With `stream: true`,
+                // an incomplete trailing byte sequence stays held in the decoder,
+                // so without this call those bytes never reach the buffer.
+                buffer += decoder.decode();
                 Logger.trace("[decodeSSE] Stream done, chunkCount=", chunkCount, "payloadCount=", payloadCount);
                 StructuredLogger.debug("stream.chunk_received", {
                     event: "done",

@@ -20,7 +20,18 @@ export interface TokenSnapshot {
     systemPromptTokens: number;
 
     // Output side
+    /**
+     * The upstream `completion_tokens` when the gateway reported one, otherwise
+     * the local estimate of the text buffer, which includes thinking. An
+     * upstream count also covers tool-call output; the local estimate does not.
+     */
     completionTokens: number;
+    /**
+     * Output tokens the request produced. Upstream `completion_tokens` when the
+     * gateway reported it, otherwise the local estimate of text plus tool-call
+     * tokens.
+     */
+    outputTokens: number;
     reasoningTokens: number;
     toolTokens: number;
     acceptedPredictionTokens: number;
@@ -58,7 +69,7 @@ export class StreamTokenCapture {
     private _reasoningBuffer = "";
     private _toolCallTokens = 0;
 
-    // Upstream usage (from DataPart or response.completed)
+    // Upstream usage (from a DataPart, `response.completed`, or `response.incomplete`)
     private _sawUpstreamUsage = false;
     private _upstream?: OpenAIUsagePayload;
 
@@ -137,6 +148,7 @@ export class StreamTokenCapture {
             // Output: prefer upstream, fall back to internal accumulation
             completionTokens:
                 this._upstream?.completion_tokens ?? countTokens(this._textBuffer, this._modelId, this._modelInfo),
+            outputTokens: this._resolveOutputTokens(),
             reasoningTokens:
                 completionDetails?.reasoning_tokens ??
                 countTokens(this._reasoningBuffer, this._modelId, this._modelInfo),
@@ -149,7 +161,7 @@ export class StreamTokenCapture {
 
         const cost: RequestCost = calculateRequestCost({
             promptTokens: snapshot.promptTokens,
-            completionTokens: snapshot.completionTokens,
+            completionTokens: snapshot.outputTokens,
             cachedTokens: snapshot.cachedTokens,
             cacheCreationInputTokens: snapshot.cacheCreationInputTokens,
             pricing: this._pricing,
@@ -161,6 +173,18 @@ export class StreamTokenCapture {
         }
 
         return snapshot;
+    }
+
+    /**
+     * Output tokens for a request. The text buffer already holds the thinking
+     * text, so the local estimate adds the tool-call tokens only and reasoning
+     * is not counted twice.
+     */
+    private _resolveOutputTokens(): number {
+        if (typeof this._upstream?.completion_tokens === "number") {
+            return this._upstream.completion_tokens;
+        }
+        return countTokens(this._textBuffer, this._modelId, this._modelInfo) + this._toolCallTokens;
     }
 
     /**
@@ -179,16 +203,12 @@ export class StreamTokenCapture {
         // Build usage payload from accumulated counts
         const snapshot = this.getSnapshot();
 
-        // Don't emit usage if there's no meaningful token usage (empty stream)
-        // Check if any actual tokens were generated (not just estimated prompt tokens)
-        if (snapshot.completionTokens === 0 && snapshot.toolTokens === 0 && snapshot.reasoningTokens === 0) {
-            // No output tokens generated, don't emit usage
+        // An empty stream has no usage to report; prompt tokens are only an estimate.
+        if (snapshot.outputTokens === 0) {
             return;
         }
 
-        // For completion_tokens, use the max of text tokens and tool tokens
-        // This handles cases where only tool calls are streamed (no text)
-        const completionTokens = Math.max(snapshot.completionTokens, snapshot.toolTokens);
+        const completionTokens = snapshot.outputTokens;
 
         const usagePayload: OpenAIUsagePayload = {
             prompt_tokens: snapshot.promptTokens,
@@ -300,8 +320,7 @@ export class StreamTokenCapture {
             }
 
             const promptDetails: OpenAIUsagePromptTokenDetails | undefined = this._upstream.prompt_tokens_details;
-            const completionCount =
-                this._upstream.completion_tokens ?? countTokens(this._textBuffer, this._modelId, this._modelInfo);
+            const completionCount = this._resolveOutputTokens();
             const promptCount = this._upstream.prompt_tokens ?? this._estimatedPromptTokens;
 
             const enriched: OpenAIUsagePayload = {

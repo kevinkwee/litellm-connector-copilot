@@ -185,9 +185,9 @@ function settleChatToolCallBuffers(state: StreamingState, finishReason: string):
 
 /**
  * True while tool call fragments remain buffered. A finish frame settles the
- * chat-completions buffers, and output_item.done or response.completed settles
- * keyed /responses calls. A function_call output_item.done, or the
- * end-of-stream flush, settles an anonymous call.
+ * chat-completions buffers, and `output_item.done`, `response.completed`, or
+ * `response.incomplete` settles keyed /responses calls. A `function_call`
+ * `output_item.done`, or the end-of-stream flush, settles an anonymous call.
  */
 export function hasBufferedToolCalls(state: StreamingState): boolean {
     return (
@@ -293,6 +293,128 @@ function extractUpstreamStreamError(data: Record<string, unknown>): UpstreamStre
         );
     }
     return undefined;
+}
+
+/**
+ * `/responses` usage object. LiteLLM reports the counters as `input_tokens` and
+ * `output_tokens`; the detail objects keep the `RawUsagePayload` spellings.
+ */
+interface ResponsesStreamUsage extends RawUsagePayload {
+    input_tokens?: number;
+    output_tokens?: number;
+}
+
+/**
+ * The `response` object of `response.completed` and `response.incomplete`,
+ * reduced to the fields the interpreter reads.
+ */
+interface ResponsesStreamResponse {
+    usage?: ResponsesStreamUsage;
+    incomplete_details?: { reason?: string };
+}
+
+/**
+ * Maps an `/responses` `incomplete_details.reason` onto the chat-completions
+ * `length` and `content_filter` finish reasons, which the provider renders as a
+ * stopped-early notice. An unknown or missing reason maps to `undefined`, so the
+ * turn ends without a finish part rather than claiming a cause the connector
+ * cannot name.
+ */
+function mapIncompleteDetailsReason(reason: string | undefined): string | undefined {
+    if (reason === "max_output_tokens") {
+        return "length";
+    }
+    if (reason === "content_filter") {
+        return "content_filter";
+    }
+    return undefined;
+}
+
+/**
+ * Maps the `/responses` counters (`input_tokens`, `output_tokens`) onto the
+ * chat-completions names `normalizeUsagePayload` reads. The remaining fields,
+ * detail objects included, pass through in whichever spelling the gateway sent.
+ */
+function toRawUsage(usage: ResponsesStreamUsage): RawUsagePayload {
+    const { input_tokens, output_tokens, ...rest } = usage;
+    return {
+        ...rest,
+        prompt_tokens: input_tokens ?? rest.prompt_tokens,
+        completion_tokens: output_tokens ?? rest.completion_tokens,
+    };
+}
+
+/**
+ * Delivers each keyed `/responses` tool call that has a name and valid JSON
+ * arguments, and drops the rest. Settles the buffers so a later frame cannot
+ * emit the same call twice.
+ */
+function flushResponsesToolCalls(state: StreamingState, toolCallParts: EmittedPart[]): number {
+    let flushedToolCallCount = 0;
+    for (const id of state.responseToolCallOrder) {
+        const buffer = state.responseToolCallBuffers.get(id);
+        if (!buffer) {
+            continue;
+        }
+        if (buffer.name && buffer.args) {
+            try {
+                JSON.parse(buffer.args);
+                Logger.trace(`[interpretStreamEvent] Flushing /responses tool call: ${buffer.name} (id: ${buffer.id})`);
+                toolCallParts.push({
+                    type: "tool_call",
+                    index: toolCallParts.length,
+                    id: buffer.id,
+                    name: buffer.name,
+                    args: buffer.args,
+                });
+                flushedToolCallCount++;
+            } catch {
+                // drop malformed tool call
+                Logger.warn(
+                    `[interpretStreamEvent] ${requestTag(state)} Dropped malformed tool call args for ${buffer.name}`
+                );
+                StructuredLogger.warn("stream.responses_tool_call_buffer_dropped", {
+                    requestId: state.requestId,
+                    toolName: buffer.name,
+                    id: buffer.id,
+                    argsLength: buffer.args.length,
+                });
+            }
+        }
+    }
+    state.responseToolCallBuffers.clear();
+    state.responseToolCallOrder = [];
+    return flushedToolCallCount;
+}
+
+/**
+ * Emits the usage data part for a settled `/responses` turn. Only a usage object
+ * with at least one token count produces a data part; one with no counts leaves
+ * the connector's own estimate in place.
+ */
+function appendResponsesUsage(
+    usage: ResponsesStreamUsage | undefined,
+    dataParts: EmittedPart[],
+    flushedToolCallCount: number
+): void {
+    if (typeof usage?.input_tokens !== "number" && typeof usage?.output_tokens !== "number") {
+        return;
+    }
+    const usageValue = normalizeUsagePayload(toRawUsage(usage));
+    Logger.debug(
+        `[interpretStreamEvent] Recording usage: input=${usageValue.prompt_tokens} output=${usageValue.completion_tokens}`
+    );
+    dataParts.push({
+        type: "data",
+        mimeType: "usage",
+        value: usageValue,
+    });
+    StructuredLogger.trace("stream.responses_usage", {
+        inputTokens: usageValue.prompt_tokens,
+        outputTokens: usageValue.completion_tokens,
+        systemPromptTokens: usageValue.system_prompt_tokens,
+        toolCallsEmitted: flushedToolCallCount,
+    });
 }
 
 /**
@@ -530,9 +652,9 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
             length: data.delta.length,
         });
     }
-    // 2b. Robust event shape: response.output_item.delta (keyed on item.call_id)
-    // This is the event shape used by ResponsesClient — preserved here for providers
-    // that stream tool args via output_item.delta rather than output_tool_call.*.
+    // 2b. Robust event shape: `response.output_item.delta`, keyed on `item.call_id`.
+    // Providers that stream tool arguments through this event instead of
+    // `response.output_tool_call.*` take this branch.
     if (data.type === "response.output_item.delta") {
         const item = data.item as Record<string, unknown> | undefined;
         if (item?.type === "function_call") {
@@ -564,7 +686,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                     });
                 }
             } else {
-                // No call_id yet — buffer anonymously (providers that stream args before id)
+                // No call_id yet, so buffer anonymously for providers that stream args before the id.
                 if (name) {
                     // Apply tool name sanitization for AWS Bedrock Converse API compliance (64-char limit)
                     const { name: sanitizedName } = sanitizeToolName(name);
@@ -616,26 +738,9 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
             }
         }
     }
-    if (data.type === "response.completed") {
-        Logger.info(`[interpretStreamEvent] Received /responses response.completed event`);
-        const response = data.response as
-            | {
-                  usage?: {
-                      input_tokens?: number;
-                      output_tokens?: number;
-                      system_tokens?: number;
-                      input_token_details?: { cached_tokens?: number; cache_creation_input_tokens?: number };
-                      cache_creation_input_tokens?: number;
-                      cache_read_input_tokens?: number;
-                      output_token_details?: {
-                          reasoning_tokens?: number;
-                          tool_tokens?: number;
-                          accepted_prediction_tokens?: number;
-                          rejected_prediction_tokens?: number;
-                      };
-                  };
-              }
-            | undefined;
+    if (data.type === "response.completed" || data.type === "response.incomplete") {
+        Logger.info(`[interpretStreamEvent] Received /responses ${data.type} event`);
+        const response = data.response as ResponsesStreamResponse | undefined;
         responseParts.push({
             type: "response",
             usage: {
@@ -643,69 +748,20 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                 outputTokens: response?.usage?.output_tokens,
             },
         });
-        // Flush buffered /responses tool calls
-        let flushedToolCallCount = 0;
-        for (const id of state.responseToolCallOrder) {
-            const buffer = state.responseToolCallBuffers.get(id);
-            if (!buffer) {
-                continue;
-            }
-            if (buffer.name && buffer.args) {
-                try {
-                    JSON.parse(buffer.args);
-                    Logger.trace(
-                        `[interpretStreamEvent] Flushing /responses tool call: ${buffer.name} (id: ${buffer.id})`
-                    );
-                    toolCallParts.push({
-                        type: "tool_call",
-                        index: toolCallParts.length,
-                        id: buffer.id,
-                        name: buffer.name,
-                        args: buffer.args,
-                    });
-                    flushedToolCallCount++;
-                } catch {
-                    // drop malformed tool call
-                    Logger.warn(`[interpretStreamEvent] Dropped malformed tool call args for ${buffer.name}`);
-                }
-            }
-        }
-        state.responseToolCallBuffers.clear();
-        state.responseToolCallOrder = [];
-        Logger.trace(`[interpretStreamEvent] Flushed ${flushedToolCallCount} tool calls on response.completed`);
+        const flushedToolCallCount = flushResponsesToolCalls(state, toolCallParts);
+        Logger.trace(`[interpretStreamEvent] Flushed ${flushedToolCallCount} tool calls on ${data.type}`);
 
-        if (typeof response?.usage?.input_tokens === "number" || typeof response?.usage?.output_tokens === "number") {
-            const usageValue = normalizeUsagePayload({
-                prompt_tokens: response?.usage?.input_tokens,
-                completion_tokens: response?.usage?.output_tokens,
-                system_tokens: response?.usage?.system_tokens,
-                input_token_details: response?.usage?.input_token_details,
-                output_token_details: response?.usage?.output_token_details,
-                cache_creation_input_tokens: response?.usage?.cache_creation_input_tokens,
-                cache_read_input_tokens: response?.usage?.cache_read_input_tokens,
-            });
+        appendResponsesUsage(response?.usage, dataParts, flushedToolCallCount);
 
-            if (!usageValue.prompt_tokens_details) {
-                usageValue.prompt_tokens_details = { cached_tokens: 0 };
-            }
-            if (!usageValue.completion_tokens_details) {
-                usageValue.completion_tokens_details = { reasoning_tokens: 0 };
-            }
-
-            Logger.debug(
-                `[interpretStreamEvent] Recording usage: input=${usageValue.prompt_tokens} output=${usageValue.completion_tokens}`
-            );
-            dataParts.push({
-                type: "data",
-                mimeType: "usage",
-                value: usageValue,
-            });
-            StructuredLogger.trace("stream.responses_usage", {
-                inputTokens: usageValue.prompt_tokens,
-                outputTokens: usageValue.completion_tokens,
-                systemPromptTokens: usageValue.system_prompt_tokens,
-                toolCallsEmitted: flushedToolCallCount,
-            });
+        // An incomplete response ends the turn the same way a chat-completions
+        // `finish_reason` does, so the provider shows its stopped-early notice
+        // instead of presenting a truncated answer as a finished one.
+        const incompleteReason =
+            data.type === "response.incomplete"
+                ? mapIncompleteDetailsReason(response?.incomplete_details?.reason)
+                : undefined;
+        if (incompleteReason) {
+            finishParts.push({ type: "finish", reason: incompleteReason });
         }
     }
     if (data.type === "response.output_item.done") {
@@ -718,7 +774,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
 
             if (callId) {
                 // Per-callId flush: emit the specific buffered call and remove it from the order
-                // list so response.completed does not double-emit it.
+                // list so a later `response.completed` or `response.incomplete` does not double-emit it.
                 const buffer = state.responseToolCallBuffers.get(callId);
                 const name = nameFromDone ?? buffer?.name;
                 const args = argsFromDone ?? buffer?.args;
@@ -748,8 +804,8 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                 state.responseToolCallBuffers.delete(callId);
                 state.responseToolCallOrder = state.responseToolCallOrder.filter((id) => id !== callId);
             } else {
-                // Anonymous tool call (no stable call_id) — emit best-effort from anonymous buffer.
-                // Preserved from ResponsesClient for providers that never emit a call_id.
+                // Anonymous tool call (no stable call_id), emitted best-effort from the
+                // anonymous buffer for providers that never emit a call_id.
                 const name = nameFromDone ?? state.anonymousResponseToolName;
                 const args = argsFromDone ?? state.anonymousResponseToolArgs;
                 Logger.trace(`[interpretStreamEvent] Flushing anonymous tool call on output_item.done: ${name}`);
@@ -778,40 +834,12 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
             state.anonymousResponseToolName = undefined;
             state.anonymousResponseToolArgs = "";
         } else {
-            // No function_call item (e.g., text item, or no item at all) — legacy flush-all.
+            // No function_call item (e.g., text item, or no item at all): legacy flush-all.
             // Preserves backward compat with output_tool_call.* path which relies on
-            // output_item.done to drain all buffered calls when no response.completed follows.
+            // output_item.done to drain all buffered calls when no `response.completed`
+            // or `response.incomplete` frame follows.
             Logger.debug(`[interpretStreamEvent] Legacy flush-all on output_item.done (non-function_call item)`);
-            let legacyFlushedCount = 0;
-            for (const id of state.responseToolCallOrder) {
-                const buffer = state.responseToolCallBuffers.get(id);
-                if (!buffer) {
-                    continue;
-                }
-                if (buffer.name && buffer.args) {
-                    try {
-                        JSON.parse(buffer.args);
-                        Logger.trace(
-                            `[interpretStreamEvent] Legacy flushed tool call: ${buffer.name} (id: ${buffer.id})`
-                        );
-                        toolCallParts.push({
-                            type: "tool_call",
-                            index: toolCallParts.length,
-                            id: buffer.id,
-                            name: buffer.name,
-                            args: buffer.args,
-                        });
-                        legacyFlushedCount++;
-                    } catch {
-                        // drop malformed tool call
-                        Logger.warn(
-                            `[interpretStreamEvent] Dropped malformed tool call ${buffer.name} on legacy flush`
-                        );
-                    }
-                }
-            }
-            state.responseToolCallBuffers.clear();
-            state.responseToolCallOrder = [];
+            const legacyFlushedCount = flushResponsesToolCalls(state, toolCallParts);
             Logger.debug(`[interpretStreamEvent] Legacy flushed ${legacyFlushedCount} tool calls on output_item.done`);
             StructuredLogger.trace("stream.responses_legacy_flush", {
                 toolCallsEmitted: legacyFlushedCount,
@@ -874,7 +902,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
 
 /**
  * Settles every buffered tool call at a stream end that carried no
- * response.completed or finish frame.
+ * `response.completed`, `response.incomplete`, or other finish frame.
  *
  * Emits:
  * - Named /responses-format tool calls with valid JSON arguments

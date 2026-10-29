@@ -577,14 +577,33 @@ suite("Utility Unit Tests", () => {
         assert.throws(() => validateRequest(invalid));
     });
 
-    test("convertTools throws when ToolMode.Required with multiple tools", () => {
+    test("convertTools asks for any tool when ToolMode.Required covers several tools", () => {
         const tools: vscode.LanguageModelChatTool[] = [
             { name: "t1", description: "", inputSchema: {} },
             { name: "t2", description: "", inputSchema: {} },
+            { name: "t3", description: "", inputSchema: {} },
         ];
-        assert.throws(() =>
-            convertTools({ tools, toolMode: vscode.LanguageModelChatToolMode.Required, requestInitiator: "test" })
-        );
+
+        const result = convertTools({
+            tools,
+            toolMode: vscode.LanguageModelChatToolMode.Required,
+            requestInitiator: "test",
+        });
+
+        assert.strictEqual(result.tool_choice, "required");
+        assert.strictEqual(result.tools?.length, 3);
+    });
+
+    test("convertTools names the only tool when ToolMode.Required covers one", () => {
+        const tools: vscode.LanguageModelChatTool[] = [{ name: "only", description: "", inputSchema: {} }];
+
+        const result = convertTools({
+            tools,
+            toolMode: vscode.LanguageModelChatToolMode.Required,
+            requestInitiator: "test",
+        });
+
+        assert.deepStrictEqual(result.tool_choice, { type: "function", function: { name: "only" } });
     });
 
     test("tryParseJSONObject handles valid and invalid JSON", () => {

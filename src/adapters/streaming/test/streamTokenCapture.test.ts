@@ -82,6 +82,60 @@ suite("StreamTokenCapture", () => {
         assert.ok(snapshot.toolTokens > 0, "expected tool tokens to be estimated");
     });
 
+    test("a tool-only reply reports its tool tokens as output and prices them", () => {
+        const reportedParts: vscode.LanguageModelDataPart[] = [];
+        const progress: vscode.Progress<vscode.LanguageModelResponsePart> = {
+            report: (part) => {
+                if (part instanceof vscode.LanguageModelDataPart && part.mimeType === "usage") {
+                    reportedParts.push(part);
+                }
+            },
+        };
+        const capture = new StreamTokenCapture("model-x", progress, {
+            model: "model-x",
+            pricing: { inputCostPerToken: 1e-6, outputCostPerToken: 2e-6 },
+        });
+
+        capture.progress.report(asToolCallPart("myTool", { a: 1 }));
+        capture.flushUsage();
+
+        const snapshot = capture.getSnapshot();
+        assert.ok(snapshot.toolTokens > 0);
+        assert.strictEqual(snapshot.completionTokens, 0, "a tool-only reply emits no text");
+        assert.strictEqual(snapshot.outputTokens, snapshot.toolTokens);
+        assert.strictEqual(snapshot.estimatedOutputCost, snapshot.toolTokens * 2e-6);
+
+        assert.strictEqual(reportedParts.length, 1);
+        const emitted = JSON.parse(Buffer.from(reportedParts[0].data).toString("utf-8")) as OpenAIUsagePayload;
+        assert.strictEqual(emitted.completion_tokens, snapshot.toolTokens);
+        assert.strictEqual(emitted.total_tokens, snapshot.toolTokens);
+    });
+
+    test("a reply with text and a tool call sums both into the output estimate", () => {
+        const { progress } = createInnerProgress();
+        const capture = new StreamTokenCapture("model-x", progress);
+
+        capture.progress.report(asTextPart("here is the answer"));
+        capture.progress.report(asToolCallPart("myTool", { a: 1 }));
+
+        const snapshot = capture.getSnapshot();
+        assert.ok(snapshot.completionTokens > 0);
+        assert.ok(snapshot.toolTokens > 0);
+        assert.strictEqual(snapshot.outputTokens, snapshot.completionTokens + snapshot.toolTokens);
+    });
+
+    test("upstream completion tokens stay authoritative over the local estimate", () => {
+        const { progress } = createInnerProgress();
+        const capture = new StreamTokenCapture("model-x", progress);
+
+        capture.progress.report(asTextPart("a long stretch of generated text"));
+        capture.progress.report(asToolCallPart("myTool", { a: 1 }));
+        capture.progress.report(asUsagePart({ prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 }));
+
+        const snapshot = capture.getSnapshot();
+        assert.strictEqual(snapshot.outputTokens, 2);
+    });
+
     test("captures upstream usage from data part and prefers it over internal counts", () => {
         const { parts, progress } = createInnerProgress();
         const capture = new StreamTokenCapture("model-x", progress);
@@ -218,6 +272,7 @@ suite("StreamTokenCapture", () => {
             cacheCreationInputTokens: 5,
             systemPromptTokens: 0,
             completionTokens: 25,
+            outputTokens: 25,
             reasoningTokens: 0,
             toolTokens: 0,
             acceptedPredictionTokens: 0,
