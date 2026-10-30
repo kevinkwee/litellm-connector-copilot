@@ -29,10 +29,14 @@
  *  - `getModelInfo(id)` / `getDerivedCapabilities(id)`: read the
  *    capability caches populated during discovery.
  *  - `size()`: number of distinct backends currently registered.
- *  - `clear()`: wipe the routing table (call on user-initiated reload).
  *  - `clearCaches()`: wipe the per-model caches (model info, derived
  *    capabilities, unsupported parameters), the discovery response cache, and
  *    every backend's backoff history.
+ *  - `clearDiscoveryCaches()`: wipes the two caches a model reload must refresh,
+ *    the discovery response cache and every backend's backoff history. Routing
+ *    and the per-model caches survive.
+ *  - `getAllModels()`: the deduplicated union of every backend's last delivered
+ *    list, for the Show Available Models command.
  *  - `onDidChange`: fires when a backend's model set changes.
  *
  * Internal surface (write)
@@ -259,6 +263,12 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
      */
     private readonly modelsByBackend = new Map<string, LanguageModelChatInformation[]>();
     /**
+     * Backend identity each named group last discovered from. A group whose URL
+     * or key changes would otherwise leave its previous backend's list behind,
+     * and `getAllModels` would keep listing models the group no longer serves.
+     */
+    private readonly backendKeyByGroupName = new Map<string, string>();
+    /**
      * The exact model objects handed to VS Code, mapped to their routing entry.
      * VS Code calls `provideLanguageModelChatResponse` with the object it stored
      * for that group, so object identity resolves routing exactly even when two
@@ -286,6 +296,13 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
 
     // Discovery response cache for /model/info responses
     private readonly discoveryResponseCache = new Map<string, CachedDiscoveryResult>();
+    /**
+     * Bumped whenever the discovery caches are cleared. A discovery that was
+     * already awaiting the proxy when the clear happened carries the older
+     * epoch, so it must not write its pre-change result back into the fresh
+     * cache or the per-backend list.
+     */
+    private discoveryEpoch = 0;
 
     // Debounced change event emitter (initialized lazily on first use)
     private _debouncedOnDidChange: DebouncedEmitter | undefined;
@@ -422,9 +439,8 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     /**
-     * Aggregated, deduplicated model list across all registered backends.
-     * Intended for read-only access from the show-models and reload-models
-     * commands, without introducing secondary caches.
+     * Aggregated, deduplicated model list across all registered backends, for
+     * the Show Available Models command.
      */
     public getAllModels(): LanguageModelChatInformation[] {
         const seen = new Set<string>();
@@ -483,19 +499,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     /**
-     * Wipes every routing entry, the identity map, every per-backend model list,
-     * and the discovery response cache. Call on user-initiated model reload so
-     * the next discovery pass starts from a clean slate. Does NOT touch the
-     * per-model capability caches; call `clearCaches()` for that.
-     */
-    public clear(): void {
-        this.entries.clear();
-        this.modelsByBackend.clear();
-        this.entriesByInfo = new WeakMap();
-        this.discoveryResponseCache.clear();
-    }
-
-    /**
      * Wipes the per-model caches (model info, derived capabilities, unsupported
      * parameters), the discovery response cache, and every backend's backoff
      * history. Does NOT touch the routing table.
@@ -504,6 +507,17 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         this.modelInfoCache.clear();
         this.derivedCapabilitiesCache.clear();
         this.unsupportedParamsByModel.clear();
+        this.clearDiscoveryCaches();
+    }
+
+    /**
+     * Wipes the two caches a model reload must refresh, the discovery response
+     * cache and every backend's backoff history. The routing table and the
+     * per-model capability caches survive, so an in-flight request keeps resolving
+     * while VS Code re-queries each group.
+     */
+    public clearDiscoveryCaches(): void {
+        this.discoveryEpoch += 1;
         this.discoveryResponseCache.clear();
         sharedDiscoveryBackoff.reset();
     }
@@ -575,6 +589,37 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         );
     }
 
+    /**
+     * Forgets the list a named group delivered from a different backend, so a
+     * group whose URL or key changed stops contributing its old models to
+     * `getAllModels`. The list is kept while another group still maps to that
+     * backend, because that group's stale-while-error refresh depends on it. The
+     * old routing entries stay either way: an in-flight request that already
+     * holds one of the old model objects still needs to resolve.
+     */
+    private dropStaleGroupBackend(groupName: string | undefined, backendKey: string): void {
+        if (!groupName) {
+            return;
+        }
+        const previousKey = this.backendKeyByGroupName.get(groupName);
+        if (previousKey !== undefined && previousKey !== backendKey) {
+            const stillUsedByAnotherGroup = [...this.backendKeyByGroupName].some(
+                ([name, key]) => name !== groupName && key === previousKey
+            );
+            if (stillUsedByAnotherGroup) {
+                Logger.trace(
+                    `LiteLLMProviderRegistry.dropStaleGroupBackend: group="${groupName}" kept its previous backend list, another group still uses it`
+                );
+            } else {
+                this.modelsByBackend.delete(previousKey);
+                Logger.trace(
+                    `LiteLLMProviderRegistry.dropStaleGroupBackend: group="${groupName}" dropped its previous backend list`
+                );
+            }
+        }
+        this.backendKeyByGroupName.set(groupName, backendKey);
+    }
+
     private getModelsForBackend(backendKey: string): LanguageModelChatInformation[] | undefined {
         return this.modelsByBackend.get(backendKey);
     }
@@ -624,6 +669,9 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         // fall back to the models this group last delivered.
         let backendKey: string | undefined;
         let failureBaseUrl: string | undefined;
+        // A reload during the fetch makes this call's result stale, so it must
+        // not overwrite the list the re-query wrote.
+        const epochAtStart = this.discoveryEpoch;
         try {
             if (!options.configuration) {
                 // Vendor-level call: nothing to discover. Return an empty list
@@ -679,8 +727,13 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
                 `LiteLLMProviderRegistry.discoverModels: baseUrl="${session.baseUrl}" routingIdentity="${routingIdentity}" ` +
                     `modelCount=${models.length} sampleIds=[${[...newIds].slice(0, 3).join(", ")}] changed=${changed}`
             );
-            if (session.apiKey) {
+            if (session.apiKey && this.discoveryEpoch === epochAtStart) {
+                this.dropStaleGroupBackend(options.groupName, backendKey);
                 this.setModelsForBackend(backendKey, session.baseUrl, session.apiKey, routingIdentity, models);
+            } else if (session.apiKey) {
+                Logger.trace(
+                    `LiteLLMProviderRegistry.discoverModels: skipping registry write for a result a reload superseded baseUrl="${session.baseUrl}"`
+                );
             } else {
                 Logger.trace(
                     `LiteLLMProviderRegistry.discoverModels: skipping registry write (no session/apiKey) baseUrl="${session.baseUrl}" modelCount=${models.length}`
@@ -766,6 +819,9 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     ): Promise<vscode.LanguageModelChatInformation[]> {
         const config = await this.configManager.getConfig();
         const ttlMs = config.discoveryCacheTtlMs ?? 60_000;
+        // Captured before the fetch: a reload that lands while the request is in
+        // flight bumps the epoch, and this call must then skip its cache write.
+        const epochAtFetchStart = this.discoveryEpoch;
 
         // Check cache first
         const cacheKey = await toBackendIdentityKey(session.baseUrl, session.apiKey);
@@ -820,8 +876,10 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             )
             .filter((info) => info.isUserSelectable !== false);
 
-        // Cache the response if TTL > 0
-        if (ttlMs > 0) {
+        // Cache the response if TTL > 0. A reload during the fetch invalidates
+        // the entry this call would write, so it is skipped instead of
+        // poisoning the freshly cleared cache with the pre-change list.
+        if (ttlMs > 0 && this.discoveryEpoch === epochAtFetchStart) {
             // Create a deterministic hash of the response body
             const bodyHash = await sha256HexAsync(JSON.stringify(models.data ?? []));
             this.discoveryResponseCache.set(cacheKey, {

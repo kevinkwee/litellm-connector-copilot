@@ -8,27 +8,37 @@ import { join } from "node:path";
  * error-level diagnostics that would explain a failure are typically gone
  * by the time someone investigates. The sink appends every log line to a
  * daily file under `<globalStorage>/structured-logs/` with day rollover, a
- * per-file size cap, and a retention prune on startup.
+ * per-file size cap, a folder-wide byte cap, and a retention prune at startup
+ * and at every rollover.
  *
  * Failure policy: persistence must never break the request pipeline. A sink
  * that cannot write disables itself; the channel keeps logging.
+ *
+ * The storage folder is shared by every VS Code window that uses the same
+ * extension host storage, so a cap pass in one window can delete a file another
+ * window is writing. That window recreates the file on its next append, and every
+ * deletion is best effort.
  */
 
 const FILE_PREFIX = "structured-";
 const FILE_SUFFIX = ".jsonl";
 const DEFAULT_MAX_FILE_BYTES = 32 * 1024 * 1024;
+const DEFAULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
 const DEFAULT_RETENTION_DAYS = 14;
 const MS_PER_DAY = 86_400_000;
 
 export interface StructuredLogFileSinkOptions {
     /** Byte cap per file before rolling to a second file within the same day. */
     maxFileBytes?: number;
-    /** Days a log file survives the startup retention prune. 0 disables pruning. */
+    /** Byte cap across every log file. Beyond it, the oldest files are deleted at startup and at each rollover. */
+    maxTotalBytes?: number;
+    /** Days a log file survives a retention prune. 0 disables pruning. */
     retentionDays?: number;
 }
 
 export class StructuredLogFileSink {
     private readonly maxFileBytes: number;
+    private readonly maxTotalBytes: number;
     private readonly retentionDays: number;
 
     private enabled = false;
@@ -39,6 +49,7 @@ export class StructuredLogFileSink {
 
     public constructor(options: StructuredLogFileSinkOptions = {}) {
         this.maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
+        this.maxTotalBytes = options.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
         this.retentionDays = options.retentionDays ?? DEFAULT_RETENTION_DAYS;
     }
 
@@ -69,6 +80,8 @@ export class StructuredLogFileSink {
             mkdirSync(this.storageDir, { recursive: true });
             this.pruneExpiredFiles();
             this.ensureCurrentFile();
+            // Also enforce the folder cap at startup, not only at rollover.
+            this.enforceTotalCap();
             this.enabled = true;
         } catch {
             this.storageDir = undefined;
@@ -88,7 +101,9 @@ export class StructuredLogFileSink {
         try {
             this.ensureCurrentFile();
             appendFileSync(this.activeFilePath as string, `${line}\n`);
-            this.byteCount += line.length + 1;
+            // Bytes, not UTF-16 units: a multi-byte line would otherwise be
+            // undercounted and the cap would overshoot.
+            this.byteCount += Buffer.byteLength(line, "utf8") + 1;
         } catch {
             this.enabled = false;
         }
@@ -105,6 +120,7 @@ export class StructuredLogFileSink {
         if (this.activeFilePath && sameDay && this.byteCount < this.maxFileBytes) {
             return;
         }
+        const rolling = this.activeFilePath !== undefined;
         let name = `${FILE_PREFIX}${dayKey}${FILE_SUFFIX}`;
         if (this.activeFilePath && sameDay && this.byteCount >= this.maxFileBytes) {
             name = `${FILE_PREFIX}${dayKey}-${Date.now()}${FILE_SUFFIX}`;
@@ -112,6 +128,68 @@ export class StructuredLogFileSink {
         this.activeFilePath = join(this.storageDir as string, name);
         this.currentDayKey = dayKey;
         this.byteCount = existsSync(this.activeFilePath) ? statSync(this.activeFilePath).size : 0;
+        if (rolling) {
+            // Retention also runs at every rollover, so a long-running session
+            // cannot keep expired files past their window.
+            this.pruneExpiredFiles();
+            this.enforceTotalCap();
+        }
+    }
+
+    /**
+     * Deletes the oldest log files until the total fits the cap, never touching
+     * the file the sink is writing. Runs at startup and at rollover, so the cap
+     * covers a folder that grew while the extension was closed and a long-running
+     * session alike, without a per-line cost.
+     */
+    private enforceTotalCap(): void {
+        if (!this.storageDir || this.maxTotalBytes <= 0) {
+            return;
+        }
+        const files = this.listLogFiles();
+        let totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+        for (const file of files) {
+            if (totalBytes <= this.maxTotalBytes) {
+                return;
+            }
+            if (file.path === this.activeFilePath) {
+                continue;
+            }
+            try {
+                rmSync(file.path, { force: true });
+                totalBytes -= file.size;
+            } catch {
+                // Best effort: the loop continues with the next-oldest file, so an
+                // undeletable file leaves only its own bytes over the cap.
+            }
+        }
+    }
+
+    /** Lists the sink's log files, oldest first. */
+    private listLogFiles(): { path: string; size: number; modifiedMs: number }[] {
+        if (!this.storageDir) {
+            return [];
+        }
+        let entries: string[];
+        try {
+            entries = readdirSync(this.storageDir);
+        } catch {
+            return [];
+        }
+        const files: { path: string; size: number; modifiedMs: number }[] = [];
+        for (const entry of entries) {
+            if (!entry.startsWith(FILE_PREFIX) || !entry.endsWith(FILE_SUFFIX)) {
+                continue;
+            }
+            const fullPath = join(this.storageDir, entry);
+            try {
+                const stats = statSync(fullPath);
+                files.push({ path: fullPath, size: stats.size, modifiedMs: stats.mtimeMs });
+            } catch {
+                // A file that vanished between listing and stat is already gone.
+            }
+        }
+        return files.sort((left, right) => left.modifiedMs - right.modifiedMs);
     }
 
     /** Deletes log files older than the retention window. Best effort per file. */
@@ -120,21 +198,12 @@ export class StructuredLogFileSink {
             return;
         }
         const cutoff = Date.now() - this.retentionDays * MS_PER_DAY;
-        let entries: string[];
-        try {
-            entries = readdirSync(this.storageDir);
-        } catch {
-            return;
-        }
-        for (const entry of entries) {
-            if (!entry.startsWith(FILE_PREFIX) || !entry.endsWith(FILE_SUFFIX)) {
+        for (const file of this.listLogFiles()) {
+            if (file.modifiedMs >= cutoff) {
                 continue;
             }
-            const fullPath = join(this.storageDir, entry);
             try {
-                if (statSync(fullPath).mtimeMs < cutoff) {
-                    rmSync(fullPath, { force: true });
-                }
+                rmSync(file.path, { force: true });
             } catch {
                 // Retention is best effort; an undeletable file is harmless.
             }

@@ -50,7 +50,6 @@ interface BaseTestAccess {
             id: string
         ) => { baseUrl: string; apiKey: string; rawModelName: string; routingIdentity: string } | undefined;
         getModelInfo: (id: string) => LiteLLMModelInfo | undefined;
-        clear: () => void;
         clearCaches: () => void;
         size: () => number;
         recordUnsupportedParameter: (modelId: string, param: string) => void;
@@ -1271,27 +1270,6 @@ suite("LiteLLMProviderBase", () => {
             } finally {
                 localSandbox.restore();
             }
-        });
-    });
-
-    suite("clearModelCache", () => {
-        test("clears the BackendRegistry routing table and the base capability cache", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            // Seed the BackendRegistry with a backend so the routing table
-            // is non-empty. After clearModelCache the registry must be
-            // empty.
-            const registry = access(provider)._registry;
-            // Use the public `clear` is the observable surface; we test
-            // that `size` shrinks to 0 after clearModelCache.
-            // Seed by reaching into a public test seam: the registry's
-            // `size()` returns the count of backends; a fresh registry is 0.
-            assert.strictEqual(registry.size(), 0);
-
-            // clearModelCache must clear the registry. The base
-            // provider has no separate model-info cache to clear, because the
-            // registry is the single source of truth.
-            provider.clearModelCache();
-            assert.strictEqual(registry.size(), 0);
         });
     });
 

@@ -20,6 +20,75 @@ import { makeMinimalBody, makeMinimalEntry, makeMinimalSnapshot } from "../../te
  */
 
 suite("renderCopilotMd", () => {
+    test("escapes HTML inside the metadata block so the preview cannot be swallowed", () => {
+        const body = {
+            ...makeMinimalBody(),
+            tools: [
+                {
+                    type: "function" as const,
+                    function: {
+                        name: "pick<select>",
+                        description: "a <script>alert(1)</script> and <!-- comment -->",
+                        parameters: { type: "object", properties: {} },
+                    },
+                },
+            ],
+        };
+        const md = renderCopilotMd(makeMinimalEntry({ body }));
+
+        assert.ok(md.includes("<details>"), "details stays real HTML");
+        assert.ok(md.includes("<summary>tools"), "summary stays real HTML");
+        assert.ok(md.includes("&lt;script&gt;"), "the tool description is escaped");
+        assert.ok(md.includes("&lt;!--"), "an HTML comment opener is escaped");
+        assert.strictEqual(md.includes("<select>"), false, "a raw select tag never reaches the preview");
+    });
+
+    test("renders a multi-line failure reason as one escaped heading line", () => {
+        const entry = makeMinimalEntry({
+            status: "failure",
+            statusReason: "upstream said:\n<script>oops</script>",
+            responseParts: [],
+        });
+
+        const md = renderCopilotMd(entry);
+        const failureLine = md.split("\n").find((line) => line.startsWith("## FAILED:"));
+
+        assert.ok(failureLine, "a FAILED heading is rendered");
+        assert.strictEqual(failureLine?.includes("<script>"), false, "no raw script tag reaches the heading");
+        assert.ok(failureLine?.includes("&lt;script&gt;"), "the heading text is escaped");
+        assert.strictEqual(
+            md.split("\n").some((line) => line.startsWith("## FAILED: upstream said:")),
+            true
+        );
+    });
+
+    test("renders the partial response of a failed request before the failure heading", () => {
+        const entry = makeMinimalEntry({
+            status: "failure",
+            statusReason: "socket closed",
+            responseParts: [new vscode.LanguageModelTextPart("partial answer")],
+        });
+
+        const md = renderCopilotMd(entry);
+
+        assert.ok(md.includes("partial answer"), "the streamed text is kept");
+        assert.ok(md.indexOf("partial answer") < md.indexOf("## FAILED:"), "the text precedes the failure heading");
+    });
+
+    test("widens the fence when the content contains a tilde line", () => {
+        const entry = makeMinimalEntry({
+            status: "success",
+            responseParts: [new vscode.LanguageModelTextPart("before\n~~~\ninside\n~~~~\nafter")],
+        });
+
+        const md = renderCopilotMd(entry);
+        const fenceLines = md.split("\n").filter((line) => /^~{3,}md$/.test(line));
+
+        assert.ok(fenceLines.length > 0, "a fenced block is rendered");
+        assert.strictEqual(fenceLines[0], "~~~~~md", "the fence is longer than the longest tilde run");
+        assert.ok(md.includes("\n~~~~~\n"), "the block closes with the same fence");
+    });
+
     test("renders the privacy banner and H1 header first", () => {
         const md = renderCopilotMd(makeMinimalEntry());
         const lines = md.split("\n");

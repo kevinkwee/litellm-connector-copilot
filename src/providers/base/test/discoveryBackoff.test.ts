@@ -15,8 +15,9 @@ import { LiteLLMProviderRegistry } from "../../liteLLMProviderRegistry";
  * returns an empty list, until the failure threshold is exceeded and a
  * `vscode.LanguageModelError.Blocked` is thrown.
  *
- * `clearCaches()` clears every backend's history so a user-initiated reload
- * starts from a clean slate.
+ * `clearDiscoveryCaches()` clears every backend's history so a model reload
+ * starts from a clean slate. `clearCaches()` resets the same histories alongside
+ * the per-model caches.
  */
 suite("Discovery backoff", () => {
     let sandbox: sinon.SinonSandbox;

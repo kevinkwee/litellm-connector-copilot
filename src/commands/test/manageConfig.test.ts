@@ -46,13 +46,12 @@ suite("ManageConfig Command Unit Tests", () => {
         assert.strictEqual(executeCommandStub.called, true);
     });
 
-    test("reloadModels triggers provider discovery and shows info", async () => {
+    test("reloadModels asks the provider to reload discovery and reports it", async () => {
         const infoStub = sandbox.stub(vscode.window, "showInformationMessage");
+        const reloadStub = sandbox.stub();
 
         const provider = {
-            clearModelCache: sandbox.stub(),
-            getLastKnownModels: () => [],
-            provideLanguageModelChatInformation: sandbox.stub().resolves([]),
+            reloadModelDiscovery: reloadStub,
         } as unknown as LiteLLMChatProvider;
 
         let handler: (() => Promise<void>) | undefined;
@@ -66,7 +65,9 @@ suite("ManageConfig Command Unit Tests", () => {
         registerReloadModelsCommand(provider);
         await handler?.();
 
+        assert.strictEqual(reloadStub.calledOnce, true);
         assert.ok(infoStub.calledOnce);
+        assert.strictEqual(infoStub.firstCall.args[0], "LiteLLM: Reloading models...");
     });
 });
 
@@ -81,6 +82,30 @@ suite("Model Commands Unit Tests", () => {
         sandbox.restore();
     });
 
+    test("showModels: describes each row with the routable id", async () => {
+        const model = { id: "litellm.example/model", name: "model" } as vscode.LanguageModelChatInformation;
+        const provider = {
+            getLastKnownModels: () => [model],
+        } as unknown as LiteLLMChatProvider;
+        let items: readonly vscode.QuickPickItem[] | undefined;
+        sandbox.stub(vscode.window, "showQuickPick").callsFake(async (candidate) => {
+            items = candidate as readonly vscode.QuickPickItem[];
+            return undefined;
+        });
+
+        let handler: (() => Promise<void>) | undefined;
+        sandbox.stub(vscode.commands, "registerCommand").callsFake((id, cb) => {
+            if (id === "litellm-connector.showModels") {
+                handler = cb as () => Promise<void>;
+            }
+            return { dispose: sandbox.stub() } as vscode.Disposable;
+        });
+
+        registerShowModelsCommand(provider);
+        await handler?.();
+
+        assert.strictEqual(items?.[0].description, "litellm.example/model");
+    });
     test("showModels: prompts to reload when cache is empty", async () => {
         const provider = {
             getLastKnownModels: () => [],

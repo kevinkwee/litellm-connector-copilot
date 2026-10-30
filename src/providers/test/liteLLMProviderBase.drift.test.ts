@@ -216,7 +216,7 @@ suite("Model Drift Detection & State Persistence", () => {
         assert.strictEqual(fired.length, 1, "change event should fire only on the first call");
     });
 
-    test("clearModelCache clears per-config cache", async () => {
+    test("a model reload clears the per-config discovery cache", async () => {
         const config = {
             providerName: "test-group",
             baseUrl: "http://localhost:4000",
@@ -245,7 +245,7 @@ suite("Model Drift Detection & State Persistence", () => {
             new vscode.CancellationTokenSource().token
         );
 
-        provider.clearModelCache();
+        provider.reloadModelDiscovery();
 
         const rediscoverStub = mockSession.client.getModelInfo as sinon.SinonStub;
         rediscoverStub.resetHistory();

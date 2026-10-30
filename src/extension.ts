@@ -72,15 +72,24 @@ export function activate(context: vscode.ExtensionContext): void {
     // Proactively nudge VS Code to call provideLanguageModelChatInformation immediately after
     // registration.  Without this, model discovery (and reasoning-effort schema population) is
     // deferred until the user first opens the model picker.  Firing the change event right after
-    // registration causes VS Code to eagerly re-query the provider — this time with the correct
+    // registration causes VS Code to eagerly re-query the provider, this time with the correct
     // per-group options.configuration values, so reasoning capabilities populate on first load.
     setImmediate(() => {
         Logger.info("Post-registration: nudging VS Code to refresh model information...");
         activeProvider.refreshModelInformation();
     });
 
-    // Re-query models after settings updates so newly completed Language Models provider
-    // configuration flows are reflected without requiring a reload.
+    // Re-query models when a workspace setting that shapes discovery changes, so the
+    // picker reflects it without the user running Reload Models. Only those settings
+    // are watched. Anything else would clear the response cache and re-fetch every
+    // backend for nothing.
+    const discoveryShapingSettings = [
+        "litellm-connector.modelOverrides",
+        "litellm-connector.enableModelOverrides",
+        "litellm-connector.modelCapabilitiesOverrides",
+        "litellm-connector.displayPricingInPicker",
+        "litellm-connector.forceResponsesEndpoint",
+    ];
     let refreshModelsTimer: NodeJS.Timeout | undefined;
     const refreshModelInformation = () => {
         if (refreshModelsTimer) {
@@ -89,17 +98,12 @@ export function activate(context: vscode.ExtensionContext): void {
         refreshModelsTimer = setTimeout(() => {
             refreshModelsTimer = undefined;
             Logger.info("Configuration changed; refreshing model information...");
-            activeProvider.refreshModelInformation();
+            activeProvider.reloadModelDiscovery();
         }, 250);
     };
     context.subscriptions.push(
         vscode.workspace.onDidChangeConfiguration((e) => {
-            // Only refresh when LiteLM-specific settings change, not generic provider config
-            // (e.affectsConfiguration) returns true for the top-level "litellm-connector.*" path
-            if (
-                e.affectsConfiguration("litellm-connector.modelOverrides") ||
-                e.affectsConfiguration("litellm-connector.backendGroups")
-            ) {
+            if (discoveryShapingSettings.some((setting) => e.affectsConfiguration(setting))) {
                 refreshModelInformation();
             }
         })

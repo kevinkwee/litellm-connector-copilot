@@ -39,8 +39,6 @@ export function registerShowModelsCommand(provider: LiteLLMChatProvider): vscode
 
         type ModelQuickPickItem = vscode.QuickPickItem & { modelId: string };
 
-        // Show a quick pick list with user-facing backend:model label.
-        // Copy the internal routable model id to the clipboard.
         const picked = await vscode.window.showQuickPick(
             models
                 .slice()
@@ -49,7 +47,7 @@ export function registerShowModelsCommand(provider: LiteLLMChatProvider): vscode
                 )
                 .map((m) => ({
                     label: m.name,
-                    description: m.name !== m.id ? m.name : undefined,
+                    description: m.id,
                     detail: m.tooltip,
                     modelId: m.id,
                 })) as ModelQuickPickItem[],
@@ -72,29 +70,7 @@ export function registerShowModelsCommand(provider: LiteLLMChatProvider): vscode
 
 export function registerReloadModelsCommand(provider: LiteLLMChatProvider): vscode.Disposable {
     return vscode.commands.registerCommand("litellm-connector.reloadModels", async () => {
-        provider.clearModelCache();
-        try {
-            await vscode.window.withProgress(
-                {
-                    location: vscode.ProgressLocation.Notification,
-                    title: "LiteLLM: Reloading models",
-                    cancellable: false,
-                },
-                async () => {
-                    // Trigger a fresh discovery request. VS Code will call discovery when it needs it,
-                    // but we do it proactively so completions pick up new models immediately.
-                    await provider.provideLanguageModelChatInformation(
-                        { silent: true },
-                        new vscode.CancellationTokenSource().token
-                    );
-                }
-            );
-
-            const count = provider.getLastKnownModels().length;
-            vscode.window.showInformationMessage(`LiteLLM: Reloaded ${count} models.`);
-        } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            vscode.window.showWarningMessage(`LiteLLM: Model reload failed: ${msg}`);
-        }
+        provider.reloadModelDiscovery();
+        vscode.window.showInformationMessage("LiteLLM: Reloading models...");
     });
 }

@@ -147,18 +147,14 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Clears the registry's routing table and every per-model cache, the
-     * discovery response cache, and the backoff histories, then refreshes the
-     * VS Code picker. There is no other model-info cache on the base provider,
-     * because capability lookups always go through the registry, which is
-     * the single source of truth.
+     * Reloads model discovery without dropping routing. The discovery response
+     * cache and the backoff histories are cleared, then VS Code re-queries every
+     * group, so an in-flight request keeps resolving while the picker refills.
      */
-    public clearModelCache(): void {
-        Logger.info("Clearing model discovery cache");
-        this._registry.clear();
-        this._registry.clearCaches();
+    public reloadModelDiscovery(): void {
+        Logger.info("Reloading model discovery");
+        this._registry.clearDiscoveryCaches();
         this.refreshModelInformation();
-        Logger.info("Cleared cache");
     }
 
     /**
