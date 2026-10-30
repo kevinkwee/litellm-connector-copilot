@@ -31,8 +31,6 @@ const CANONICAL_REASONING_EFFORTS: readonly SupportedReasoningEffort[] = [
     "max",
 ];
 
-const CANONICAL_DEFAULT_EFFORT: SupportedReasoningEffort = "medium";
-
 const MODEL_OVERRIDES_SETTING_KEY = "litellm-connector.modelOverrides";
 
 let bundledOverridesCache: ModelOverride[] | undefined;
@@ -72,7 +70,13 @@ function normalizeEfforts(efforts: unknown): SupportedReasoningEffort[] | undefi
     }
 
     const normalized = efforts.filter(isSupportedReasoningEffort);
-    return normalized.length > 0 ? normalized : undefined;
+    if (normalized.length === 0) {
+        return undefined;
+    }
+    // The default is the last entry, so a hand-written override such as
+    // `["high", "low"]` is ordered by the canonical ranking rather than left in
+    // its declared order.
+    return CANONICAL_REASONING_EFFORTS.filter((effort) => normalized.includes(effort));
 }
 
 function validateOverride(entry: unknown, source: string): ModelOverride | undefined {
@@ -272,6 +276,18 @@ export function getEffectiveEfforts(
     return [];
 }
 
+/**
+ * Resolves the default effort for a model.
+ *
+ * An override's `defaultEffort` wins when the list the override declares (or the
+ * canonical list, when it declares none) contains it. Otherwise the default is that
+ * list's highest level, its last entry, because both lists follow the canonical
+ * order.
+ *
+ * The result can sit outside the list the model advertises, because this function
+ * checks membership against the override's list only. Callers check it against the
+ * model's list before showing it.
+ */
 export function getDefaultEffort(
     modelId: string,
     modelInfo?: LiteLLMModelInfo,
@@ -288,26 +304,23 @@ export function getDefaultEffort(
             return undefined;
         }
 
-        if (override.defaultEffort) {
+        const efforts = override.reasoningEfforts ?? CANONICAL_REASONING_EFFORTS;
+        if (override.defaultEffort && efforts.includes(override.defaultEffort)) {
             return override.defaultEffort;
         }
 
-        const efforts = override.reasoningEfforts ?? CANONICAL_REASONING_EFFORTS;
         if (override.supportsReasoning === true || modelInfo?.supports_reasoning) {
-            if (efforts.includes(CANONICAL_DEFAULT_EFFORT)) {
-                return CANONICAL_DEFAULT_EFFORT;
-            }
-            return getDefaultReasoningEffort(efforts) ?? CANONICAL_DEFAULT_EFFORT;
+            return getDefaultReasoningEffort(efforts);
         }
         return undefined;
     }
 
     if (modelInfo?.supports_reasoning) {
-        return CANONICAL_DEFAULT_EFFORT;
+        return getDefaultReasoningEffort(CANONICAL_REASONING_EFFORTS);
     }
 
     return undefined;
 }
 
-export { CANONICAL_REASONING_EFFORTS, CANONICAL_DEFAULT_EFFORT };
+export { CANONICAL_REASONING_EFFORTS };
 export type { ModelOverride } from "../types";

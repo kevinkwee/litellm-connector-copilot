@@ -157,7 +157,14 @@ export function deriveCapabilitiesFromModelInfo(
     const supportsStreaming = supportsNativeStreaming || supportedParams.includes("stream");
 
     const rawLimit = modelInfo?.max_input_tokens ?? modelInfo?.context_window_tokens ?? modelInfo?.max_tokens ?? 128000;
-    const maxOutputTokens = modelInfo?.max_output_tokens ?? 16000;
+    const requestedOutputTokens = modelInfo?.max_output_tokens ?? DEFAULT_RESERVED_OUTPUT_TOKENS;
+    // LiteLLM's model map often declares an output limit at or above the whole
+    // context window, so the reservation is capped at half of it. Reserving it
+    // whole would leave an input limit near zero. A zero reservation would make
+    // the request builder send `max_tokens: 0`, so the reservation floors at one
+    // token.
+    const cappedOutputTokens = requestedOutputTokens > rawLimit / 2 ? Math.floor(rawLimit / 2) : requestedOutputTokens;
+    const maxOutputTokens = Math.max(1, cappedOutputTokens);
     const maxInputTokens = Math.max(1, rawLimit - maxOutputTokens);
 
     return {
@@ -196,16 +203,24 @@ export function capabilitiesToVSCode(
     };
 }
 
+/**
+ * Builds the VS Code model tags for one model.
+ *
+ * `modelName` is the raw model name LiteLLM reports, not the namespaced
+ * `<host>/<model>` id, because the name decides the `inline-edit` tag and a
+ * hostname could otherwise contain `code` and tag every model of that backend.
+ * Tag overrides are keyed by the same raw name.
+ */
 export function getModelTags(
-    modelId: string,
+    modelName: string,
     derived: DerivedModelCapabilities,
     overrides?: Record<string, string[]>,
     capabilityOverrides?: ModelCapabilityOverride
 ): string[] {
     const tags = new Set<string>();
 
-    const modelName = modelId.toLowerCase();
-    if (modelName.includes("coder") || modelName.includes("code")) {
+    const lowerModelName = modelName.toLowerCase();
+    if (lowerModelName.includes("coder") || lowerModelName.includes("code")) {
         tags.add("inline-edit");
     }
 
@@ -236,8 +251,8 @@ export function getModelTags(
         tags.add("terminal-chat");
     }
 
-    if (overrides && overrides[modelId]) {
-        for (const tag of overrides[modelId]) {
+    if (overrides && overrides[modelName]) {
+        for (const tag of overrides[modelName]) {
             tags.add(tag);
         }
     }
@@ -274,6 +289,9 @@ const DEFAULT_REASONING_EFFORTS: readonly SupportedReasoningEffort[] = [
     "xhigh",
     "max",
 ];
+
+/** Output tokens reserved when the model info declares no output limit. */
+const DEFAULT_RESERVED_OUTPUT_TOKENS = 16000;
 
 /**
  * True when the model declares reasoning support, either through the general
@@ -427,6 +445,15 @@ function extractExplicitReasoningEfforts(modelInfo?: LiteLLMModelInfo): Supporte
     return effortOrder.filter((e) => efforts.has(e));
 }
 
+/**
+ * Picks the effort the picker reports when the user has not chosen one.
+ *
+ * A `modelOverrides` default wins when the list the picker offers
+ * (`supportedEfforts`) contains it. Otherwise the default is the highest level that
+ * list offers, so a model that never lists `medium` is not sent a level it rejects.
+ * `supportedEfforts` is in ascending effort order. An empty list has no level to
+ * report, so the result is `undefined`.
+ */
 export function getDefaultReasoningEffort(
     supportedEfforts: readonly SupportedReasoningEffort[],
     modelId?: string,
@@ -439,16 +466,12 @@ export function getDefaultReasoningEffort(
 
     if (modelId) {
         const overrideDefault = getDefaultEffort(modelId, modelInfo, config);
-        if (overrideDefault) {
+        if (overrideDefault && supportedEfforts.includes(overrideDefault)) {
             return overrideDefault;
         }
     }
 
-    if (supportedEfforts.includes("medium")) {
-        return "medium";
-    }
-
-    return supportedEfforts.find((effort) => effort !== "none") ?? supportedEfforts[0];
+    return supportedEfforts[supportedEfforts.length - 1];
 }
 
 /**
@@ -593,20 +616,6 @@ export function mergeConfigurationSchemas(
         properties.temperature = temperatureProperty as unknown as Record<string, unknown>;
     }
     return Object.keys(properties).length > 0 ? { properties } : undefined;
-}
-
-/**
- * Convert LiteLLM effort field names from arbitrary database keys to standard effort strings.
- *
- * Some LiteLLM models may have effort level fields named differently (e.g., camelCase, prefixed).
- * This helper normalizes them to the standard effort strings used in the picker.
- *
- * @param modelInfo LiteLLM model information with reasoning capabilities
- * @returns Standardized reasoning effort string or undefined if not supported
- */
-export function resolveReasoningEffort(modelInfo?: LiteLLMModelInfo): SupportedReasoningEffort | undefined {
-    const supports = getSupportedReasoningEfforts(modelInfo);
-    return getDefaultReasoningEffort(supports);
 }
 
 /**

@@ -107,6 +107,32 @@ suite("modelCapabilities - Reasoning Overhaul", () => {
             const result = deriveCapabilitiesFromModelInfo("test-model", modelInfo);
             assert.strictEqual(result.supportsTools, false); // tools not in empty array
         });
+
+        test("caps an output limit at or above the window to half the window", () => {
+            const cases: { window: number; output?: number; input: number; reserved: number }[] = [
+                { window: 128000, output: 128000, input: 64000, reserved: 64000 },
+                { window: 262144, output: 262144, input: 131072, reserved: 131072 },
+                { window: 200000, output: 128000, input: 100000, reserved: 100000 },
+                { window: 128000, output: 16000, input: 112000, reserved: 16000 },
+                { window: 128000, output: 64000, input: 64000, reserved: 64000 },
+                { window: 128000, input: 112000, reserved: 16000 },
+                { window: 8192, input: 4096, reserved: 4096 },
+                { window: 1, input: 1, reserved: 1 },
+                { window: 0, input: 1, reserved: 1 },
+            ];
+
+            for (const testCase of cases) {
+                const modelInfo: LiteLLMModelInfo = { context_window_tokens: testCase.window };
+                if (testCase.output !== undefined) {
+                    modelInfo.max_output_tokens = testCase.output;
+                }
+
+                const result = deriveCapabilitiesFromModelInfo(`window-${testCase.window}`, modelInfo);
+
+                assert.strictEqual(result.maxInputTokens, testCase.input, `${testCase.window}/${testCase.output}`);
+                assert.strictEqual(result.maxOutputTokens, testCase.reserved, `${testCase.window}/${testCase.output}`);
+            }
+        });
     });
 
     suite("buildReasoningEffortConfigurationSchema", () => {

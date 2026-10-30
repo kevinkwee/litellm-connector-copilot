@@ -1,4 +1,6 @@
 import * as assert from "assert";
+import * as sinon from "sinon";
+import * as vscode from "vscode";
 import {
     capabilitiesToVSCode,
     getModelTags,
@@ -11,6 +13,21 @@ import {
     type DerivedModelCapabilities,
 } from "../modelCapabilities";
 import type { LiteLLMModelInfo, ModelCapabilityOverride, SupportedReasoningEffort } from "../../types";
+
+/** Points `vscode.workspace.getConfiguration` at an override list. Callers restore the stub in a `finally`. */
+function stubWorkspaceConfiguration(overrides: unknown): void {
+    sinon.stub(vscode.workspace, "getConfiguration").returns({
+        get: (key: string, defaultValue?: unknown) => {
+            if (key === "litellm-connector.modelOverrides") {
+                return overrides;
+            }
+            if (key === "litellm-connector.enableModelOverrides") {
+                return true;
+            }
+            return defaultValue;
+        },
+    } as unknown as vscode.WorkspaceConfiguration);
+}
 
 suite("modelCapabilities", () => {
     suite("capabilitiesToVSCode", () => {
@@ -539,26 +556,87 @@ suite("modelCapabilities", () => {
             assert.strictEqual(descs?.[3], "Greater reasoning depth but slower");
         });
 
-        test("defaults to medium for canonical reasoning configuration", () => {
+        test("defaults to the highest listed effort for a canonical reasoning configuration", () => {
             const canonicalEfforts: SupportedReasoningEffort[] = ["none", "minimal", "low", "medium", "high"];
 
             const defaultEffort = getDefaultReasoningEffort(canonicalEfforts, "any-other-model");
             const schema = buildReasoningEffortConfigurationSchema(canonicalEfforts, "any-other-model");
 
-            assert.strictEqual(defaultEffort, "medium");
+            assert.strictEqual(defaultEffort, "high");
             // `default` is present so VS Code renders the effort label next to the model name
-            // (e.g. "model-name · Medium") before the user makes an explicit selection.
-            assert.strictEqual(schema?.properties.reasoningEffort.default, "medium");
+            // (e.g. "model-name · High") before the user makes an explicit selection.
+            assert.strictEqual(schema?.properties.reasoningEffort.default, "high");
         });
 
-        test("defaults to medium for Claude reasoning configuration", () => {
+        test("defaults to the highest listed effort for a Claude reasoning configuration", () => {
             const claudeEfforts: SupportedReasoningEffort[] = ["none", "low", "medium", "high"];
 
             const defaultEffort = getDefaultReasoningEffort(claudeEfforts, "claude-haiku-4-5");
             const schema = buildReasoningEffortConfigurationSchema(claudeEfforts, "claude-haiku-4-5");
 
-            assert.strictEqual(defaultEffort, "medium");
-            assert.strictEqual(schema?.properties.reasoningEffort.default, "medium");
+            assert.strictEqual(defaultEffort, "high");
+            assert.strictEqual(schema?.properties.reasoningEffort.default, "high");
+        });
+
+        test("defaults to the highest listed effort for a single-level ladder and a ladder that skips levels", () => {
+            const minimalOnly: SupportedReasoningEffort[] = ["minimal"];
+
+            assert.strictEqual(getDefaultReasoningEffort(minimalOnly), "minimal");
+            assert.strictEqual(getDefaultReasoningEffort(["none", "xhigh"]), "xhigh");
+        });
+
+        test("returns undefined for an empty effort list", () => {
+            assert.strictEqual(getDefaultReasoningEffort([]), undefined);
+        });
+
+        test("keeps an override default inside the model's list", () => {
+            stubWorkspaceConfiguration([
+                { match: "^test-.*", supportsReasoning: true, reasoningEfforts: ["low", "high"], defaultEffort: "low" },
+            ]);
+            try {
+                assert.strictEqual(
+                    getDefaultReasoningEffort(["low", "high"], "test-model", { supports_reasoning: true }),
+                    "low"
+                );
+            } finally {
+                sinon.restore();
+            }
+        });
+
+        test("falls back to the model's highest effort when the override default is outside its list", () => {
+            stubWorkspaceConfiguration([
+                { match: "^test-.*", supportsReasoning: true, reasoningEfforts: ["low", "high"], defaultEffort: "max" },
+            ]);
+            try {
+                assert.strictEqual(
+                    getDefaultReasoningEffort(["low", "high"], "test-model", { supports_reasoning: true }),
+                    "high"
+                );
+            } finally {
+                sinon.restore();
+            }
+        });
+
+        test("ignores a canonical override default the model does not offer", () => {
+            // The override default passes `getDefaultEffort` because the canonical list
+            // contains it, so only `getDefaultReasoningEffort`'s membership check keeps
+            // the schema default inside the model's narrower ladder.
+            stubWorkspaceConfiguration([{ match: "^test-.*", supportsReasoning: true, defaultEffort: "max" }]);
+            const supportedEfforts: SupportedReasoningEffort[] = ["none", "low", "high", "xhigh"];
+            try {
+                assert.strictEqual(
+                    getDefaultReasoningEffort(supportedEfforts, "test-model", { supports_reasoning: true }),
+                    "xhigh"
+                );
+                assert.strictEqual(
+                    buildReasoningEffortConfigurationSchema(supportedEfforts, "test-model", {
+                        supports_reasoning: true,
+                    })?.properties.reasoningEffort.default,
+                    "xhigh"
+                );
+            } finally {
+                sinon.restore();
+            }
         });
     });
 

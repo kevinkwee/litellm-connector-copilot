@@ -122,7 +122,7 @@ suite("modelOverrides", () => {
         assert.deepStrictEqual(unsupported, []);
     });
 
-    test("getDefaultEffort returns undefined when no override and no model info", () => {
+    test("getDefaultEffort leaves the model info to decide when no override matches", () => {
         getConfigurationStub.returns(buildWorkspaceConfiguration([]));
 
         const gptDefault = getDefaultEffort("gpt-5-mini");
@@ -130,7 +130,7 @@ suite("modelOverrides", () => {
         const unsupportedDefault = getDefaultEffort("unknown-model", { supports_reasoning: false });
 
         assert.strictEqual(gptDefault, undefined);
-        assert.strictEqual(fallbackDefault, "medium");
+        assert.strictEqual(fallbackDefault, "max");
         assert.strictEqual(unsupportedDefault, undefined);
     });
 
@@ -217,8 +217,67 @@ suite("modelOverrides", () => {
 
         const result = getDefaultEffort("test-model", { supports_reasoning: true });
 
-        // Override defaultEffort of "high" should be ignored; falls through to model info path.
-        // With supports_reasoning: true and no override, returns CANONICAL_DEFAULT_EFFORT ("medium").
-        assert.strictEqual(result, "medium");
+        // Overrides are off, so the canonical list decides and its highest level is "max".
+        assert.strictEqual(result, "max");
+    });
+
+    test("getEffectiveEfforts lists a hand-written effort list from weakest to strongest", () => {
+        const userOverrides: ModelOverride[] = [
+            {
+                match: "^test-.*",
+                supportsReasoning: true,
+                reasoningEfforts: ["high", "low"],
+            },
+        ];
+        getConfigurationStub.returns(buildWorkspaceConfiguration(userOverrides));
+
+        assert.deepStrictEqual(getEffectiveEfforts("test-model"), ["low", "high"]);
+    });
+
+    test("getDefaultEffort sorts a hand-written effort list and returns its highest level", () => {
+        const userOverrides: ModelOverride[] = [
+            {
+                match: "^test-.*",
+                supportsReasoning: true,
+                reasoningEfforts: ["high", "low"],
+            },
+        ];
+        getConfigurationStub.returns(buildWorkspaceConfiguration(userOverrides));
+
+        const result = getDefaultEffort("test-model", { supports_reasoning: true });
+
+        assert.strictEqual(result, "high");
+    });
+
+    test("getDefaultEffort ignores an override default outside the override's declared list", () => {
+        const userOverrides: ModelOverride[] = [
+            {
+                match: "^test-.*",
+                supportsReasoning: true,
+                reasoningEfforts: ["low", "high"],
+                defaultEffort: "max",
+            },
+        ];
+        getConfigurationStub.returns(buildWorkspaceConfiguration(userOverrides));
+
+        const result = getDefaultEffort("test-model", { supports_reasoning: true });
+
+        assert.strictEqual(result, "high");
+    });
+
+    test("getDefaultEffort keeps an override default inside the override's declared list", () => {
+        const userOverrides: ModelOverride[] = [
+            {
+                match: "^test-.*",
+                supportsReasoning: true,
+                reasoningEfforts: ["low", "high"],
+                defaultEffort: "low",
+            },
+        ];
+        getConfigurationStub.returns(buildWorkspaceConfiguration(userOverrides));
+
+        const result = getDefaultEffort("test-model", { supports_reasoning: true });
+
+        assert.strictEqual(result, "low");
     });
 });

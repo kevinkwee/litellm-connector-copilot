@@ -57,6 +57,13 @@ suite("Model Tags Unit Tests", () => {
         assert.ok(tags.includes("inline-edit"));
     });
 
+    test("getModelTags adds inline-edit only for a model name that carries a code marker", () => {
+        const derived = createDerived({ supportsStreaming: true });
+
+        assert.strictEqual(getModelTags("gpt-4o", derived).includes("inline-edit"), false);
+        assert.ok(getModelTags("qwen-coder", derived).includes("inline-edit"));
+    });
+
     test("getModelTags adds tools tag for function-calling models", () => {
         const derived = createDerived({ supportsTools: true });
         const tags = getModelTags("gpt-4", derived);

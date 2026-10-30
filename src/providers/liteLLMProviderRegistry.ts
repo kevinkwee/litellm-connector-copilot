@@ -891,7 +891,7 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
 
         const capabilityOverrides = modelCapabilitiesOverrides?.[modelId] ?? modelCapabilitiesOverrides?.[modelName];
         const capabilities = capabilitiesToVSCode(derived, capabilityOverrides);
-        const tags = getDerivedModelTags(modelId, derived, {}, capabilityOverrides);
+        const tags = getDerivedModelTags(modelName, derived, {}, capabilityOverrides);
         const supportedEfforts = getSupportedReasoningEfforts(modelInfo, modelId);
         const reasoningSchema = buildReasoningEffortConfigurationSchema(supportedEfforts, modelId, modelInfo);
         // The temperature knob is advertised only for models that accept the
