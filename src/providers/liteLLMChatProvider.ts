@@ -11,13 +11,14 @@ import type {
 import { LanguageModelTextPart } from "vscode";
 
 import { tryParseJSONObject } from "../utils";
-import { formatConnectorNotice } from "../utils/connectorNotice";
+import { describeStoppedEarly, formatConnectorNotice } from "../utils/connectorNotice";
 import { Logger } from "../utils/logger";
 import { appendRateLimitHint } from "../utils/rateLimitNotice";
 import type { ToolNameMapping } from "../utils/toolNameUtils";
 import { LiteLLMTelemetry } from "../utils/telemetry";
 import { LiteLLMProviderBase } from "./liteLLMProviderBase";
 import { StructuredLogger } from "../observability/structuredLogger";
+import { logFinalUsageEnvelope } from "../observability/finalUsageEnvelope";
 import { ResponsePartCollector, exportCopilotMdEntry } from "../observability";
 import type { CopilotMdEntry } from "../observability";
 import { resolveChatSessionId } from "../utils/chatSessionId";
@@ -59,36 +60,6 @@ import {
 } from "../utils/transportRetry";
 
 /**
- * Returns the notice for a finish reason that leaves the answer incomplete, or
- * `undefined` for reasons that need none. The notice starts with a blank line so
- * it begins its own block.
- */
-function describeStoppedEarly(reason: string | undefined): { reason: string; notice: string } | undefined {
-    if (reason === "length") {
-        return {
-            reason,
-            notice:
-                "\n\n" +
-                formatConnectorNotice(
-                    "The response stopped at the model's output token limit, so it is incomplete. " +
-                        "Raise the model's max output tokens, or ask it to continue."
-                ),
-        };
-    }
-    if (reason === "content_filter") {
-        return {
-            reason,
-            notice:
-                "\n\n" +
-                formatConnectorNotice(
-                    "The provider's content filter ended the response early; part of the answer was withheld."
-                ),
-        };
-    }
-    return undefined;
-}
-
-/**
  * Closes an upstream response body the stream loop may have stopped reading.
  * `decodeSSE` releases its reader lock before returning, so this is safe for an
  * open body (cancels the transfer), a closed one (no-op), or a locked or errored
@@ -111,48 +82,6 @@ function cancelUpstreamBody(body: ReadableStream<Uint8Array>): void {
 export class LiteLLMChatProvider extends LiteLLMProviderBase implements LanguageModelChatProvider {
     constructor(secrets: vscode.SecretStorage, userAgent: string, effortFallbackCache?: EffortFallbackCache) {
         super(secrets, userAgent, effortFallbackCache);
-    }
-
-    private logFinalUsageEnvelope(
-        requestId: string,
-        modelId: string,
-        caller: string,
-        usage: {
-            tokensIn?: number;
-            tokensOut?: number;
-            cachedTokens?: number;
-            cacheCreationInputTokens?: number;
-            reasoningTokens?: number;
-            toolTokens?: number;
-            acceptedPredictionTokens?: number;
-            rejectedPredictionTokens?: number;
-            systemPromptTokens?: number;
-            reservedOutputTokens?: number;
-            totalTokenMax?: number;
-            sawUsageDataPart: boolean;
-            estimatedInputCost?: number;
-            estimatedOutputCost?: number;
-            estimatedTotalCost?: number;
-        }
-    ): void {
-        Logger.debug(
-            `[TokenUsage][Final] request_id=${requestId} model=${modelId} caller=${caller} ` +
-                `tokens_in=${usage.tokensIn ?? "n/a"} tokens_out=${usage.tokensOut ?? "n/a"} ` +
-                `cached_tokens=${usage.cachedTokens ?? "n/a"} cache_creation_input_tokens=${
-                    usage.cacheCreationInputTokens ?? "n/a"
-                } ` +
-                `reasoning_tokens=${usage.reasoningTokens ?? "n/a"} tool_tokens=${usage.toolTokens ?? "n/a"} ` +
-                `accepted_prediction_tokens=${usage.acceptedPredictionTokens ?? "n/a"} rejected_prediction_tokens=${
-                    usage.rejectedPredictionTokens ?? "n/a"
-                } ` +
-                `system_prompt_tokens=${usage.systemPromptTokens ?? "n/a"} reserved_output_tokens=${
-                    usage.reservedOutputTokens ?? "n/a"
-                } ` +
-                `total_token_max=${usage.totalTokenMax ?? "n/a"} streamed_usage=${usage.sawUsageDataPart} ` +
-                `estimated_input_cost=${usage.estimatedInputCost ?? "n/a"} estimated_output_cost=${
-                    usage.estimatedOutputCost ?? "n/a"
-                } estimated_total_cost=${usage.estimatedTotalCost ?? "n/a"}`
-        );
     }
 
     async provideLanguageModelChatInformation(
@@ -557,7 +486,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         : undefined,
             };
             LiteLLMTelemetry.reportMetric(metric);
-            this.logFinalUsageEnvelope(requestId, model.id, caller, {
+            logFinalUsageEnvelope(requestId, model.id, caller, {
                 tokensIn: tokensInForTelemetry,
                 tokensOut,
                 cachedTokens,

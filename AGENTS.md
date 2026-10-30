@@ -195,11 +195,11 @@ src/
 ├── extension.ts         # activation, provider registration, command wiring
 ├── types.ts             # shared extension types
 ├── providers/           # Language Model provider implementations
-│   └── base/            # shared base-orchestrator support modules
+│   └── base/            # shared support modules for the orchestrator and the registry
 ├── adapters/            # HTTP client, payload shaping, SSE and stream parsing, tokenizers
 ├── config/              # configuration and secrets
 ├── commands/            # command registrations and UI entry points
-├── observability/       # structured logging, .copilotmd debug export
+├── observability/       # structured logging, .copilotmd debug export, final usage line
 ├── utils/               # shared utilities (logging, model helpers, pricing)
 └── test/                # integration tests and shared test utilities
 ```
@@ -255,12 +255,12 @@ This structure can be updated as the project evolves. If you add new files or mo
 
 Folder ownership (unit tests are co-located with the module under test in `src/**/test/`):
 
-- `src/providers/`: Language Model provider implementations (`liteLLMProviderBase.ts`, `liteLLMChatProvider.ts`, `index.ts`)
+- `src/providers/`: Language Model provider implementations (`liteLLMProviderBase.ts`, `liteLLMChatProvider.ts`, `index.ts`) and `base/`, the shared modules behind the provider orchestrator and the discovery registry: `requestBuilder.ts`, `transport.ts`, `types.ts`, `discoveryBackoff.ts`, `backendIdentity.ts`, `discoveryFailure.ts`, `pausedModelListing.ts`, `debouncedEmitter.ts`
 - `src/adapters/`: HTTP clients, payload shaping, endpoint-specific parsing, SSE and streaming (`sse/`, `streaming/`), tokenizers
 - `src/utils/`: shared utilities (logging, local request metrics, model helpers, pricing, `chatSessionId`, `thinkingBlocks`, `promptCaching`, `connectorNotice`, `transportRetry`, `rateLimitRetryPolicy`, `rateLimitNotice`, `toolNameUtils`, `byteEncoding`)
 - `src/config/`: configuration and secrets
 - `src/commands/`: command registrations and UI entry points
-- `src/observability/`: structured logging and the `.copilotmd` debug export
+- `src/observability/`: structured logging, the `.copilotmd` debug export, and `finalUsageEnvelope.ts`, which writes the token and cost totals of a completed request to a single `[TokenUsage][Final]` line
 - `src/test/`: integration tests (`integration/`) and shared test utilities (`utils/`)
 
 ## Error Handling
@@ -619,6 +619,7 @@ This extension integrates LiteLLM proxies into VS Code's Language Model APIs. It
   - `src/adapters/litellmClient.ts`: HTTP client and endpoint routing integration.
   - `src/adapters/responsesAdapter.ts`: LiteLLM `/responses` endpoint payload translation. It converts a named `tool_choice` to the top-level `{ type: "function", name }` shape and passes `auto` / `required` through. A named choice whose tool is not in the tools it sends is dropped, because the endpoint rejects a choice for a missing tool. The output-token cap travels as `max_output_tokens`, because the Responses API has no `max_tokens` parameter.
   - `/responses` stream event handling (`output_item.delta`, `output_item.done`, anonymous tool buffering) lives in `src/adapters/streaming/liteLLMStreamInterpreter.ts`.
+  - `src/adapters/streaming/upstreamStreamError.ts`: reads a mid-stream failure frame (`{"error": ...}`, a Responses `error` event, or `response.failed`) into an `UpstreamStreamError`, including LiteLLM's three-digit `code` status and the length-capped detail.
   - `src/adapters/streaming/usagePayload.ts`: normalizes LiteLLM's usage variants into the internal shape and resolves the Anthropic cache-write and cache-read counters from `prompt_tokens_details`, the plural `input_tokens_details` (LiteLLM's `ResponseAPIUsage` spelling), the singular `input_token_details`, or the top-level mirrors (in that precedence). A detail object the payload omits stays absent rather than being created as zeros. One the payload carries but leaves uncounted still reports zero.
   - `src/adapters/tokenUtils.ts`: token budgeting, trimming, and related helpers.
 
@@ -659,7 +660,7 @@ Keep this pipeline shared unless the change is intentionally protocol-specific a
 - **Tool names**: `sanitizeToolName` (`src/utils/toolNameUtils.ts`) is the single sanitizer. A name matching `^[a-zA-Z][a-zA-Z0-9_-]{0,63}$` passes through unchanged, so `github__create_issue` stays distinct from `github_create_issue`; any other name has invalid characters replaced, gains a `tool_` prefix when it does not start with a letter, and is truncated to 64 characters for the Bedrock Converse API. Repeated underscores are never collapsed, because collapsing merges two declared tools into one name. `deriveWireToolNames` then makes the advertised list unique: two declared names that sanitize or truncate to the same wire name would otherwise let a call resolve to the wrong tool, so the later one gains a numeric suffix and `tools.name_collision` records it. `buildToolNameMapping` returns both directions in one `ToolNameMapping`. `convertTools` returns that mapping with the tool definitions, and `buildOpenAIChatRequest` returns it with the body. Two consumers read it: `convertMessages` replays a tool call under the wire name the request advertised, and `createInitialStreamingState` carries the wire-to-declared direction so `resolveToolCallName` can translate a model's call at every place the interpreter reads a tool name (the chat delta and update buffers, the keyed and anonymous `/responses` flushes, and the Gemini passthrough). `LanguageModelToolCallPart.name` is then a name VS Code declared, and both directions come from the same list the request advertised, after quota redaction and null filtering. The context-overflow retry is the one exception: it resends a rebuilt body with the original body's mapping, so a call whose name that rebuild changed reaches VS Code untranslated and is dropped.
 - **Tool schemas**: `sanitizeSchema` (`src/utils.ts`) merges a composite (`anyOf` / `oneOf` / `allOf`) instead of replacing the schema with one branch. The outer schema's keys win, the preferred branch (the string branch, else the first) fills only the keys it lacks, a branch's `required` list is never copied, and a schema with `properties` but no `type` becomes an object. `convertTools` guarantees the top-level parameters are an object schema and preserves every declared property type.
 - **Tool selection**: a caller that forces a tool call (`LanguageModelChatToolMode.Required`) with one tool sends `tool_choice: { type: "function", function: { name } }`; with several tools it sends `tool_choice: "required"`, which LiteLLM maps onto Anthropic's `any` and OpenAI's `required`. `Auto` leaves the field to the request builder, which adds `"auto"` only when the model declares support.
-- **Connector notices**: text the connector writes itself (failure explanations, stop notices) is `formatConnectorNotice(...)` from `src/utils/connectorNotice.ts`. A notice starts the response or a new block, so a notice appended to streamed text carries `\n\n` before the prefix.
+- **Connector notices**: text the connector writes itself (failure explanations, stop notices) is `formatConnectorNotice(...)` from `src/utils/connectorNotice.ts`, and the stop notice for a `length` or `content_filter` finish reason is `describeStoppedEarly(...)` from the same module. A notice starts the response or a new block, so a notice appended to streamed text carries `\n\n` before the prefix.
 - **Cost tracking**: pricing from LiteLLM `/model/info` is extracted and propagated through `StreamTokenCapture`. Request-level estimated costs are attached to usage payloads and telemetry metrics.
 
 ### Anthropic Thinking Preservation (Claude)
@@ -779,7 +780,7 @@ The `BackendRegistry` (class `LiteLLMProviderRegistry` in `src/providers/litellm
 The contract is **public read, internal write**:
 
 - **Public surface (read + ingress)**:
-  - `discoverModels(options, token)`: the only way for VS Code (or any consumer) to fetch a model list and populate the registry. The registry owns the HTTP fetch, the namespacing (`<routing>/<rawModel>` ids), and the change detection. Consumers see a single ingress that returns the model list, updates the registry, and fires the change event as a unit. Discovery applies LiteLLM's paused-model listing rule (see `toListableDeployments`): deployments with `model_info.blocked === true` are dropped, each public `model_name` is listed once from its first live deployment, and a name whose every deployment is paused is hidden.
+  - `discoverModels(options, token)`: the only way for VS Code (or any consumer) to fetch a model list and populate the registry. The registry owns the HTTP fetch, the namespacing (`<routing>/<rawModel>` ids), and the change detection. Consumers see a single ingress that returns the model list, updates the registry, and fires the change event as a unit. Discovery applies LiteLLM's paused-model listing rule (see `toListableDeployments` in `src/providers/base/pausedModelListing.ts`): deployments with `model_info.blocked === true` are dropped, each public `model_name` is listed once from its first live deployment, and a name whose every deployment is paused is hidden. The registry builds its cache keys with `toBackendIdentityKey` (`src/providers/base/backendIdentity.ts`) and classifies refresh failures with `isTransientDiscoveryFailure` (`src/providers/base/discoveryFailure.ts`).
   - `lookup(id)`: resolve a namespaced id to its routing entry (`{baseUrl, apiKey, rawModelName, routingIdentity}`). This is the fallback for a model object the registry did not produce.
   - `lookupInfo(info)`: resolve the exact model object VS Code passes back at request time. This is the primary response-time path, because two groups on the same host produce the same namespaced ids but different credentials. The registry records each object in a `WeakMap` as it returns it from discovery.
   - `extractRawName(id)`: strip the routing prefix from a namespaced id.

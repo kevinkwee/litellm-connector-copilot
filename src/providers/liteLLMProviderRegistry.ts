@@ -78,12 +78,14 @@ import {
 import { deriveGroupNameFromUrl } from "../utils";
 import { sleepWithCancellation } from "../utils/transportRetry";
 import { sha256HexAsync } from "../utils/discoveryHash";
-import { LiteLLMDiscoveryError } from "../adapters/litellmClient";
-import type { LiteLLMConfig, LiteLLMModelInfo, LiteLLMModelInfoResponse } from "../types";
+import type { LiteLLMConfig, LiteLLMModelInfo } from "../types";
 import type { ConfigManager } from "../config/configManager";
 import type { BackendSession } from "./backendSession";
 import { sharedDiscoveryBackoff } from "./base/discoveryBackoff";
 import { DebouncedEmitter } from "./base/debouncedEmitter";
+import { toBackendIdentityKey } from "./base/backendIdentity";
+import { describeDiscoveryFailure, isTransientDiscoveryFailure } from "./base/discoveryFailure";
+import { toListableDeployments, type LiteLLMModelInfoEntry } from "./base/pausedModelListing";
 import {
     derivePriceCategory,
     extractPricing,
@@ -99,46 +101,6 @@ interface CachedDiscoveryResult {
     readonly models: readonly vscode.LanguageModelChatInformation[];
     readonly fetchedAtMs: number;
     readonly ttlMs: number;
-}
-
-/**
- * Hashes the API key for use in internal keys. Only the first 8 characters of
- * the SHA-256 digest are used, so the raw key is never logged or persisted.
- */
-async function hashApiKeySuffixAsync(apiKey: string | undefined): Promise<string> {
-    return apiKey ? (await sha256HexAsync(apiKey)).slice(0, 8) : "anonymous";
-}
-
-/**
- * Identity of one configured provider group: its server URL plus a suffix of a
- * hash of its API key.
- *
- * The same value keys the discovery response cache and the per-backend model
- * list, so groups that differ in URL, scheme, or API key never share a cache
- * entry. The scheme is kept as written because `http` and `https` may be
- * different servers.
- */
-async function toBackendIdentityKey(baseUrl: string, apiKey: string | undefined): Promise<string> {
-    return `${baseUrl.replace(/\/+$/, "")}#${await hashApiKeySuffixAsync(apiKey)}`;
-}
-
-/**
- * Returns a short, log-safe reason for a failed discovery refresh.
- */
-function describeDiscoveryFailure(err: unknown): string {
-    const message = err instanceof Error ? err.message : String(err);
-    const singleLine = message.replace(/\s+/g, " ").trim();
-    return singleLine.length > 120 ? `${singleLine.slice(0, 117)}...` : singleLine;
-}
-
-/**
- * Statuses that mean this group is misconfigured rather than the endpoint
- * being unhealthy. Serving the last known list for one of them would hide the
- * problem behind a warning icon, so discovery returns an empty list instead.
- */
-const NON_TRANSIENT_DISCOVERY_STATUS = new Set([400, 401, 403, 404]);
-function isTransientDiscoveryFailure(err: unknown): boolean {
-    return !(err instanceof LiteLLMDiscoveryError && NON_TRANSIENT_DISCOVERY_STATUS.has(err.status));
 }
 
 /**
@@ -192,63 +154,6 @@ function setsEqual(a: Set<string>, b: Set<string>): boolean {
         }
     }
     return true;
-}
-
-/**
- * A single deployment row from a `/model/info` response. The same public
- * `model_name` can be served by multiple deployments with different
- * credentials or providers.
- */
-type LiteLLMModelInfoEntry = LiteLLMModelInfoResponse["data"][number];
-
-/**
- * Applies LiteLLM's paused-model listing rule to a `/model/info` payload,
- * matching `Router.get_fully_blocked_model_names` on the proxy: a
- * deployment whose `model_info.blocked` is `true` is admin-paused and is
- * dropped. A public name is hidden only when every deployment carrying it
- * is paused; with at least one non-paused deployment the name stays
- * listable and is represented by its first non-paused deployment, so
- * multi-deployment names appear once. Entries without a `model_name` are
- * passed through unless paused, so the unknown-name skip in
- * `toVSCodeInfo` keeps reporting them. Strict `=== true` leaves older
- * proxies that do not send the flag untouched.
- */
-export function toListableDeployments(data: readonly LiteLLMModelInfoEntry[]): LiteLLMModelInfoEntry[] {
-    const namesWithPausedDeployment = new Set<string>();
-    const namesWithLiveDeployment = new Set<string>();
-    for (const entry of data) {
-        if (!entry.model_name) {
-            continue;
-        }
-        if (entry.model_info?.blocked === true) {
-            namesWithPausedDeployment.add(entry.model_name);
-        } else {
-            namesWithLiveDeployment.add(entry.model_name);
-        }
-    }
-    const hiddenNames = [...namesWithPausedDeployment].filter((name) => !namesWithLiveDeployment.has(name));
-    if (hiddenNames.length > 0) {
-        StructuredLogger.debug("discovery.paused_deployments_filtered", {
-            hiddenModelNames: hiddenNames.sort(),
-            hiddenCount: hiddenNames.length,
-        });
-    }
-
-    const listedNames = new Set<string>();
-    const listable: LiteLLMModelInfoEntry[] = [];
-    for (const entry of data) {
-        if (entry.model_info?.blocked === true) {
-            continue;
-        }
-        if (entry.model_name && listedNames.has(entry.model_name)) {
-            continue;
-        }
-        if (entry.model_name) {
-            listedNames.add(entry.model_name);
-        }
-        listable.push(entry);
-    }
-    return listable;
 }
 
 export class LiteLLMProviderRegistry implements vscode.Disposable {
@@ -900,7 +805,7 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     private toVSCodeInfo(
-        entry: LiteLLMModelInfoResponse["data"][number],
+        entry: LiteLLMModelInfoEntry,
         backendName: string,
         backend: { url?: string; apiKey?: string } | undefined,
         displayLabel: string,
