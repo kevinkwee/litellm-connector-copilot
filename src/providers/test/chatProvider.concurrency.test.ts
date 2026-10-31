@@ -3,7 +3,7 @@ import * as sinon from "sinon";
 import * as vscode from "vscode";
 
 import { LiteLLMChatProvider } from "../";
-import type { OpenAIChatCompletionRequest } from "../../types";
+import type { OpenAIChatCompletionRequest, OpenAIChatMessage } from "../../types";
 import {
     collectResponseText,
     collectToolCalls,
@@ -30,19 +30,19 @@ const STOP_ARGUMENTS = { shellId: "logo-verify-server" };
 
 const MODEL = createMockModel({ maxOutputTokens: 4096, capabilities: { toolCalling: true, imageInput: false } });
 
-function sessionLabelOf(messages: readonly vscode.LanguageModelChatRequestMessage[]): string {
-    const firstPart = messages[0]?.content[0];
-    if (!(firstPart instanceof vscode.LanguageModelTextPart)) {
+function sessionLabelOf(messages: readonly OpenAIChatMessage[]): string {
+    const firstContent = messages[0]?.content;
+    if (typeof firstContent !== "string") {
         throw new Error("Expected the first request message to carry the session label");
     }
-    return firstPart.value;
+    return firstContent;
 }
 
 interface ProviderSeams {
     _configManager: { getConfig: () => Promise<unknown> };
     sendRequestWithRetry: (
         body: OpenAIChatCompletionRequest,
-        messages: readonly vscode.LanguageModelChatRequestMessage[]
+        model: vscode.LanguageModelChatInformation
     ) => Promise<ReadableStream<Uint8Array>>;
 }
 
@@ -65,8 +65,8 @@ class ConcurrentSessionsHarness {
             emptyResponseRetryDelayMs: 1,
             networkRetryDelayMs: 1,
         });
-        sandbox.stub(seams, "sendRequestWithRetry").callsFake(async (_body, messages) => {
-            const label = sessionLabelOf(messages);
+        sandbox.stub(seams, "sendRequestWithRetry").callsFake(async (body) => {
+            const label = sessionLabelOf(body.messages);
             const previousCalls = this.upstreamCallsBySession.get(label) ?? 0;
             this.upstreamCallsBySession.set(label, previousCalls + 1);
             return previousCalls === 0 ? streamsBySession[label].body : createMockSSEStream([]);

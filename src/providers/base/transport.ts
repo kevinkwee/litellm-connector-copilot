@@ -1,9 +1,8 @@
 import type * as vscode from "vscode";
 import { LiteLLMClient } from "../../adapters/litellmClient";
-import { isContextOverflowError } from "../../adapters/tokenUtils";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types";
-import type { SendRequestArgs, TransportDeps } from "./types";
+import type { TransportDeps } from "./types";
 
 /**
  * Sends a LiteLLM request to the configured endpoint.
@@ -44,29 +43,6 @@ export class Transport {
                     },
                     this.userAgent
                 ));
-    }
-
-    public async sendRequestWithRetry(args: SendRequestArgs): Promise<ReadableStream<Uint8Array>> {
-        const { request, progress, token, caller, modelInfo, model, configuration, requestId } = args;
-        try {
-            return await this.sendRequestToLiteLLM(
-                request,
-                progress,
-                token,
-                caller,
-                modelInfo,
-                configuration,
-                requestId
-            );
-        } catch (err) {
-            if (isContextOverflowError(err) && modelInfo?.max_input_tokens) {
-                this.logger.warn("Retrying after context overflow", err);
-                const trimmed: OpenAIChatCompletionRequest = { ...request };
-                trimmed.max_tokens = Math.min(trimmed.max_tokens ?? model.maxOutputTokens, model.maxOutputTokens);
-                return this.sendRequestToLiteLLM(trimmed, progress, token, caller, modelInfo, configuration, requestId);
-            }
-            throw err;
-        }
     }
 
     public async sendRequestToLiteLLM(

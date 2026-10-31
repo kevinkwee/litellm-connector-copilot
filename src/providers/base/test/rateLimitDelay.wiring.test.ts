@@ -91,18 +91,15 @@ suite("rateLimitMaxDelayMs wiring", () => {
     test("hands the request id to the client so its retry logs match the provider's", async () => {
         const transport = makeTransport();
 
-        await transport.sendRequestWithRetry({
-            request: req,
-            messages: [],
-            model: { maxOutputTokens: 100 } as vscode.LanguageModelChatInformation,
-            options: {} as vscode.ProvideLanguageModelChatResponseOptions,
-            progress: { report: () => {} },
-            token: new vscode.CancellationTokenSource().token,
-            caller: "chat",
-            modelInfo: { mode: "chat" },
-            configuration: { baseUrl: "https://x", apiKey: "k" },
-            requestId: "req-42",
-        });
+        await transport.sendRequestToLiteLLM(
+            req,
+            { report: () => {} } as unknown as vscode.Progress<vscode.LanguageModelResponsePart>,
+            new vscode.CancellationTokenSource().token,
+            "chat",
+            { mode: "chat" },
+            { baseUrl: "https://x", apiKey: "k" },
+            "req-42"
+        );
 
         assert.strictEqual(lastChatRequestId, "req-42");
     });

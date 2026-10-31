@@ -10,7 +10,7 @@
  * - trace: Full payloads, raw SSE frames, detailed parameter maps, hook context snapshots
  * - debug: Detailed flow information, endpoint selection decisions, parameter filtering outcomes
  * - info: High-level lifecycle events, request ingress, completion status, token totals
- * - warn: Recoverable issues, parameter suppression, endpoint fallback, trimming near limits
+ * - warn: Recoverable issues, parameter suppression, endpoint fallback, retried attempts
  * - error: Failures and exceptions, request failures, unhandled errors, quota exhaustion
  */
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error";
@@ -26,10 +26,7 @@ export type EventType =
     | "endpoint.fallback"
     | "param.suppressed"
     | "param.added"
-    | "trim.executed"
-    | "trim.skipped"
     | "tool.called"
-    | "tool.redacted"
     | "hook.invoked"
     | "stream.chunk"
     | "stream.complete"

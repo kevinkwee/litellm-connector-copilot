@@ -1,6 +1,5 @@
 import type * as vscode from "vscode";
 import { convertMessages, convertTools, validateRequest } from "../../utils";
-import { trimMessagesToFitBudget } from "../../adapters/tokenUtils";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest, OpenAIFunctionToolDef } from "../../types";
 import { DEFAULT_ANTHROPIC_PROMPT_CACHING, resolveAnthropicCacheControl } from "../../utils/promptCaching";
 import { isDeepSeekModel, resolveToolResultImageMode, resolveToolResultTextMode } from "../../utils/modelUtils";
@@ -10,7 +9,6 @@ import type { RequestBuilderDeps } from "./types";
 export class RequestBuilder {
     private readonly configManager: RequestBuilderDeps["configManager"];
     private readonly getReasoningEffort: RequestBuilderDeps["getReasoningEffort"];
-    private readonly detectQuotaToolRedaction: RequestBuilderDeps["detectQuotaToolRedaction"];
     private readonly stripUnsupportedParametersFromRequest: RequestBuilderDeps["stripUnsupportedParametersFromRequest"];
     private readonly isParameterSupported: RequestBuilderDeps["isParameterSupported"];
     private readonly getUnsupportedParameters: RequestBuilderDeps["getUnsupportedParameters"];
@@ -21,7 +19,6 @@ export class RequestBuilder {
     constructor(deps: RequestBuilderDeps) {
         this.configManager = deps.configManager;
         this.getReasoningEffort = deps.getReasoningEffort;
-        this.detectQuotaToolRedaction = deps.detectQuotaToolRedaction;
         this.stripUnsupportedParametersFromRequest = deps.stripUnsupportedParametersFromRequest;
         this.isParameterSupported = deps.isParameterSupported;
         this.getUnsupportedParameters = deps.getUnsupportedParameters;
@@ -35,7 +32,7 @@ export class RequestBuilder {
      *
      * Returns the body with the tool-name mapping it advertised, because the
      * response path and history replay both need to agree with exactly the tool
-     * list this build sent (after quota redaction and null filtering).
+     * list this build sent.
      */
     public async buildOpenAIChatRequest(
         messages: readonly vscode.LanguageModelChatRequestMessage[],
@@ -52,34 +49,18 @@ export class RequestBuilder {
         // set all need the RAW model name (the part after the first `/`).
         const rawModelId = this.extractRawModelName(model.id);
 
-        const toolRedaction = this.detectQuotaToolRedaction(
-            messages,
-            options.tools ?? [],
-            `build-${Math.random().toString(36).slice(2, 10)}`,
-            rawModelId,
-            config.disableQuotaToolRedaction === true,
-            _caller
-        );
-        const toolConfig = convertTools({ ...options, tools: toolRedaction.tools });
+        const toolConfig = convertTools(options);
         const toolNames = toolConfig.toolNames;
-        // Silently dropping older turns is surprising, so trimming
-        // (`litellm-connector.autoTrimMessages`) stays off by default. The
-        // overflow-recovery retry in the provider base is gated on the same
-        // setting.
-        const messagesToUse =
-            config.autoTrimMessages === true
-                ? trimMessagesToFitBudget(messages, toolConfig.tools, model, modelInfo)
-                : messages;
-        const openaiMessages = convertMessages(messagesToUse, {
+        const openaiMessages = convertMessages(messages, {
             toolResultImageMode: resolveToolResultImageMode(modelInfo),
             toolResultTextMode: resolveToolResultTextMode(modelInfo),
             wireToolNames: toolNames.declaredToWire,
             ensureReasoningContentInActiveTurn:
                 (toolConfig.tools?.length ?? 0) > 0 && isDeepSeekModel(rawModelId, modelInfo),
         });
-        validateRequest(messagesToUse);
+        validateRequest(messages);
 
-        const reasoningEffort = this.getReasoningEffort(options, model, modelInfo);
+        const reasoningEffort = this.getReasoningEffort(options);
         const mo = (options.modelOptions as Record<string, unknown>) ?? {};
 
         const requestBody: OpenAIChatCompletionRequest = {
@@ -114,17 +95,6 @@ export class RequestBuilder {
                       ? configuredTemp
                       : undefined;
             requestBody.temperature = temp;
-        }
-        if (this.isParameterSupported("frequency_penalty", modelInfo, rawModelId)) {
-            const fp = mo.frequency_penalty as number | undefined;
-            requestBody.frequency_penalty = fp;
-        }
-        if (this.isParameterSupported("presence_penalty", modelInfo, rawModelId)) {
-            const pp = mo.presence_penalty as number | undefined;
-            requestBody.presence_penalty = pp;
-        }
-        if (this.isParameterSupported("stop", modelInfo, rawModelId) && mo.stop) {
-            requestBody.stop = mo.stop as string | string[];
         }
         if (this.isParameterSupported("top_p", modelInfo, rawModelId) && typeof mo.top_p === "number") {
             requestBody.top_p = mo.top_p;

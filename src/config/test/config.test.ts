@@ -39,8 +39,6 @@ suite("ConfigManager Unit Tests", () => {
                     return 60;
                 case "litellm-connector.disableCaching":
                     return true;
-                case "litellm-connector.disableQuotaToolRedaction":
-                    return false;
                 case "litellm-connector.modelOverrides":
                     return [];
                 case "litellm-connector.modelCapabilitiesOverrides":
@@ -134,17 +132,6 @@ suite("ConfigManager Unit Tests", () => {
         const cfg = await manager.getConfig();
 
         assert.deepStrictEqual(cfg.modelCapabilitiesOverrides, {});
-    });
-
-    test("getConfig reads autoTrimMessages (default false, opt-in)", async () => {
-        const manager = new ConfigManager(mockSecrets);
-
-        const defaultConfig = await manager.getConfig();
-        assert.strictEqual(defaultConfig.autoTrimMessages, false);
-
-        settingsMap.set("litellm-connector.autoTrimMessages", true);
-        const enabledConfig = await manager.getConfig();
-        assert.strictEqual(enabledConfig.autoTrimMessages, true);
     });
 
     test("convertProviderConfiguration passes the configured discoveryTimeoutMs to the session client", async () => {
@@ -305,16 +292,21 @@ suite("ConfigManager Unit Tests", () => {
             "inactivityTimeout",
             "disableCaching",
             "anthropicPromptCaching",
-            "disableQuotaToolRedaction",
             "enableModelOverrides",
             "modelCapabilitiesOverrides",
             "forceResponsesEndpoint",
             "allowChatCompletionsFallback",
             "rateLimitMaxDelayMs",
-            "autoTrimMessages",
+            "discoveryTimeoutMs",
+            "discoveryCacheTtlMs",
+            "networkRetries",
+            "networkRetryDelayMs",
+            "emptyResponseRetries",
+            "emptyResponseRetryDelayMs",
+            "displayPricingInPicker",
             // NOTE: sendDefaultParameters, inlineCompletions*, v2ApiEnabled,
-            // enableResponses, modelOverrides (field) are intentionally absent —
-            // removed as dead config. Do NOT re-add them.
+            // enableResponses, and modelOverrides (field) are absent because
+            // nothing reads them. Do not re-add them.
         ];
         for (const field of liveFields) {
             assert.ok(

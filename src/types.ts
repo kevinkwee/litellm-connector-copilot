@@ -12,7 +12,7 @@ export interface OpenAIToolCall {
  */
 export interface OpenAIFunctionToolDef {
     type: "function";
-    function: { name: string; description?: string; parameters?: object };
+    function: { name: string; description?: string; parameters: object };
 }
 
 /**
@@ -209,7 +209,6 @@ export interface LiteLLMConfig {
      * Default: "5m".
      */
     anthropicPromptCaching?: AnthropicPromptCachingMode;
-    disableQuotaToolRedaction?: boolean;
     /**
      * Enable/disable the model override system.
      * When enabled, merged user and bundled model override rules are applied.
@@ -240,16 +239,6 @@ export interface LiteLLMConfig {
 
     /** When true, show pricing data in the model picker hover (if available from /model/info). Default: true. */
     displayPricingInPicker?: boolean;
-
-    /**
-     * When true, trims chat history to fit the model's input token budget:
-     * proactively before each request and again when the upstream rejects
-     * a request for exceeding the context window.
-     * When false (default), the full history is always sent and context
-     * overflow failures surface as errors. Opt-in because trimming
-     * silently drops older turns, which can surprise users.
-     */
-    autoTrimMessages?: boolean;
 
     /** Timeout in milliseconds for /model/info discovery requests. Default: 5000. */
     discoveryTimeoutMs?: number;
@@ -438,9 +427,6 @@ export interface OpenAIChatCompletionRequest {
     max_tokens?: number;
     temperature?: number;
     top_p?: number;
-    frequency_penalty?: number;
-    presence_penalty?: number;
-    stop?: string | string[];
     tools?: OpenAIFunctionToolDef[];
     tool_choice?: OpenAIChatToolChoice;
     stream_options?: { include_usage?: boolean };
@@ -511,9 +497,6 @@ export interface LiteLLMResponsesRequest {
     max_output_tokens?: number;
     temperature?: number;
     top_p?: number;
-    frequency_penalty?: number;
-    presence_penalty?: number;
-    stop?: string | string[];
     tools?: LiteLLMResponseTool[];
     tool_choice?: LiteLLMResponsesToolChoice;
     /**

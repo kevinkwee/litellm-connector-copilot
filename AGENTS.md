@@ -166,7 +166,7 @@ When the linter reports a violation, follow this decision tree **in order**. Use
 
 - Do not comment obvious code. Prefer self-explanatory code through good naming. A comment that exists only to compensate for a poor name is a failure to express yourself in code.
 - Comments explain **WHY**, never **WHAT**. Before writing a comment, ask whether removing it leaves the code harder to understand. If not, delete it.
-- Document non-obvious code blocks, especially around request shaping, streaming, retries, trimming, and error handling. State the assumptions, invariants, and failure modes the next reader cannot infer from the code.
+- Document non-obvious code blocks, especially around request shaping, streaming, retries, and error handling. State the assumptions, invariants, and failure modes the next reader cannot infer from the code.
 - **No black boxes**: if something just works, document *why* (assumptions, invariants, and failure modes).
 - No section separator comments (`// ====== banners` between functions), since file structure already separates the sections.
 - No commented-out code. Use version control.
@@ -211,7 +211,7 @@ This structure can be updated as the project evolves. If you add new files or mo
 - Prefer small, hierarchical modules with one clear responsibility each.
 - Keep orchestration thin. Push protocol and payload shaping and parsing into adapters, and shared transformations into pure utilities.
 - Pure transformations (input to output) stay separated from side effects (I/O, VS Code APIs, HTTP, telemetry).
-- Centralize cross-cutting concerns: logging, telemetry, model capability logic, and token budgeting and trimming.
+- Centralize cross-cutting concerns: logging, telemetry, model capability logic, and token budgeting and output reservation.
 
 ### Layer Rules
 
@@ -341,7 +341,6 @@ A given error should be logged by exactly **one** handler: the layer that **term
 - Approved log content: model identifiers, endpoint paths, HTTP status codes, durations, token counts, and error codes.
 - One exception: when tool call arguments fail to parse, `stream.tool_call_args_invalid_json`, `vscode.tool_call_parse_failed`, and the `[vscodePartEmitter] Part #<n>: Failed to parse tool call arguments` warning keep an `argsPreview` of at most 160 characters. Merged or truncated arguments can only be diagnosed from their content, for example two calls whose fragments share one buffer.
 - Even at trace level, log the **length** of a payload, delta, or reasoning chunk instead of a slice of it, apart from the tool-argument preview above. The structured channel is mirrored to a file, so a `preview` field is a persisted copy of model output or tool arguments.
-- Quota errors detected in chat history trigger tool redaction before anything is logged or retried (see `disableQuotaToolRedaction`).
 - No `console.log()` with user data, since these lines go to production logs.
 
 ## Testing
@@ -536,7 +535,7 @@ Any code you edit must be brought up to these standards:
 
 - [ ] Base class changes benefit all derived providers automatically (shared orchestration)
 - [ ] Protocol-specific code stays in derived classes only (chat protocol)
-- [ ] Shared request pipeline (message normalization, parameter filtering, token trimming) unchanged unless fixing a bug that affects all providers
+- [ ] Shared request pipeline (message normalization, parameter filtering, token budgeting) unchanged unless fixing a bug that affects all providers
 - [ ] The chat provider is tested for any base class change
 - [ ] New provider types extend base and reuse the pipeline (no duplication of request processing or endpoint-specific logic)
 - [ ] Configuration handling respects the VS Code per-group provider config system
@@ -560,9 +559,9 @@ This repository is a **VS Code extension**. Agents must follow these rules when 
 - **Target harness**: the extension is used from the VS Code Agents window with the Copilot SDK harness, not the local Copilot Chat harness. Analyze behavior on that path first. A request travels from the SDK in the agent host through `byokLmProxyService.ts`, then `agentHostClientByokLmChannel.ts`, then the renderer's `AgentHostByokLmHandler` (`src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/`), then `ILanguageModelsService.sendChatRequest`, and reaches this provider through `extHostLanguageModels.ts`. Facts on that path, as of VS Code main:
   - The channel passes `CancellationToken.None`, so Stop never cancels a provider request.
   - The handler buffers the whole response before the SDK sees any of it.
-  - `requestInitiator` is `"core"`. `options.configuration.reasoningEffort` holds the SDK's effort, merged over the schema default. `modelOptions._conversationId` is the SDK session id. `toolMode` is never set.
+  - `requestInitiator` is `"core"`. `options.configuration.reasoningEffort` holds the SDK's effort, merged over the schema default. `modelOptions` carries only `temperature`, `top_p`, `max_tokens`, and `_conversationId` (the SDK session id). `toolMode` is never set.
   - Thinking metadata (`signature`, `_completeThinking`, `redactedData`) round-trips inside the Responses `encrypted_content`, prefixed with `vscode-reasoning-metadata:`. An empty `_completeThinking` is dropped on that hop.
-  - Tool names are the SDK's own. Logic keyed to Copilot Chat's local tool names (such as quota tool redaction) does not fire there.
+  - Tool names are the SDK's own, and a function tool may carry no parameter schema at all.
 - **VS Code API**: Always target the `vscode` namespace.
 - **Proposed APIs**: Use `@vscode/dts` and keep `src/vscode.d.ts` and the `src/vscode.proposed.*.d.ts` files current when relying on proposed types.
 - **Engine target**: `package.json` `engines.vscode` is `^1.125.0`. All provider code must assume the VS Code 1.125 Language Model API surface.
@@ -597,7 +596,7 @@ This extension integrates LiteLLM proxies into VS Code's Language Model APIs. It
 - **Base Orchestrator**: `src/providers/liteLLMProviderBase.ts`
   - Owns the shared request lifecycle used by provider implementations.
   - Wires the BackendRegistry's `onDidChange` event to VS Code's `onDidChangeLanguageModelChatInformation` so the picker refreshes when a backend's model set actually changes.
-  - Runs the common ingress pipeline (normalization, validation, parameter filtering, trimming, error detection).
+  - Runs the common ingress pipeline (normalization, validation, parameter filtering).
   - Delegates transport concerns to adapter and client layers.
   - Centralizes telemetry, logging, and shared error handling.
 
@@ -612,7 +611,7 @@ This extension integrates LiteLLM proxies into VS Code's Language Model APIs. It
   - Reads the per-group credentials from the model object VS Code passes back (see [Configuration Flow](#configuration-flow-per-group)); the per-model picker configuration still arrives on `options.configuration`.
   - Resolves the session id once per request through `resolveChatSessionId` and attaches it to `metadata.session_id` and the `.copilotmd` entry (see [Session Identity](#session-identity)).
   - Returns `LanguageModelChatInformation` entries with `isUserSelectable: true` so models appear in the picker.
-  - Reuses the base request pipeline for normalization, filtering, trimming, and routing.
+  - Reuses the base request pipeline for normalization, filtering, and routing.
 
 - **Entry Point**: `src/extension.ts`
   - Activates the extension and instantiates exactly one `LiteLLMChatProvider`.
@@ -628,7 +627,7 @@ This extension integrates LiteLLM proxies into VS Code's Language Model APIs. It
   - `/responses` stream event handling (`output_item.delta`, `output_item.done`, anonymous tool buffering) lives in `src/adapters/streaming/liteLLMStreamInterpreter.ts`.
   - `src/adapters/streaming/upstreamStreamError.ts`: reads a mid-stream failure frame (`{"error": ...}`, a Responses `error` event, or `response.failed`) into an `UpstreamStreamError`, including LiteLLM's three-digit `code` status and the length-capped detail.
   - `src/adapters/streaming/usagePayload.ts`: normalizes LiteLLM's usage variants into the internal shape and resolves the Anthropic cache-write and cache-read counters from `prompt_tokens_details`, the plural `input_tokens_details` (LiteLLM's `ResponseAPIUsage` spelling), the singular `input_token_details`, or the top-level mirrors (in that precedence). A detail object the payload omits stays absent rather than being created as zeros. One the payload carries but leaves uncounted still reports zero.
-  - `src/adapters/tokenUtils.ts`: token budgeting, trimming, and related helpers.
+  - `src/adapters/tokenUtils.ts`: token counting, output reservation, and related helpers.
 
 - **Config**: `src/config/configManager.ts`
   - Handles per-group provider configuration from `options.configuration` (Base URL, API key, and any group-scoped settings supplied by VS Code).
@@ -648,10 +647,10 @@ All incoming requests flow through this pipeline:
 1. **Normalize**: Convert to `OpenAIChatCompletionRequest` format. Chat messages are already in the correct format.
 2. **Validate**: Get model info, check if model exists and is configured.
 3. **Filter parameters**: Strip unsupported params via `KNOWN_PARAMETER_LIMITATIONS`.
-4. **Trim**: Ensure messages fit within `model.maxInputTokens` budget.
-5. **Detect errors**: Check for quota failures, apply tool redaction if needed.
-6. **Route**: Send to appropriate endpoint via `LiteLLMClient.getEndpoint()`.
-7. **Process response**: Extract completion text or stream response parts.
+4. **Route**: Send to appropriate endpoint via `LiteLLMClient.getEndpoint()`.
+5. **Process response**: Extract completion text or stream response parts.
+
+No message is dropped to fit a token budget. A context-overflow rejection from the proxy is surfaced to the turn as an error.
 
 Keep this pipeline shared unless the change is intentionally protocol-specific and cannot be expressed in the common path.
 
@@ -664,8 +663,8 @@ Keep this pipeline shared unless the change is intentionally protocol-specific a
 - **A response only ever ends when its body is closed**: `processStreamingResponse` cancels the upstream body in `finally`; every exit path (error frame, retry, recovered tool calls) must stop the provider from generating and billing.
 - **Response emission**: emit `LanguageModelResponsePart`, `LanguageModelToolCallPart`, `LanguageModelToolResultPart` to the progress callback.
 - **Tool call parsing**: extract and validate tool calls from the structured streaming fields only. Text that looks like a tool call (`<tool_call>`, `<|tool_call_begin|>`) is model output and is emitted verbatim: turning it into a `LanguageModelToolCallPart` would let a model's explanation of a tool-call format execute a real tool.
-- **Tool names**: `sanitizeToolName` (`src/utils/toolNameUtils.ts`) is the single sanitizer. A name matching `^[a-zA-Z][a-zA-Z0-9_-]{0,63}$` passes through unchanged, so `github__create_issue` stays distinct from `github_create_issue`; any other name has invalid characters replaced, gains a `tool_` prefix when it does not start with a letter, and is truncated to 64 characters for the Bedrock Converse API. Repeated underscores are never collapsed, because collapsing merges two declared tools into one name. `deriveWireToolNames` then makes the advertised list unique: two declared names that sanitize or truncate to the same wire name would otherwise let a call resolve to the wrong tool, so the later one gains a numeric suffix and `tools.name_collision` records it. `buildToolNameMapping` returns both directions in one `ToolNameMapping`. `convertTools` returns that mapping with the tool definitions, and `buildOpenAIChatRequest` returns it with the body. Two consumers read it: `convertMessages` replays a tool call under the wire name the request advertised, and `createInitialStreamingState` carries the wire-to-declared direction so `resolveToolCallName` can translate a model's call at every place the interpreter reads a tool name (the chat delta and update buffers, the keyed and anonymous `/responses` flushes, and the Gemini passthrough). `LanguageModelToolCallPart.name` is then a name VS Code declared, and both directions come from the same list the request advertised, after quota redaction and null filtering. The context-overflow retry is the one exception: it resends a rebuilt body with the original body's mapping, so a call whose name that rebuild changed reaches VS Code untranslated and is dropped.
-- **Tool schemas**: `sanitizeSchema` (`src/utils.ts`) merges a composite (`anyOf` / `oneOf` / `allOf`) instead of replacing the schema with one branch. The outer schema's keys win, the preferred branch (the string branch, else the first) fills only the keys it lacks, a branch's `required` list is never copied, and a schema with `properties` but no `type` becomes an object. `convertTools` guarantees the top-level parameters are an object schema and preserves every declared property type.
+- **Tool names**: `sanitizeToolName` (`src/utils/toolNameUtils.ts`) is the single sanitizer. A name matching `^[a-zA-Z][a-zA-Z0-9_-]{0,63}$` passes through unchanged, so `github__create_issue` stays distinct from `github_create_issue`; any other name has invalid characters replaced, gains a `tool_` prefix when it does not start with a letter, and is truncated to 64 characters for the Bedrock Converse API. Repeated underscores are never collapsed, because collapsing merges two declared tools into one name. `deriveWireToolNames` then makes the advertised list unique: two declared names that sanitize or truncate to the same wire name would otherwise let a call resolve to the wrong tool, so the later one gains a numeric suffix and `tools.name_collision` records it. `buildToolNameMapping` returns both directions in one `ToolNameMapping`. `convertTools` returns that mapping with the tool definitions, and `buildOpenAIChatRequest` returns it with the body. Two consumers read it: `convertMessages` replays a tool call under the wire name the request advertised, and `createInitialStreamingState` carries the wire-to-declared direction so `resolveToolCallName` can translate a model's call at every place the interpreter reads a tool name (the chat delta and update buffers, the keyed and anonymous `/responses` flushes, and the Gemini passthrough). `LanguageModelToolCallPart.name` is then a name VS Code declared, and both directions come from the same list the request advertised.
+- **Tool schemas**: a declared `inputSchema` is forwarded by reference, exactly as the caller wrote it. The LiteLLM fork already converts schemas where a provider needs another shape, and a rewrite in the connector can only lose information the provider needs. `convertTools` substitutes `{ "type": "object", "properties": {} }` only when a tool declares no schema, or declares one that is not a JSON object, because every endpoint validates tool arguments as an object.
 - **Tool selection**: a caller that forces a tool call (`LanguageModelChatToolMode.Required`) with one tool sends `tool_choice: { type: "function", function: { name } }`; with several tools it sends `tool_choice: "required"`, which LiteLLM maps onto Anthropic's `any` and OpenAI's `required`. `Auto` leaves the field to the request builder, which adds `"auto"` only when the model declares support.
 - **Connector notices**: text the connector writes itself (failure explanations, stop notices) is `formatConnectorNotice(...)` from `src/utils/connectorNotice.ts`, and the stop notice for a `length` or `content_filter` finish reason is `describeStoppedEarly(...)` from the same module. A notice starts the response or a new block, so a notice appended to streamed text carries `\n\n` before the prefix.
 - **Cost tracking**: pricing from LiteLLM `/model/info` is extracted and propagated through `StreamTokenCapture`. Request-level estimated costs are attached to usage payloads and telemetry metrics.

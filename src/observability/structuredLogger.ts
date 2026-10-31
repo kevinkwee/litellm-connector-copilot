@@ -61,7 +61,7 @@ function shouldSkipForLevel(channel: vscode.LogOutputChannel, level: LogLevel): 
  * - trace: Full payloads, raw SSE frames, detailed parameter maps, hook context snapshots
  * - debug: Detailed flow information, endpoint selection decisions, parameter filtering outcomes
  * - info: High-level lifecycle events, request ingress, completion status, token totals
- * - warn: Recoverable issues, parameter suppression, endpoint fallback, trimming near limits
+ * - warn: Recoverable issues, parameter suppression, endpoint fallback, retried attempts
  * - error: Failures and exceptions, request failures, unhandled errors, quota exhaustion
  */
 export class StructuredLogger {
@@ -217,7 +217,7 @@ export class StructuredLogger {
 
     /**
      * Logs at warn level.
-     * Use for recoverable issues, parameter suppression, endpoint fallback, trimming near limits.
+     * Use for recoverable issues, parameter suppression, endpoint fallback, retried attempts.
      */
     public static warn(
         event: EventType | string,

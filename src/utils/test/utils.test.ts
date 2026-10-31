@@ -732,228 +732,70 @@ suite("Utility Unit Tests", () => {
         assert.throws(() => validateRequest(missing));
     });
 
-    test("convertTools sanitizes names and schemas and enforces Required mode", () => {
-        const tools: vscode.LanguageModelChatTool[] = [
-            {
-                name: "-bad name",
-                description: "",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        user_id: { type: "number", additionalProperties: { foo: "bar" } },
-                        choice: { anyOf: [{ type: "string" }, { type: "object", custom: true }] },
-                        extra: { type: "object", required: ["a", 7], properties: {} },
-                    },
-                    required: ["user_id", 5],
-                    title: "ignored",
-                },
+    test("convertTools sends the declared schema unchanged and enforces Required mode", () => {
+        const inputSchema = {
+            type: "object",
+            properties: {
+                mode: { anyOf: [{ type: "null" }, { type: "integer" }] },
+                ref: { $ref: "#/$defs/Thing" },
+                name: { type: "string", const: "fixed", title: "Name" },
+                tags: { type: "array", items: [{ type: "string" }, { type: "number" }], minItems: 1 },
+                nested: { type: ["object", "null"], additionalProperties: { type: "string" } },
             },
-        ];
+            $defs: { Thing: { type: "object", properties: { id: { type: "string" } } } },
+            required: ["name"],
+            additionalProperties: false,
+        };
+        const tools: vscode.LanguageModelChatTool[] = [{ name: "-bad name", description: "", inputSchema }];
 
         const res = convertTools({
             tools,
             toolMode: vscode.LanguageModelChatToolMode.Required,
             requestInitiator: "test",
         });
+
         assert.ok(res.tools);
         assert.strictEqual(res.tools?.length, 1);
         assert.strictEqual(res.tools?.[0].function.name, "tool_-bad_name");
-        const params = res.tools?.[0].function.parameters as {
-            properties: Record<string, { type?: string; [key: string]: unknown }>;
-            required: string[];
-        };
-        const userId = params.properties.user_id;
-        assert.strictEqual(userId.type, "number");
-        assert.deepStrictEqual(params.required, ["user_id"]);
-        const choice = params.properties.choice;
-        assert.strictEqual(choice.type, "string");
-        assert.ok(!("custom" in choice));
-        const extra = params.properties.extra;
-        assert.deepStrictEqual(extra.required, ["a"]);
+        assert.strictEqual(res.tools?.[0].function.parameters, inputSchema);
         assert.ok(res.tool_choice && typeof res.tool_choice !== "string");
         assert.strictEqual(res.tool_choice?.function.name, "tool_-bad_name");
     });
 
-    test("convertTools keeps a composite schema's own keys and the branch's type", () => {
-        const tools: vscode.LanguageModelChatTool[] = [
-            {
-                name: "lookup",
-                description: "",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        // pydantic optional: description and default sit beside anyOf
-                        query: {
-                            anyOf: [{ type: "string" }, { type: "null" }],
-                            description: "what to look up",
-                            default: "",
-                        },
-                        filter: {
-                            type: "object",
-                            properties: { owner: { type: "string" } },
-                            anyOf: [{ required: ["owner"] }, { required: ["team"] }],
-                        },
-                    },
-                },
-            },
-        ];
-
-        const params = convertTools({
-            tools,
-            toolMode: vscode.LanguageModelChatToolMode.Auto,
-            requestInitiator: "test",
-        }).tools?.[0].function.parameters as {
-            properties: Record<string, Record<string, unknown>>;
-        };
-
-        assert.deepStrictEqual(params.properties.query, {
-            type: "string",
-            description: "what to look up",
-            default: "",
+    test("convertTools passes a deep-frozen declared schema through untouched", () => {
+        const inputSchema = Object.freeze({
+            type: "object",
+            properties: Object.freeze({ q: Object.freeze({ type: "string" }) }),
         });
-        assert.strictEqual(params.properties.filter.type, "object");
-        assert.deepStrictEqual(params.properties.filter.properties, { owner: { type: "string" } });
-        // A branch's required list never describes the merged value.
-        assert.strictEqual(params.properties.filter.required, undefined);
-    });
 
-    test("convertTools resolves a nested composite inside items", () => {
-        const tools: vscode.LanguageModelChatTool[] = [
-            {
-                name: "batch",
-                description: "",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        rows: { type: "array", items: { anyOf: [{ type: "integer" }, { type: "null" }] } },
-                    },
-                },
-            },
-        ];
-
-        const params = convertTools({
-            tools,
+        const res = convertTools({
+            tools: [{ name: "search", description: "", inputSchema }],
             toolMode: vscode.LanguageModelChatToolMode.Auto,
             requestInitiator: "test",
-        }).tools?.[0].function.parameters as {
-            properties: Record<string, Record<string, unknown>>;
-        };
+        });
 
-        assert.deepStrictEqual(params.properties.rows, { type: "array", items: { type: "integer" } });
+        assert.strictEqual(res.tools?.[0].function.parameters, inputSchema);
     });
 
-    test("convertTools turns a schema with properties but no type into an object", () => {
-        const tools: vscode.LanguageModelChatTool[] = [
-            {
-                name: "loose",
-                description: "",
-                inputSchema: { properties: { value: { type: "string" } } },
-            },
-        ];
-
-        const params = convertTools({
-            tools,
+    test("convertTools substitutes an empty object schema when the tool declares none", () => {
+        const res = convertTools({
+            tools: [
+                { name: "first", description: "" },
+                { name: "second", description: "", inputSchema: null as unknown as object },
+                { name: "third", description: "", inputSchema: [] as unknown as object },
+                { name: "fourth", description: "", inputSchema: "nope" as unknown as object },
+            ],
             toolMode: vscode.LanguageModelChatToolMode.Auto,
             requestInitiator: "test",
-        }).tools?.[0].function.parameters as {
-            type?: string;
-            properties: Record<string, Record<string, unknown>>;
-        };
+        });
 
-        assert.strictEqual(params.type, "object");
-        assert.deepStrictEqual(params.properties, { value: { type: "string" } });
-    });
-
-    test("convertTools guarantees an object schema at the top level", () => {
-        const tools: vscode.LanguageModelChatTool[] = [
-            { name: "primitive", description: "", inputSchema: { type: "string" } },
-        ];
-
-        const params = convertTools({
-            tools,
-            toolMode: vscode.LanguageModelChatToolMode.Auto,
-            requestInitiator: "test",
-        }).tools?.[0].function.parameters as { type?: string; properties?: Record<string, unknown> };
-
-        assert.strictEqual(params.type, "object");
-        assert.deepStrictEqual(params.properties, {});
-    });
-
-    test("convertTools keeps a numeric property numeric", () => {
-        const tools: vscode.LanguageModelChatTool[] = [
-            {
-                name: "measure",
-                description: "",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        confidence: { type: "number" },
-                        width: { type: "number" },
-                        count: { type: "integer" },
-                    },
-                },
-            },
-        ];
-
-        const params = convertTools({
-            tools,
-            toolMode: vscode.LanguageModelChatToolMode.Auto,
-            requestInitiator: "test",
-        }).tools?.[0].function.parameters as {
-            properties: Record<string, Record<string, unknown>>;
-        };
-
-        assert.strictEqual(params.properties.confidence.type, "number");
-        assert.strictEqual(params.properties.width.type, "number");
-        assert.strictEqual(params.properties.count.type, "integer");
-    });
-
-    test("convertTools keeps the outer required list when a composite is present", () => {
-        const tools: vscode.LanguageModelChatTool[] = [
-            {
-                name: "mixed",
-                description: "",
-                inputSchema: {
-                    type: "object",
-                    properties: { a: { type: "string" }, c: { type: "string" } },
-                    required: ["a"],
-                    anyOf: [{ required: ["c"] }, { required: ["a", "c"] }],
-                },
-            },
-        ];
-
-        const params = convertTools({
-            tools,
-            toolMode: vscode.LanguageModelChatToolMode.Auto,
-            requestInitiator: "test",
-        }).tools?.[0].function.parameters as { required?: string[] };
-
-        assert.deepStrictEqual(params.required, ["a"]);
-    });
-
-    test("convertTools resolves a composite nested directly inside a composite", () => {
-        const tools: vscode.LanguageModelChatTool[] = [
-            {
-                name: "nested",
-                description: "",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        value: { anyOf: [{ anyOf: [{ type: "number" }, { type: "null" }] }] },
-                    },
-                },
-            },
-        ];
-
-        const params = convertTools({
-            tools,
-            toolMode: vscode.LanguageModelChatToolMode.Auto,
-            requestInitiator: "test",
-        }).tools?.[0].function.parameters as {
-            properties: Record<string, Record<string, unknown>>;
-        };
-
-        assert.strictEqual(params.properties.value.type, "number");
+        const schemas = (res.tools ?? []).map((tool) => tool.function.parameters);
+        assert.deepStrictEqual(schemas[0], { type: "object", properties: {} });
+        assert.deepStrictEqual(schemas[1], { type: "object", properties: {} });
+        assert.deepStrictEqual(schemas[2], { type: "object", properties: {} });
+        assert.deepStrictEqual(schemas[3], { type: "object", properties: {} });
+        // Each schema-less tool must receive its own object, not a shared one.
+        assert.notStrictEqual(schemas[0], schemas[1]);
     });
 
     test("convertTools suffixes a tool name that collides with an earlier one", () => {

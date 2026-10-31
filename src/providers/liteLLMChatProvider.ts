@@ -72,7 +72,7 @@ function cancelUpstreamBody(body: ReadableStream<Uint8Array>): void {
 /**
  * Chat provider implementation for VS Code's LanguageModelChatProvider.
  *
- * All shared orchestration (model discovery, request building, trimming, parameter filtering,
+ * All shared orchestration (model discovery, request building, parameter filtering,
  * endpoint routing) is implemented in LiteLLMProviderBase.
  *
  * One instance serves every concurrent request (chat sessions, subagents, and background
@@ -188,9 +188,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
 
             const requestBuild = await this.buildOpenAIChatRequest(messages, model, options, modelInfo, caller);
             const requestBody = requestBuild.request;
-            // A resume rebuilds the body, and a rebuild can redact a different
-            // tool, so the mapping is replaced with the one the rebuilt body
-            // advertised.
+            // Reassigned when a resume rebuilds the body, so the mapping always
+            // describes the tool list the current attempt sends.
             let toolNames: ToolNameMapping = requestBuild.toolNames;
             // Sent even when the `.copilotmd` export is off: spend grouping is
             // independent of debug logging.
@@ -224,7 +223,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             tokenCapture.setReservedOutputTokens(reservedOutputTokens);
             tokenCapture.setTotalTokenMax(totalTokenMax);
 
-            // Count the actual transport request after trimming/conversion.
+            // Input estimate for the telemetry report. A resume replaces it with the
+            // resumed estimate.
             tokensIn = estimatedTransportInputTokens;
 
             // A socket death (`terminated` / `fetch failed`) or inactivity abort
@@ -307,7 +307,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     }
                     stream = await this.sendRequestWithRetry(
                         requestBodyBuilt,
-                        activeMessages,
                         model,
                         options,
                         trackedProgress,

@@ -81,22 +81,9 @@ interface BaseTestAccess {
         modelInfo: LiteLLMModelInfo | undefined,
         modelId?: string
     ) => void;
-    detectQuotaToolRedaction: (
-        messages: readonly vscode.LanguageModelChatRequestMessage[],
-        tools: readonly vscode.LanguageModelChatTool[],
-        requestId: string,
-        modelId: string,
-        disableRedaction: boolean
-    ) => {
-        tools: readonly vscode.LanguageModelChatTool[];
-        confidence: "none" | "low" | "high";
-    };
     isParameterSupported: (param: string, modelInfo: LiteLLMModelInfo | undefined, modelId?: string) => boolean;
-    sanitizeErrorTextForLogs: (text: string) => string;
-    collectMessageText: (m: vscode.LanguageModelChatRequestMessage) => string;
     sendRequestWithRetry: (
         request: OpenAIChatCompletionRequest,
-        messages: readonly vscode.LanguageModelChatRequestMessage[],
         model: vscode.LanguageModelChatInformation,
         options: vscode.ProvideLanguageModelChatResponseOptions,
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
@@ -339,13 +326,6 @@ suite("LiteLLMProviderBase", () => {
 
             const stream = await access(provider).sendRequestWithRetry(
                 { model: "model-reasoning", messages: [], stream: true, max_tokens: 100, reasoning_effort: "high" },
-                [
-                    {
-                        role: vscode.LanguageModelChatMessageRole.User,
-                        name: undefined,
-                        content: [new vscode.LanguageModelTextPart("hi")],
-                    },
-                ],
                 model,
                 { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
                 { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
@@ -357,7 +337,7 @@ suite("LiteLLMProviderBase", () => {
             assert.ok(sendStub.calledTwice);
         });
 
-        test("overflow retry surfaces ContextExceeded when autoTrimMessages is disabled", async () => {
+        test("a context overflow surfaces the proxy error once, with no silent retry", async () => {
             const provider = setupProvider();
             const baseConfig = { baseUrl: "https://wolfram.example", apiKey: "k" };
             seedBackendForCall(sandbox, provider, baseConfig, {
@@ -366,194 +346,22 @@ suite("LiteLLMProviderBase", () => {
                 apiKey: "k",
                 client: {} as never,
             });
-            sandbox.stub(access(provider)._configManager, "getConfig").resolves({ autoTrimMessages: false });
-
-            const sendStub = sandbox
-                .stub(access(provider)._transport, "sendRequestToLiteLLM")
-                .rejects(apiError("LiteLLM API error 400: maximum context length exceeded", 400));
-
-            const longText = "word ".repeat(500);
-            const messages: vscode.LanguageModelChatRequestMessage[] = [
-                {
-                    role: vscode.LanguageModelChatMessageRole.User,
-                    name: undefined,
-                    content: [new vscode.LanguageModelTextPart(longText)],
-                },
-                {
-                    role: vscode.LanguageModelChatMessageRole.User,
-                    name: undefined,
-                    content: [new vscode.LanguageModelTextPart("hi")],
-                },
-            ];
-            const smallModel = { ...model, maxInputTokens: 10, maxOutputTokens: 5 };
+            const overflow = apiError("LiteLLM API error 400: maximum context length exceeded", 400);
+            const sendStub = sandbox.stub(access(provider)._transport, "sendRequestToLiteLLM").rejects(overflow);
 
             await assert.rejects(
                 () =>
                     access(provider).sendRequestWithRetry(
-                        { model: "model-reasoning", messages: [], stream: true, max_tokens: 5 },
-                        messages,
-                        smallModel,
+                        { model: "overflow-model", messages: [], stream: true, max_tokens: 5 },
+                        model,
                         { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
                         { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
                         new vscode.CancellationTokenSource().token,
                         "test"
                     ),
-                (err: unknown) =>
-                    err instanceof vscode.LanguageModelError &&
-                    (err as unknown as { code?: string }).code === "ContextExceeded"
+                (err: unknown) => err === overflow
             );
-            // Trimming is disabled, so the overflow must not trigger a
-            // second, silently trimmed attempt.
-            assert.ok(sendStub.calledOnce);
-        });
-
-        test("overflow recovery trims when autoTrimMessages is enabled", async () => {
-            const provider = setupProvider();
-            const baseConfig = { baseUrl: "https://wolfram.example", apiKey: "k" };
-            seedBackendForCall(sandbox, provider, baseConfig, {
-                backendName: "wolfram",
-                baseUrl: "https://wolfram.example",
-                apiKey: "k",
-                client: {} as never,
-            });
-            sandbox.stub(access(provider)._configManager, "getConfig").resolves({ autoTrimMessages: true });
-
-            const sendStub = sandbox
-                .stub(access(provider)._transport, "sendRequestToLiteLLM")
-                .onCall(0)
-                .rejects(apiError("LiteLLM API error 400: maximum context length exceeded", 400))
-                .onCall(1)
-                .resolves(new ReadableStream());
-
-            const longText = "word ".repeat(500);
-            const messages: vscode.LanguageModelChatRequestMessage[] = [
-                {
-                    role: vscode.LanguageModelChatMessageRole.User,
-                    name: undefined,
-                    content: [new vscode.LanguageModelTextPart(longText)],
-                },
-                {
-                    role: vscode.LanguageModelChatMessageRole.User,
-                    name: undefined,
-                    content: [new vscode.LanguageModelTextPart("hi")],
-                },
-            ];
-            const smallModel = { ...model, maxInputTokens: 10, maxOutputTokens: 5 };
-
-            const stream = await access(provider).sendRequestWithRetry(
-                { model: "model-reasoning", messages: [], stream: true, max_tokens: 5 },
-                messages,
-                smallModel,
-                { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
-                new vscode.CancellationTokenSource().token,
-                "test"
-            );
-
-            assert.ok(stream);
-            assert.ok(sendStub.calledTwice);
-            // The retried request must carry the aggressively trimmed history,
-            // not the original oversized message list.
-            const retryMessages = sendStub.secondCall.args[0].messages;
-            assert.strictEqual(retryMessages.length, 1);
-            assert.strictEqual(retryMessages[0].content, "hi");
-        });
-
-        test("overflow retry keeps the session id and the effective effort", async () => {
-            const provider = setupProvider();
-            const baseConfig = { baseUrl: "https://wolfram.example", apiKey: "k" };
-            seedBackendForCall(sandbox, provider, baseConfig, {
-                backendName: "wolfram",
-                baseUrl: "https://wolfram.example",
-                apiKey: "k",
-                client: {} as never,
-            });
-            sandbox.stub(access(provider)._configManager, "getConfig").resolves({ autoTrimMessages: true });
-
-            const sendStub = sandbox
-                .stub(access(provider)._transport, "sendRequestToLiteLLM")
-                .onCall(0)
-                .rejects(apiError("LiteLLM API error 400: maximum context length exceeded", 400))
-                .onCall(1)
-                .resolves(new ReadableStream());
-
-            const messages: vscode.LanguageModelChatRequestMessage[] = [
-                {
-                    role: vscode.LanguageModelChatMessageRole.User,
-                    name: undefined,
-                    content: [new vscode.LanguageModelTextPart("word ".repeat(500))],
-                },
-                {
-                    role: vscode.LanguageModelChatMessageRole.User,
-                    name: undefined,
-                    content: [new vscode.LanguageModelTextPart("hi")],
-                },
-            ];
-
-            await access(provider).sendRequestWithRetry(
-                {
-                    model: "model-reasoning",
-                    messages: [],
-                    stream: true,
-                    max_tokens: 5,
-                    reasoning_effort: "medium",
-                    metadata: { session_id: "11111111-2222-4333-8444-555555555555" },
-                },
-                messages,
-                { ...model, maxInputTokens: 10, maxOutputTokens: 5 },
-                { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
-                new vscode.CancellationTokenSource().token,
-                "test"
-            );
-
-            const retried = sendStub.secondCall.args[0];
-            assert.strictEqual(retried.metadata?.session_id, "11111111-2222-4333-8444-555555555555");
-            assert.strictEqual(retried.reasoning_effort, "medium");
-        });
-
-        test("overflow retry omits an effort the rebuild would re-add", async () => {
-            const provider = setupProvider();
-            // The picker configuration would make the rebuilt body carry "high".
-            const baseConfig = { baseUrl: "https://wolfram.example", apiKey: "k", reasoningEffort: "high" };
-            seedBackendForCall(sandbox, provider, baseConfig, {
-                backendName: "wolfram",
-                baseUrl: "https://wolfram.example",
-                apiKey: "k",
-                client: {} as never,
-            });
-            sandbox.stub(access(provider)._configManager, "getConfig").resolves({ autoTrimMessages: true });
-
-            const sendStub = sandbox
-                .stub(access(provider)._transport, "sendRequestToLiteLLM")
-                .onCall(0)
-                .rejects(apiError("LiteLLM API error 400: maximum context length exceeded", 400))
-                .onCall(1)
-                .resolves(new ReadableStream());
-
-            // No effort on the request itself, so none is in effect.
-            await access(provider).sendRequestWithRetry(
-                { model: "model-reasoning", messages: [], stream: true, max_tokens: 5 },
-                [
-                    {
-                        role: vscode.LanguageModelChatMessageRole.User,
-                        name: undefined,
-                        content: [new vscode.LanguageModelTextPart("word ".repeat(500))],
-                    },
-                    {
-                        role: vscode.LanguageModelChatMessageRole.User,
-                        name: undefined,
-                        content: [new vscode.LanguageModelTextPart("hi")],
-                    },
-                ],
-                { ...model, maxInputTokens: 10, maxOutputTokens: 5 },
-                { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
-                new vscode.CancellationTokenSource().token,
-                "test"
-            );
-
-            assert.strictEqual(sendStub.secondCall.args[0].reasoning_effort, undefined);
+            sinon.assert.calledOnce(sendStub);
         });
 
         test("notifies once per model and original effort", async () => {
@@ -579,13 +387,6 @@ suite("LiteLLMProviderBase", () => {
                 // `EffortFallbackCache` notification key with the
                 // "retries once on reasoning 4xx" test which runs first.
                 { model: "notify-once-model", messages: [], stream: true, max_tokens: 100, reasoning_effort: "high" },
-                [
-                    {
-                        role: vscode.LanguageModelChatMessageRole.User,
-                        name: undefined,
-                        content: [new vscode.LanguageModelTextPart("hi")],
-                    },
-                ],
                 model,
                 { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
                 { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
@@ -612,13 +413,6 @@ suite("LiteLLMProviderBase", () => {
             await assert.rejects(() =>
                 access(provider).sendRequestWithRetry(
                     { model: "model-reasoning", messages: [], stream: true, max_tokens: 100, reasoning_effort: "high" },
-                    [
-                        {
-                            role: vscode.LanguageModelChatMessageRole.User,
-                            name: undefined,
-                            content: [new vscode.LanguageModelTextPart("hi")],
-                        },
-                    ],
                     model,
                     { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
                     { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
@@ -646,13 +440,6 @@ suite("LiteLLMProviderBase", () => {
             await assert.rejects(() =>
                 access(provider).sendRequestWithRetry(
                     { model: "model-reasoning", messages: [], stream: true, max_tokens: 100, reasoning_effort: "high" },
-                    [
-                        {
-                            role: vscode.LanguageModelChatMessageRole.User,
-                            name: undefined,
-                            content: [new vscode.LanguageModelTextPart("hi")],
-                        },
-                    ],
                     model,
                     { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
                     { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
@@ -687,13 +474,6 @@ suite("LiteLLMProviderBase", () => {
 
             const stream = await access(provider).sendRequestWithRetry(
                 { model: "model-reasoning", messages: [], stream: true, max_tokens: 100, reasoning_effort: "high" },
-                [
-                    {
-                        role: vscode.LanguageModelChatMessageRole.User,
-                        name: undefined,
-                        content: [new vscode.LanguageModelTextPart("hi")],
-                    },
-                ],
                 model,
                 { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
                 { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
@@ -723,13 +503,6 @@ suite("LiteLLMProviderBase", () => {
             await assert.rejects(() =>
                 access(provider).sendRequestWithRetry(
                     { model: "model-reasoning", messages: [], stream: true, max_tokens: 100, reasoning_effort: "max" },
-                    [
-                        {
-                            role: vscode.LanguageModelChatMessageRole.User,
-                            name: undefined,
-                            content: [new vscode.LanguageModelTextPart("hi")],
-                        },
-                    ],
                     model,
                     { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
                     { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
@@ -766,13 +539,6 @@ suite("LiteLLMProviderBase", () => {
                     max_tokens: 100,
                     stream_options: { include_usage: true },
                 },
-                [
-                    {
-                        role: vscode.LanguageModelChatMessageRole.User,
-                        name: undefined,
-                        content: [new vscode.LanguageModelTextPart("hi")],
-                    },
-                ],
                 model,
                 { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
                 { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
@@ -803,13 +569,6 @@ suite("LiteLLMProviderBase", () => {
 
             await access(provider).sendRequestWithRetry(
                 { model: "model-reasoning", messages: [], stream: true, max_tokens: 100, reasoning_effort: "high" },
-                [
-                    {
-                        role: vscode.LanguageModelChatMessageRole.User,
-                        name: undefined,
-                        content: [new vscode.LanguageModelTextPart("hi")],
-                    },
-                ],
                 model,
                 { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
                 { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
@@ -1430,15 +1189,21 @@ suite("LiteLLMProviderBase", () => {
             assert.strictEqual(body.temperature, undefined);
         });
 
-        test("removes cache keys inside extra_body and deletes empty containers", () => {
+        test("leaves extra_body and a top-level cache key untouched", () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const body: Record<string, unknown> = {
-                extra_body: { cache: { "no-cache": true, other: "x" } },
-            };
+            const cache = { "no-cache": true, other: "x" };
+            const extraBody = { cache };
+            const body: Record<string, unknown> = { extra_body: extraBody, cache };
+
             access(provider).stripUnsupportedParametersFromRequest(body, {} as LiteLLMModelInfo, "m");
-            const eb = body.extra_body as { cache?: { other?: string } };
-            assert.ok(eb.cache);
-            assert.strictEqual(eb.cache?.other, "x");
+
+            // The client adds the cache directive after the body is built, so
+            // stripping must not reach `extra_body` or `cache`.
+            assert.strictEqual(body.extra_body, extraBody);
+            assert.strictEqual((body.extra_body as { cache: unknown }).cache, cache);
+            assert.strictEqual(body.cache, cache);
+            // An in-place scrub would keep the identities above, so pin the contents too.
+            assert.deepStrictEqual(cache, { "no-cache": true, other: "x" });
         });
 
         test("preserves supported fields when model has no limitations", () => {
@@ -1487,291 +1252,6 @@ suite("LiteLLMProviderBase", () => {
         });
     });
 
-    suite("detectQuotaToolRedaction", () => {
-        const makeText = (s: string): vscode.LanguageModelChatRequestMessage => ({
-            role: vscode.LanguageModelChatMessageRole.User,
-            name: undefined,
-            content: [new vscode.LanguageModelTextPart(s)],
-        });
-
-        const tools: vscode.LanguageModelChatTool[] = [
-            { name: "insert_edit_into_file", description: "", inputSchema: {} },
-        ];
-
-        test("removes failing tool when enabled", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const messages: vscode.LanguageModelChatRequestMessage[] = [
-                {
-                    role: vscode.LanguageModelChatMessageRole.Assistant,
-                    name: undefined,
-                    content: [new vscode.LanguageModelToolCallPart("call_legacy_1", "insert_edit_into_file", {})],
-                } as unknown as vscode.LanguageModelChatRequestMessage,
-                {
-                    role: vscode.LanguageModelChatMessageRole.User,
-                    name: undefined,
-                    content: [
-                        new vscode.LanguageModelToolResultPart("call_legacy_1", [
-                            new vscode.LanguageModelTextPart(
-                                "Error: 429 rate limit exceeded when calling insert_edit_into_file"
-                            ),
-                        ]),
-                    ],
-                } as unknown as vscode.LanguageModelChatRequestMessage,
-            ];
-            const result = access(provider).detectQuotaToolRedaction(messages, tools, "rid", "m", false);
-            assert.strictEqual(result.tools.length, 0);
-            assert.strictEqual(result.confidence, "high");
-        });
-
-        test("does not remove tool when disabled", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const result = access(provider).detectQuotaToolRedaction(
-                [makeText("Error: 429 rate limit exceeded when calling insert_edit_into_file")],
-                tools,
-                "rid",
-                "m",
-                true
-            );
-            assert.strictEqual(result.tools.length, 1);
-            assert.strictEqual(result.confidence, "none");
-        });
-
-        test("does not redact on a bare or path-qualified 429", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            for (const text of [
-                "Applied. Note the unused import on line 429.",
-                "Updated issue-429.md with the requested notes.",
-                "See http429.md for details.",
-                "Fetched https://httpbin.org/status/429 for the test.",
-            ]) {
-                const result = access(provider).detectQuotaToolRedaction(
-                    [
-                        {
-                            role: vscode.LanguageModelChatMessageRole.Assistant,
-                            name: undefined,
-                            content: [new vscode.LanguageModelToolCallPart("call_neg", "insert_edit_into_file", {})],
-                        } as unknown as vscode.LanguageModelChatRequestMessage,
-                        {
-                            role: vscode.LanguageModelChatMessageRole.User,
-                            name: undefined,
-                            content: [
-                                new vscode.LanguageModelToolResultPart("call_neg", [
-                                    new vscode.LanguageModelTextPart(text),
-                                ]),
-                            ],
-                        } as unknown as vscode.LanguageModelChatRequestMessage,
-                    ],
-                    tools,
-                    "rid",
-                    "m",
-                    false
-                );
-                assert.strictEqual(result.tools.length, 1, `should not redact for: ${text}`);
-            }
-        });
-
-        test("redacts when the 429 carries status wording", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            for (const text of [
-                "Request failed with status code 429",
-                "HTTP 429 Too Many Requests",
-                "429 Too Many Requests",
-                "status:429",
-                "code=429",
-                "HTTP-429",
-                "Free tier quota exceeded",
-            ]) {
-                const result = access(provider).detectQuotaToolRedaction(
-                    [
-                        {
-                            role: vscode.LanguageModelChatMessageRole.Assistant,
-                            name: undefined,
-                            content: [new vscode.LanguageModelToolCallPart("call_x", "insert_edit_into_file", {})],
-                        } as unknown as vscode.LanguageModelChatRequestMessage,
-                        {
-                            role: vscode.LanguageModelChatMessageRole.User,
-                            name: undefined,
-                            content: [
-                                new vscode.LanguageModelToolResultPart("call_x", [
-                                    new vscode.LanguageModelTextPart(text),
-                                ]),
-                            ],
-                        } as unknown as vscode.LanguageModelChatRequestMessage,
-                    ],
-                    tools,
-                    "rid",
-                    "m",
-                    false
-                );
-                assert.strictEqual(result.tools.length, 0, `should redact for: ${text}`);
-            }
-        });
-
-        test("does not redact when quota tool is not present", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const result = access(provider).detectQuotaToolRedaction(
-                [makeText("Error: 429 rate limit exceeded")],
-                tools,
-                "rid",
-                "m",
-                false
-            );
-            assert.strictEqual(result.tools.length, 1);
-            assert.strictEqual(result.confidence, "none");
-        });
-
-        test("does not redact when message has no text", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const result = access(provider).detectQuotaToolRedaction(
-                [
-                    {
-                        role: vscode.LanguageModelChatMessageRole.User,
-                        name: undefined,
-                        content: [],
-                    } as unknown as vscode.LanguageModelChatRequestMessage,
-                ],
-                tools,
-                "rid",
-                "m",
-                false
-            );
-            assert.strictEqual(result.tools.length, 1);
-            assert.strictEqual(result.confidence, "none");
-        });
-
-        test("does not redact when quota regex does not match", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const result = access(provider).detectQuotaToolRedaction(
-                [makeText("All good, no errors here insert_edit_into_file")],
-                tools,
-                "rid",
-                "m",
-                false
-            );
-            assert.strictEqual(result.tools.length, 1);
-            assert.strictEqual(result.confidence, "none");
-        });
-
-        test("does not redact when tool regex does not match", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const result = access(provider).detectQuotaToolRedaction(
-                [makeText("Error: 429 rate limit exceeded with replace_string_in_file")],
-                [{ name: "insert_edit_into_file", description: "", inputSchema: {} }],
-                "rid",
-                "m",
-                false
-            );
-            assert.strictEqual(result.tools.length, 1);
-            assert.strictEqual(result.confidence, "low");
-        });
-
-        test("does not redact on echoed Copilot context without rate/quota signal", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const result = access(provider).detectQuotaToolRedaction(
-                [makeText("<context>Some text</context> insert_edit_into_file normal response")],
-                tools,
-                "rid",
-                "m",
-                false
-            );
-            assert.strictEqual(result.tools.length, 1);
-            assert.strictEqual(result.confidence, "none");
-        });
-
-        // Helper functions for new confidence-aware tests
-        const makeToolResultMessage = (
-            callId: string,
-            _toolName: string,
-            resultText: string
-        ): vscode.LanguageModelChatRequestMessage =>
-            ({
-                role: vscode.LanguageModelChatMessageRole.User,
-                name: undefined,
-                content: [
-                    new vscode.LanguageModelToolResultPart(callId, [new vscode.LanguageModelTextPart(resultText)]),
-                ],
-            }) as unknown as vscode.LanguageModelChatRequestMessage;
-
-        const makeAssistantToolCall = (callId: string, toolName: string): vscode.LanguageModelChatRequestMessage =>
-            ({
-                role: vscode.LanguageModelChatMessageRole.Assistant,
-                name: undefined,
-                content: [new vscode.LanguageModelToolCallPart(callId, toolName, {})],
-            }) as unknown as vscode.LanguageModelChatRequestMessage;
-
-        test("redacts on real tool-result quota error for the matching tool", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const messages = [
-                makeAssistantToolCall("call_1", "insert_edit_into_file"),
-                makeToolResultMessage(
-                    "call_1",
-                    "insert_edit_into_file",
-                    "Error: 429 rate limit exceeded while writing file"
-                ),
-            ];
-            const tools: vscode.LanguageModelChatTool[] = [
-                { name: "insert_edit_into_file", description: "", inputSchema: {} },
-            ];
-            const result = access(provider).detectQuotaToolRedaction(messages, tools, "rid", "m", false);
-            assert.strictEqual(result.tools.length, 0);
-            assert.strictEqual(result.confidence, "high");
-        });
-
-        test("does not redact when reminderInstructions body mentions both patterns", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            // A plausible <reminderInstructions> body: text content only, no tool parts.
-            const reminder =
-                "If a tool returns 429 / rate limit exceeded / quota exceeded when calling " +
-                "tools like insert_edit_into_file or replace_string_in_file, do not retry.";
-            const result = access(provider).detectQuotaToolRedaction([makeText(reminder)], tools, "rid", "m", false);
-            assert.strictEqual(result.tools.length, 1);
-            assert.strictEqual(result.confidence, "low");
-        });
-
-        test("does not redact when userRequest body mentions both patterns", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const userRequest =
-                "Help me debug a 429 quota exceeded error coming from insert_edit_into_file in our e2e tests.";
-            const result = access(provider).detectQuotaToolRedaction([makeText(userRequest)], tools, "rid", "m", false);
-            assert.strictEqual(result.tools.length, 1);
-            assert.strictEqual(result.confidence, "low");
-        });
-
-        test("does not redact when quota error is in an older turn (not the most recent tool result)", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const messages = [
-                // Older assistant turn that did NOT call insert_edit_into_file.
-                makeText("Earlier in the conversation."),
-                // Old quota tool result for a different tool.
-                makeToolResultMessage("call_old", "run_in_terminal", "Error: 429 rate limit exceeded"),
-                // Most recent user turn: a clean new request with no quota signal.
-                makeText("Now please continue with the on-boarding flow."),
-            ];
-            const result = access(provider).detectQuotaToolRedaction(messages, tools, "rid", "m", false);
-            assert.strictEqual(result.tools.length, 1);
-            // We find the quota error in an old tool result, but since it's for a
-            // non-redactable tool, we return "low" confidence (not our concern).
-            assert.strictEqual(result.confidence, "low");
-        });
-
-        test("does not redact when tool result is for a different tool than the matched one", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const messages = [
-                makeAssistantToolCall("call_2", "run_in_terminal"),
-                makeToolResultMessage("call_2", "run_in_terminal", "Error: 429 rate limit exceeded from upstream"),
-            ];
-            const tools: vscode.LanguageModelChatTool[] = [
-                { name: "insert_edit_into_file", description: "", inputSchema: {} },
-                { name: "run_in_terminal", description: "", inputSchema: {} },
-            ];
-            const result = access(provider).detectQuotaToolRedaction(messages, tools, "rid", "m", false);
-            assert.strictEqual(result.tools.length, 2);
-            // We find a real quota error in a tool result, but it's for run_in_terminal
-            // which we don't redact, so it's "low" confidence (observability only).
-            assert.strictEqual(result.confidence, "low");
-        });
-    });
-
     suite("provideTokenCount", () => {
         const model: vscode.LanguageModelChatInformation = {
             id: "gpt-4",
@@ -1814,26 +1294,6 @@ suite("LiteLLMProviderBase", () => {
                 apiKey: "k",
             });
             assert.strictEqual(count, 286);
-        });
-    });
-
-    suite("sanitizeErrorTextForLogs / collectMessageText", () => {
-        test("caps long text and removes prompt wrappers", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const longText = "<context>big payload</context> " + "x".repeat(2000);
-            const out = access(provider).sanitizeErrorTextForLogs(longText);
-            assert.ok(out.length <= 600);
-            assert.ok(out.includes("<context>…</context>"));
-        });
-
-        test("collectMessageText handles string content parts", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const text = access(provider).collectMessageText({
-                role: vscode.LanguageModelChatMessageRole.User,
-                name: undefined,
-                content: [new vscode.LanguageModelTextPart("hello")],
-            });
-            assert.strictEqual(text, "hello");
         });
     });
 

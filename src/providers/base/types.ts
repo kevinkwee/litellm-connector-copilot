@@ -1,26 +1,11 @@
 import type * as vscode from "vscode";
-import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types";
+import type { LiteLLMModelInfo } from "../../types";
 import type { LiteLLMClient } from "../../adapters/litellmClient";
 import type { ConfigManager as configMgr } from "../../config/configManager";
 
 export interface RequestBuilderDeps {
     configManager: configMgr;
-    getReasoningEffort: (
-        options: vscode.ProvideLanguageModelChatResponseOptions,
-        model: vscode.LanguageModelChatInformation,
-        modelInfo?: LiteLLMModelInfo
-    ) => string | undefined;
-    detectQuotaToolRedaction: (
-        messages: readonly vscode.LanguageModelChatRequestMessage[],
-        tools: readonly vscode.LanguageModelChatTool[],
-        requestId: string,
-        modelId: string,
-        disableRedaction: boolean,
-        caller?: string
-    ) => {
-        tools: readonly vscode.LanguageModelChatTool[];
-        confidence: "none" | "low" | "high";
-    };
+    getReasoningEffort: (options: vscode.ProvideLanguageModelChatResponseOptions) => string | undefined;
     stripUnsupportedParametersFromRequest: (
         requestBody: Record<string, unknown>,
         modelInfo: LiteLLMModelInfo | undefined,
@@ -72,24 +57,4 @@ export interface TransportDeps {
      * parameter incompatibilities (registry `recordUnsupportedParameter`).
      */
     onUnsupportedParameter?: (model: string, param: string) => void;
-}
-
-export interface SendRequestArgs {
-    request: OpenAIChatCompletionRequest;
-    messages: readonly vscode.LanguageModelChatRequestMessage[];
-    model: vscode.LanguageModelChatInformation;
-    options: vscode.ProvideLanguageModelChatResponseOptions;
-    progress: vscode.Progress<vscode.LanguageModelResponsePart>;
-    token: vscode.CancellationToken;
-    caller?: string;
-    modelInfo?: LiteLLMModelInfo;
-    /**
-     * Per-group provider configuration passed by VS Code on the originating
-     * call. When present, the transport uses its `baseUrl` / `apiKey` directly
-     * to construct the LiteLLM client. When absent, the request cannot be
-     * routed and the transport throws a configuration error.
-     */
-    configuration?: Record<string, unknown>;
-    /** Ties the client's retry logs to the provider's request logs. */
-    requestId?: string;
 }

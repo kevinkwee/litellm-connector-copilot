@@ -15,7 +15,6 @@ export class ConfigManager {
     private static lastInactivityTimeoutWarning: string | undefined;
     private static readonly DISABLE_CACHING_KEY = "litellm-connector.disableCaching";
     private static readonly ANTHROPIC_PROMPT_CACHING_KEY = "litellm-connector.anthropicPromptCaching";
-    private static readonly DISABLE_QUOTA_TOOL_REDACTION_KEY = "litellm-connector.disableQuotaToolRedaction";
     private static readonly KEY_MODEL_OVERRIDES_ENABLE = "litellm-connector.enableModelOverrides";
     private static readonly MODEL_CAPABILITIES_OVERRIDES_KEY = "litellm-connector.modelCapabilitiesOverrides";
     private static readonly FORCE_RESPONSES_ENDPOINT_KEY = "litellm-connector.forceResponsesEndpoint";
@@ -30,7 +29,6 @@ export class ConfigManager {
     private static readonly EMPTY_RESPONSE_RETRIES_KEY = "litellm-connector.emptyResponseRetries";
     private static readonly EMPTY_RESPONSE_RETRY_DELAY_MS_KEY = "litellm-connector.emptyResponseRetryDelayMs";
     private static readonly RATE_LIMIT_MAX_DELAY_SECONDS_KEY = "litellm-connector.rateLimitMaxDelaySeconds";
-    private static readonly AUTO_TRIM_MESSAGES_KEY = "litellm-connector.autoTrimMessages";
 
     // Discovery config defaults and bounds
     private static readonly DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
@@ -203,10 +201,6 @@ export class ConfigManager {
         const anthropicPromptCaching = normalizeAnthropicPromptCachingMode(
             workspaceConfig.get<unknown>(ConfigManager.ANTHROPIC_PROMPT_CACHING_KEY)
         );
-        const disableQuotaToolRedaction = workspaceConfig.get<boolean>(
-            ConfigManager.DISABLE_QUOTA_TOOL_REDACTION_KEY,
-            false
-        );
         const enableModelOverrides = workspaceConfig.get<boolean>(ConfigManager.KEY_MODEL_OVERRIDES_ENABLE, true);
 
         const modelCapabilitiesOverridesRaw = workspaceConfig.get<Record<string, string | string[]>>(
@@ -306,13 +300,10 @@ export class ConfigManager {
         );
         const rateLimitMaxDelayMs = Math.round(rateLimitMaxDelaySeconds * ConfigManager.MS_PER_SECOND);
 
-        const autoTrimMessages = workspaceConfig.get<boolean>(ConfigManager.AUTO_TRIM_MESSAGES_KEY, false);
-
         const config: LiteLLMConfig = {
             inactivityTimeout,
             disableCaching,
             anthropicPromptCaching,
-            disableQuotaToolRedaction,
             enableModelOverrides,
             modelCapabilitiesOverrides,
             forceResponsesEndpoint,
@@ -327,7 +318,6 @@ export class ConfigManager {
             emptyResponseRetries,
             emptyResponseRetryDelayMs,
             rateLimitMaxDelayMs,
-            autoTrimMessages,
         };
         this._lastConfig = config;
         // Shallow copy so callers cannot mutate the cached config in place.

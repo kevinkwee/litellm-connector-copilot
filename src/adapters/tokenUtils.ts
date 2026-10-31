@@ -1,8 +1,6 @@
-import * as vscode from "vscode";
+import type * as vscode from "vscode";
 import type { LiteLLMModelInfo, OpenAIChatMessage } from "../types";
-import { isAnthropicModel } from "../utils/modelUtils";
 import { selectTokenizer } from "./tokenizers/selectTokenizer";
-import { Logger } from "../utils/logger";
 
 // Token estimation constants for binary media types
 // These are conservative estimates to avoid context window overflow
@@ -95,8 +93,8 @@ function estimateImagePartTokens(url: string): number {
 }
 
 /**
- * Counts tokens for the OpenAI-style transport messages that are actually sent
- * to LiteLLM after trimming and tool conversion.
+ * Counts tokens for the OpenAI-style transport messages that the request sends
+ * to LiteLLM after message conversion.
  */
 export function countOpenAIChatMessagesTokens(
     messages: readonly OpenAIChatMessage[],
@@ -183,29 +181,7 @@ export function getTotalTokenLimit(model: vscode.LanguageModelChatInformation, m
 }
 
 /**
- * Roughly estimate tokens for VS Code chat messages (text only)
- */
-export function estimateMessagesTokens(
-    msgs: readonly vscode.LanguageModelChatRequestMessage[],
-    modelId?: string,
-    modelInfo?: LiteLLMModelInfo
-): number {
-    return countTokens(msgs, modelId, modelInfo);
-}
-
-/**
- * Roughly estimate tokens for a single VS Code chat message (text only)
- */
-export function estimateSingleMessageTokens(
-    msg: vscode.LanguageModelChatRequestMessage,
-    modelId?: string,
-    modelInfo?: LiteLLMModelInfo
-): number {
-    return countTokens(msg, modelId, modelInfo);
-}
-
-/**
- * Rough token estimate for tool definitions by JSON size
+ * Rough token estimate for tool definitions by JSON size.
  */
 export function estimateToolTokens(
     tools: { type: string; function: { name: string; description?: string; parameters?: object } }[] | undefined
@@ -219,182 +195,4 @@ export function estimateToolTokens(
     } catch {
         return 0;
     }
-}
-
-/**
- * Determine whether a model should use stricter Anthropic-style budgeting.
- */
-/**
- * Trim messages to fit within the model's input token budget, preserving the system prompt
- * and as much recent context as possible. Anthropic models get a safety margin to avoid
- * overfilling the context window.
- */
-export function trimMessagesToFitBudget(
-    messages: readonly vscode.LanguageModelChatRequestMessage[],
-    tools: { type: string; function: { name: string; description?: string; parameters?: object } }[] | undefined,
-    model: vscode.LanguageModelChatInformation,
-    modelInfo?: LiteLLMModelInfo,
-    hardBudgetOverride?: number
-): readonly vscode.LanguageModelChatRequestMessage[] {
-    const toolTokenCount = estimateToolTokens(tools);
-    const tokenLimit = Math.max(1, model.maxInputTokens);
-
-    const budgetLimit =
-        hardBudgetOverride !== undefined
-            ? Math.max(1, Math.floor(hardBudgetOverride))
-            : (() => {
-                  // Apply a flat safety buffer to avoid context overflow due to tokenizer variance,
-                  // provider-side framing, and other hidden tokens.
-                  //
-                  // This is intentionally applied to *all* models (not just Anthropic) because
-                  // overflow failures are catastrophic and the 5% reduction is a small tradeoff.
-                  const bufferedLimit = Math.max(1, Math.floor(tokenLimit * 0.95));
-
-                  // Keep an additional small margin for Anthropic-style models which tend to be
-                  // stricter about context limits.
-                  return isAnthropicModel(model.id, modelInfo)
-                      ? Math.max(1, Math.floor(bufferedLimit * 0.98))
-                      : bufferedLimit;
-              })();
-
-    const budget = budgetLimit - toolTokenCount;
-    if (budget <= 0) {
-        throw new Error("Message exceeds token limit.");
-    }
-
-    const originalTokens = countTokens(messages, model.id, modelInfo);
-
-    let systemMessage: vscode.LanguageModelChatRequestMessage | undefined;
-    const remaining: vscode.LanguageModelChatRequestMessage[] = [];
-    const messageArray: readonly vscode.LanguageModelChatRequestMessage[] = Array.isArray(messages)
-        ? messages
-        : [messages];
-    for (const msg of messageArray) {
-        // Guard: ensure message has required properties before accessing role
-        if (!msg || typeof msg !== "object" || !("role" in msg)) {
-            continue;
-        }
-        const msgObj = msg as { role?: unknown };
-        const roleValue =
-            typeof msgObj.role === "number" ? msgObj.role : typeof msgObj.role === "string" ? msgObj.role : "";
-        const isSystem =
-            roleValue !== vscode.LanguageModelChatMessageRole.User &&
-            roleValue !== vscode.LanguageModelChatMessageRole.Assistant;
-        if (!systemMessage && isSystem) {
-            systemMessage = msg;
-        } else {
-            remaining.push(msg);
-        }
-    }
-
-    const selected: vscode.LanguageModelChatRequestMessage[] = [];
-    let used = 0;
-
-    // Detect continuation request
-    const lastMessage = remaining.length > 0 ? remaining[remaining.length - 1] : undefined;
-    const isContinuation =
-        lastMessage?.role === (vscode.LanguageModelChatMessageRole.User as unknown as number) &&
-        lastMessage.content.length === 1 &&
-        lastMessage.content[0] instanceof vscode.LanguageModelTextPart &&
-        lastMessage.content[0].value.trim().toLowerCase() === "continue";
-
-    if (systemMessage) {
-        const sysTokens = estimateSingleMessageTokens(systemMessage);
-        if (sysTokens > budget) {
-            throw new Error("Message exceeds token limit.");
-        }
-        selected.push(systemMessage);
-        used += sysTokens;
-    }
-
-    for (let i = remaining.length - 1; i >= 0; i--) {
-        const msg = remaining[i];
-        const msgTokens = estimateSingleMessageTokens(msg);
-
-        // If it's a continuation, we MUST include the immediately preceding assistant message
-        // to provide context for where to resume.
-        const isProtectedAssistantMessage =
-            isContinuation &&
-            i === remaining.length - 2 &&
-            msg.role === (vscode.LanguageModelChatMessageRole.Assistant as unknown as number);
-
-        if (used + msgTokens <= budget || selected.length === (systemMessage ? 1 : 0) || isProtectedAssistantMessage) {
-            selected.splice(systemMessage ? 1 : 0, 0, msg);
-            used += msgTokens;
-        } else {
-            break;
-        }
-    }
-
-    if (selected.length < messageArray.length) {
-        Logger.info(
-            `[TokenTrim] model=${model.id} caller=chat original_tokens=${originalTokens} kept_tokens=${used} budget=${budget}`
-        );
-    }
-
-    return dropOrphanedToolResults(selected, systemMessage !== undefined);
-}
-
-/**
- * Drops leading tool-result messages whose tool call was trimmed away.
- *
- * Trimming keeps a contiguous newest suffix, so a tool result can only become
- * orphaned at the start of the conversation part: its assistant message with the
- * matching tool call fell outside the budget. Providers reject a tool result with
- * no matching call, so keeping it would make every later request fail.
- *
- * A selection that ends up with no conversation message at all is rejected
- * instead: `[system]` alone passes validation, and the model would be asked to
- * answer with no task in front of it.
- */
-function dropOrphanedToolResults(
-    selected: vscode.LanguageModelChatRequestMessage[],
-    hasSystemMessage: boolean
-): vscode.LanguageModelChatRequestMessage[] {
-    const firstConversationIndex = hasSystemMessage ? 1 : 0;
-    let dropped = 0;
-    while (selected.length > firstConversationIndex && messageCarriesToolResult(selected[firstConversationIndex])) {
-        selected.splice(firstConversationIndex, 1);
-        dropped += 1;
-    }
-    if (dropped === 0) {
-        return selected;
-    }
-    if (selected.length === firstConversationIndex) {
-        throw new Error("Message exceeds token limit.");
-    }
-    Logger.warn(`[TokenTrim] Dropped ${dropped} tool result message(s) whose tool call was trimmed`);
-    return selected;
-}
-
-function messageCarriesToolResult(message: vscode.LanguageModelChatRequestMessage): boolean {
-    return (message.content ?? []).some((part) => part instanceof vscode.LanguageModelToolResultPart);
-}
-
-/**
- * Detects whether an error represents a context overflow / max tokens condition.
- */
-export function isContextOverflowError(err: unknown): boolean {
-    if (!err || typeof err !== "object") {
-        return false;
-    }
-
-    const errorObj = err as { code?: unknown; message?: unknown; type?: unknown };
-    const code = typeof errorObj.code === "string" ? errorObj.code : undefined;
-    const message = typeof errorObj.message === "string" ? errorObj.message : undefined;
-    const type = typeof errorObj.type === "string" ? errorObj.type : undefined;
-
-    if (code === "context_length_exceeded" || code === "tokens_exceeded") {
-        return true;
-    }
-
-    if (type === "invalid_request_error" && message && message.toLowerCase().includes("maximum context length")) {
-        return true;
-    }
-
-    if (message && /maximum context length|context length exceeded/i.test(message)) {
-        return true;
-    }
-
-    return false;
 }

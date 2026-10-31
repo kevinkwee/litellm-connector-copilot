@@ -146,7 +146,6 @@ suite("LiteLLM model display", () => {
         sandbox.stub(providerAny._configManager, "getConfig").resolves({
             inactivityTimeout: 60,
             disableCaching: true,
-            disableQuotaToolRedaction: false,
             enableModelOverrides: true,
             modelCapabilitiesOverrides: {},
             forceResponsesEndpoint: false,

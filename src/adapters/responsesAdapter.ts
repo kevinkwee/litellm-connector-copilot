@@ -306,9 +306,6 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
         max_output_tokens: requestBody.max_tokens,
         temperature: requestBody.temperature,
         top_p: requestBody.top_p,
-        frequency_penalty: requestBody.frequency_penalty,
-        presence_penalty: requestBody.presence_penalty,
-        stop: requestBody.stop,
         // LiteLLM /responses also accepts the flat `reasoning_effort` key. We pass it
         // through unchanged so reasoning effort works identically across endpoints
         // and the connector keeps a single canonical request shape.
@@ -325,10 +322,8 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
         responsesBody.tools = requestBody.tools
             .map((tool) => {
                 const func = tool.function;
-                if (!func.name || !func.parameters) {
-                    Logger.warn(
-                        `[responsesAdapter] Dropping tool ${func.name || "unknown"} - missing name or parameters`
-                    );
+                if (!func.name) {
+                    Logger.warn(`[responsesAdapter] Dropping a tool with no name`);
                     return null;
                 }
                 return {

@@ -7,17 +7,10 @@ import type {
 } from "vscode";
 
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../types";
-import { convertTools } from "../utils";
-import {
-    trimMessagesToFitBudget,
-    estimateToolTokens,
-    isContextOverflowError,
-    countTokens,
-} from "../adapters/tokenUtils";
+import { countTokens } from "../adapters/tokenUtils";
 import { ConfigManager } from "../config/configManager";
 import { Logger } from "../utils/logger";
-import { LiteLLMTelemetry } from "../utils/telemetry";
-import { getSupportedReasoningEfforts, isOpenAIParamSupported } from "../utils/modelCapabilities";
+import { isOpenAIParamSupported } from "../utils/modelCapabilities";
 import type { SupportedReasoningEffort } from "../types";
 import {
     EFFORT_LADDER_LENGTH,
@@ -45,10 +38,9 @@ import { LiteLLMProviderRegistry } from "./liteLLMProviderRegistry";
  * - Wiring the BackendRegistry's `onDidChange` event to VS Code's
  *   `onDidChangeLanguageModelChatInformation` so the picker refreshes when
  *   a backend's model set actually changes.
- * - Shared request ingress pipeline (normalize, validate, filter, trim)
+ * - Shared request ingress pipeline (normalize, validate, filter)
  * - Endpoint routing (via call-time configuration)
  * - Shared error parsing and capability mapping
- * - Shared quota/tool-redaction heuristics
  *
  * Non-responsibilities:
  * - Model discovery (lives in the BackendRegistry, see
@@ -103,7 +95,6 @@ export abstract class LiteLLMProviderBase {
         const requestBuilderDeps: RequestBuilderDeps = {
             configManager: this._configManager,
             getReasoningEffort: this.getReasoningEffort.bind(this),
-            detectQuotaToolRedaction: this.detectQuotaToolRedaction.bind(this),
             stripUnsupportedParametersFromRequest: this.stripUnsupportedParametersFromRequest.bind(this),
             isParameterSupported: this.isParameterSupported.bind(this),
             getUnsupportedParameters: (modelId: string) => this._registry.getUnsupportedParameters(modelId),
@@ -251,15 +242,13 @@ export abstract class LiteLLMProviderBase {
         const opt = options as vscode.ProvideLanguageModelChatResponseOptions & {
             caller?: string;
             justification?: string;
-            // VS Code 1.120 per-group provider config (baseUrl, apiKey, providerName).
+            // Per-model configuration on the SDK harness, or a group's credentials
+            // when the host passes them.
             configuration?: Record<string, unknown>;
             // Per-model picker selections (reasoningEffort, etc.) from configurationSchema.
             modelConfiguration?: Record<string, unknown>;
         };
 
-        // The two configuration objects serve different purposes:
-        //   opt.configuration:      provider group config (baseUrl, apiKey), always present when using 1.120 BYOK
-        //   opt.modelConfiguration: per-model picker selections (reasoningEffort), present when user changes effort
         const modelConfig: Record<string, unknown> = {
             ...(opt.configuration ?? {}),
             ...(opt.modelConfiguration ?? {}),
@@ -273,62 +262,20 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Extracts reasoning effort from the modelConfiguration (preferred) or from
-     * modelOptions. Returns the effort string ONLY when the user (or caller) has
-     * explicitly selected one.
+     * Returns the reasoning effort the picker reports for this request, or
+     * `undefined` when it reports none.
+     *
+     * The effort arrives in the per-model configuration, which reaches the
+     * provider as `modelConfiguration` or as `configuration` depending on the
+     * caller. `getTelemetryOptions` merges both.
      */
-    protected getReasoningEffort(
-        options: ProvideLanguageModelChatResponseOptions,
-        model: LanguageModelChatInformation,
-        modelInfoOverride?: LiteLLMModelInfo
-    ): string | undefined {
-        const telemetry = this.getTelemetryOptions(options);
-        const modelInfo = modelInfoOverride ?? this._registry.getModelInfo(model.id);
-
-        Logger.debug(`[getReasoningEffort] modelId: ${model.id}`);
-        Logger.debug(`[getReasoningEffort] modelInfo from cache: ${JSON.stringify(modelInfo)}`);
-        Logger.debug(`[getReasoningEffort] modelInfoOverride: ${JSON.stringify(modelInfoOverride)}`);
-
-        const pickerEffort = telemetry.modelConfiguration?.reasoningEffort;
-        Logger.debug(`[getReasoningEffort] pickerEffort (from modelConfiguration): ${pickerEffort}`);
-        if (typeof pickerEffort === "string") {
-            Logger.debug(`[getReasoningEffort] Returning pickerEffort without validation: ${pickerEffort}`);
-            return pickerEffort;
-        }
-
-        const modelOptions = (options.modelOptions as Record<string, unknown> | undefined) ?? {};
-        const overrideEffort = modelOptions.reasoning_effort ?? modelOptions.reasoningEffort;
-        if (typeof overrideEffort === "string") {
-            if (this.isReasoningEffortSupported(overrideEffort, modelInfo, model.id)) {
-                return overrideEffort;
-            }
-            Logger.warn(
-                `[reasoning] modelOptions effort "${overrideEffort}" not supported by ${model.id}; suppressing field.`
-            );
+    protected getReasoningEffort(options: ProvideLanguageModelChatResponseOptions): string | undefined {
+        const pickerEffort = this.getTelemetryOptions(options).modelConfiguration?.reasoningEffort;
+        if (typeof pickerEffort !== "string") {
             return undefined;
         }
-
-        Logger.debug(`[reasoning] getReasoningEffort for ${model.id}: returning undefined (no explicit choice)`);
-        return undefined;
-    }
-
-    /**
-     * Validates that a reasoning effort string is supported by the model.
-     */
-    protected isReasoningEffortSupported(effort: string, modelInfo?: LiteLLMModelInfo, modelId?: string): boolean {
-        Logger.debug(
-            `[isReasoningEffortSupported] effort: ${effort}, modelInfo: ${JSON.stringify(modelInfo)}, modelId: ${modelId}`
-        );
-        if (!modelInfo && !modelId) {
-            Logger.debug("[isReasoningEffortSupported] No modelInfo and no modelId -> returning false");
-            return false;
-        }
-
-        const supportedEfforts = getSupportedReasoningEfforts(modelInfo, modelId);
-        Logger.debug(`[isReasoningEffortSupported] supportedEfforts: ${supportedEfforts}`);
-        const result = supportedEfforts.includes(effort as (typeof supportedEfforts)[number]);
-        Logger.debug(`[isReasoningEffortSupported] result: ${result}`);
-        return result;
+        Logger.debug(`[getReasoningEffort] effort from model configuration: ${pickerEffort}`);
+        return pickerEffort;
     }
 
     /**
@@ -373,13 +320,12 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Sends a LiteLLM request with a single retry on context overflow. The first attempt uses the
-     * standard buffered budget. On overflow, we re-trim messages with a hard cap equal to the raw
-     * model max input (minus tool tokens) and retry once.
+     * Sends a LiteLLM request, walking the reasoning-effort ladder when the
+     * upstream rejects the effort the request carries, and retrying once without
+     * `stream_options.include_usage` when the upstream rejects that flag.
      */
     protected async sendRequestWithRetry(
         request: OpenAIChatCompletionRequest,
-        messages: readonly LanguageModelChatRequestMessage[],
         model: LanguageModelChatInformation,
         options: ProvideLanguageModelChatResponseOptions,
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
@@ -408,15 +354,13 @@ export abstract class LiteLLMProviderBase {
         // The give-up check below ends the walk on the last of those.
         while (attempts <= EFFORT_LADDER_LENGTH) {
             try {
-                return await this.sendOnceWithOverflow(
+                return await this.sendRequestToLiteLLM(
                     request,
-                    messages,
-                    model,
-                    options,
                     progress,
                     token,
                     caller,
                     modelInfo,
+                    await this.getCallTimeConfiguration(options, model),
                     requestId
                 );
             } catch (err) {
@@ -543,101 +487,6 @@ export abstract class LiteLLMProviderBase {
         markReasoningFallbackNotified(modelId, originalEffort);
     }
 
-    private async sendOnceWithOverflow(
-        request: OpenAIChatCompletionRequest,
-        messages: readonly LanguageModelChatRequestMessage[],
-        model: LanguageModelChatInformation,
-        options: ProvideLanguageModelChatResponseOptions,
-        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-        token: vscode.CancellationToken,
-        caller?: string,
-        modelInfo?: LiteLLMModelInfo,
-        requestId?: string
-    ): Promise<ReadableStream<Uint8Array>> {
-        try {
-            return await this.sendRequestToLiteLLM(
-                request,
-                progress,
-                token,
-                caller,
-                modelInfo,
-                await this.getCallTimeConfiguration(options, model),
-                requestId
-            );
-        } catch (err) {
-            if (!isContextOverflowError(err)) {
-                throw err;
-            }
-
-            // Trimming is opt-in (`litellm-connector.autoTrimMessages`). When
-            // disabled, silently dropping history to recover from an overflow
-            // would hide the real failure, so surface the overflow instead of
-            // retrying with a trimmed conversation.
-            const config = await this._configManager.getConfig();
-            if (config.autoTrimMessages !== true) {
-                const contextError = new vscode.LanguageModelError(
-                    "Context window exceeded. The conversation is too long for this model."
-                );
-                (contextError as { code?: string }).code = "ContextExceeded";
-                throw contextError;
-            }
-
-            Logger.warn("[sendRequestWithRetry] Context overflow detected, retrying with aggressive trim", err);
-
-            const toolConfig = convertTools(options);
-            const hardBudget = Math.max(1, model.maxInputTokens - estimateToolTokens(toolConfig.tools));
-            const trimmedMessages = trimMessagesToFitBudget(messages, toolConfig.tools, model, modelInfo, hardBudget);
-            const retrimmedBuild = await this.buildOpenAIChatRequest(
-                trimmedMessages,
-                model,
-                options,
-                modelInfo,
-                caller
-            );
-            const retrimmedRequest = retrimmedBuild.request;
-            // The trimmed body can advertise a different tool set than the one
-            // the caller's mapping describes, because redaction reads the
-            // messages and trimming removes them. The retry returns only a
-            // stream, so the mapping stays with the original body. A name the
-            // trimmed body changed then reaches VS Code untranslated, which
-            // loses that call rather than running a different tool.
-            // Rebuilding from scratch drops the two fields the request gains
-            // after it is built: the in-effect reasoning effort and the session
-            // metadata the provider attaches. Carry them over so the trimmed
-            // attempt keeps per-session spend grouping and does not resend a
-            // rejected effort.
-            if (request.metadata !== undefined) {
-                retrimmedRequest.metadata = { ...request.metadata };
-            }
-            if (request.reasoning_effort === undefined) {
-                delete retrimmedRequest.reasoning_effort;
-            } else {
-                retrimmedRequest.reasoning_effort = request.reasoning_effort;
-            }
-
-            try {
-                return await this.sendRequestToLiteLLM(
-                    retrimmedRequest,
-                    progress,
-                    token,
-                    caller,
-                    modelInfo,
-                    await this.getCallTimeConfiguration(options, model),
-                    requestId
-                );
-            } catch (retryErr) {
-                if (isContextOverflowError(retryErr)) {
-                    const contextError = new vscode.LanguageModelError(
-                        "Context window exceeded. The conversation is too long for this model."
-                    );
-                    (contextError as { code?: string }).code = "ContextExceeded";
-                    throw contextError;
-                }
-                throw retryErr;
-            }
-        }
-    }
-
     /**
      * Resolves the per-group configuration for a response-time call.
      *
@@ -696,11 +545,11 @@ export abstract class LiteLLMProviderBase {
                 `getCallTimeConfiguration: options.configuration missing; falling back to registry lookup for modelId="${model.id}" modelName="${model.name}"`
             );
         }
-        // No options.configuration at response time (the common case in VS
-        // Code 1.120+). Fall back to the registry, preferring the model object
-        // VS Code passed back over its id: the object is the exact one this
-        // group's discovery returned, so it routes correctly even when two
-        // groups share a hostname and therefore produce the same ids.
+        // No usable group credentials at response time. Fall back to the
+        // registry, preferring the model object VS Code passed back over its id:
+        // the object is the exact one this group's discovery returned, so it
+        // routes correctly even when two groups share a hostname and therefore
+        // produce the same ids.
         const entry = this._registry.lookupInfo(model) ?? this._registry.lookup(model.id);
         if (entry) {
             Logger.trace(`getCallTimeConfiguration: registry HIT modelId="${model.id}" -> baseUrl="${entry.baseUrl}"`);
@@ -762,15 +611,8 @@ export abstract class LiteLLMProviderBase {
     ): void {
         const paramsToCheck = [
             "temperature",
-            "stop",
-            "frequency_penalty",
-            "presence_penalty",
             "top_p",
-            "cache",
             "cache_control",
-            "no_cache",
-            "no-cache",
-            "extra_body",
             "tool_choice", // Added for GPT-5.6 Azure and similar models that don't support tool_choice
         ];
         for (const p of paramsToCheck) {
@@ -778,272 +620,6 @@ export abstract class LiteLLMProviderBase {
                 delete requestBody[p];
             }
         }
-
-        if ("cache" in requestBody) {
-            delete requestBody.cache;
-        }
-
-        if (requestBody.extra_body && typeof requestBody.extra_body === "object") {
-            const eb = requestBody.extra_body as Record<string, unknown>;
-            if (eb.cache && typeof eb.cache === "object") {
-                const cache = eb.cache as Record<string, unknown>;
-                delete cache["no-cache"];
-                delete cache.no_cache;
-                if (Object.keys(cache).length === 0) {
-                    delete eb.cache;
-                }
-            }
-            if (Object.keys(eb).length === 0) {
-                delete requestBody.extra_body;
-            }
-        }
-    }
-
-    protected detectQuotaToolRedaction(
-        messages: readonly LanguageModelChatRequestMessage[],
-        tools: readonly vscode.LanguageModelChatTool[],
-        requestId: string,
-        modelId: string,
-        disableRedaction: boolean,
-        caller?: string
-    ): {
-        tools: readonly vscode.LanguageModelChatTool[];
-        confidence: "none" | "low" | "high";
-    } {
-        if (disableRedaction || !tools.length || !messages.length) {
-            return { tools, confidence: "none" };
-        }
-
-        const quotaMatch = this.findQuotaErrorInMessages(messages);
-        if (!quotaMatch) {
-            return { tools, confidence: "none" };
-        }
-
-        const { toolName, errorTextLength, turnIndex, confidence } = quotaMatch;
-
-        // Low-confidence matches (e.g. a quota phrase mentioned in
-        // <reminderInstructions> or a user prompt about quotas) are logged
-        // at DEBUG and do NOT trigger redaction or telemetry. High-confidence
-        // matches (a real provider 429 in a tool result) keep the existing
-        // WARN + telemetry behavior.
-        if (confidence !== "high") {
-            // For low-confidence matches, only report as "low" if there's a
-            // redactable tool in the tools list. Otherwise, treat as "none"
-            // since there's nothing actionable.
-            const hasRedactableTool = tools.some((t) => LiteLLMProviderBase.REDACTABLE_TOOL_NAMES.includes(t.name));
-            const reportedConfidence = hasRedactableTool ? confidence : "none";
-            Logger.debug("Quota phrase detected in non-tool-result text; not redacting", {
-                toolName,
-                errorTextLength,
-                modelId,
-                requestId,
-                turnIndex,
-                confidence: reportedConfidence,
-            });
-            return { tools, confidence: reportedConfidence };
-        }
-
-        const toolNames = new Set(tools.map((tool) => tool.name));
-        if (!toolNames.has(toolName)) {
-            Logger.debug("Quota error detected, but tool not present", {
-                toolName,
-                errorTextLength,
-                requestId,
-                modelId,
-                turnIndex,
-            });
-            return { tools, confidence };
-        }
-
-        const filteredTools = tools.filter((tool) => tool.name !== toolName);
-        Logger.warn("Quota error detected; redacting tool for current turn", {
-            toolName,
-            errorTextLength,
-            modelId,
-            requestId,
-            turnIndex,
-        });
-        LiteLLMTelemetry.reportMetric({
-            requestId,
-            model: modelId,
-            status: "failure",
-            error: `quota_exceeded:${toolName}`,
-            ...(caller && { caller }),
-        });
-
-        return { tools: filteredTools, confidence };
-    }
-
-    /**
-     * Tools the detector knows how to redact. Kept narrow on purpose: only
-     * `insert_edit_into_file` and `replace_string_in_file`. Adding more here
-     * is a deliberate code change and must come with a test that exercises a
-     * real tool result for the new tool name (not just a substring match in
-     * prompt scaffolding).
-     */
-    private static readonly REDACTABLE_TOOL_NAMES: readonly string[] = [
-        "insert_edit_into_file",
-        "replace_string_in_file",
-    ] as const;
-
-    /**
-     * Quota wording that identifies a provider-side rate limit or quota
-     * failure. A bare `429` is not enough: an edit result can mention a
-     * diagnostic on line 429 or a file named after it, and the redaction would
-     * then remove the edit tool for the rest of the conversation. The number
-     * only counts with status wording around it.
-     */
-    private static readonly QUOTA_PHRASE_REGEX =
-        /(\b(?:http|status|status\s*code|error|code)[\s:=#-]+429\b|\b429\s+too\s+many\s+requests\b|rate\s*limit\s*exceeded|rate\s*limited|too\s*many\s*requests|insufficient\s*quota|quota\s*exceeded|exceeded\s*your\s*current\s*quota)/i;
-
-    /**
-     * Detects whether the conversation history contains a real provider-side
-     * quota error attached to a tool call we know how to redact.
-     *
-     * High-confidence match: a `LanguageModelToolResultPart` whose text
-     * contains a quota phrase AND whose `callId` resolves to one of the
-     * `REDACTABLE_TOOL_NAMES` tools (verified by walking the messages in
-     * reverse to find the matching `LanguageModelToolCallPart`).
-     *
-     * Low-confidence match: a quota phrase appearing in any other text
-     * content. This is returned for observability (DEBUG log only) but does
-     * NOT trigger redaction.
-     *
-     * None: no quota phrase anywhere in the message text.
-     */
-    private findQuotaErrorInMessages(messages: readonly LanguageModelChatRequestMessage[]):
-        | {
-              toolName: string;
-              /** Length of the matched text, which is safe to log. The text itself is not. */
-              errorTextLength: number;
-              turnIndex: number;
-              confidence: "none" | "low" | "high";
-          }
-        | undefined {
-        // 1. Walk messages in reverse to find a tool result that contains a
-        //    quota phrase. The result's `callId` anchors the match.
-        for (let i = messages.length - 1; i >= 0; i--) {
-            const message = messages[i];
-            const toolResultHit = this.findQuotaInToolResults(message);
-            if (toolResultHit) {
-                const owningToolName = this.lookupToolNameForCallId(messages, toolResultHit.callId);
-                if (owningToolName && LiteLLMProviderBase.REDACTABLE_TOOL_NAMES.includes(owningToolName)) {
-                    return {
-                        toolName: owningToolName,
-                        errorTextLength: toolResultHit.text.length,
-                        turnIndex: i,
-                        confidence: "high",
-                    };
-                }
-                // Tool result is for a tool we don't redact. Treat as
-                // low-confidence (observability only) and keep walking.
-                return {
-                    toolName: owningToolName ?? toolResultHit.callId,
-                    errorTextLength: toolResultHit.text.length,
-                    turnIndex: i,
-                    confidence: "low",
-                };
-            }
-        }
-
-        // 2. No qualifying tool result. Look for a quota phrase in any
-        //    OTHER text content. Strip Copilot wrappers first so we never
-        //    match the scaffolding. Only report as "low" if we find BOTH
-        //    a quota phrase AND a tool name in the text (mimicking original
-        //    behavior). If only quota is found without a tool name, treat
-        //    as "none" since there's nothing to redact.
-        const toolRegex = /(insert_edit_into_file|replace_string_in_file)/i;
-        for (let i = messages.length - 1; i >= 0; i--) {
-            const message = messages[i];
-            const text = this.collectMessageText(message);
-            if (!text) {
-                continue;
-            }
-            const stripped = this.stripCopilotWrappers(text);
-            if (!stripped) {
-                continue;
-            }
-            if (!LiteLLMProviderBase.QUOTA_PHRASE_REGEX.test(stripped)) {
-                continue;
-            }
-            // Check if there's also a tool name in the text
-            const toolMatch = stripped.match(toolRegex);
-            if (!toolMatch) {
-                // Quota phrase found but no tool name, so nothing is actionable
-                continue;
-            }
-            return {
-                toolName: "",
-                errorTextLength: text.length,
-                turnIndex: i,
-                confidence: "low",
-            };
-        }
-
-        return undefined;
-    }
-
-    /**
-     * Returns the first quota phrase match that lives inside a
-     * `LanguageModelToolResultPart` on this message, plus the `callId` of
-     * that tool result. Returns `undefined` if no tool result part contains
-     * a quota phrase.
-     */
-    private findQuotaInToolResults(
-        message: LanguageModelChatRequestMessage
-    ): { callId: string; text: string } | undefined {
-        const parts = message.content ?? [];
-        for (const part of parts) {
-            if (!(part instanceof vscode.LanguageModelToolResultPart)) {
-                continue;
-            }
-            const text = this.collectPartText(part.content);
-            if (!text) {
-                continue;
-            }
-            if (!LiteLLMProviderBase.QUOTA_PHRASE_REGEX.test(text)) {
-                continue;
-            }
-            return { callId: part.callId, text };
-        }
-        return undefined;
-    }
-
-    /**
-     * Walks messages in reverse to find the assistant turn that produced
-     * `callId` via a `LanguageModelToolCallPart` and returns the tool name
-     * declared there. Returns `undefined` if no matching tool call is found.
-     */
-    private lookupToolNameForCallId(
-        messages: readonly LanguageModelChatRequestMessage[],
-        callId: string
-    ): string | undefined {
-        for (let i = messages.length - 1; i >= 0; i--) {
-            const parts = messages[i].content ?? [];
-            for (const part of parts) {
-                if (part instanceof vscode.LanguageModelToolCallPart && part.callId === callId) {
-                    return part.name;
-                }
-            }
-        }
-        return undefined;
-    }
-
-    /**
-     * Text-only projection of a tool result's content array. Mirrors
-     * `collectMessageText` but operates on a single part's `content` field
-     * (which is itself an array of `LanguageModelTextPart`-shaped objects).
-     */
-    private collectPartText(content: readonly unknown[]): string {
-        let text = "";
-        for (const part of content) {
-            if (part instanceof vscode.LanguageModelTextPart) {
-                text += part.value;
-            } else if (typeof part === "string") {
-                text += part;
-            }
-        }
-        return text.trim();
     }
 
     private sanitizeErrorTextForLogs(text: string): string {
@@ -1115,9 +691,6 @@ export abstract class LiteLLMProviderBase {
             max_tokens: request.max_tokens,
             temperature: request.temperature,
             top_p: request.top_p,
-            frequency_penalty: request.frequency_penalty,
-            presence_penalty: request.presence_penalty,
-            stop: request.stop,
             reasoning_effort: request.reasoning_effort,
             stream_options: request.stream_options,
             tool_choice: request.tool_choice,
@@ -1125,50 +698,7 @@ export abstract class LiteLLMProviderBase {
             messages: summarizeMessages,
             toolCount: request.tools?.length ?? 0,
             tools: summarizeTools,
-            hasExtraBody: typeof request.extra_body === "object" && request.extra_body !== null,
         };
-    }
-
-    private collectMessageText(message: LanguageModelChatRequestMessage): string {
-        const parts = message.content ?? [];
-        let text = "";
-        for (const part of parts) {
-            if (part instanceof vscode.LanguageModelTextPart) {
-                text += part.value;
-            } else if (typeof part === "string") {
-                text += part;
-            }
-        }
-        return text.trim();
-    }
-
-    /**
-     * Strips Copilot-injected prompt scaffolding wrappers from `text` and
-     * returns the cleaned, trimmed result. This is the SAME list of wrappers
-     * the log sanitizer collapses, but applied *before* the quota regex runs
-     * so the detector never matches on prompt scaffolding.
-     *
-     * Why this lives here: Copilot Chat injects `<context>`, `<editorContext>`,
-     * `<reminderInstructions>`, and `<userRequest>` blocks into every user
-     * message. The `<reminderInstructions>` block routinely documents the
-     * exact tool-error handling rules that contain both the quota phrase
-     * and the `insert_edit_into_file` / `replace_string_in_file` tool names,
-     * a structural false positive for the regex-pair detector.
-     *
-     * Invariant: this function is pure (no I/O, no side effects). The
-     * original `text` is not mutated.
-     */
-    private stripCopilotWrappers(text: string): string {
-        const trimmed = (text || "").trim();
-        if (!trimmed) {
-            return "";
-        }
-        return trimmed
-            .replace(/<context>[\s\S]*?<\/context>/gi, "")
-            .replace(/<editorContext>[\s\S]*?<\/editorContext>/gi, "")
-            .replace(/<reminderInstructions>[\s\S]*?<\/reminderInstructions>/gi, "")
-            .replace(/<userRequest>[\s\S]*?<\/userRequest>/gi, "")
-            .trim();
     }
 
     protected buildCapabilities(modelInfo: LiteLLMModelInfo | undefined): vscode.LanguageModelChatCapabilities {

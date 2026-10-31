@@ -532,15 +532,28 @@ suite("Responses Adapter Unit Tests", () => {
         const body = transformToResponsesFormat({
             model: "m",
             messages: [{ role: "user", content: "hi" }],
-            // The only declared tool is filtered out for having no parameters.
-            tools: [{ type: "function", function: { name: "kept", parameters: undefined as never } }],
+            // The only declared tool is filtered out for having no name.
+            tools: [{ type: "function", function: { name: "", parameters: { type: "object", properties: {} } } }],
             tool_choice: { type: "function", function: { name: "kept" } },
         });
 
         assert.strictEqual(body.tool_choice, undefined);
     });
 
-    // Regression: bug #98 — inline-edit caller with image content sent to /responses endpoint.
+    test("transformToResponsesFormat keeps a tool whose parameters are absent", () => {
+        const body = transformToResponsesFormat({
+            model: "m",
+            messages: [{ role: "user", content: "hi" }],
+            tools: [{ type: "function", function: { name: "kept", parameters: undefined as never } }],
+            tool_choice: { type: "function", function: { name: "kept" } },
+        });
+
+        assert.strictEqual(body.tools?.length, 1);
+        assert.strictEqual(body.tools?.[0]?.name, "kept");
+        assert.deepStrictEqual(body.tool_choice, { type: "function", name: "kept" });
+    });
+
+    // Regression: bug #98, an inline-edit caller with image content sent to the /responses endpoint.
     //
     // The inline-edit workflow produces large multi-turn conversations that include
     // image_url content items (e.g. editor screenshots). Before the fix, the responses

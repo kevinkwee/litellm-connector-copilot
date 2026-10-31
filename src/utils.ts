@@ -130,145 +130,6 @@ function hashOfLength(input: string, length: number): string {
     return out.slice(0, length);
 }
 
-/**
- * Merges a composite (`anyOf` / `oneOf` / `allOf`) schema into one flat schema.
- *
- * The outer schema describes the value the endpoint validates against, so its
- * own keys win: a pydantic optional keeps its `description` and `default`, and
- * an object that constrains a property through `anyOf` keeps its `type` and
- * `properties`. The preferred branch, the string branch when there is one and
- * otherwise the first, only fills the keys the outer schema leaves out.
- * `required` is never taken from a branch, because a branch's required list
- * describes that branch, not the merged value.
- *
- * A preferred branch that is itself a composite is merged the same way, up to
- * `MAX_COMPOSITE_DEPTH` levels, so ordinary nesting cannot leave a composite key
- * behind for `pruneUnknownSchemaKeywords` to drop.
- */
-function mergeCompositeSchema(schema: Record<string, unknown>): Record<string, unknown> {
-    let current = schema;
-    for (let depth = 0; depth < MAX_COMPOSITE_DEPTH; depth++) {
-        const merged = mergeOneCompositeLevel(current);
-        if (merged === current) {
-            return current;
-        }
-        current = merged;
-    }
-    return current;
-}
-
-/** Longest chain of composites the sanitizer resolves. Deeper nesting keeps its last merge. */
-const MAX_COMPOSITE_DEPTH = 4;
-
-/**
- * Resolves the first composite the schema carries, one level deep, and returns
- * the input unchanged when it carries none.
- */
-function mergeOneCompositeLevel(schema: Record<string, unknown>): Record<string, unknown> {
-    for (const composite of ["anyOf", "oneOf", "allOf"]) {
-        const branches = schema[composite];
-        if (!Array.isArray(branches) || branches.length === 0) {
-            continue;
-        }
-        const candidates = branches.filter(
-            (branch): branch is Record<string, unknown> =>
-                !!branch && typeof branch === "object" && !Array.isArray(branch)
-        );
-        const preferred = candidates.find((branch) => branch.type === "string") ?? candidates[0] ?? {};
-
-        const { [composite]: _composite, required: ownRequired, ...ownKeys } = schema;
-        const merged: Record<string, unknown> = { ...preferred, ...ownKeys };
-        if (ownRequired === undefined) {
-            delete merged.required;
-        } else {
-            merged.required = ownRequired;
-        }
-        return merged;
-    }
-    return schema;
-}
-
-function pruneUnknownSchemaKeywords(schema: unknown): Record<string, unknown> {
-    if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
-        return {};
-    }
-    const allow = new Set([
-        "type",
-        "properties",
-        "required",
-        "additionalProperties",
-        "description",
-        "enum",
-        "default",
-        "items",
-        "minLength",
-        "maxLength",
-        "minimum",
-        "maximum",
-        "pattern",
-        "format",
-    ]);
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(schema as Record<string, unknown>)) {
-        if (allow.has(k)) {
-            out[k] = v as unknown;
-        }
-    }
-    return out;
-}
-
-/**
- * Normalizes one JSON schema node: merges a composite, drops keywords the
- * endpoints do not accept, and recurses into `properties` and `items`.
- */
-function sanitizeSchema(input: unknown): Record<string, unknown> {
-    if (!input || typeof input !== "object" || Array.isArray(input)) {
-        return { type: "object", properties: {} } as Record<string, unknown>;
-    }
-
-    const schema = pruneUnknownSchemaKeywords(mergeCompositeSchema(input as Record<string, unknown>));
-
-    let t = schema.type as string | undefined;
-    if (t === null || (t === undefined && schema.properties !== undefined)) {
-        t = "object";
-        schema.type = t;
-    }
-
-    if (t === "object") {
-        const props = (schema.properties as Record<string, unknown> | undefined) ?? {};
-        const newProps: Record<string, unknown> = {};
-        if (props && typeof props === "object") {
-            for (const [k, v] of Object.entries(props)) {
-                newProps[k] = sanitizeSchema(v);
-            }
-        }
-        schema.properties = newProps;
-
-        const req = schema.required as unknown;
-        if (Array.isArray(req)) {
-            schema.required = req.filter((r) => typeof r === "string");
-        } else if (req !== undefined) {
-            schema.required = [];
-        }
-
-        const ap = schema.additionalProperties as unknown;
-        if (ap !== undefined && typeof ap !== "boolean") {
-            delete schema.additionalProperties;
-        }
-    } else if (t === "array") {
-        const items = schema.items as unknown;
-        if (Array.isArray(items) && items.length > 0) {
-            schema.items = sanitizeSchema(items[0]);
-        } else if (items && typeof items === "object") {
-            schema.items = sanitizeSchema(items);
-        } else {
-            schema.items = { type: "string" } as Record<string, unknown>;
-        }
-    }
-
-    return schema;
-}
-
 /** Transport choices applied while converting chat messages for the proxy. */
 export interface ConvertMessagesOptions {
     /**
@@ -577,16 +438,17 @@ function buildMessageContent(
 }
 
 /**
- * Builds the top-level parameter schema for one tool definition.
+ * Returns the parameter schema of one tool definition as the caller declared it.
  *
- * Every endpoint validates tool parameters as an object, so a schema that
- * declares another type is sent as an empty object schema instead of a schema
- * the endpoint rejects.
+ * The proxy's LiteLLM fork converts a schema per provider (Vertex and Gemini,
+ * Anthropic, Bedrock, vLLM, watsonx), so returning the declared object keeps
+ * information the provider needs. A tool that declares no schema, or one that
+ * is not a JSON object, receives an empty object schema, because every endpoint
+ * validates tool arguments as an object.
  */
 function toToolParameterSchema(input: unknown): Record<string, unknown> {
-    const schema = sanitizeSchema(input);
-    if (schema.type === "object") {
-        return schema;
+    if (input !== null && typeof input === "object" && !Array.isArray(input)) {
+        return input as Record<string, unknown>;
     }
     return { type: "object", properties: {} };
 }
@@ -619,7 +481,7 @@ export function convertTools(options: vscode.ProvideLanguageModelChatResponseOpt
     const wireNames = toolNames.wireNames;
     const toolDefs: OpenAIFunctionToolDef[] = declaredTools.map((tool, index) => {
         const description = typeof tool.description === "string" ? tool.description : "";
-        const params = toToolParameterSchema(tool.inputSchema ?? { type: "object", properties: {} });
+        const params = toToolParameterSchema(tool.inputSchema);
         return {
             type: "function" as const,
             function: {
