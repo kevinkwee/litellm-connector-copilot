@@ -68,7 +68,6 @@ import { StructuredLogger } from "../observability/structuredLogger";
 import {
     deriveCapabilitiesFromModelInfo,
     capabilitiesToVSCode,
-    getModelTags as getDerivedModelTags,
     buildReasoningEffortConfigurationSchema,
     buildTemperatureConfigurationProperty,
     mergeConfigurationSchemas,
@@ -82,7 +81,6 @@ import type { LiteLLMConfig, LiteLLMModelInfo } from "../types";
 import type { ConfigManager } from "../config/configManager";
 import type { BackendSession } from "./backendSession";
 import { sharedDiscoveryBackoff } from "./base/discoveryBackoff";
-import { DebouncedEmitter } from "./base/debouncedEmitter";
 import { toBackendIdentityKey } from "./base/backendIdentity";
 import { describeDiscoveryFailure, isTransientDiscoveryFailure } from "./base/discoveryFailure";
 import { toListableDeployments, type LiteLLMModelInfoEntry } from "./base/pausedModelListing";
@@ -209,13 +207,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
      */
     private discoveryEpoch = 0;
 
-    // Debounced change event emitter (initialized lazily on first use)
-    private _debouncedOnDidChange: DebouncedEmitter | undefined;
-
-    // Discovery debounce defaults
-    private static readonly DEFAULT_DISCOVERY_FIRE_DEBOUNCE_MS = 250;
-    private static readonly DEFAULT_DISCOVERY_FIRE_MIN_INTERVAL_MS = 2_000;
-
     /**
      * Emits when a backend's discovered model set has actually changed
      * since the prior delivery. The base provider subscribes once and
@@ -226,37 +217,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     constructor(deps: RegistryDeps) {
         this.configManager = deps.configManager;
         this._userAgent = deps.userAgent;
-    }
-
-    /**
-     * Builds the debounced emitter used by `onDidChange` coalescing. Nothing on
-     * the discovery path calls it: `discoverModels` fires the raw emitter so the
-     * picker reflects a model-set change immediately.
-     */
-    private async getDebouncedEmitter(): Promise<DebouncedEmitter> {
-        if (!this._debouncedOnDidChange) {
-            const config = await this.configManager.getConfig();
-            const debounceMs =
-                config.discoveryFireDebounceMs ?? LiteLLMProviderRegistry.DEFAULT_DISCOVERY_FIRE_DEBOUNCE_MS;
-            const minIntervalMs =
-                config.discoveryFireMinIntervalMs ?? LiteLLMProviderRegistry.DEFAULT_DISCOVERY_FIRE_MIN_INTERVAL_MS;
-
-            this._debouncedOnDidChange = new DebouncedEmitter(
-                () => this._onDidChangeEmitter.fire(),
-                debounceMs,
-                minIntervalMs,
-                (reasons) => {
-                    if (reasons.length > 1) {
-                        StructuredLogger.debug("discovery.fire_debounced", {
-                            baseUrl: reasons[0] ?? "unknown",
-                            coalescedFires: reasons.length,
-                            windowMs: debounceMs,
-                        });
-                    }
-                }
-            );
-        }
-        return this._debouncedOnDidChange;
     }
 
     // Public ingress
@@ -285,10 +245,8 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         const outcome = await this.discoverInternal(options, token);
         if (outcome.changed) {
             const baseUrl = outcome.session?.baseUrl ?? "unknown";
-            // Fire immediately when model set changes. The debounce logic was
-            // intended to rate-limit rapid discoveries but caused test failures
-            // because tests expect immediate change notifications. In production,
-            // VS Code's own UI has natural debouncing from user interaction.
+            // Fires as soon as the id set differs. A delayed notification would
+            // only postpone the picker refresh the change is meant to trigger.
             Logger.debug("discovery.fire", { baseUrl, reason: "model_change" });
             this._onDidChangeEmitter.fire();
         }
@@ -450,7 +408,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     public dispose(): void {
-        this._debouncedOnDidChange?.dispose();
         this._onDidChangeEmitter.dispose();
     }
 
@@ -854,7 +811,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
 
         const capabilityOverrides = modelCapabilitiesOverrides?.[modelId] ?? modelCapabilitiesOverrides?.[modelName];
         const capabilities = capabilitiesToVSCode(derived, capabilityOverrides);
-        const tags = getDerivedModelTags(modelName, derived, {}, capabilityOverrides);
         const supportedEfforts = getSupportedReasoningEfforts(modelInfo, modelId);
         const reasoningSchema = buildReasoningEffortConfigurationSchema(supportedEfforts, modelId, modelInfo);
         // The temperature knob is advertised only for models that accept the
@@ -882,7 +838,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         const info: vscode.LanguageModelChatInformation & {
             vendor?: string;
             backendName?: string;
-            tags?: string[];
             detail?: string;
             tooltip?: string;
             pricing?: string;
@@ -907,7 +862,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             maxInputTokens: derived.maxInputTokens,
             maxOutputTokens: derived.maxOutputTokens,
             capabilities,
-            tags,
             isUserSelectable: true,
             // The picker reads this field via `getCategoryLabel(category)` and
             // crashes with `TypeError: a.charAt is not a function` when the

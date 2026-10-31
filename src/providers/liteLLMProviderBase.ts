@@ -233,20 +233,18 @@ export abstract class LiteLLMProviderBase {
 
     /**
      * Extended options including internal telemetry fields.
+     *
+     * `caller` is VS Code's `requestInitiator`, the extension that started the
+     * request (`"core"` for the Agents window's Copilot SDK harness).
      */
     protected getTelemetryOptions(options: vscode.ProvideLanguageModelChatResponseOptions): {
-        caller?: string;
-        justification?: string;
+        caller: string;
         modelConfiguration?: Record<string, unknown>;
     } {
         const opt = options as vscode.ProvideLanguageModelChatResponseOptions & {
-            caller?: string;
-            justification?: string;
             // Per-model configuration on the SDK harness, or a group's credentials
             // when the host passes them.
             configuration?: Record<string, unknown>;
-            // Per-model picker selections (reasoningEffort, etc.) from configurationSchema.
-            modelConfiguration?: Record<string, unknown>;
         };
 
         const modelConfig: Record<string, unknown> = {
@@ -255,8 +253,10 @@ export abstract class LiteLLMProviderBase {
         };
 
         return {
-            caller: opt.caller,
-            justification: opt.justification,
+            caller:
+                typeof opt.requestInitiator === "string" && opt.requestInitiator.length > 0
+                    ? opt.requestInitiator
+                    : "unknown",
             modelConfiguration: modelConfig,
         };
     }

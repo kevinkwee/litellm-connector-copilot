@@ -65,7 +65,7 @@ import type { ChatSessionIdSource } from "../utils/chatSessionId";
  * so no new instrumentation is required upstream.
  */
 export interface CopilotMdEntry {
-    /** Short request label, e.g. "chat", "panel/editAgent". Becomes the H1 suffix and filename stem. */
+    /** Short request label, e.g. "core". Becomes the H1 suffix and filename stem. */
     debugName: string;
     /** 8-char hex id (matches Copilot's `generateUuid().substring(0, 8)`). */
     id: string;
@@ -387,8 +387,8 @@ function requestPartToMarkdown(part: vscode.LanguageModelInputPart | unknown): s
  * - **Thinking parts** contribute their text to a `reasoning:` line,
  *   concatenated like the answer text. A `---` rule separates the reasoning
  *   from answer text when no tool call falls between them.
- * - **Data parts** (usage, cache-control) are dropped from the response
- *   body. They are metadata, already surfaced in the `usage` metadata line.
+ * - **Data parts** (usage) are dropped from the response body. They are
+ *   metadata, already surfaced in the `usage` metadata line.
  *
  * Boundaries between part types get a newline so a text stream followed
  * by a tool call doesn't run together (`...text🛠️ tool...`).
@@ -457,8 +457,8 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
             const callPart = part as vscode.LanguageModelToolCallPart;
             lines.push(`🛠️ ${callPart.name} (${callPart.callId}) ${prettyToolArgs(callPart.input)}`);
         } else if (part instanceof vscode.LanguageModelDataPart) {
-            // Usage / cache-control data parts are metadata, so they do not
-            // belong in the rendered response body. Skip silently.
+            // Data parts are metadata, so they do not belong in the rendered
+            // response body. Skip silently.
             continue;
         } else {
             // Check for LanguageModelThinkingPart (proposed API). The class

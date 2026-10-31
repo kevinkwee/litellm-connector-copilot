@@ -33,7 +33,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - An image returned by a tool now reaches the model instead of being silently dropped.
 - The wire shape follows the provider family. Anthropic, Gemini/Vertex and Bedrock models receive `image_url` parts inside the `role: "tool"` message. OpenAI-compatible models (OpenAI, OpenRouter, DeepSeek, Moonshot, Mistral, SambaNova and anything unknown) receive placeholder text in the tool message plus one following user message with the images, because LiteLLM's transforms for those providers keep only the text of a content list and would drop the image.
 - Images from parallel tool calls are grouped into one user message after the last tool message of the run, so tool-call adjacency is preserved, and each image group is attributed to the tool that produced it.
-- Parts tagged with a `LanguageModelPartAudience` that excludes the model are not uploaded.
+- Tool result parts are not filtered by `LanguageModelPartAudience`. A part is converted according to its own content, not the audience it targets.
 - Images returned by tools count toward the token budget, and `.copilotmd` transcripts render them as a size placeholder instead of raw bytes.
 
 ### `.copilotmd` session transcripts
@@ -70,7 +70,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 ### Request handling fixes
 - Reasoning-only assistant messages are supported (empty-string content) instead of being rejected.
 - `normalizeToolCallId` only treats a leading `fc_` as a provider prefix and varies the padding filler, preventing dropped or duplicated tool call ids on repeated runs.
-- Request errors are surfaced as response text instead of thrown exceptions, so the failed turn stays in history. Each occurrence writes a `request.error_surfaced_as_text` entry with the caller and justification, so a failure from a background caller (for example a summarization request) still leaves a trace.
+- Request errors are surfaced as response text instead of thrown exceptions, so the failed turn stays in history. Each occurrence writes a `request.error_surfaced_as_text` entry with the request id, model, caller and a short error summary, so a failure from a background caller (for example a summarization request) still leaves a trace. The caller is VS Code's `requestInitiator` (`core` from the Agents window harness), or `unknown` when the host sends none.
 - The streaming cancellation listener is disposed when the stream ends, and a cancelled request is reported as `cancelled` rather than as a failure.
 - `litellm-connector.inactivityTimeout` is clamped to 1 to 3600 seconds. A value of 0 or less would otherwise abort every response as soon as it starts.
 - `discoveryTimeoutMs` is passed through to per-session clients and applies to reading the model-list body as well as the response headers.

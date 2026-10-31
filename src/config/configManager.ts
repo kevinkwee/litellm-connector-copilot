@@ -22,8 +22,6 @@ export class ConfigManager {
     private static readonly DISPLAY_PRICING_IN_PICKER_KEY = "litellm-connector.displayPricingInPicker";
     private static readonly DISCOVERY_TIMEOUT_MS_KEY = "litellm-connector.discoveryTimeoutMs";
     private static readonly DISCOVERY_CACHE_TTL_MS_KEY = "litellm-connector.discoveryCacheTtlMs";
-    private static readonly DISCOVERY_FIRE_DEBOUNCE_MS_KEY = "litellm-connector.discoveryFireDebounceMs";
-    private static readonly DISCOVERY_FIRE_MIN_INTERVAL_MS_KEY = "litellm-connector.discoveryFireMinIntervalMs";
     private static readonly NETWORK_RETRIES_KEY = "litellm-connector.networkRetries";
     private static readonly NETWORK_RETRY_DELAY_MS_KEY = "litellm-connector.networkRetryDelayMs";
     private static readonly EMPTY_RESPONSE_RETRIES_KEY = "litellm-connector.emptyResponseRetries";
@@ -37,10 +35,6 @@ export class ConfigManager {
     private static readonly DEFAULT_DISCOVERY_CACHE_TTL_MS = 60_000;
     private static readonly MIN_DISCOVERY_CACHE_TTL_MS = 0;
     private static readonly MAX_DISCOVERY_CACHE_TTL_MS = 300_000;
-    private static readonly DEFAULT_DISCOVERY_FIRE_DEBOUNCE_MS = 250;
-    private static readonly MAX_DISCOVERY_FIRE_DEBOUNCE_MS = 5_000;
-    private static readonly DEFAULT_DISCOVERY_FIRE_MIN_INTERVAL_MS = 2_000;
-    private static readonly MAX_DISCOVERY_FIRE_MIN_INTERVAL_MS = 30_000;
 
     // Rate-limit retry ceiling defaults and bounds. The setting is expressed in
     // seconds because Retry-After is a seconds-based header; the internal
@@ -253,18 +247,6 @@ export class ConfigManager {
         const discoveryCacheTtlMs = this.clampDiscoveryCacheTtlMs(
             workspaceConfig.get<number>(ConfigManager.DISCOVERY_CACHE_TTL_MS_KEY)
         );
-        const discoveryFireDebounceMs = this.clampRange(
-            workspaceConfig.get<number>(ConfigManager.DISCOVERY_FIRE_DEBOUNCE_MS_KEY),
-            0,
-            ConfigManager.MAX_DISCOVERY_FIRE_DEBOUNCE_MS,
-            ConfigManager.DEFAULT_DISCOVERY_FIRE_DEBOUNCE_MS
-        );
-        const discoveryFireMinIntervalMs = this.clampRange(
-            workspaceConfig.get<number>(ConfigManager.DISCOVERY_FIRE_MIN_INTERVAL_MS_KEY),
-            0,
-            ConfigManager.MAX_DISCOVERY_FIRE_MIN_INTERVAL_MS,
-            ConfigManager.DEFAULT_DISCOVERY_FIRE_MIN_INTERVAL_MS
-        );
 
         const networkRetries = this.clampRange(
             workspaceConfig.get<number>(ConfigManager.NETWORK_RETRIES_KEY),
@@ -311,8 +293,6 @@ export class ConfigManager {
             displayPricingInPicker,
             discoveryTimeoutMs,
             discoveryCacheTtlMs,
-            discoveryFireDebounceMs,
-            discoveryFireMinIntervalMs,
             networkRetries,
             networkRetryDelayMs,
             emptyResponseRetries,

@@ -59,7 +59,7 @@ suite("vscodePartEmitter", () => {
         assert.deepStrictEqual((reported[0] as vscode.LanguageModelToolCallPart).input, {});
     });
 
-    test("suppresses cache-control data parts before reporting to VS Code", () => {
+    test("reports every data part without dropping any", () => {
         const reported: unknown[] = [];
         const progress = {
             report: (p: unknown) => reported.push(p),
@@ -77,10 +77,15 @@ suite("vscodePartEmitter", () => {
             progress
         );
 
-        assert.strictEqual(reported.length, 1);
-        assert.ok(reported[0] instanceof vscode.LanguageModelTextPart);
+        assert.strictEqual(reported.length, 2);
+        assert.ok(reported[0] instanceof vscode.LanguageModelDataPart);
+        assert.deepStrictEqual(
+            (reported[0] as vscode.LanguageModelDataPart).mimeType,
+            "application/vnd.cache-control+json"
+        );
+        assert.ok(reported[1] instanceof vscode.LanguageModelTextPart);
         assert.strictEqual(
-            (reported[0] as vscode.LanguageModelTextPart).value,
+            (reported[1] as vscode.LanguageModelTextPart).value,
             "cache_control is legitimate text here"
         );
     });

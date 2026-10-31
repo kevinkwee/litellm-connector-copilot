@@ -85,9 +85,7 @@ function isOpenAIParamRestrictable(param: string): boolean {
 export interface DerivedModelCapabilities {
     supportsTools: boolean;
     supportsVision: boolean;
-    supportsStreaming: boolean;
     supportsReasoning: boolean;
-    supportsPdf: boolean;
     // Additional capabilities derived from supports_* fields
     supportsAudioInput: boolean;
     supportsAudioOutput: boolean;
@@ -140,8 +138,6 @@ export function deriveCapabilitiesFromModelInfo(
     const supportsPromptCaching = modelInfo?.supports_prompt_caching === true;
     const supportsWebSearch = modelInfo?.supports_web_search === true;
     const supportsUrlContext = modelInfo?.supports_url_context === true;
-    const supportsNativeStreaming = modelInfo?.supports_native_streaming === true;
-    const supportsPdf = modelInfo?.supports_pdf_input === true;
 
     // Reasoning capabilities
     const supportsReasoning =
@@ -153,8 +149,6 @@ export function deriveCapabilitiesFromModelInfo(
     // Check if reasoning_effort and thinking appear in supported_openai_params
     const supportsReasoningEffort = supportedParams.includes("reasoning_effort");
     const supportsThinking = supportedParams.includes("thinking");
-
-    const supportsStreaming = supportsNativeStreaming || supportedParams.includes("stream");
 
     const rawLimit = modelInfo?.max_input_tokens ?? modelInfo?.context_window_tokens ?? modelInfo?.max_tokens ?? 128000;
     const requestedOutputTokens = modelInfo?.max_output_tokens ?? DEFAULT_RESERVED_OUTPUT_TOKENS;
@@ -170,9 +164,7 @@ export function deriveCapabilitiesFromModelInfo(
     return {
         supportsTools,
         supportsVision,
-        supportsStreaming,
         supportsReasoning,
-        supportsPdf,
         supportsAudioInput,
         supportsAudioOutput,
         supportsComputerUse,
@@ -201,63 +193,6 @@ export function capabilitiesToVSCode(
         toolCalling: overrides?.toolCalling ?? derived.supportsTools,
         imageInput: overrides?.imageInput ?? derived.supportsVision,
     };
-}
-
-/**
- * Builds the VS Code model tags for one model.
- *
- * `modelName` is the raw model name LiteLLM reports, not the namespaced
- * `<host>/<model>` id, because the name decides the `inline-edit` tag and a
- * hostname could otherwise contain `code` and tag every model of that backend.
- * Tag overrides are keyed by the same raw name.
- */
-export function getModelTags(
-    modelName: string,
-    derived: DerivedModelCapabilities,
-    overrides?: Record<string, string[]>,
-    capabilityOverrides?: ModelCapabilityOverride
-): string[] {
-    const tags = new Set<string>();
-
-    const lowerModelName = modelName.toLowerCase();
-    if (lowerModelName.includes("coder") || lowerModelName.includes("code")) {
-        tags.add("inline-edit");
-    }
-
-    // Use capability override if set, otherwise use derived value
-    const effectiveTools = capabilityOverrides?.toolCalling ?? derived.supportsTools;
-    const effectiveVision = capabilityOverrides?.imageInput ?? derived.supportsVision;
-    const effectiveReasoning = capabilityOverrides?.reasoning ?? derived.supportsReasoning;
-    const effectivePdf = capabilityOverrides?.pdfInput ?? derived.supportsPdf;
-
-    if (effectiveTools) {
-        tags.add("tools");
-    }
-
-    if (effectiveVision) {
-        tags.add("vision");
-    }
-
-    if (effectiveReasoning) {
-        tags.add("reasoning");
-    }
-
-    if (effectivePdf) {
-        tags.add("pdf");
-    }
-
-    if (derived.supportsStreaming) {
-        tags.add("inline-completions");
-        tags.add("terminal-chat");
-    }
-
-    if (overrides && overrides[modelName]) {
-        for (const tag of overrides[modelName]) {
-            tags.add(tag);
-        }
-    }
-
-    return Array.from(tags);
 }
 
 /**
@@ -338,10 +273,10 @@ function reasoningEffortParamStatus(modelInfo?: LiteLLMModelInfo): boolean | nul
 /**
  * Resolves the reasoning effort levels to expose for a model in the picker.
  *
- * The explicit `supports_<level>_reasoning_effort` fields are the base set, a
- * non-empty `modelOverrides` entry replaces it, and a model that reports only
- * `supports_reasoning` gets `DEFAULT_REASONING_EFFORTS`. An empty result means
- * no effort picker.
+ * The explicit `supports_<level>_reasoning_effort` fields are the base set, and
+ * a `forceMandatory` override replaces them. A model that reports only
+ * `supports_reasoning` gets the canonical list. An empty result means no effort
+ * picker.
  */
 export function getSupportedReasoningEfforts(
     modelInfo?: LiteLLMModelInfo,
@@ -353,15 +288,9 @@ export function getSupportedReasoningEfforts(
         return [];
     }
 
-    // Explicit false means no reasoning support unless overrides force it
+    // An explicit false wins over any override. Some models still carry explicit
+    // effort fields, which stay authoritative here.
     if (modelInfo?.supports_reasoning === false) {
-        if (modelId) {
-            const overrideEfforts = getEffectiveEfforts(modelId, modelInfo, config);
-            if (overrideEfforts.length > 0) {
-                return overrideEfforts;
-            }
-        }
-        // Still check for explicit effort fields as some models may have them
         const explicitEfforts = extractExplicitReasoningEfforts(modelInfo);
         if (explicitEfforts !== undefined) {
             return explicitEfforts;

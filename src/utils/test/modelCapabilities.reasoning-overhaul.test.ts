@@ -83,14 +83,6 @@ suite("modelCapabilities - Reasoning Overhaul", () => {
             assert.strictEqual(result.supportsTools, true);
         });
 
-        test("detects streaming from supported_openai_params", () => {
-            const modelInfo: LiteLLMModelInfo = {
-                supported_openai_params: ["stream", "temperature"],
-            };
-            const result = deriveCapabilitiesFromModelInfo("test-model", modelInfo);
-            assert.strictEqual(result.supportsStreaming, true);
-        });
-
         test("detects reasoning from explicit effort fields", () => {
             const modelInfo: LiteLLMModelInfo = {
                 supports_high_reasoning_effort: true,

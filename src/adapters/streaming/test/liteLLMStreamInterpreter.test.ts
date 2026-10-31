@@ -390,7 +390,7 @@ suite("LiteLLMStreamInterpreter: Tool Call Regressions", () => {
         }
     });
 
-    test("should suppress cache-control VS Code DataPart carrier objects", () => {
+    test("produces no part for a marshalled VS Code object", () => {
         const state = createInitialStreamingState();
         const parts = interpretStreamEvent(
             {
@@ -402,30 +402,6 @@ suite("LiteLLMStreamInterpreter: Tool Call Regressions", () => {
         );
 
         assert.deepStrictEqual(parts, []);
-    });
-
-    test("should pass through non-cache-control VS Code DataPart carrier objects", () => {
-        const state = createInitialStreamingState();
-        const parts = interpretStreamEvent(
-            {
-                $mid: 2,
-                mimeType: "usage",
-                data: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
-            },
-            state
-        );
-
-        assert.strictEqual(parts.length, 1);
-        const [part] = parts;
-        assert.strictEqual(part.type, "data");
-        if (part.type === "data") {
-            assert.strictEqual(part.mimeType, "usage");
-            assert.deepStrictEqual(part.value, {
-                prompt_tokens: 1,
-                completion_tokens: 2,
-                total_tokens: 3,
-            });
-        }
     });
 
     test("should normalize tool call ids on update and merge name/args", () => {

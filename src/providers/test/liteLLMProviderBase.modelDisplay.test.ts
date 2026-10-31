@@ -94,41 +94,6 @@ suite("LiteLLM model display", () => {
         );
     });
 
-    test("does not tag models for inline edits when only the hostname contains a code marker", async () => {
-        const mockSecrets: vscode.SecretStorage = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            onDidChange: (_listener: unknown) => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
-
-        const provider = new LiteLLMChatProvider(mockSecrets, "test-agent");
-        const token = new vscode.CancellationTokenSource().token;
-
-        sandbox.stub(LiteLLMClient.prototype, "getModelInfo").resolves({
-            data: [
-                {
-                    model_name: "gpt-4o",
-                    model_info: { key: "example/gpt-4o", litellm_provider: "openai" },
-                },
-            ],
-        });
-
-        const models = await provider.discoverModels(
-            {
-                silent: true,
-                configuration: { baseUrl: "http://code-llm.example", apiKey: "test-key" },
-            },
-            token
-        );
-
-        // The routing identity carries the hostname, and the raw model name `gpt-4o`
-        // carries no code marker, so no `inline-edit` tag results.
-        assert.strictEqual(models[0].id, "code-llm.example/gpt-4o");
-        const tags = (models[0] as unknown as { tags?: readonly string[] }).tags ?? [];
-        assert.strictEqual(tags.includes("inline-edit"), false);
-    });
-
     test("populates pricing fields when backend returns pricing and displayPricingInPicker is enabled", async () => {
         const mockSecrets: vscode.SecretStorage = {
             get: async () => undefined,

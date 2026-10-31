@@ -54,6 +54,6 @@ export interface LogEvent {
     model?: string;
     /** Endpoint path (if applicable) */
     endpoint?: string;
-    /** Caller context (e.g., "inline-completions", "terminal-chat", "chat") */
+    /** VS Code's `options.requestInitiator`. The Agents window harness sends "core". */
     caller?: string;
 }

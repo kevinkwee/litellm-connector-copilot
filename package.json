@@ -80,7 +80,7 @@
 				"litellm-connector.modelOverrides": {
 					"type": "array",
 					"default": [],
-					"description": "User-supplied model overrides for reasoning capabilities. Merged on top of bundled overrides (user entries take precedence on regex match). Each entry: { match: string (regex), supportsReasoning?: boolean|null, reasoningEfforts?: string[], defaultEffort?: string, notes?: string }.",
+					"description": "User-supplied model overrides for reasoning capabilities. Merged on top of bundled overrides (user entries take precedence on regex match). Each entry: { match: string (regex), supportsReasoning?: boolean|null, reasoningEfforts?: string[], defaultEffort?: string, forceMandatory?: boolean, notes?: string }.",
 					"items": {
 						"type": "object",
 						"properties": {
@@ -105,7 +105,8 @@
 										"low",
 										"medium",
 										"high",
-										"xhigh"
+										"xhigh",
+										"max"
 									]
 								}
 							},
@@ -117,8 +118,13 @@
 									"low",
 									"medium",
 									"high",
-									"xhigh"
+									"xhigh",
+									"max"
 								]
+							},
+							"forceMandatory": {
+								"type": "boolean",
+								"description": "Use this override's reasoning effort list instead of the levels the proxy reports, or all levels when the override declares none. The proxy still wins when it reports the model does not reason, excludes the reasoning_effort parameter, or reports its own explicit effort levels."
 							},
 							"notes": {
 								"type": "string"
@@ -225,26 +231,6 @@
 						"advanced"
 					],
 					"description": "TTL in milliseconds for cached /model/info discovery responses. Set to 0 to disable caching. Default: 60000."
-				},
-				"litellm-connector.discoveryFireDebounceMs": {
-					"type": "number",
-					"default": 250,
-					"minimum": 0,
-					"maximum": 5000,
-					"tags": [
-						"advanced"
-					],
-					"description": "Trailing-edge debounce window in milliseconds for outward model-discovery change notifications. Set to 0 to disable debouncing. Default: 250."
-				},
-				"litellm-connector.discoveryFireMinIntervalMs": {
-					"type": "number",
-					"default": 2000,
-					"minimum": 0,
-					"maximum": 30000,
-					"tags": [
-						"advanced"
-					],
-					"description": "Minimum interval in milliseconds between outward model-discovery change notifications. Set to 0 to disable rate limiting. Default: 2000."
 				},
 				"litellm-connector.debug.copilotMdExport.enabled": {
 					"type": "boolean",
@@ -366,7 +352,6 @@
 		"languageModelProxy",
 		"languageModelSystem",
 		"languageModelThinkingPart",
-		"languageModelToolResultAudience",
 		"languageModelToolSupportsModel"
 	]
 }

@@ -147,10 +147,6 @@ export interface ModelCapabilityOverride {
     toolCalling?: boolean;
     /** Override the imageInput (vision) capability reported to VS Code. */
     imageInput?: boolean;
-    /** Override the reasoning capability (surfaced as tag). */
-    reasoning?: boolean;
-    /** Override the pdf input capability (surfaced as tag). */
-    pdfInput?: boolean;
 }
 
 export type SupportedReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -164,12 +160,8 @@ export interface ModelOverride {
     reasoningEfforts?: SupportedReasoningEffort[];
     /** Default reasoning effort when reasoning is supported */
     defaultEffort?: SupportedReasoningEffort;
-    /** Force this override to be mandatory (ignore remote LiteLLM values) */
+    /** Use this override's effort list instead of the levels the proxy reports. The proxy still wins when it reports the model does not reason, excludes the reasoning_effort parameter, or reports its own explicit effort levels. */
     forceMandatory?: boolean;
-    /** Custom tags to add to model */
-    tags?: string[];
-    /** Override for supported_openai_params */
-    supportedOpenaiParams?: string[];
     /** Additional notes about this override */
     notes?: string;
 }
@@ -245,12 +237,6 @@ export interface LiteLLMConfig {
 
     /** TTL in milliseconds for cached /model/info discovery responses. Default: 60000. Set to 0 to disable caching. */
     discoveryCacheTtlMs?: number;
-
-    /** Trailing-edge debounce window in milliseconds for outward model-discovery change notifications. Default: 250. */
-    discoveryFireDebounceMs?: number;
-
-    /** Minimum interval in milliseconds between outward model-discovery change notifications. Default: 2000. */
-    discoveryFireMinIntervalMs?: number;
 
     /**
      * Maximum transport-level retry attempts for a chat request when the

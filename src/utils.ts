@@ -237,14 +237,7 @@ export function convertMessages(
             if (part instanceof vscode.LanguageModelTextPart) {
                 textParts.push(part.value);
             } else if (part instanceof vscode.LanguageModelDataPart) {
-                // Handle image and other data parts
-                if (isCacheControlMimeType(part.mimeType)) {
-                    // Drop cache_control metadata unconditionally (see
-                    // isCacheControlMimeType doc for rationale). This branch runs
-                    // BEFORE the JSON branch so that MIME types like
-                    // "application/vnd.cache-control+json" cannot slip through.
-                    Logger.trace(`[convertMessages] Dropping cache_control part (mimeType: ${part.mimeType})`);
-                } else if (part.mimeType.startsWith("image/")) {
+                if (part.mimeType.startsWith("image/")) {
                     contentItems.push(toImageContentItem(part.mimeType, part.data));
                 } else if (part.mimeType.startsWith("application/json")) {
                     // Handle JSON data parts by decoding and appending as text
@@ -252,6 +245,8 @@ export function convertMessages(
                 } else if (part.mimeType.startsWith("text/")) {
                     // Handle explicit text data parts
                     textParts.push(decodeUtf8(part.data));
+                } else {
+                    Logger.trace(`[convertMessages] Skipping data part with unsupported mime type: ${part.mimeType}`);
                 }
             } else if (part instanceof vscode.LanguageModelToolCallPart) {
                 const id = normalizeToolCallId(
@@ -394,22 +389,6 @@ export function convertMessages(
     }
     flushPendingToolResultImages();
     return out;
-}
-
-/**
- * Returns true for any MIME type that represents opaque prompt-caching metadata
- * rather than message content. These parts must be silently dropped at the
- * transport layer, because decoding them produces strings like "ephemeral" or a
- * raw {"$mid":...,"mimeType":"cache_control",...} carrier object that, once
- * injected into user/assistant content, causes LLMs to fixate on the stray
- * fragment and abandon the active task.
- */
-export function isCacheControlMimeType(mimeType: string): boolean {
-    if (mimeType === "cache_control") {
-        return true;
-    }
-    // Match any vnd.*cache-control* variant, regardless of suffix (+json, +text, etc.)
-    return /cache[-_]control/i.test(mimeType);
 }
 
 /**
@@ -634,9 +613,6 @@ export function getThinkingPartText(part: unknown): string {
     return Array.isArray(obj.value) ? obj.value.join("\n") : obj.value;
 }
 
-/** Value of `LanguageModelPartAudience.Assistant`, duplicated because the enum may be absent at runtime. */
-const ASSISTANT_AUDIENCE = 0;
-
 /**
  * Image MIME types forwarded from tool results. Anything else keeps its text
  * treatment or is dropped, matching the media Copilot itself delivers.
@@ -662,8 +638,7 @@ const TOOL_RESULT_IMAGE_BOUNDARY_TEXT =
  *
  * Text, JSON and stringifiable values become one `textParts` entry per non-empty
  * part, so a caller can keep the boundaries or join them. Image data parts
- * become `image_url` items so they survive as vision input. Parts tagged with
- * an audience that excludes the model are skipped, as are cache_control carriers.
+ * become `image_url` items so they survive as vision input.
  *
  * @param pr Tool result-like object with content array.
  */
@@ -674,19 +649,17 @@ function collectToolResultContent(pr: { content?: readonly unknown[] }): {
     const textParts: string[] = [];
     const images: OpenAIChatMessageContentItem[] = [];
     for (const part of pr.content ?? []) {
-        if (!isPartVisibleToModel(part)) {
-            Logger.trace("[collectToolResultContent] Dropping part whose audience excludes the model");
-            continue;
-        }
         if (part instanceof vscode.LanguageModelTextPart) {
             textParts.push(part.value);
         } else if (part instanceof vscode.LanguageModelDataPart) {
-            if (isCacheControlMimeType(part.mimeType)) {
-                Logger.trace(`[collectToolResultContent] Dropping cache_control part (mimeType: ${part.mimeType})`);
-            } else if (TOOL_RESULT_IMAGE_MIME_TYPES.has(part.mimeType.toLowerCase())) {
+            if (TOOL_RESULT_IMAGE_MIME_TYPES.has(part.mimeType.toLowerCase())) {
                 images.push(toImageContentItem(part.mimeType, part.data));
             } else if (part.mimeType.startsWith("text/") || part.mimeType.includes("json")) {
                 textParts.push(decodeUtf8(part.data));
+            } else {
+                Logger.trace(
+                    `[collectToolResultContent] Skipping data part with unsupported mime type: ${part.mimeType}`
+                );
             }
         } else if (typeof part === "string") {
             textParts.push(part);
@@ -699,24 +672,6 @@ function collectToolResultContent(pr: { content?: readonly unknown[] }): {
         }
     }
     return { textParts: textParts.filter((text) => text.length > 0), images };
-}
-
-/**
- * Reports whether a content part may be shown to the language model.
- *
- * Parts without an `audience` list apply to every audience. Parts that do carry
- * one are model-visible only when it includes `Assistant`, which matches how
- * Copilot filters its own requests.
- */
-function isPartVisibleToModel(part: unknown): boolean {
-    if (!part || typeof part !== "object") {
-        return true;
-    }
-    const audiences = (part as { audience?: unknown }).audience;
-    if (!Array.isArray(audiences)) {
-        return true;
-    }
-    return (audiences as readonly unknown[]).includes(ASSISTANT_AUDIENCE);
 }
 
 /**

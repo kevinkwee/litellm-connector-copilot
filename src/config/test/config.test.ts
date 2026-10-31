@@ -134,6 +134,16 @@ suite("ConfigManager Unit Tests", () => {
         assert.deepStrictEqual(cfg.modelCapabilitiesOverrides, {});
     });
 
+    test("getConfig reports no discovery change-notification timing fields", async () => {
+        const manager = new ConfigManager(mockSecrets);
+        const cfg = await manager.getConfig();
+
+        // The registry fires the change event as soon as a model set changes, so
+        // there is nothing for a debounce or rate-limit window to configure.
+        assert.strictEqual("discoveryFireDebounceMs" in cfg, false);
+        assert.strictEqual("discoveryFireMinIntervalMs" in cfg, false);
+    });
+
     test("convertProviderConfiguration passes the configured discoveryTimeoutMs to the session client", async () => {
         settingsMap.set("litellm-connector.discoveryTimeoutMs", 15_000);
         await configManager.getConfig();

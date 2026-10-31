@@ -1003,42 +1003,35 @@ suite("Utility Unit Tests", () => {
         assert.strictEqual(out[0].tool_calls?.[0].function.arguments, "{}");
     });
 
-    // Regression tests for the "$mid / cache_control / json_cache" bug where
-    // Anthropic-style prompt-cache metadata was being decoded and injected as
-    // raw text into outbound LLM messages. Once that happens, LLMs fixate on
-    // the stray "ephemeral" / "$mid" fragment and can no longer proceed with
-    // the active task. These tests guard every transport conversion path so
-    // the metadata can never reach the wire again.
-    suite("cache_control metadata stripping (regression)", () => {
-        suite("deriveGroupNameFromUrl", () => {
-            test("returns hostname from https URL", () => {
-                const result = deriveGroupNameFromUrl("https://llm-kit.geth.cc");
-                assert.strictEqual(result, "llm-kit.geth.cc");
-            });
-
-            test("returns hostname from http URL with port", () => {
-                const result = deriveGroupNameFromUrl("http://localhost:4000");
-                assert.strictEqual(result, "localhost:4000");
-            });
-
-            test("returns empty string for empty input", () => {
-                const result = deriveGroupNameFromUrl("");
-                assert.strictEqual(result, "");
-            });
-
-            test("returns empty string for non-URL string", () => {
-                const result = deriveGroupNameFromUrl("not-a-url");
-                assert.strictEqual(result, "");
-            });
-
-            test("strips path and query from URL", () => {
-                const result = deriveGroupNameFromUrl("https://proxy.example.com/v1?key=abc");
-                assert.strictEqual(result, "proxy.example.com");
-            });
+    suite("deriveGroupNameFromUrl", () => {
+        test("returns hostname from https URL", () => {
+            const result = deriveGroupNameFromUrl("https://llm-kit.geth.cc");
+            assert.strictEqual(result, "llm-kit.geth.cc");
         });
-        test("convertMessages drops cache_control parts (bare + +json variants)", () => {
-            // Copilot Chat can deliver the same poisoned data parts to providers
-            // via convertMessages, so this path must strip them too.
+
+        test("returns hostname from http URL with port", () => {
+            const result = deriveGroupNameFromUrl("http://localhost:4000");
+            assert.strictEqual(result, "localhost:4000");
+        });
+
+        test("returns empty string for empty input", () => {
+            const result = deriveGroupNameFromUrl("");
+            assert.strictEqual(result, "");
+        });
+
+        test("returns empty string for non-URL string", () => {
+            const result = deriveGroupNameFromUrl("not-a-url");
+            assert.strictEqual(result, "");
+        });
+
+        test("strips path and query from URL", () => {
+            const result = deriveGroupNameFromUrl("https://proxy.example.com/v1?key=abc");
+            assert.strictEqual(result, "proxy.example.com");
+        });
+    });
+
+    suite("convertMessages data parts and tool result images", () => {
+        test("convertMessages ignores data parts whose MIME type is not content", () => {
             const msgs: vscode.LanguageModelChatMessage[] = [
                 {
                     role: vscode.LanguageModelChatMessageRole.User,
@@ -1059,7 +1052,7 @@ suite("Utility Unit Tests", () => {
             assert.strictEqual(out[0].content, "visible");
         });
 
-        test("tool result serialization drops cache_control data parts but keeps text", () => {
+        test("tool result serialization keeps text and ignores a non-content data part", () => {
             const msgs: vscode.LanguageModelChatMessage[] = [
                 {
                     role: vscode.LanguageModelChatMessageRole.Assistant,
@@ -1082,8 +1075,7 @@ suite("Utility Unit Tests", () => {
             const serialized = JSON.stringify(out);
 
             assert.ok(serialized.includes("real tool output"));
-            assert.ok(!serialized.includes("ephemeral"), "cache_control payload must not leak");
-            assert.ok(!serialized.includes("cache_control"), "cache_control marker must not leak");
+            assert.ok(!serialized.includes("ephemeral"), "a non-content data part must not leak");
         });
 
         suite("convertMessages tool result images", () => {
@@ -1273,7 +1265,7 @@ suite("Utility Unit Tests", () => {
                 assert.ok(content[0].text?.includes("Tool returned an image"));
             });
 
-            test("drops tool result parts whose audience excludes the model", () => {
+            test("keeps a tool result part whatever audience it declares", () => {
                 const out = convertMessages(
                     buildRun([
                         {
@@ -1291,24 +1283,10 @@ suite("Utility Unit Tests", () => {
                     ])
                 );
 
-                assert.strictEqual(out[1].content, "model note\n\nshared note");
+                assert.strictEqual(out[1].content, "user-facing note\n\nmodel note\n\nshared note");
             });
 
-            test("drops a tool result part with an empty audience list", () => {
-                const out = convertMessages(
-                    buildRun([
-                        {
-                            callId: "call_1",
-                            name: "inspect",
-                            content: [withAudience(new vscode.LanguageModelTextPart("hidden"), [])],
-                        },
-                    ])
-                );
-
-                assert.strictEqual(out[1].content, "Success");
-            });
-
-            test("does not forward an image whose audience excludes the model", () => {
+            test("keeps an image whose audience lists only the user", () => {
                 const out = convertMessages(
                     buildRun([
                         { callId: "call_1", name: "screenshot", content: [withAudience(imagePart(), [USER_AUDIENCE])] },
@@ -1316,14 +1294,11 @@ suite("Utility Unit Tests", () => {
                     { toolResultImageMode: "native" }
                 );
 
-                assert.deepStrictEqual(
-                    out.map((message) => message.role),
-                    ["assistant", "tool"]
-                );
-                assert.strictEqual(out[1].content, "Success");
+                const content = out[1].content as OpenAIChatMessageContentItem[];
+                assert.strictEqual(content.filter((item) => item.type === "image_url").length, 1);
             });
 
-            test("drops cache_control parts but keeps the image in the same tool result", () => {
+            test("ignores a non-content data part but keeps the image in the same tool result", () => {
                 const out = convertMessages(
                     buildRun([
                         {
@@ -1338,7 +1313,7 @@ suite("Utility Unit Tests", () => {
                     { toolResultImageMode: "native" }
                 );
 
-                assert.ok(!JSON.stringify(out).includes("cache_control"));
+                assert.ok(!JSON.stringify(out).includes("ephemeral"));
                 const content = out[1].content as OpenAIChatMessageContentItem[];
                 assert.strictEqual(content.filter((item) => item.type === "image_url").length, 1);
             });

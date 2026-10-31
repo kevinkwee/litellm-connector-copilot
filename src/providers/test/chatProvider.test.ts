@@ -5,6 +5,7 @@ import * as vscode from "vscode";
 import { LiteLLMChatProvider } from "../";
 import { LiteLLMApiError, LiteLLMClient, LiteLLMRateLimitError } from "../../adapters/litellmClient";
 import { StructuredLogger } from "../../observability/structuredLogger";
+import { CopilotMdManager } from "../../observability";
 import type { OpenAIChatCompletionRequest } from "../../types";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
 import { createMockSecrets } from "../../test/utils/testMocks";
@@ -1003,6 +1004,124 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         assert.strictEqual(payload.estimated_total_cost, 0);
 
         sinon.assert.calledWithMatch(telemetrySpy, sinon.match({ tokensIn: 12, tokensOut: 7 }));
+    });
+
+    test("reports the request initiator as the caller", async () => {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const model = {
+            id: "model-caller",
+            name: "model-caller",
+            tooltip: "",
+            family: "litellm",
+            version: "1.0.0",
+            maxInputTokens: 1000,
+            maxOutputTokens: 1000,
+            capabilities: { toolCalling: true, imageInput: false },
+            // A stray `tags` property must not influence caller attribution.
+            tags: ["inline-completions"],
+        } as vscode.LanguageModelChatInformation;
+        seedDiscoveredBackend(sandbox, provider, "model-caller");
+        sandbox.stub(LiteLLMClient.prototype, "chat").resolves(createMockSSEStream(["ok"]));
+
+        const telemetrySpy = sandbox.spy(LiteLLMTelemetry, "reportMetric");
+        await provider.provideLanguageModelChatResponse(
+            model,
+            [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart("hi")],
+                },
+            ],
+            {
+                modelOptions: {},
+                tools: [],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+                requestInitiator: "core",
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            { report: () => {} },
+            new vscode.CancellationTokenSource().token
+        );
+
+        sinon.assert.calledWithMatch(telemetrySpy, sinon.match({ caller: "core" }));
+    });
+
+    test("reports an unknown caller when VS Code sends no initiator", async () => {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const model = {
+            id: "model-caller-missing",
+            name: "model-caller-missing",
+            tooltip: "",
+            family: "litellm",
+            version: "1.0.0",
+            maxInputTokens: 1000,
+            maxOutputTokens: 1000,
+            capabilities: { toolCalling: true, imageInput: false },
+            // A stray `tags` property must not become a caller fallback either.
+            tags: ["inline-completions"],
+        } as vscode.LanguageModelChatInformation;
+        seedDiscoveredBackend(sandbox, provider, "model-caller-missing");
+        sandbox.stub(LiteLLMClient.prototype, "chat").resolves(createMockSSEStream(["ok"]));
+
+        const telemetrySpy = sandbox.spy(LiteLLMTelemetry, "reportMetric");
+        await provider.provideLanguageModelChatResponse(
+            model,
+            [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart("hi")],
+                },
+            ],
+            {
+                modelOptions: {},
+                tools: [],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            { report: () => {} },
+            new vscode.CancellationTokenSource().token
+        );
+
+        sinon.assert.calledWithMatch(telemetrySpy, sinon.match({ caller: "unknown" }));
+    });
+
+    test("names the .copilotmd export after the caller", async () => {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const model = {
+            id: "model-caller-export",
+            name: "model-caller-export",
+            tooltip: "",
+            family: "litellm",
+            version: "1.0.0",
+            maxInputTokens: 1000,
+            maxOutputTokens: 1000,
+            capabilities: { toolCalling: true, imageInput: false },
+        } as vscode.LanguageModelChatInformation;
+        seedDiscoveredBackend(sandbox, provider, "model-caller-export");
+        sandbox.stub(LiteLLMClient.prototype, "chat").resolves(createMockSSEStream(["ok"]));
+        const exportStub = sandbox.stub(CopilotMdManager.instance, "exportEntry").resolves(undefined);
+
+        await provider.provideLanguageModelChatResponse(
+            model,
+            [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart("hi")],
+                },
+            ],
+            {
+                modelOptions: {},
+                tools: [],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+                requestInitiator: "background-summarizer",
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            { report: () => {} },
+            new vscode.CancellationTokenSource().token
+        );
+
+        sinon.assert.calledOnce(exportStub);
+        assert.strictEqual(exportStub.firstCall.args[0].debugName, "background-summarizer");
     });
 
     test("merges partial usage frames to avoid dropping previously reported token details", async () => {

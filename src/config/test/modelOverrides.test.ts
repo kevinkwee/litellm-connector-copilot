@@ -134,7 +134,73 @@ suite("modelOverrides", () => {
         assert.strictEqual(unsupportedDefault, undefined);
     });
 
-    test("forceMandatory override returns values even when LiteLLM has data", async () => {
+    test("an override marked forceMandatory wins over the proxy's effort flags", () => {
+        const override: ModelOverride = {
+            match: "^test-.*",
+            reasoningEfforts: ["high"],
+            forceMandatory: true,
+        };
+        getConfigurationStub.returns(buildWorkspaceConfiguration([override]));
+
+        const modelInfo: LiteLLMModelInfo = {
+            supports_reasoning: true,
+            supports_low_reasoning_effort: true,
+        };
+
+        const result = getEffectiveEfforts("test-model", modelInfo);
+
+        assert.deepStrictEqual(result, ["high"]);
+    });
+
+    test("a forceMandatory override supplies its list when the proxy reports reasoning without levels", () => {
+        const override: ModelOverride = {
+            match: "^test-.*",
+            reasoningEfforts: ["low", "high"],
+            forceMandatory: true,
+        };
+        getConfigurationStub.returns(buildWorkspaceConfiguration([override]));
+
+        const result = getEffectiveEfforts("test-model", { supports_reasoning: true });
+
+        assert.deepStrictEqual(result, ["low", "high"]);
+    });
+
+    test("a forceMandatory override with no effort list takes the canonical list", () => {
+        const override: ModelOverride = {
+            match: "^test-.*",
+            forceMandatory: true,
+        };
+        getConfigurationStub.returns(buildWorkspaceConfiguration([override]));
+
+        const modelInfo: LiteLLMModelInfo = {
+            supports_reasoning: true,
+            supports_low_reasoning_effort: true,
+        };
+
+        const result = getEffectiveEfforts("test-model", modelInfo);
+
+        assert.deepStrictEqual(result, [...CANONICAL_REASONING_EFFORTS]);
+    });
+
+    test("an override that denies reasoning wins over the proxy's effort flags", () => {
+        const override: ModelOverride = {
+            match: "^test-.*",
+            supportsReasoning: false,
+            forceMandatory: true,
+        };
+        getConfigurationStub.returns(buildWorkspaceConfiguration([override]));
+
+        const modelInfo: LiteLLMModelInfo = {
+            supports_reasoning: true,
+            supports_high_reasoning_effort: true,
+        };
+
+        const result = getEffectiveEfforts("test-model", modelInfo);
+
+        assert.deepStrictEqual(result, []);
+    });
+
+    test("a forceMandatory override cannot outvote a model the proxy reports as non-reasoning", () => {
         const override: ModelOverride = {
             match: "^test-.*",
             reasoningEfforts: ["high"],
@@ -146,9 +212,27 @@ suite("modelOverrides", () => {
             supports_reasoning: false,
         };
 
-        const result = getEffectiveEfforts("test-model", modelInfo, undefined, true);
-        assert.ok(result.includes("high"));
-        assert.strictEqual(result.length, 1);
+        const result = getEffectiveEfforts("test-model", modelInfo);
+
+        assert.deepStrictEqual(result, []);
+    });
+
+    test("a non-mandatory override leaves the proxy's explicit effort flags in charge", () => {
+        const override: ModelOverride = {
+            match: "^test-.*",
+            reasoningEfforts: ["high"],
+            forceMandatory: false,
+        };
+        getConfigurationStub.returns(buildWorkspaceConfiguration([override]));
+
+        const modelInfo: LiteLLMModelInfo = {
+            supports_reasoning: true,
+            supports_low_reasoning_effort: true,
+        };
+
+        const result = getEffectiveEfforts("test-model", modelInfo);
+
+        assert.deepStrictEqual(result, ["low"]);
     });
 
     test("non-mandatory override is ignored when LiteLLM has valid data", async () => {
@@ -198,10 +282,10 @@ suite("modelOverrides", () => {
         getConfigurationStub.returns(buildWorkspaceConfiguration(userOverrides, false));
 
         const modelInfo: LiteLLMModelInfo = { supports_reasoning: true };
-        const result = getEffectiveEfforts("test-model", modelInfo, undefined, true);
+        const result = getEffectiveEfforts("test-model", modelInfo);
 
-        // When overrides are disabled, forceMandatory should have no effect.
-        // Model has supports_reasoning but no explicit effort flags, so falls back to canonical.
+        // When overrides are disabled the override has no effect. The model has
+        // supports_reasoning but no explicit effort flags, so it falls back to canonical.
         assert.deepStrictEqual(result, [...CANONICAL_REASONING_EFFORTS]);
     });
 

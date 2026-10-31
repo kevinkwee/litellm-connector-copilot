@@ -132,19 +132,11 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         let requestBodyBuilt: OpenAIChatCompletionRequest | undefined;
         let activeMessages: readonly LanguageModelChatRequestMessage[] = messages;
 
-        // Extract caller/justification from options or model tags
-        const telemetry = this.getTelemetryOptions(options);
-        const modelWithTags = model as vscode.LanguageModelChatInformation & { tags?: string[] };
-        const caller = telemetry.caller || modelWithTags.tags?.[0] || "chat";
-        const justification = telemetry.justification;
+        const caller = this.getTelemetryOptions(options).caller;
 
         let tokensIn: number | undefined;
 
-        Logger.info(
-            `Chat request started | RequestID: ${requestId} | Model: ${model.id} | Caller: ${caller} | Justification: ${
-                justification || "none"
-            }`
-        );
+        Logger.info(`Chat request started | RequestID: ${requestId} | Model: ${model.id} | Caller: ${caller}`);
         Logger.trace(
             `Chat request: received model id="${model.id}" name="${model.name}" hasOptionsConfig=${(options as { configuration?: unknown }).configuration !== undefined}`
         );
@@ -688,14 +680,12 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             trackingProgress.report(new LanguageModelTextPart(`\n\n${formatConnectorNotice(errorMessage)}`));
             // The turn completes as a normal assistant message, so the reply
             // itself looks like model output. Record that the failure was
-            // surfaced as text, with the caller and justification, so a
-            // background caller's failure stays traceable.
+            // surfaced as text, with the initiator, so a failure stays traceable.
             Logger.warn(`Chat request surfaced as assistant error text instead of throwing | RequestID: ${requestId}`);
             StructuredLogger.warn("request.error_surfaced_as_text", {
                 requestId,
                 model: model.id,
                 caller,
-                justification,
                 errorName,
                 errorSummary: errorMessage.slice(0, 200),
                 stage: "provideLanguageModelChatResponse",

@@ -11,6 +11,15 @@ import { dirname, join } from "node:path";
  */
 
 /**
+ * The subset of a JSON-schema property declaration these assertions inspect.
+ */
+interface ManifestProperty {
+    type?: string;
+    enum?: string[];
+    items?: { type?: string; enum?: string[] };
+}
+
+/**
  * Walks up from this compiled module to the repository root and returns the
  * first ancestor holding the extension manifest. The depth is not stable
  * across build layouts (tsc emits under `out/src/...`), so the search keeps
@@ -95,5 +104,40 @@ suite("Agents Window Compatibility Manifest", () => {
             typeof manifest.main === "string" && manifest.main.length > 0,
             "main field must exist. The Agents window disables code-carrying extensions unless capabilities declare support"
         );
+    });
+
+    test("offers max in both effort enums and declares forceMandatory", () => {
+        const contributes = manifest.contributes as Record<string, unknown>;
+        const properties = (contributes.configuration as Record<string, unknown>).properties as Record<
+            string,
+            { items?: { properties?: Record<string, ManifestProperty> } }
+        >;
+        const overrideProperties = properties["litellm-connector.modelOverrides"].items?.properties;
+        assert.ok(overrideProperties, "modelOverrides item properties must exist");
+
+        // `SupportedReasoningEffort` includes `max`, so the schema must offer it
+        // or a valid override is flagged by the settings editor.
+        const effortsEnum = overrideProperties.reasoningEfforts?.items?.enum;
+        assert.ok(
+            effortsEnum?.includes("max"),
+            `reasoningEfforts must offer 'max'; got: ${JSON.stringify(effortsEnum)}`
+        );
+        const defaultEffortEnum = overrideProperties.defaultEffort?.enum;
+        assert.ok(
+            defaultEffortEnum?.includes("max"),
+            `defaultEffort must offer 'max'; got: ${JSON.stringify(defaultEffortEnum)}`
+        );
+        assert.strictEqual(
+            overrideProperties.forceMandatory?.type,
+            "boolean",
+            "forceMandatory must be declared as a boolean"
+        );
+    });
+
+    test("declares no model discovery change-notification timing settings", () => {
+        const contributes = manifest.contributes as Record<string, unknown>;
+        const properties = (contributes.configuration as Record<string, unknown>).properties as Record<string, unknown>;
+        assert.strictEqual("litellm-connector.discoveryFireDebounceMs" in properties, false);
+        assert.strictEqual("litellm-connector.discoveryFireMinIntervalMs" in properties, false);
     });
 });

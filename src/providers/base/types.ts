@@ -19,8 +19,7 @@ export interface RequestBuilderDeps {
      */
     getUnsupportedParameters: (modelId: string) => ReadonlySet<string>;
     getTelemetryOptions: (options: vscode.ProvideLanguageModelChatResponseOptions) => {
-        caller?: string;
-        justification?: string;
+        caller: string;
         modelConfiguration?: Record<string, unknown>;
     };
     usageOptOutModels: Set<string>;

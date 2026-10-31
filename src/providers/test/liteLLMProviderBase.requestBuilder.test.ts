@@ -31,7 +31,6 @@ suite("RequestBuilder", () => {
             // per-model picker selections arrive via `options.modelConfiguration`.
             getTelemetryOptions: (options: vscode.ProvideLanguageModelChatResponseOptions) => ({
                 caller: "test",
-                justification: undefined,
                 modelConfiguration: ((options as unknown as { modelConfiguration?: Record<string, unknown> })
                     .modelConfiguration ?? {}) as Record<string, unknown>,
             }),
@@ -141,7 +140,6 @@ suite("RequestBuilder", () => {
                 getUnsupportedParameters: () => new Set<string>(),
                 getTelemetryOptions: (options: vscode.ProvideLanguageModelChatResponseOptions) => ({
                     caller: "test",
-                    justification: undefined,
                     modelConfiguration: ((options as unknown as { modelConfiguration?: Record<string, unknown> })
                         .modelConfiguration ?? {}) as Record<string, unknown>,
                 }),
@@ -208,7 +206,7 @@ suite("RequestBuilder", () => {
             stripUnsupportedParametersFromRequest: () => {},
             isParameterSupported: (param: string) => param !== "tool_choice", // tool_choice not supported
             getUnsupportedParameters: () => new Set<string>(),
-            getTelemetryOptions: () => ({ caller: "test", justification: undefined, modelConfiguration: {} }),
+            getTelemetryOptions: () => ({ caller: "test", modelConfiguration: {} }),
             usageOptOutModels: new Set(),
             extractRawModelName: (id: string) => {
                 const slash = id.indexOf("/");
@@ -358,7 +356,7 @@ suite("RequestBuilder", () => {
                 isParameterSupported: () => true,
                 getUnsupportedParameters: (id: string) =>
                     id.includes("claude") ? new Set(["cache_control"]) : new Set<string>(),
-                getTelemetryOptions: () => ({ caller: "test", justification: undefined, modelConfiguration: {} }),
+                getTelemetryOptions: () => ({ caller: "test", modelConfiguration: {} }),
                 usageOptOutModels: new Set(),
                 extractRawModelName: (id: string) => {
                     const slash = id.indexOf("/");
@@ -379,7 +377,7 @@ suite("RequestBuilder", () => {
                 isParameterSupported: () => true,
                 getUnsupportedParameters: (id: string) =>
                     id.includes("gpt-") ? new Set(["cache_control"]) : new Set<string>(),
-                getTelemetryOptions: () => ({ caller: "test", justification: undefined, modelConfiguration: {} }),
+                getTelemetryOptions: () => ({ caller: "test", modelConfiguration: {} }),
                 usageOptOutModels: new Set(),
                 extractRawModelName: (id: string) => {
                     const slash = id.indexOf("/");

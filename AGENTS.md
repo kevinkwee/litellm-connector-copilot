@@ -255,7 +255,7 @@ This structure can be updated as the project evolves. If you add new files or mo
 
 Folder ownership (unit tests are co-located with the module under test in `src/**/test/`):
 
-- `src/providers/`: Language Model provider implementations (`liteLLMProviderBase.ts`, `liteLLMChatProvider.ts`, `index.ts`) and `base/`, the shared modules behind the provider orchestrator and the discovery registry: `requestBuilder.ts`, `transport.ts`, `types.ts`, `discoveryBackoff.ts`, `backendIdentity.ts`, `discoveryFailure.ts`, `pausedModelListing.ts`, `debouncedEmitter.ts`
+- `src/providers/`: Language Model provider implementations (`liteLLMProviderBase.ts`, `liteLLMChatProvider.ts`, `index.ts`) and `base/`, the shared modules behind the provider orchestrator and the discovery registry: `requestBuilder.ts`, `transport.ts`, `types.ts`, `discoveryBackoff.ts`, `backendIdentity.ts`, `discoveryFailure.ts`, `pausedModelListing.ts`
 - `src/adapters/`: HTTP clients, payload shaping, endpoint-specific parsing, SSE and streaming (`sse/`, `streaming/`), tokenizers
 - `src/utils/`: shared utilities (logging, local request metrics, model helpers, pricing, `chatSessionId`, `thinkingBlocks`, `promptCaching`, `connectorNotice`, `transportRetry`, `rateLimitRetryPolicy`, `rateLimitNotice`, `toolNameUtils`, `byteEncoding`)
 - `src/config/`: configuration and secrets
@@ -545,7 +545,7 @@ Any code you edit must be brought up to these standards:
   - Workspace settings retrieved via `vscode.workspace.getConfiguration()`
   - Use `ConfigManager.convertProviderConfiguration()` to unify config sources
 - [ ] All `LanguageModelChatInformation` entries returned from `provideLanguageModelChatInformation` set `isUserSelectable: true` so they appear in the VS Code model picker
-- [ ] Telemetry includes `caller` context to distinguish invocation source ("inline-completions", "terminal-chat", etc.)
+- [ ] Telemetry carries the caller exactly as `getTelemetryOptions` resolves it from `options.requestInitiator` (`"unknown"` when the host omits it), with no tag or option inference
 - [ ] Model discovery tested for correctness and performance via the BackendRegistry (shared across all providers)
 
 ## Key Concepts
@@ -575,10 +575,10 @@ This repository is a **VS Code extension**. Agents must follow these rules when 
 - **Model picker visibility**: every `LanguageModelChatInformation` returned from `provideLanguageModelChatInformation` must set `isUserSelectable: true` so the model appears in VS Code's model picker dropdown. Models that omit this flag (or set it to `false`) are hidden from the picker even when discovery succeeds.
 - **Backend grouping**: each `LanguageModelChatInformation` must set `category: { label, order }`. `label` is the user-visible group heading in the picker (typically the backend or group name), and `order` is the deterministic display order. Without this, models from multiple backends collapse into a single ungrouped list.
 - **Reasoning effort picker (`group: "navigation"`)**: when a model supports reasoning, its `configurationSchema.properties.reasoningEffort` must include `group: "navigation"`. Only navigation-grouped properties are surfaced as inline picker actions. Without it the effort selector is hidden behind the secondary settings UI and users cannot change effort from the chat picker.
-- **Reasoning effort list (explicit by design)**: the picker offers exactly the levels whose `supports_<level>_reasoning_effort` flag is `true` in the proxy's `/model/info`, or the levels a `modelOverrides` entry lists. No level is implied, not even `medium` or `high`. The proxy's model config declares every level each model accepts, and some models reject levels such as `medium`. A reasoning model with no effort flags at all gets the full canonical list (`none` to `max`), so its default is `max`. Upstream LiteLLM treats `medium` and `high` as implied, and its stock model map flags only the extra levels. That convention does not apply to this connector. Do not report the explicit list, or a default it produces, as a bug, and do not reason about it from the stock model map.
+- **Reasoning effort list (explicit by design)**: the picker offers exactly the levels whose `supports_<level>_reasoning_effort` flag is `true` in the proxy's `/model/info`, or the levels a `forceMandatory` `modelOverrides` entry lists, which also wins over those flags. No level is implied, not even `medium` or `high`. The proxy's model config declares every level each model accepts, and some models reject levels such as `medium`. A reasoning model with no effort flags at all gets the full canonical list (`none` to `max`), so its default is `max`. Upstream LiteLLM treats `medium` and `high` as implied, and its stock model map flags only the extra levels. That convention does not apply to this connector. Do not report the explicit list, or a default it produces, as a bug, and do not reason about it from the stock model map.
 - **Reasoning effort default**: `getSupportedReasoningEfforts` returns the model's effort list in ascending order, and `getDefaultReasoningEffort` picks the last entry, the highest level the model lists, keeping a `modelOverrides` `defaultEffort` only when that list contains it. A fixed `medium` would sit outside the enum of a model that never offers it, and VS Code merges the schema `default` into `options.configuration` on every request (`_resolveModelConfigurationWithDefaults` in `languageModels.ts` of the VS Code source), so every request would carry a level the model rejects until the effort fallback (`src/utils/reasoningEffortFallback.ts`) stepped down. `getDefaultEffort` in `src/config/modelOverrides.ts` resolves the default the same way against the list the override declares, so the membership check against the model's own list stays with `getDefaultReasoningEffort`.
 - **Output reservation**: `deriveCapabilitiesFromModelInfo` caps the reserved output tokens at half the context window. LiteLLM's model map declares `max_output_tokens` at or above the window for many models, so reserving it whole would hand the picker an input limit near zero. The reservation becomes `maxOutputTokens` (what requests send as `max_tokens`) and the remainder is `maxInputTokens`.
-- **Model tags**: `getModelTags` takes the raw model name, not the namespaced id, so a backend whose hostname contains `code` cannot tag every model it serves for inline edits.
+- **No model tags**: discovered models carry no `tags`. VS Code's model metadata mapping has no `tags` field, so a tag would be computed and never read.
 - **Browser bundle compatibility**: the extension also builds for the web (`dist/web/extension.js`), where Node's `Buffer` does not exist. Payload bytes are decoded and encoded with `TextDecoder`, `TextEncoder`, and `btoa`, and the shared conversion helpers live in `src/utils/byteEncoding.ts` (`decodeUtf8`, `encodeUtf8`, `encodeBase64`). Only `src/observability/structuredLogFileSink.ts` may keep Node APIs, and the web build swaps it for a stub.
 
 ### Reload and refresh
@@ -616,7 +616,7 @@ This extension integrates LiteLLM proxies into VS Code's Language Model APIs. It
 - **Entry Point**: `src/extension.ts`
   - Activates the extension and instantiates exactly one `LiteLLMChatProvider`.
   - Registers `LiteLLMChatProvider` with `vscode.lm.registerLanguageModelChatProvider("litellm-connector", provider)`.
-  - The extension does NOT register a `LanguageModelTextCompletionProvider`. Completions are handled by VS Code's native tag-routing (the `inline-completions` tag on chat models) routed through the chat provider.
+  - The extension does NOT register a `LanguageModelTextCompletionProvider`.
   - Holds `context.secrets` for `SecretStorage` (if needed for non-provider secrets).
   - Receives per-group configuration from VS Code via `options.configuration` in `provideLanguageModelChatInformation`; response-time routing follows the model object VS Code passes back.
   - The configuration schema is defined in the `package.json` `languageModelChatProviders` contribution point (VS Code per-group format).
@@ -694,7 +694,7 @@ Images returned by a tool (a screenshot tool, a chart renderer, an MCP server) t
 - **Native shape**: Anthropic, Gemini/Vertex and Bedrock transforms parse `image_url` parts inside a `role: "tool"` message, so the images stay in the tool message.
 - **Hoisted shape**: OpenAI-compatible providers run tool messages through `convert_content_list_to_str`, which keeps only text, so the tool message carries a placeholder and one user message after the run carries the images. Grouping after the last tool message preserves the tool-call adjacency that strict providers require, and each image group is attributed to its tool so parallel calls stay distinguishable.
 - **Mode selection**: `resolveToolResultImageMode` in `src/utils/modelUtils.ts` picks the shape from `modelInfo.litellm_provider`, and `src/providers/base/requestBuilder.ts` passes it to `convertMessages`. Unknown providers and `/responses` requests hoist, because hoisting keeps the images reachable while native content risks silent loss.
-- **Audience filtering**: a tool result part whose `audience` list excludes `Assistant` is not uploaded. Parts without the flag stay unconditional.
+- **No audience filtering**: a tool result part is never dropped for its `audience`. The Agents window harness does not set one.
 - **Responses API**: `src/adapters/responsesAdapter.ts` carries message images as `input_image` items, the only shape LiteLLM's Responses-to-chat transform reads.
 
 ### Tool Result Content
@@ -806,7 +806,7 @@ The contract is **public read, internal write**:
 
 **Backoff is per backend**: `sharedDiscoveryBackoff` keeps one `DiscoveryBackoffController` per backend identity, so a dead group's failures cannot delay or block another group's discovery, and a successful discovery clears that backend's history. Once a backend is blocked, only the group with nothing to serve receives the `Blocked` error. The backoff wait stops when VS Code cancels the discovery call.
 
-**Change notifications are immediate**: `discoverModels` fires `onDidChange` as soon as a backend's model id set differs from its prior delivery. The registry has a `DebouncedEmitter` for this purpose, but the discovery path calls `_onDidChangeEmitter` directly, so `discoveryFireDebounceMs` and `discoveryFireMinIntervalMs` are not applied on this path.
+**Change notifications are immediate**: `discoverModels` fires `onDidChange` as soon as a backend's model id set differs from its prior delivery, with no debounce and no minimum interval. A timing setting would only delay the picker refresh the change is meant to trigger.
 
 ### External Dependencies
 

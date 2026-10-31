@@ -47,23 +47,6 @@ function isSupportedReasoningEffort(value: unknown): value is SupportedReasoning
     );
 }
 
-/**
- * Coerce an unknown value to a `string[]` of trimmed, non-empty entries.
- * Returns `undefined` when the input is not an array or contains no strings.
- *
- * Used to safely validate user-supplied override fields (`tags`,
- * `supportedOpenaiParams`) without tripping `no-unsafe-*` lints. `Array.isArray`
- * on its own narrows `unknown` to `any[]`, which is why the runtime check is
- * paired here with an explicit `unknown[]` filter.
- */
-export function toStringArray(value: unknown): string[] | undefined {
-    if (!Array.isArray(value)) {
-        return undefined;
-    }
-    const items = (value as unknown[]).filter((v): v is string => typeof v === "string");
-    return items.length > 0 ? items : undefined;
-}
-
 function normalizeEfforts(efforts: unknown): SupportedReasoningEffort[] | undefined {
     if (!Array.isArray(efforts)) {
         return undefined;
@@ -118,8 +101,6 @@ function validateOverride(entry: unknown, source: string): ModelOverride | undef
         reasoningEfforts,
         defaultEffort,
         forceMandatory: candidate.forceMandatory === true,
-        tags: toStringArray(candidate.tags),
-        supportedOpenaiParams: toStringArray(candidate.supportedOpenaiParams),
         notes: candidate.notes,
     };
 }
@@ -202,22 +183,21 @@ function getExplicitReasoningEfforts(modelInfo?: LiteLLMModelInfo): SupportedRea
     return hasAnyExplicitField ? explicitEfforts : undefined;
 }
 
+/**
+ * Resolves the efforts an override asks for.
+ *
+ * An override marked `forceMandatory` supplies the effort list in place of the
+ * levels the proxy reports, and supplies the canonical list when it declares no
+ * list. It cannot turn reasoning on for a proxy that reports
+ * `supports_reasoning: false`: that check runs first.
+ */
 export function getEffectiveEfforts(
     modelId: string,
     modelInfo?: LiteLLMModelInfo,
-    config?: vscode.WorkspaceConfiguration,
-    forceMandatory?: boolean
+    config?: vscode.WorkspaceConfiguration
 ): readonly SupportedReasoningEffort[] {
     const override = findOverride(modelId, config);
     const overrideEfforts = override?.reasoningEfforts;
-
-    // Force-mandatory request parameter should win regardless of LiteLLM data
-    if (forceMandatory && override) {
-        if (override.supportsReasoning === false) {
-            return [];
-        }
-        return overrideEfforts ?? [...CANONICAL_REASONING_EFFORTS];
-    }
 
     if (modelInfo?.supports_reasoning === false) {
         return [];

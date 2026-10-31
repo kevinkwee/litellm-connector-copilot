@@ -7,36 +7,7 @@ import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types"
 import type { ToolNameMapping } from "../../utils/toolNameUtils";
 import { createMockSecrets } from "../../test/utils/testMocks";
 import { EffortFallbackCache } from "../../utils/reasoningEffortFallback";
-import { getModelTags } from "../../utils/modelCapabilities";
-import type { DerivedModelCapabilities } from "../../utils/modelCapabilities";
 import type { BackendSession } from "../backendSession";
-
-function createDerived(overrides: Partial<DerivedModelCapabilities> = {}): DerivedModelCapabilities {
-    return {
-        supportsTools: false,
-        supportsVision: false,
-        supportsStreaming: false,
-        supportsReasoning: false,
-        supportsPdf: false,
-        supportsAudioInput: false,
-        supportsAudioOutput: false,
-        supportsComputerUse: false,
-        supportsFunctionCalling: false,
-        supportsToolChoice: false,
-        supportsSystemMessages: false,
-        supportsResponseSchema: false,
-        supportsPromptCaching: false,
-        supportsWebSearch: false,
-        supportsUrlContext: false,
-        supportsReasoningEffort: false,
-        supportsThinking: false,
-        endpointMode: "chat" as const,
-        maxInputTokens: 4096,
-        maxOutputTokens: 2048,
-        rawContextWindow: 8192,
-        ...overrides,
-    };
-}
 
 /**
  * Typed view of protected/private members and methods used in tests. We cast
@@ -75,7 +46,6 @@ interface BaseTestAccess {
     ) => Promise<{ request: OpenAIChatCompletionRequest; toolNames: ToolNameMapping }>;
     buildCapabilities: (modelInfo: LiteLLMModelInfo | undefined) => vscode.LanguageModelChatCapabilities;
     parseApiError: (statusCode: number, errorText: string) => string;
-    getModelTags: (modelId: string, modelInfo?: LiteLLMModelInfo, overrides?: Record<string, string[]>) => string[];
     stripUnsupportedParametersFromRequest: (
         requestBody: Record<string, unknown>,
         modelInfo: LiteLLMModelInfo | undefined,
@@ -636,6 +606,23 @@ suite("LiteLLMProviderBase", () => {
             assert.strictEqual(models1[0].id, models2[0].id, "model id is stable across calls");
         });
 
+        test("returns model objects without tags", async () => {
+            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const configManager = access(provider)._configManager;
+            const mockSession = makeMockSession();
+            sandbox.stub(configManager, "convertProviderConfiguration").returns(mockSession);
+
+            const models = await provider.discoverModels(
+                { silent: true, configuration: config },
+                new vscode.CancellationTokenSource().token
+            );
+
+            assert.strictEqual(models.length, 1);
+            // VS Code's model metadata mapping has no `tags` field, so the
+            // connector does not compute them.
+            assert.strictEqual("tags" in models[0], false);
+        });
+
         test("attaches reasoning configuration schema when supported", async () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
             const configManager = access(provider)._configManager;
@@ -1132,33 +1119,6 @@ suite("LiteLLMProviderBase", () => {
                 } as unknown as vscode.LanguageModelChatInformation
             );
             assert.strictEqual(result, undefined);
-        });
-    });
-
-    suite("getModelTags", () => {
-        test("adds inline-completions for streaming chat models", () => {
-            const tags = getModelTags("gpt-4-streaming", createDerived({ supportsStreaming: true }), {});
-            assert.ok(tags.includes("inline-completions"));
-        });
-
-        test("does not add inline-completions when streaming is unsupported", () => {
-            const tags = getModelTags("m", createDerived({ supportsStreaming: false }), {});
-            assert.ok(!tags.includes("inline-completions"));
-        });
-
-        test("applies user overrides", () => {
-            const tags = getModelTags("m", createDerived(), { m: ["custom-tag"] });
-            assert.ok(tags.includes("custom-tag"));
-        });
-
-        test("adds inline-edit for models containing 'coder' or 'code'", () => {
-            const tags = getModelTags("codex", createDerived(), {});
-            assert.ok(tags.includes("inline-edit"));
-        });
-
-        test("adds tools tag for function-calling or vision models", () => {
-            const tags = getModelTags("m", createDerived({ supportsTools: true }), {});
-            assert.ok(tags.includes("tools"));
         });
     });
 

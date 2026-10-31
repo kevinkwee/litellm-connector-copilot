@@ -349,8 +349,7 @@ suite("LiteLLMChatProvider stream attempt", () => {
         const recorder = createPartRecorder();
         const options = {
             ...createMockChatResponseOptions(),
-            caller: "background-summarizer",
-            justification: "compact the conversation",
+            requestInitiator: "background-summarizer",
         } as unknown as vscode.ProvideLanguageModelChatResponseOptions;
 
         await provider.provideLanguageModelChatResponse(
@@ -367,7 +366,6 @@ suite("LiteLLMChatProvider stream attempt", () => {
             .map((call) => call.args[1] as Record<string, unknown>);
         assert.strictEqual(surfaced.length, 1);
         assert.strictEqual(surfaced[0].caller, "background-summarizer");
-        assert.strictEqual(surfaced[0].justification, "compact the conversation");
         assert.strictEqual(typeof surfaced[0].errorSummary, "string");
         // The turn still completes as an assistant message.
         assert.ok(collectResponseText(recorder.parts).includes("[litellm-connector]"));

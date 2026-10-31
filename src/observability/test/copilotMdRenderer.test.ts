@@ -531,22 +531,22 @@ suite("renderCopilotMd", () => {
 suite("buildCopilotMdFilename", () => {
     test("builds {debugName}_{sortableTimestamp}_{id}.copilotmd", () => {
         const entry = makeMinimalEntry({
-            debugName: "panel/editAgent",
+            debugName: "core",
             id: "f3af93ab",
             startTimeIso: "2026-07-11T09:25:59.651Z",
         });
         const filename = buildCopilotMdFilename(entry);
-        // debugName is sanitized: / becomes _; timestamp strips -, ms, Z.
-        assert.strictEqual(filename, "panel_editAgent_20260711_092559_f3af93ab.copilotmd");
+        // timestamp strips -, ms, Z.
+        assert.strictEqual(filename, "core_20260711_092559_f3af93ab.copilotmd");
     });
 
-    test("strips other non-word characters from debugName", () => {
+    test("replaces every non-word character in debugName with an underscore", () => {
         const entry = makeMinimalEntry({
-            debugName: "chat:tool-calling",
+            debugName: "agent/host:core",
             id: "ab12cd34",
             startTimeIso: "2026-07-26T10:00:00.000Z",
         });
         const filename = buildCopilotMdFilename(entry);
-        assert.strictEqual(filename, "chat_tool_calling_20260726_100000_ab12cd34.copilotmd");
+        assert.strictEqual(filename, "agent_host_core_20260726_100000_ab12cd34.copilotmd");
     });
 });
