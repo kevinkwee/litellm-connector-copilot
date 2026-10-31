@@ -18,7 +18,7 @@ export interface IMetrics {
     estimatedInputCost?: number;
     estimatedOutputCost?: number;
     estimatedTotalCost?: number;
-    status: "success" | "failure" | "cancelled" | "caching_bypassed";
+    status: "success" | "failure" | "cancelled";
     error?: string;
     /** VS Code's `options.requestInitiator`; "unknown" when the host omits it. */
     caller?: string;

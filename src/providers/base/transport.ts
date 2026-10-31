@@ -53,7 +53,8 @@ export class Transport {
         caller?: string,
         modelInfo?: LiteLLMModelInfo,
         configuration?: Record<string, unknown>,
-        requestId?: string
+        requestId?: string,
+        learnedLimitsKey?: string
     ): Promise<ReadableStream<Uint8Array>> {
         this.logger.debug(
             `[transport.sendRequestToLiteLLM] Preparing LiteLLM request for model: ${request.model} (caller: ${caller})`
@@ -92,7 +93,7 @@ export class Transport {
         }
 
         // Thread disableCaching from the per-call configuration through to the
-        // LiteLLMClient so Cache-Control headers are set on the HTTP connection.
+        // LiteLLMClient, which then adds the proxy cache directive to the body.
         const disableCaching =
             typeof configuration?.disableCaching === "boolean" ? configuration.disableCaching : undefined;
         // The configuration merge does not guarantee clamped values, so the
@@ -111,7 +112,13 @@ export class Transport {
             key: apiKey,
             disableCaching,
             rateLimitMaxDelayMs,
-            onUnsupportedParameter: this.onUnsupportedParameter,
+            // A learned rejection belongs to one proxy's model config, so it is
+            // recorded under the namespaced picker id, not the wire model name.
+            // A caller that omits the id falls back to the wire name, which is
+            // still better than dropping the rejection.
+            onUnsupportedParameter: (_wireModel: string, param: string) => {
+                this.onUnsupportedParameter?.(learnedLimitsKey ?? _wireModel, param);
+            },
         });
 
         this.logger.info(

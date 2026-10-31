@@ -257,7 +257,7 @@ Folder ownership (unit tests are co-located with the module under test in `src/*
 
 - `src/providers/`: Language Model provider implementations (`liteLLMProviderBase.ts`, `liteLLMChatProvider.ts`, `index.ts`) and `base/`, the shared modules behind the provider orchestrator and the discovery registry: `requestBuilder.ts`, `transport.ts`, `types.ts`, `errorLogFields.ts`, `discoveryBackoff.ts`, `backendIdentity.ts`, `discoveryFailure.ts`, `pausedModelListing.ts`
 - `src/adapters/`: HTTP clients, payload shaping, endpoint-specific parsing, SSE and streaming (`sse/`, `streaming/`), tokenizers
-- `src/utils/`: shared utilities (logging, local request metrics, model helpers, pricing, `chatSessionId`, `thinkingBlocks`, `promptCaching`, `connectorNotice`, `transportRetry`, `rateLimitRetryPolicy`, `rateLimitNotice`, `toolNameUtils`, `byteEncoding`)
+- `src/utils/`: shared utilities (logging, local request metrics, model helpers, pricing, `chatSessionId`, `thinkingBlocks`, `promptCaching`, `connectorNotice`, `transportRetry`, `rateLimitRetryPolicy`, `rateLimitNotice`, `toolNameUtils`, `byteEncoding`, `proxyBaseUrl`)
 - `src/config/`: configuration and secrets
 - `src/commands/`: command registrations and UI entry points
 - `src/observability/`: structured logging, the `.copilotmd` debug export, and `finalUsageEnvelope.ts`, which writes the token and cost totals of a completed request to a single `[TokenUsage][Final]` line
@@ -717,7 +717,7 @@ A tool result may carry several content parts. `collectToolResultContent` (`src/
 
 - `litellm-connector.anthropicPromptCaching` (`off` | `5m` | `1h`, default `5m`) adds a top-level `cache_control: {type: "ephemeral"}` directive (plus `ttl: "1h"` on the higher tier) to chat requests; LiteLLM forwards it to the Claude API as the automatic prompt-caching marker. Unrelated to `disableCaching`, which bypasses the proxy response cache.
 - **Gating**: `src/utils/promptCaching.ts` allows the marker only for Anthropic-family requests where `modelInfo.litellm_provider` is authoritative and `supports_prompt_caching` is not explicitly false.
-- **Live learning**: when a 400 names `cache_control`, `litellmClient.chat` strips it and retries once, then notifies the transport, which records it through the registry (`recordUnsupportedParameter`). The request builder consults `getUnsupportedParameters`, so later requests omit the marker without paying a failed round trip. The learned key is the raw model name (the request body's `model` value).
+- **Live learning**: when a 400 or 403 names `cache_control` or the `no-cache` directive, `litellmClient.chat` strips it and retries once, then notifies the transport, which records it through the registry (`recordUnsupportedParameter`). The request builder consults `getUnsupportedParameters`, so later requests omit the marker without paying a failed round trip, and the base skips the cache directive up front for a model whose key refused it. The learned key is the namespaced picker id, because a learned limit describes one proxy's model config. Reload Models clears them.
 
 ### Session Identity
 
@@ -739,7 +739,7 @@ A tool result may carry several content parts. `collectToolResultContent` (`src/
 
 Configuration from user settings reaches providers via VS Code's language model API on a per-group basis:
 
-1. User configures Base URL, API Key, and any other declared properties for a provider group in the language model provider settings UI.
+1. User configures Base URL, API Key, and any other declared properties for a provider group in the language model provider settings UI. The base URL runs through `normalizeProxyBaseUrl` (`src/utils/proxyBaseUrl.ts`), which trims whitespace, strips a trailing slash, and strips one terminal `/chat/completions`, `/completions`, `/responses`, or `/model/info`, keeping a `/v1` prefix. A pasted endpoint path therefore reaches the same backend identity as the bare host, and no request is built as `<url>/chat/completions/chat/completions`.
 2. VS Code encrypts secrets (fields marked `"secret": true` in `package.json`).
 3. VS Code passes the per-group configuration to the provider via `options.configuration` on `provideLanguageModelChatInformation`.
 4. `ConfigManager.convertProviderConfiguration()` converts the per-group object to internal `LiteLLMConfig` format.
@@ -799,7 +799,7 @@ The contract is **public read, internal write**:
   - `extractRawName(id)`: strip the routing prefix from a namespaced id.
   - `getModelInfo(id)` / `getDerivedCapabilities(id)`: read the per-model capability caches populated during discovery. These are NOT a model-list cache. They cache the capability info for known models and feed the request hot path. Ids are per host, so two groups on one host share these entries.
   - `size()`, `clearCaches()`, `clearDiscoveryCaches()`: registration-state reads and reset. `clearCaches()` wipes the per-model caches (model info, derived capabilities, unsupported parameters), the discovery response cache, and every backend's backoff history. `clearDiscoveryCaches()` wipes only the discovery response cache and the backoff histories, and bumps the discovery epoch, which is what a model reload uses.
-  - `recordUnsupportedParameter(modelId, param)` / `getUnsupportedParameters(modelId)`: the in-session store of parameters a live 400 taught the client to strip. Keyed by the raw model name (the request body's `model` value). The transport wires the client's strip-and-retry callback into `recordUnsupportedParameter`; the request builder reads `getUnsupportedParameters` to skip re-sending what a model already rejected. Only connector-added parameters (the `cache_control` marker) are recorded: a model parameter the proxy's `/model/info` claimed to support is surfaced to the user instead of being stripped.
+  - `recordUnsupportedParameter(modelId, param)` / `getUnsupportedParameters(modelId)`: the in-session store of parameters a live rejection taught the client to strip. Keyed by the namespaced picker id, because a learned limit describes one proxy's model config. The transport wires the client's strip-and-retry callback into `recordUnsupportedParameter`; the request builder reads `getUnsupportedParameters` to skip re-sending what a model already rejected. Only connector-added parameters (the `cache_control` marker and the `cache` directive) are recorded: a model parameter the proxy's `/model/info` claimed to support is surfaced to the user instead of being stripped. `clearUnsupportedParameters()` forgets them on a user-initiated reload.
   - `onDidChange`: fires when a backend's model set has actually changed. The base provider subscribes once and forwards to VS Code's `onDidChangeLanguageModelChatInformation`.
 
 - **Internal surface (write, NOT part of the public contract)**:

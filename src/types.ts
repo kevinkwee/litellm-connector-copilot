@@ -223,9 +223,10 @@ export interface LiteLLMConfig {
     forceResponsesEndpoint?: boolean;
 
     /**
-     * When true and forceResponsesEndpoint is true, falls back to `/chat/completions` if `/responses` fails.
+     * When true and the model's mode is `responses`, a 5xx from `/responses`
+     * retries once on `/chat/completions`.
      * This is an escape hatch for models that cannot use /responses.
-     * Default: false (JSON-only, not in Settings UI).
+     * Default: false.
      */
     allowChatCompletionsFallback?: boolean;
 
@@ -457,17 +458,15 @@ export interface OpenAIChatCompletionRequest {
      */
     reasoning_effort?: string | { effort: string; summary?: string };
     /**
-     * LiteLLM passthrough body.
-     * Used for features like caching controls.
+     * LiteLLM cache directive. The proxy reads `cache["no-cache"]` at the top
+     * level and lists `cache` in `all_litellm_params`, so it is never forwarded
+     * to a provider.
      *
      * Docs: https://docs.litellm.ai/docs/proxy/caching#no-cache
      */
-    extra_body?: {
-        cache?: {
-            /** Skip cache check, get fresh response */
-            "no-cache"?: boolean;
-        };
-        [key: string]: unknown;
+    cache?: {
+        /** Skip the cache lookup and get a fresh response */
+        "no-cache"?: boolean;
     };
 }
 
@@ -504,14 +503,10 @@ export interface LiteLLMResponsesRequest {
         [key: string]: unknown;
     };
     /**
-     * LiteLLM passthrough body.
-     * Used for features like caching controls.
+     * LiteLLM cache directive, read at the top level by the proxy.
      */
-    extra_body?: {
-        cache?: {
-            "no-cache"?: boolean;
-        };
-        [key: string]: unknown;
+    cache?: {
+        "no-cache"?: boolean;
     };
 }
 

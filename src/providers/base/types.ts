@@ -13,8 +13,8 @@ export interface RequestBuilderDeps {
     ) => void;
     isParameterSupported: (param: string, modelInfo: LiteLLMModelInfo | undefined, modelId?: string) => boolean;
     /**
-     * Parameters a live 400 taught us to omit for this raw model id. Fed by
-     * the registry's learned-unsupported store so a single failed request
+     * Parameters a live rejection taught us to omit for this namespaced model id.
+     * Fed by the registry's learned-unsupported store so a single failed request
      * short-circuits later ones.
      */
     getUnsupportedParameters: (modelId: string) => ReadonlySet<string>;

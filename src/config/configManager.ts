@@ -5,6 +5,7 @@ import type { BackendSession } from "../providers/backendSession";
 import { Logger } from "../utils/logger";
 import { normalizeAnthropicPromptCachingMode } from "../utils/promptCaching";
 import { deriveGroupNameFromUrl } from "../utils";
+import { normalizeProxyBaseUrl } from "../utils/proxyBaseUrl";
 
 export class ConfigManager {
     private static readonly INACTIVITY_TIMEOUT_KEY = "litellm-connector.inactivityTimeout";
@@ -324,7 +325,7 @@ export class ConfigManager {
         groupName: string,
         configuration: Record<string, unknown>
     ): BackendSession | undefined {
-        const baseUrl = typeof configuration.baseUrl === "string" ? configuration.baseUrl.trim() : "";
+        const baseUrl = normalizeProxyBaseUrl(typeof configuration.baseUrl === "string" ? configuration.baseUrl : "");
         const apiKey = typeof configuration.apiKey === "string" ? configuration.apiKey.trim() : "";
 
         if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) {

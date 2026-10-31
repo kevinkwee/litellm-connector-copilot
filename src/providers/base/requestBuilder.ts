@@ -44,10 +44,11 @@ export class RequestBuilder {
         const config = await this.configManager.getConfig();
 
         // `model.id` is the namespaced `<routing>/<raw>` form VS Code hands
-        // us at response time. The LiteLLM request body, the capability
-        // lookup, the parameter-supported probes, and the usage-opt-out
-        // set all need the RAW model name (the part after the first `/`).
+        // us at response time. The LiteLLM request body and the capability
+        // probes need the RAW model name (the part after the first `/`), while
+        // what a proxy taught us about a model is stored under the namespaced id.
         const rawModelId = this.extractRawModelName(model.id);
+        const learnedLimitsKey = model.id;
 
         const toolConfig = convertTools(options);
         const toolNames = toolConfig.toolNames;
@@ -76,7 +77,7 @@ export class RequestBuilder {
                 : {}),
         };
 
-        if (!this.usageOptOutModels.has(rawModelId)) {
+        if (!this.usageOptOutModels.has(learnedLimitsKey)) {
             requestBody.stream_options = { include_usage: true } as { include_usage?: boolean };
         }
 
@@ -112,7 +113,7 @@ export class RequestBuilder {
         if (
             cacheControl &&
             this.isParameterSupported("cache_control", modelInfo, rawModelId) &&
-            !this.getUnsupportedParameters(rawModelId).has("cache_control")
+            !this.getUnsupportedParameters(learnedLimitsKey).has("cache_control")
         ) {
             requestBody.cache_control = cacheControl;
         }

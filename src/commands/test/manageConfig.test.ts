@@ -46,12 +46,12 @@ suite("ManageConfig Command Unit Tests", () => {
         assert.strictEqual(executeCommandStub.called, true);
     });
 
-    test("reloadModels asks the provider to reload discovery and reports it", async () => {
+    test("calls reloadModels and reports that a reload started", async () => {
         const infoStub = sandbox.stub(vscode.window, "showInformationMessage");
         const reloadStub = sandbox.stub();
 
         const provider = {
-            reloadModelDiscovery: reloadStub,
+            reloadModels: reloadStub,
         } as unknown as LiteLLMChatProvider;
 
         let handler: (() => Promise<void>) | undefined;

@@ -15,13 +15,13 @@ suite("Types Unit Tests", () => {
             model: "m",
             messages: [msg],
             stream: true,
-            extra_body: { cache: { "no-cache": true } },
+            cache: { "no-cache": true },
         };
 
         assert.strictEqual(req.model, "m");
         assert.strictEqual(req.messages[0].role, "user");
         assert.strictEqual(req.stream, true);
-        assert.strictEqual(req.extra_body?.cache?.["no-cache"], true);
+        assert.strictEqual(req.cache?.["no-cache"], true);
     });
 
     test("LiteLLMResponseInputItem union accepts message and tool items", () => {

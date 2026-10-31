@@ -187,7 +187,7 @@
 				"litellm-connector.disableCaching": {
 					"type": "boolean",
 					"default": true,
-					"description": "When enabled, LiteLLM caching will be bypassed by sending 'no-cache: true' and 'Cache-Control: no-cache' headers.",
+					"description": "Ask the LiteLLM proxy to skip its response cache for every request (sends cache: {\"no-cache\": true}). A key that is not allowed to set it is detected once per model and the directive is dropped.",
 					"tags": [
 						"experimental"
 					]
@@ -211,6 +211,16 @@
 					"type": "boolean",
 					"default": true,
 					"description": "Show model pricing in the model picker when available."
+				},
+				"litellm-connector.forceResponsesEndpoint": {
+					"type": "boolean",
+					"default": false,
+					"description": "Send models whose proxy mode is chat to the /responses endpoint. Changing it reloads the model list."
+				},
+				"litellm-connector.allowChatCompletionsFallback": {
+					"type": "boolean",
+					"default": false,
+					"description": "When a request routed to /responses fails with a 5xx status, retry it once on /chat/completions."
 				},
 				"litellm-connector.discoveryTimeoutMs": {
 					"type": "number",

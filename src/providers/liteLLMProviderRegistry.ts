@@ -386,6 +386,14 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     /**
+     * Forgets every parameter a live rejection taught this session. Used when the
+     * user asks for a reload, because the proxy's model config may have changed.
+     */
+    public clearUnsupportedParameters(): void {
+        this.unsupportedParamsByModel.clear();
+    }
+
+    /**
      * Records an auto-stripped parameter for a model so future requests can
      * proactively omit it. Only to be called when the transport detected a failed
      * request and removed the parameter before retrying.

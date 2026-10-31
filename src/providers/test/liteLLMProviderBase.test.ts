@@ -37,6 +37,8 @@ interface BaseTestAccess {
         ) => Promise<ReadableStream<Uint8Array>>;
     };
     _effortFallbackCache: EffortFallbackCache;
+    _usageOptOutModels: Set<string>;
+    refreshModelInformation: () => void;
     buildOpenAIChatRequest: (
         messages: vscode.LanguageModelChatRequestMessage[],
         model: vscode.LanguageModelChatInformation,
@@ -353,11 +355,11 @@ suite("LiteLLMProviderBase", () => {
                 .resolves(new ReadableStream());
 
             await access(provider).sendRequestWithRetry(
-                // Use a unique model id to avoid sharing the
-                // `EffortFallbackCache` notification key with the
-                // "retries once on reasoning 4xx" test which runs first.
+                // The learned-limit key is the namespaced model id, so this test
+                // uses its own model object to avoid sharing the notification key
+                // with the "retries once on reasoning 4xx" test.
                 { model: "notify-once-model", messages: [], stream: true, max_tokens: 100, reasoning_effort: "high" },
-                model,
+                { ...model, id: "notify-once-model" },
                 { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
                 { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
                 new vscode.CancellationTokenSource().token,
@@ -1277,6 +1279,59 @@ suite("LiteLLMProviderBase", () => {
             transport.onUnsupportedParameter?.("claude-opus", "cache_control");
 
             sinon.assert.calledOnceWithExactly(record, "claude-opus", "cache_control");
+        });
+
+        test("reloadModels forgets every learned limit", async () => {
+            const provider = new LiteLLMChatProvider(mockSecrets, userAgent, new EffortFallbackCache());
+            const internals = access(provider);
+            internals._effortFallbackCache.recordFailure("host-a.example/model", "high");
+            internals._usageOptOutModels.add("host-a.example/model");
+            internals._registry.recordUnsupportedParameter("host-a.example/model", "cache_control");
+            sandbox.stub(internals, "refreshModelInformation");
+
+            provider.reloadModels();
+
+            assert.strictEqual(
+                internals._effortFallbackCache.getEffectiveEffort("host-a.example/model", "high"),
+                "high"
+            );
+            assert.strictEqual(internals._usageOptOutModels.size, 0);
+            assert.strictEqual(internals._registry.getUnsupportedParameters("host-a.example/model").size, 0);
+        });
+
+        test("a settings-triggered reload keeps every learned limit", async () => {
+            const provider = new LiteLLMChatProvider(mockSecrets, userAgent, new EffortFallbackCache());
+            const internals = access(provider);
+            internals._usageOptOutModels.add("host-a.example/model");
+            internals._registry.recordUnsupportedParameter("host-a.example/model", "cache_control");
+            sandbox.stub(internals, "refreshModelInformation");
+
+            provider.reloadModelDiscovery();
+
+            assert.strictEqual(internals._usageOptOutModels.has("host-a.example/model"), true);
+            assert.strictEqual(
+                internals._registry.getUnsupportedParameters("host-a.example/model").has("cache_control"),
+                true,
+                "learned limits describe the proxy, not the settings"
+            );
+        });
+
+        test("a rejection on one host leaves the same model name on another host untouched", () => {
+            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const internals = access(provider);
+            const transport = internals._transport as unknown as {
+                onUnsupportedParameter?: (model: string, param: string) => void;
+            };
+            // The transport records under the key the base hands it, which is the
+            // namespaced picker id: two hosts serving one raw name stay separate.
+            internals._registry.recordUnsupportedParameter("a.example/gpt-4o", "cache_control");
+
+            assert.strictEqual(
+                internals._registry.getUnsupportedParameters("a.example/gpt-4o").has("cache_control"),
+                true
+            );
+            assert.strictEqual(internals._registry.getUnsupportedParameters("b.example/gpt-4o").size, 0);
+            assert.ok(transport);
         });
     });
 });

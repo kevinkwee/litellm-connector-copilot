@@ -40,13 +40,18 @@ suite("onUnsupportedParameter wiring", () => {
             new vscode.CancellationTokenSource().token,
             undefined,
             { mode: "chat" },
-            { baseUrl: "https://x", apiKey: "k" }
+            { baseUrl: "https://x", apiKey: "k" },
+            "req-1",
+            "host.example/wire-model-name"
         );
     }
 
-    test("threads the hook through the factory-injected LiteLLMClient", async () => {
+    test("threads the hook through the factory-injected LiteLLMClient under the learned-limits key", async () => {
         lastClientParams = undefined;
-        const onUnsupportedParameter = (_model: string, _param: string) => {};
+        const recorded: { model: string; param: string }[] = [];
+        const onUnsupportedParameter = (model: string, param: string) => {
+            recorded.push({ model, param });
+        };
         const transport = makeTransport({
             configManager: { getConfig: async () => ({}) } as unknown as ConfigManager,
             userAgent: "test-ua",
@@ -60,6 +65,13 @@ suite("onUnsupportedParameter wiring", () => {
 
         await call(transport);
 
-        assert.strictEqual(lastClientParams!.onUnsupportedParameter, onUnsupportedParameter);
+        const hook = lastClientParams!.onUnsupportedParameter;
+        assert.ok(hook, "the transport must pass a hook to the client");
+        hook("wire-model-name", "cache_control");
+        assert.deepStrictEqual(
+            recorded,
+            [{ model: "host.example/wire-model-name", param: "cache_control" }],
+            "the hook records under the namespaced picker id, not the wire name"
+        );
     });
 });

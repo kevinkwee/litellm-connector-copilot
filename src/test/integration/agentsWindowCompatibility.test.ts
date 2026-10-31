@@ -140,4 +140,19 @@ suite("Agents Window Compatibility Manifest", () => {
         assert.strictEqual("litellm-connector.discoveryFireDebounceMs" in properties, false);
         assert.strictEqual("litellm-connector.discoveryFireMinIntervalMs" in properties, false);
     });
+
+    test("declares the two routing settings as opt-in booleans", () => {
+        const contributes = manifest.contributes as Record<string, unknown>;
+        const properties = (contributes.configuration as Record<string, unknown>).properties as Record<
+            string,
+            ManifestProperty & { default?: unknown }
+        >;
+
+        for (const key of ["forceResponsesEndpoint", "allowChatCompletionsFallback"]) {
+            const declared = properties[`litellm-connector.${key}`];
+            assert.ok(declared, `${key} must be declared`);
+            assert.strictEqual(declared.type, "boolean", `${key} must be a boolean`);
+            assert.strictEqual(declared.default, false, `${key} must default to false`);
+        }
+    });
 });

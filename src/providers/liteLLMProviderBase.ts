@@ -68,10 +68,10 @@ export abstract class LiteLLMProviderBase {
     protected readonly _effortFallbackCache: EffortFallbackCache;
     // Per-session memo of models that have rejected `stream_options.include_usage`
     // on a live upstream call. NOT a model-info cache: it cannot be corrupted by
-    // stale capability data. Keyed by the raw model name, because the key used on
-    // write must be the name the request body carries as `model`. Without this,
-    // the request builder would re-send `include_usage: true` on every request to
-    // a model that previously rejected it, causing an infinite retry loop.
+    // stale capability data. Keyed by the namespaced picker id, because a learned
+    // limit describes one proxy's model config. Without this, the request builder
+    // would re-send `include_usage: true` on every request to a model that
+    // previously rejected it, causing an infinite retry loop.
     private _usageOptOutModels = new Set<string>();
 
     constructor(
@@ -147,6 +147,26 @@ export abstract class LiteLLMProviderBase {
         Logger.info("Reloading model discovery");
         this._registry.clearDiscoveryCaches();
         this.refreshModelInformation();
+    }
+
+    /**
+     * Reloads the model list and forgets what live rejections taught this session.
+     * A user-initiated reload means the proxy's model config may have changed, so
+     * a parameter rejected before is worth trying again.
+     */
+    public reloadModels(): void {
+        this.clearLearnedLimits();
+        this.reloadModelDiscovery();
+    }
+
+    /**
+     * Forgets every per-proxy limit learned from a live request: the effort
+     * fallback ladder, the `include_usage` opt-out, and the unsupported parameters.
+     */
+    protected clearLearnedLimits(): void {
+        this._effortFallbackCache.clear();
+        this._usageOptOutModels.clear();
+        this._registry.clearUnsupportedParameters();
     }
 
     /**
@@ -307,7 +327,8 @@ export abstract class LiteLLMProviderBase {
         caller?: string,
         modelInfo?: LiteLLMModelInfo,
         configuration?: Record<string, unknown>,
-        requestId?: string
+        requestId?: string,
+        learnedLimitsKey?: string
     ): Promise<ReadableStream<Uint8Array>> {
         return this._transport.sendRequestToLiteLLM(
             request,
@@ -316,7 +337,8 @@ export abstract class LiteLLMProviderBase {
             caller,
             modelInfo,
             configuration,
-            requestId
+            requestId,
+            learnedLimitsKey
         );
     }
 
@@ -335,7 +357,9 @@ export abstract class LiteLLMProviderBase {
         modelInfo?: LiteLLMModelInfo,
         requestId?: string
     ): Promise<ReadableStream<Uint8Array>> {
-        const modelId = request.model;
+        const modelId = model.id;
+        // A learned limit describes one proxy's model config, so the key is the
+        // namespaced picker id rather than the wire model name.
         Logger.debug(`[sendRequestWithRetry] modelId: ${modelId}, reasoning_effort: ${request.reasoning_effort}`);
         const originalEffort = (request as { reasoning_effort?: SupportedReasoningEffort }).reasoning_effort;
         let effectiveEffort = this._effortFallbackCache.getEffectiveEffort(modelId, originalEffort);
@@ -362,7 +386,8 @@ export abstract class LiteLLMProviderBase {
                     caller,
                     modelInfo,
                     await this.getCallTimeConfiguration(options, model),
-                    requestId
+                    requestId,
+                    modelId
                 );
             } catch (err) {
                 this.logRequestPayloadOnFailure(request, err, {
@@ -374,9 +399,7 @@ export abstract class LiteLLMProviderBase {
 
                 const errorMessage = err instanceof Error ? err.message : String(err);
                 if (this.isUsageIncludeUsageParameterError(errorMessage)) {
-                    // The memo key must be the name the request body carries as
-                    // `model`, so the namespaced picker id must not be stored here.
-                    this._usageOptOutModels.add(request.model);
+                    this._usageOptOutModels.add(modelId);
                     clearUsageFlag();
 
                     if (!usageRetryAttempted) {
@@ -531,7 +554,9 @@ export abstract class LiteLLMProviderBase {
             return {
                 ...opt.configuration,
                 allowChatCompletionsFallback: cfg.allowChatCompletionsFallback,
-                disableCaching: cfg.disableCaching,
+                // A key that already rejected the directive must not pay for it on
+                // every request, so the learned rejection disables it up front.
+                disableCaching: cfg.disableCaching && !this._registry.getUnsupportedParameters(model.id).has("cache"),
                 rateLimitMaxDelayMs: cfg.rateLimitMaxDelayMs,
             };
         }
@@ -560,7 +585,7 @@ export abstract class LiteLLMProviderBase {
                 baseUrl: entry.baseUrl,
                 apiKey: entry.apiKey,
                 allowChatCompletionsFallback: cfg.allowChatCompletionsFallback,
-                disableCaching: cfg.disableCaching,
+                disableCaching: cfg.disableCaching && !this._registry.getUnsupportedParameters(model.id).has("cache"),
                 rateLimitMaxDelayMs: cfg.rateLimitMaxDelayMs,
             };
         }

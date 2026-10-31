@@ -70,7 +70,9 @@ export function registerShowModelsCommand(provider: LiteLLMChatProvider): vscode
 
 export function registerReloadModelsCommand(provider: LiteLLMChatProvider): vscode.Disposable {
     return vscode.commands.registerCommand("litellm-connector.reloadModels", async () => {
-        provider.reloadModelDiscovery();
+        // A user-initiated reload also forgets the limits a live rejection taught
+        // this session, because the proxy's model config may have changed.
+        provider.reloadModels();
         vscode.window.showInformationMessage("LiteLLM: Reloading models...");
     });
 }

@@ -9,9 +9,8 @@ import type {
 import { transformToResponsesFormat } from "./responsesAdapter";
 import { StructuredLogger } from "../observability/structuredLogger";
 import { Logger } from "../utils/logger";
-import { isAnthropicModel } from "../utils/modelUtils";
 import { planRateLimitRetry, type RateLimitFailure, type RateLimitWaitSource } from "../utils/rateLimitRetryPolicy";
-import { LiteLLMTelemetry } from "../utils/telemetry";
+import { normalizeProxyBaseUrl } from "../utils/proxyBaseUrl";
 
 /**
  * Error thrown when a /model/info discovery request times out.
@@ -138,7 +137,11 @@ export class LiteLLMClient {
     constructor(
         private readonly config: LiteLLMClientConfig,
         private readonly userAgent: string
-    ) {}
+    ) {
+        // Every endpoint URL is `${config.url}${endpoint}`, so the base is
+        // normalized once here rather than at each call site.
+        this.config = { ...config, url: normalizeProxyBaseUrl(config.url) };
+    }
 
     /**
      * Fetches model information from the LiteLLM proxy.
@@ -169,10 +172,12 @@ export class LiteLLMClient {
                 lastResponse = resp;
                 if (resp.status === 404) {
                     Logger.warn(`Model info endpoint returned 404, trying fallback URL: ${url}`);
+                    this.discardBody(resp);
                     continue;
                 }
 
                 Logger.error(`Failed to fetch model info: ${resp.status} ${resp.statusText}`);
+                this.discardBody(resp);
                 throw new LiteLLMDiscoveryError(resp.status, resp.statusText);
             }
 
@@ -195,27 +200,11 @@ export class LiteLLMClient {
     }
 
     private getModelInfoUrls(): string[] {
-        const trimmed = this.config.url.replace(/\/+$/, "");
-        const stripTerminalEndpoint = (url: string): string =>
-            url.replace(/\/(?:chat\/completions|completions|responses|model\/info)$/i, "");
-        const stripV1 = (url: string): string => url.replace(/\/v1$/i, "");
-
-        const baseCandidates = new Set<string>([
-            trimmed,
-            stripTerminalEndpoint(trimmed),
-            stripV1(trimmed),
-            stripV1(stripTerminalEndpoint(trimmed)),
-            stripTerminalEndpoint(stripV1(trimmed)),
-        ]);
-
-        const urls: string[] = [];
-        for (const base of baseCandidates) {
-            if (!base) {
-                continue;
-            }
-            urls.push(`${base}/model/info`);
-        }
-        return urls;
+        const base = normalizeProxyBaseUrl(this.config.url);
+        const withoutV1 = base.replace(/\/v1$/i, "");
+        return [...new Set([base, withoutV1].filter((candidate) => candidate.length > 0))].map(
+            (candidate) => `${candidate}/model/info`
+        );
     }
 
     /**
@@ -257,26 +246,13 @@ export class LiteLLMClient {
         const endpoint = this.getEndpoint(mode);
         let body: OpenAIChatCompletionRequest | LiteLLMResponsesRequest = request;
 
-        const isAnthropic = isAnthropicModel(request.model, modelInfo);
-
-        if (this.config.disableCaching) {
-            if (isAnthropic) {
-                Logger.info(`Bypassing 'disable caching' for Anthropic/Claude model: ${request.model}`);
-                LiteLLMTelemetry.reportMetric({
-                    requestId: `bypass-${Math.random().toString(36).substring(7)}`,
-                    model: request.model,
-                    status: "caching_bypassed",
-                });
-            } else {
-                body = this.withNoCacheExtraBody(body);
-            }
-        }
-
         if (endpoint === "/responses") {
             body = transformToResponsesFormat(request);
-            if (this.config.disableCaching && !isAnthropic) {
-                body = this.withNoCacheExtraBody(body);
-            }
+        }
+        // The fork reads the bypass from a top-level `cache` member, and lists
+        // `cache` in `all_litellm_params`, so it reaches the proxy but no provider.
+        if (this.config.disableCaching) {
+            body = this.withNoCacheDirective(body);
         }
 
         Logger.trace(`Sending chat request to ${endpoint}`, { model: request.model });
@@ -286,7 +262,7 @@ export class LiteLLMClient {
             url,
             {
                 method: "POST",
-                headers: this.getHeaders(request.model, modelInfo),
+                headers: this.getHeaders(),
                 body: JSON.stringify(body),
             },
             rateLimitOptions
@@ -296,7 +272,7 @@ export class LiteLLMClient {
         // and retried. A parameter the proxy itself claimed to support is
         // reported instead: hiding it would send the same rejected body on
         // every later request.
-        if (response.status === 400) {
+        if (response.status === 400 || response.status === 403) {
             const retry = this.planConnectorParameterRetry(
                 await response.clone().text(),
                 body,
@@ -305,6 +281,7 @@ export class LiteLLMClient {
             );
             if (retry) {
                 Logger.warn(`Retrying ${request.model} without a connector-added parameter the proxy rejected`);
+                this.discardBody(response);
                 response = await this.fetchWithRateLimit(
                     url,
                     {
@@ -345,8 +322,9 @@ export class LiteLLMClient {
      * - `cache_control`, the Anthropic prompt-caching marker added by the
      *   request builder. It is reported through `onUnsupportedParameter` so
      *   later requests omit it without paying a failed round trip.
-     * - the cache-bypass flag added for `litellm-connector.disableCaching`
-     *   (`extra_body.cache["no-cache"]` plus its `Cache-Control` header).
+     * - the cache-bypass directive added for `litellm-connector.disableCaching`
+     *   (`cache["no-cache"]`). A key the proxy does not allow to set it answers
+     *   403, so the same strip-and-retry covers both statuses.
      *
      * Nothing else in the body is touched: any other parameter is either the
      * user's own configuration or was accepted by the proxy's capability data,
@@ -356,7 +334,7 @@ export class LiteLLMClient {
         errorText: string,
         body: OpenAIChatCompletionRequest | LiteLLMResponsesRequest,
         modelId: string,
-        modelInfo: LiteLLMModelInfo | undefined
+        _modelInfo: LiteLLMModelInfo | undefined
     ): { body: OpenAIChatCompletionRequest | LiteLLMResponsesRequest; headers: Record<string, string> } | undefined {
         const errorLower = errorText.toLowerCase();
         const promptCachingRejected = errorLower.includes("cache_control");
@@ -373,7 +351,7 @@ export class LiteLLMClient {
 
         const retryBody = JSON.parse(JSON.stringify(body)) as OpenAIChatCompletionRequest | LiteLLMResponsesRequest;
         const retryBodyRecord = retryBody as unknown as Record<string, unknown>;
-        const headers = this.getHeaders(modelId, modelInfo);
+        const headers = this.getHeaders();
         let strippedSomething = false;
 
         if (promptCachingRejected && "cache_control" in retryBodyRecord) {
@@ -383,25 +361,11 @@ export class LiteLLMClient {
             strippedSomething = true;
         }
 
-        if (cacheBypassRejected) {
-            if (retryBody.extra_body && typeof retryBody.extra_body === "object") {
-                const extraBody = retryBody.extra_body as Record<string, unknown>;
-                const cache = extraBody.cache;
-                if (cache && typeof cache === "object" && "no-cache" in (cache as Record<string, unknown>)) {
-                    delete (cache as Record<string, unknown>)["no-cache"];
-                    strippedSomething = true;
-                    if (Object.keys(cache as Record<string, unknown>).length === 0) {
-                        delete extraBody.cache;
-                    }
-                }
-                if (Object.keys(extraBody).length === 0) {
-                    delete retryBody.extra_body;
-                }
-            }
-            if (headers["Cache-Control"] !== undefined) {
-                delete headers["Cache-Control"];
-                strippedSomething = true;
-            }
+        if (cacheBypassRejected && retryBody.cache !== undefined) {
+            Logger.info(`Stripping ${modelId} cache bypass: the proxy's key may not set no-cache`);
+            delete retryBodyRecord.cache;
+            this.config.onUnsupportedParameter?.(modelId, "cache");
+            strippedSomething = true;
         }
 
         // A body that did not change would be rejected identically, so do not
@@ -409,7 +373,7 @@ export class LiteLLMClient {
         return strippedSomething ? { body: retryBody, headers } : undefined;
     }
 
-    private getHeaders(modelId?: string, modelInfo?: LiteLLMModelInfo): Record<string, string> {
+    private getHeaders(): Record<string, string> {
         const headers: Record<string, string> = {
             "Content-Type": "application/json",
             "User-Agent": this.userAgent,
@@ -417,12 +381,6 @@ export class LiteLLMClient {
         if (this.config.key) {
             headers.Authorization = `Bearer ${this.config.key}`;
             headers["X-API-Key"] = this.config.key;
-        }
-        if (this.config.disableCaching) {
-            const isAnthropic = modelId ? isAnthropicModel(modelId, modelInfo) : false;
-            if (!isAnthropic) {
-                headers["Cache-Control"] = "no-cache";
-            }
         }
         return headers;
     }
@@ -438,18 +396,12 @@ export class LiteLLMClient {
         return "/chat/completions";
     }
 
-    private withNoCacheExtraBody(
+    private withNoCacheDirective(
         body: OpenAIChatCompletionRequest | LiteLLMResponsesRequest
     ): OpenAIChatCompletionRequest | LiteLLMResponsesRequest {
-        const extraBody = body.extra_body ?? {};
-        const cache = (extraBody.cache ?? {}) as Record<string, unknown>;
-        cache["no-cache"] = true;
         return {
             ...body,
-            extra_body: {
-                ...extraBody,
-                cache,
-            },
+            cache: { ...body.cache, "no-cache": true },
         };
     }
 
@@ -483,6 +435,7 @@ export class LiteLLMClient {
                     return response;
                 }
                 attempt++;
+                this.discardBody(response);
                 await this.sleep(delayMs, options?.token);
             } catch (err: unknown) {
                 if (err instanceof Error && err.name === "AbortError") {
@@ -543,6 +496,7 @@ export class LiteLLMClient {
             }
 
             attempt++;
+            this.discardBody(response);
             this.logRateLimitRetry(options, {
                 attempt,
                 delayMs: decision.delayMs,
@@ -566,6 +520,12 @@ export class LiteLLMClient {
             { requestId: options.requestId, ...entry },
             { requestId: options.requestId, model: options.model, endpoint: options.endpoint }
         );
+    }
+
+    private discardBody(response: Response): void {
+        // An unread body holds the connection open, so a retried request would
+        // keep both responses' sockets alive until the garbage collector runs.
+        void response.body?.cancel().catch(() => undefined);
     }
 
     private sleep(ms: number, token?: vscode.CancellationToken): Promise<void> {

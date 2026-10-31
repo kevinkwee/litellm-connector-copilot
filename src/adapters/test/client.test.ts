@@ -61,21 +61,14 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.strictEqual(headers["User-Agent"], userAgent);
     });
 
-    test("getHeaders includes Cache-Control: no-cache when disabled", () => {
+    test("getHeaders never sets a Cache-Control header", () => {
         const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
         // @ts-expect-error - accessing private method for testing
-        const headers = client.getHeaders("gpt-4");
-        assert.strictEqual(headers["Cache-Control"], "no-cache");
+        const headers = client.getHeaders();
+        assert.strictEqual(headers["Cache-Control"], undefined, "the fork reads the body directive, not this header");
     });
 
-    test("getHeaders bypasses Cache-Control for Claude models", () => {
-        const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
-        // @ts-expect-error - accessing private method for testing
-        const headers = client.getHeaders("claude-3-sonnet");
-        assert.strictEqual(headers["Cache-Control"], undefined);
-    });
-
-    test("chat includes no_cache in body when disabled", async () => {
+    test("chat sends a top-level cache directive when caching is disabled", async () => {
         const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
         const fetchStub = sandbox.stub(global, "fetch").resolves({
             ok: true,
@@ -88,14 +81,13 @@ suite("LiteLLM Client Unit Tests", () => {
         const requestInit = args0[1] as RequestInit | undefined;
         const bodyStr = requestInit?.body as string | undefined;
         const body = bodyStr ? (JSON.parse(bodyStr) as Record<string, unknown>) : {};
-        assert.strictEqual(body.no_cache, undefined);
-        assert.strictEqual(body["no-cache"], undefined);
-        const extraBody = body.extra_body as Record<string, unknown> | undefined;
-        const cache = extraBody?.cache as Record<string, unknown> | undefined;
-        assert.strictEqual(cache?.["no-cache"], true);
+        assert.deepStrictEqual(body.cache, { "no-cache": true });
+        assert.strictEqual(body.extra_body, undefined);
+        const headers = (requestInit?.headers as Record<string, string>) ?? {};
+        assert.strictEqual(headers["Cache-Control"], undefined, "the fork reads the body directive, not the header");
     });
 
-    test("chat bypasses no_cache for Claude models", async () => {
+    test("chat sends the cache directive for Claude models too", async () => {
         const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
         const fetchStub = sandbox.stub(global, "fetch").resolves({
             ok: true,
@@ -108,11 +100,22 @@ suite("LiteLLM Client Unit Tests", () => {
         const requestInit = args0[1] as RequestInit | undefined;
         const bodyStr = requestInit?.body as string | undefined;
         const body = bodyStr ? (JSON.parse(bodyStr) as Record<string, unknown>) : {};
-        assert.strictEqual(body.no_cache, undefined);
-        assert.strictEqual(body["no-cache"], undefined);
-        assert.strictEqual(body.extra_body, undefined);
-        const headers = (requestInit?.headers as Record<string, string>) ?? {};
-        assert.strictEqual(headers["Cache-Control"], undefined);
+        assert.deepStrictEqual(body.cache, { "no-cache": true }, "the proxy cache is not provider specific");
+    });
+
+    test("chat omits the cache directive when caching is enabled", async () => {
+        const client = new LiteLLMClient(config, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch").resolves({
+            ok: true,
+            body: new ReadableStream(),
+        } as Response);
+
+        await client.chat({ model: "gpt-4", messages: [] });
+
+        const requestInit = fetchStub.getCall(0).args[1] as RequestInit | undefined;
+        const bodyStr = requestInit?.body as string | undefined;
+        const body = bodyStr ? (JSON.parse(bodyStr) as Record<string, unknown>) : {};
+        assert.strictEqual(body.cache, undefined);
     });
 
     test("getEndpoint resolves correctly", () => {
@@ -125,14 +128,14 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.strictEqual(client.getEndpoint(undefined), "/chat/completions");
     });
 
-    test("chat retries without caching if unsupported parameter error occurs", async () => {
+    test("chat retries once when the proxy refuses the cache directive", async () => {
         const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
 
         const errorResponse = {
             ok: false,
-            status: 400,
-            statusText: "Bad Request",
-            text: async () => "Unsupported parameter: no_cache",
+            status: 403,
+            statusText: "Forbidden",
+            text: async () => "Not allowed to set no-cache as a cache control",
             clone: function () {
                 return this;
             },
@@ -150,29 +153,15 @@ suite("LiteLLM Client Unit Tests", () => {
 
         await client.chat({ model: "gpt-4", messages: [] });
 
-        assert.strictEqual(fetchStub.callCount, 2, "Should have retried");
+        assert.strictEqual(fetchStub.callCount, 2, "a refused directive is retried once");
 
-        // First call should have no_cache
         const firstCallInit = fetchStub.getCall(0).args[1] as RequestInit | undefined;
-        const firstCallBodyStr = firstCallInit?.body as string | undefined;
-        const firstCallBody = firstCallBodyStr ? (JSON.parse(firstCallBodyStr) as Record<string, unknown>) : {};
-        assert.strictEqual(firstCallBody.no_cache, undefined);
-        assert.strictEqual(firstCallBody["no-cache"], undefined);
-        const firstExtraBody = firstCallBody.extra_body as Record<string, unknown> | undefined;
-        const firstCache = firstExtraBody?.cache as Record<string, unknown> | undefined;
-        assert.strictEqual(firstCache?.["no-cache"], true);
-        const firstCallHeaders = (firstCallInit?.headers as Record<string, string>) ?? {};
-        assert.strictEqual(firstCallHeaders["Cache-Control"], "no-cache");
+        const firstCallBody = JSON.parse(String(firstCallInit?.body)) as Record<string, unknown>;
+        assert.deepStrictEqual(firstCallBody.cache, { "no-cache": true });
 
-        // Second call should NOT have no_cache or Cache-Control
         const secondCallInit = fetchStub.getCall(1).args[1] as RequestInit | undefined;
-        const secondCallBodyStr = secondCallInit?.body as string | undefined;
-        const secondCallBody = secondCallBodyStr ? (JSON.parse(secondCallBodyStr) as Record<string, unknown>) : {};
-        assert.strictEqual(secondCallBody.no_cache, undefined);
-        assert.strictEqual(secondCallBody["no-cache"], undefined);
-        assert.strictEqual(secondCallBody.extra_body, undefined);
-        const secondCallHeaders = (secondCallInit?.headers as Record<string, string>) ?? {};
-        assert.strictEqual(secondCallHeaders["Cache-Control"], undefined);
+        const secondCallBody = JSON.parse(String(secondCallInit?.body)) as Record<string, unknown>;
+        assert.strictEqual(secondCallBody.cache, undefined, "the retry omits the refused directive");
     });
 
     test("chat surfaces a rejected model parameter instead of stripping and resending it", async () => {
@@ -228,14 +217,15 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.strictEqual(isUnsupportedParameterError("Maximum context length exceeded"), false);
     });
 
-    test("chat strips the cache-bypass flag and header when the backend rejects them", async () => {
-        const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
+    test("chat strips the cache directive and records it when the backend rejects it", async () => {
+        const onUnsupportedParameter = sandbox.stub();
+        const client = new LiteLLMClient({ ...config, disableCaching: true, onUnsupportedParameter }, userAgent);
 
         const errorResponse = {
             ok: false,
-            status: 400,
-            statusText: "Bad Request",
-            text: async () => "Unknown parameter: cache",
+            status: 403,
+            statusText: "Forbidden",
+            text: async () => "Not allowed to set no-cache as a cache control",
             clone: function () {
                 return this;
             },
@@ -251,23 +241,19 @@ suite("LiteLLM Client Unit Tests", () => {
         fetchStub.onCall(0).resolves(errorResponse as unknown as Response);
         fetchStub.onCall(1).resolves(successResponse as unknown as Response);
 
-        // The connector adds exactly this shape when caching is disabled.
-        await client.chat({ model: "gpt-4", messages: [], extra_body: { cache: { "no-cache": true } } });
+        await client.chat({ model: "gpt-4", messages: [] });
 
-        assert.strictEqual(fetchStub.callCount, 2);
+        assert.strictEqual(fetchStub.callCount, 2, "a rejected directive is retried once");
 
         const firstCallInit = fetchStub.getCall(0).args[1] as RequestInit | undefined;
         const firstCallBody = JSON.parse(String(firstCallInit?.body)) as Record<string, unknown>;
-        const firstExtraBody = firstCallBody.extra_body as Record<string, unknown> | undefined;
-        const firstCache = firstExtraBody?.cache as Record<string, unknown> | undefined;
-        assert.strictEqual(firstCache?.["no-cache"], true);
+        assert.deepStrictEqual(firstCallBody.cache, { "no-cache": true });
 
         const retryCallInit = fetchStub.getCall(1).args[1] as RequestInit | undefined;
         const retryCallBody = JSON.parse(String(retryCallInit?.body)) as Record<string, unknown>;
-        assert.strictEqual(retryCallBody.extra_body, undefined);
+        assert.strictEqual(retryCallBody.cache, undefined);
 
-        const retryHeaders = (retryCallInit?.headers as Record<string, string>) ?? {};
-        assert.strictEqual(retryHeaders["Cache-Control"], undefined);
+        sinon.assert.calledWith(onUnsupportedParameter, "gpt-4", "cache");
     });
 
     test("chat strips a rejected cache_control marker and records the incompatibility", async () => {
