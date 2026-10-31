@@ -17,6 +17,7 @@ import { appendRateLimitHint } from "../utils/rateLimitNotice";
 import type { ToolNameMapping } from "../utils/toolNameUtils";
 import { LiteLLMTelemetry } from "../utils/telemetry";
 import { LiteLLMProviderBase } from "./liteLLMProviderBase";
+import { describeFailureForLog, toErrorLogFields } from "./base/errorLogFields";
 import { StructuredLogger } from "../observability/structuredLogger";
 import { logFinalUsageEnvelope } from "../observability/finalUsageEnvelope";
 import { ResponsePartCollector, exportCopilotMdEntry } from "../observability";
@@ -315,6 +316,13 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         toolNames.wireToDeclared
                     );
 
+                    // A cancelled stream ends without an error, so without this
+                    // check the request would be reported and billed as a success.
+                    if (token.isCancellationRequested) {
+                        Logger.debug(`[transportRetry] request=${requestId} cancelled after a clean stream end`);
+                        throw Object.assign(new Error("Operation cancelled by user"), { name: "CancellationError" });
+                    }
+
                     // Upstream may stream no usage frame; VS Code still needs one usage report.
                     tokenCapture.flushUsage();
                     break;
@@ -331,6 +339,25 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         });
                     }
                     if (err instanceof ReasoningOnlyError) {
+                        // A resumed attempt can legitimately stream nothing but its
+                        // finish frame: the previous attempt already delivered the
+                        // answer. Proof is required, though: the attempt must have
+                        // ended with a `stop` finish, carried no reasoning, and the
+                        // earlier attempt must have delivered text. A clean close, a
+                        // usage-only tail, or a cut-short finish is not proof.
+                        if (
+                            resumed &&
+                            accumulator.text.trim().length > 0 &&
+                            err.reasoningChars === 0 &&
+                            err.normalFinish
+                        ) {
+                            StructuredLogger.info("request.resume_completed_empty", {
+                                requestId,
+                                resumedTextChars: accumulator.text.length,
+                            });
+                            tokenCapture.flushUsage();
+                            break;
+                        }
                         if (emptyAttempt < maxEmptyRetries && !token.isCancellationRequested) {
                             emptyAttempt += 1;
                             resumed = true;
@@ -384,12 +411,12 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         if (accumulator.sawToolCall && isTransportRetriableError(err) && !isLastAttempt) {
                             Logger.error(
                                 `[transportRetry] request=${requestId} unrecoverable: tool call was already emitted before the transport error; not retrying to avoid double tool execution`,
-                                err
+                                toErrorLogFields(err)
                             );
                             StructuredLogger.error("request.transport_retry_blocked_tool_call", {
                                 requestId,
                                 attempt,
-                                error: err instanceof Error ? err.message : String(err),
+                                ...toErrorLogFields(err),
                             });
                         }
                         // Rethrow so non-transport errors flow through the
@@ -412,7 +439,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         requestId,
                         attempt,
                         maxTransportRetries,
-                        err instanceof Error ? err.message : String(err),
+                        describeFailureForLog(err),
                         accumulator.text.length
                     );
                     StructuredLogger.warn("request.transport_retry", {
@@ -421,14 +448,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         maxRetries: maxTransportRetries,
                         delayMs: delay,
                         resumedTextChars: accumulator.text.length,
-                        error: err instanceof Error ? err.message : String(err),
-                        ...(err instanceof UpstreamStreamError
-                            ? {
-                                  upstreamStatus: err.status,
-                                  upstreamCode: err.code,
-                                  upstreamType: err.type,
-                              }
-                            : {}),
+                        ...toErrorLogFields(err),
                     });
                     // Fresh attempt: drop partial-response token accounting so
                     // the next usage snapshot reflects only the resumed stream.
@@ -527,8 +547,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // usage DataParts during streaming and enriches them.
         } catch (err: unknown) {
             let errorMessage = err instanceof Error ? err.message : String(err);
-            const errorStack = err instanceof Error ? err.stack : undefined;
-            const errorName = err instanceof Error ? err.constructor.name : typeof err;
 
             if (errorMessage.includes("LiteLLM API error")) {
                 const statusMatch = errorMessage.match(/error: (\d+)/);
@@ -558,12 +576,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         ". This model may not support certain parameters like temperature. Please check your model settings.";
                 }
             }
-            // Node.js wraps network failures (ECONNREFUSED, DNS errors) as
-            // "TypeError: fetch failed" without surfacing the root cause in
-            // the error message. Extract the chained `.cause` so operators
-            // see the real reason (e.g. ECONNREFUSED) rather than a generic label.
-            const rootCause = err instanceof Error && err.cause instanceof Error ? err.cause.message : undefined;
-
             if (token.isCancellationRequested) {
                 Logger.info(
                     `Chat request cancelled | RequestID: ${requestId} | Model: ${model.id} | Caller: ${caller}`
@@ -574,8 +586,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     caller,
                     stage: "provideLanguageModelChatResponse",
                 });
-                // Cancellation is not a failure: no failure metric and no
-                // "FAILED" transcript. VS Code renders the cancelled state.
+                // Cancellation is not a failure: the metric says cancelled and
+                // the transcript says canceled, which is the state the host renders.
                 const cancelledDurationMs = LiteLLMTelemetry.endTimer(startTime);
                 LiteLLMTelemetry.reportMetric({
                     requestId,
@@ -616,17 +628,16 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 });
             }
 
-            // Log full error details to both Logger and StructuredLogger
-            Logger.error("Chat request failed", err);
+            // Log identifiers only: the message stays in the user-facing notice
+            // and the opt-in transcript, where it may echo the prompt.
+            const errorLogFields = toErrorLogFields(err);
+            Logger.error(`Chat request failed | RequestID: ${requestId} | Model: ${model.id}`, errorLogFields);
             StructuredLogger.error("request.failed", {
                 requestId,
                 model: model.id,
                 caller,
-                errorName,
-                errorMessage,
-                errorStack,
-                rootCause,
                 stage: "provideLanguageModelChatResponse",
+                ...errorLogFields,
             });
 
             const metric = {
@@ -635,7 +646,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 durationMs: LiteLLMTelemetry.endTimer(startTime),
                 tokensIn,
                 status: "failure" as const,
-                error: errorMessage,
+                error: describeFailureForLog(err),
                 caller,
             };
             LiteLLMTelemetry.reportMetric(metric);
@@ -670,25 +681,21 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 } satisfies CopilotMdEntry);
             }
 
-            // VS Code excludes an errored turn from the conversation history
-            // sent upstream, so a thrown error would erase everything the
-            // model already said this turn; on the next turn the model would
-            // see neither its own partial answer nor the failure. Completing
-            // with the error as an assistant text part keeps the turn in
-            // history; cancellation stays a throw because VS Code renders
-            // that state itself.
+            // The Agents window handler answers a thrown error with a 502 and
+            // discards the parts already reported, which would lose everything
+            // the model said this turn. Completing with the notice as an
+            // assistant text part keeps the partial answer in the conversation;
+            // cancellation stays a throw because the host renders that state.
             trackingProgress.report(new LanguageModelTextPart(`\n\n${formatConnectorNotice(errorMessage)}`));
-            // The turn completes as a normal assistant message, so the reply
-            // itself looks like model output. Record that the failure was
-            // surfaced as text, with the initiator, so a failure stays traceable.
+            // The reply now looks like model output, so record that it was a
+            // failure notice and which initiator triggered it.
             Logger.warn(`Chat request surfaced as assistant error text instead of throwing | RequestID: ${requestId}`);
             StructuredLogger.warn("request.error_surfaced_as_text", {
                 requestId,
                 model: model.id,
                 caller,
-                errorName,
-                errorSummary: errorMessage.slice(0, 200),
                 stage: "provideLanguageModelChatResponse",
+                ...toErrorLogFields(err),
             });
         }
     }
@@ -729,7 +736,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         let reasoningChars = 0;
         // Set by a `finish` part that ends the turn without completing it.
         let stoppedEarly: { reason: string; notice: string } | undefined;
-
+        // Proof that the model chose to end its turn, not merely that bytes stopped.
+        let sawNormalFinish = false;
         // Create an AbortController to actually cancel the stream on timeout
         const controller = new AbortController();
 
@@ -745,6 +753,13 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     reasoningChars += typeof part.value === "string" ? part.value.length : part.value.join("").length;
                 } else if (part.type === "finish") {
                     stoppedEarly = describeStoppedEarly(part.reason) ?? stoppedEarly;
+                    // A normal finish is the only evidence that the model chose to
+                    // stop. A clean close, a usage-only tail, or an unrecognized
+                    // reason leaves this false, so a resumed attempt cannot be
+                    // mistaken for a completed answer.
+                    if (part.reason === "stop") {
+                        sawNormalFinish = true;
+                    }
                 }
             }
             emitPartsToVSCode(parts, progress);
@@ -879,7 +894,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     eventCount,
                     sawUsagePart,
                 });
-                throw new ReasoningOnlyError(eventCount, reasoningChars);
+                throw new ReasoningOnlyError(eventCount, reasoningChars, sawNormalFinish);
             }
 
             // Deliberately after the reasoning-only check: if the model only
@@ -903,16 +918,12 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // failure in the channel.
             Logger.warn(
                 `[processStreamingResponse] request=${requestId} Stream attempt failed after ${eventCount} events`,
-                {
-                    error: error instanceof Error ? error.message : String(error),
-                    stack: error instanceof Error ? error.stack : undefined,
-                }
+                toErrorLogFields(error)
             );
             StructuredLogger.warn("stream.attempt_failed", {
                 requestId,
-                error: error instanceof Error ? error.message : String(error),
                 eventCount,
-                stack: error instanceof Error ? error.stack : undefined,
+                ...toErrorLogFields(error),
             });
 
             const isStreamEndError =

@@ -20,6 +20,7 @@ import {
     markReasoningFallbackNotified,
 } from "../utils/reasoningEffortFallback";
 import { RequestBuilder } from "./base/requestBuilder";
+import { describeFailureForLog } from "./base/errorLogFields";
 import { Transport } from "./base/transport";
 import type { RequestBuilderDeps, TransportDeps } from "./base/types";
 import type { ToolNameMapping } from "../utils/toolNameUtils";
@@ -622,23 +623,6 @@ export abstract class LiteLLMProviderBase {
         }
     }
 
-    private sanitizeErrorTextForLogs(text: string): string {
-        const trimmed = (text || "").trim();
-        if (!trimmed) {
-            return "";
-        }
-
-        const withoutCopilotContext = trimmed
-            .replace(/<context>[\s\S]*?<\/context>/gi, "<context>…</context>")
-            .replace(/<editorContext>[\s\S]*?<\/editorContext>/gi, "<editorContext>…</editorContext>")
-            .replace(
-                /<reminderInstructions>[\s\S]*?<\/reminderInstructions>/gi,
-                "<reminderInstructions>…</reminderInstructions>"
-            );
-
-        return withoutCopilotContext.length > 500 ? `${withoutCopilotContext.slice(0, 500)}…` : withoutCopilotContext;
-    }
-
     protected logRequestPayloadOnFailure(
         request: OpenAIChatCompletionRequest,
         error: unknown,
@@ -649,12 +633,13 @@ export abstract class LiteLLMProviderBase {
             modelInfoMode?: string;
         }
     ): void {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        const sanitizedError = this.sanitizeErrorTextForLogs(errorMessage);
         const payloadSummary = this.summarizeRequestPayloadForLogs(request);
 
+        // The error message is left out on purpose: an upstream error can echo
+        // the request body, and this trace-level entry exists to show the shape
+        // of the payload that failed.
         Logger.trace(
-            `[request-failure] stage=${context.stage} model=${context.modelId} caller=${context.caller ?? "unknown"} mode=${context.modelInfoMode ?? "unknown"} error=${sanitizedError}`,
+            `[request-failure] stage=${context.stage} model=${context.modelId} caller=${context.caller ?? "unknown"} mode=${context.modelInfoMode ?? "unknown"} error=${describeFailureForLog(error)}`,
             payloadSummary
         );
     }

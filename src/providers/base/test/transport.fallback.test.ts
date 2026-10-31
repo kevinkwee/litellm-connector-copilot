@@ -1,9 +1,12 @@
 import * as assert from "assert";
+import * as sinon from "sinon";
 import * as vscode from "vscode";
 import { Transport } from "../transport";
+import { StructuredLogger } from "../../../observability/structuredLogger";
 import type { TransportDeps } from "../types";
 import type { ConfigManager } from "../../../config/configManager";
 import type { LiteLLMClient } from "../../../adapters/litellmClient";
+import { LiteLLMApiError } from "../../../adapters/litellmClient";
 import type { OpenAIChatCompletionRequest, LiteLLMModelInfo } from "../../../types";
 
 // Test seam: a fake LiteLLMClient that records the `mode` passed to chat()
@@ -149,5 +152,64 @@ suite("Transport /responses -> /chat/completions fallback", () => {
             /400 Bad Request/
         );
         assert.deepStrictEqual(fake.calls, ["responses"]);
+    });
+
+    test("logs no upstream body when the /responses fallback fires", async () => {
+        const sentinel = "SECRET_PROMPT_TEXT";
+        const loggerLines: string[] = [];
+        const structuredLines: string[] = [];
+        const transport = new Transport({
+            ...makeDeps(new FakeLiteLLMClient({ url: "https://x", key: "k" }, "test-ua")),
+            logger: {
+                info: (...args: unknown[]) => loggerLines.push(JSON.stringify(args)),
+                warn: (...args: unknown[]) => loggerLines.push(JSON.stringify(args)),
+                error: (...args: unknown[]) => loggerLines.push(JSON.stringify(args)),
+                debug: (...args: unknown[]) => loggerLines.push(JSON.stringify(args)),
+                trace: (...args: unknown[]) => loggerLines.push(JSON.stringify(args)),
+            },
+            liteLLMClientFactory: () =>
+                ({
+                    chat: async () => {
+                        throw new LiteLLMApiError(
+                            500,
+                            `{"error":{"message":"${sentinel}"}}`,
+                            `LiteLLM API error: 500\n${sentinel}`
+                        );
+                    },
+                }) as unknown as LiteLLMClient,
+        });
+        const sandbox = sinon.createSandbox();
+        for (const method of ["warn", "error", "info", "debug", "trace"] as const) {
+            sandbox.stub(StructuredLogger, method).callsFake((...args: unknown[]) => {
+                structuredLines.push(JSON.stringify(args));
+            });
+        }
+
+        try {
+            await assert.rejects(() =>
+                transport.sendRequestToLiteLLM(
+                    baseRequest,
+                    { report: () => {} } as unknown as vscode.Progress<vscode.LanguageModelResponsePart>,
+                    new vscode.CancellationTokenSource().token,
+                    "tools",
+                    responsesModelInfo,
+                    { baseUrl: "https://x", apiKey: "k", allowChatCompletionsFallback: true }
+                )
+            );
+        } finally {
+            sandbox.restore();
+        }
+
+        assert.ok(
+            loggerLines.some((line) => line.includes("falling back to /chat/completions")),
+            "the fallback warning still fires"
+        );
+        const fallbackEvent = structuredLines.find((line) => line.includes("transport.responses_fallback_to_chat"));
+        assert.ok(fallbackEvent, "the structured fallback event still fires");
+        assert.ok(fallbackEvent.includes('"status":500'), "the status is what the event keeps");
+        assert.ok(
+            ![...loggerLines, ...structuredLines].some((line) => line.includes(sentinel)),
+            "no log may carry the proxy body"
+        );
     });
 });

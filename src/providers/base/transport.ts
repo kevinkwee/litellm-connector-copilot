@@ -3,6 +3,7 @@ import { LiteLLMClient } from "../../adapters/litellmClient";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types";
 import type { TransportDeps } from "./types";
+import { describeFailureForLog, toErrorLogFields } from "./errorLogFields";
 
 /**
  * Sends a LiteLLM request to the configured endpoint.
@@ -158,12 +159,12 @@ export class Transport {
             if (allowFallback && isResponsesMode && is500) {
                 this.logger.warn(
                     `[transport.sendRequestToLiteLLM] /responses failed with 5xx for model ${request.model}; falling back to /chat/completions (allowChatCompletionsFallback=true)`,
-                    err
+                    describeFailureForLog(err)
                 );
                 StructuredLogger.warn("transport.responses_fallback_to_chat", {
                     model: request.model,
                     caller,
-                    error: err instanceof Error ? err.message : String(err),
+                    ...toErrorLogFields(err),
                 });
                 const chatModelInfo: LiteLLMModelInfo | undefined = modelInfo
                     ? { ...modelInfo, mode: "chat" }
@@ -171,12 +172,8 @@ export class Transport {
                 return client.chat(request, "chat", token, chatModelInfo, requestId);
             }
 
-            this.logger.error(`[transport.sendRequestToLiteLLM] HTTP request failed for model ${request.model}`, err);
-            StructuredLogger.error("transport.http_request_failed", {
-                model: request.model,
-                caller,
-                error: err instanceof Error ? err.message : String(err),
-            });
+            // The provider owns the single log for a request failure, so this
+            // layer rethrows without logging.
             throw err;
         }
     }

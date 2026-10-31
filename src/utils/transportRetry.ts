@@ -114,7 +114,9 @@ function describeUpstreamFailure(
 export class ReasoningOnlyError extends Error {
     public constructor(
         public readonly eventCount: number,
-        public readonly reasoningChars: number
+        public readonly reasoningChars: number,
+        /** True only when a `stop` finish frame ended the turn normally. */
+        public readonly normalFinish = false
     ) {
         super(
             `Model returned reasoning-only response with no content or tool calls ` +

@@ -339,6 +339,36 @@ suite("LiteLLMStreamInterpreter: Tool Call Regressions", () => {
         assert.strictEqual(toolCallParts.length, 0, "should not double-emit flushed tool call");
     });
 
+    test("reports a completed response as a stop finish", () => {
+        const state = createInitialStreamingState();
+
+        const parts = interpretStreamEvent(
+            { type: "response.completed", response: { usage: { input_tokens: 1, output_tokens: 2 } } },
+            state
+        );
+
+        const finishes = parts.filter((part) => part.type === "finish");
+        assert.deepStrictEqual(finishes, [{ type: "finish", reason: "stop" }]);
+    });
+
+    test("reports a completed response the bridge marked incomplete without a stop finish", () => {
+        const state = createInitialStreamingState();
+
+        const parts = interpretStreamEvent(
+            {
+                type: "response.completed",
+                response: { status: "incomplete", usage: { input_tokens: 1, output_tokens: 2 } },
+            },
+            state
+        );
+
+        assert.deepStrictEqual(
+            parts.filter((part) => part.type === "finish"),
+            [],
+            "a cut-short answer is not a normal finish"
+        );
+    });
+
     test("should preserve legacy flush-all behavior when output_item.done has no item", () => {
         const state = createInitialStreamingState();
 
@@ -644,8 +674,9 @@ suite("LiteLLMStreamInterpreter: Tool Call Regressions", () => {
             },
             state
         );
-        assert.strictEqual(parts2.length, 2);
+        assert.strictEqual(parts2.length, 3);
         assert.strictEqual(parts2[1].type, "data");
+        assert.deepStrictEqual(parts2[2], { type: "finish", reason: "stop" });
 
         // response.output_item.done
         const parts3 = interpretStreamEvent({ type: "response.output_item.done" }, state);
@@ -1260,6 +1291,35 @@ suite("Dropped tool call buffer logging", () => {
                 argsLength: '{"mode":"background"}'.length,
             },
         ]);
+    });
+
+    test("drops a call whose name never arrived instead of naming it 'tool'", () => {
+        const state = createInitialStreamingState(REQUEST_ID);
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        interpretStreamEvent(toolCallDelta({ id: "call_noname", function: { arguments: '{"q":1}' } }), state);
+
+        const parts = flushPendingBuffers(state).filter((part) => part.type === "tool_call");
+
+        assert.deepStrictEqual(parts, [], "an unnamed call must not reach VS Code under a placeholder name");
+        assert.deepStrictEqual(
+            droppedEventFields(warnStub).map((fields) => fields.reason),
+            ["incomplete_at_finish"]
+        );
+    });
+
+    test("keeps one call when the id arrives after the first fragment", () => {
+        const state = createInitialStreamingState(REQUEST_ID);
+        sandbox.stub(StructuredLogger, "warn");
+        interpretStreamEvent(toolCallDelta({ function: { name: "read_file", arguments: '{"path"' } }), state);
+        interpretStreamEvent(toolCallDelta({ id: "call_late", function: { arguments: ':"a.ts"}' } }), state);
+
+        const parts = flushPendingBuffers(state).filter((part) => part.type === "tool_call");
+
+        assert.strictEqual(parts.length, 1);
+        const call = parts[0];
+        assert.ok(call.type === "tool_call", "the settled buffer is a tool call");
+        assert.ok((call.id ?? "").startsWith("fc_"), "the late id is normalized");
+        assert.strictEqual(call.args, '{"path":"a.ts"}');
     });
 
     test("reports a buffer with no arguments discarded at finish", () => {

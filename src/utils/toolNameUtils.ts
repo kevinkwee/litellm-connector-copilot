@@ -69,7 +69,7 @@ export function sanitizeToolName(name: unknown): string {
 
     if (sanitized.length > TOOL_NAME_MAX_LENGTH) {
         const truncated = sanitized.slice(0, TOOL_NAME_MAX_LENGTH);
-        StructuredLogger.warn("stream.tool_name_truncated", {
+        StructuredLogger.debug("tools.name_truncated", {
             name,
             originalLength: name.length,
             sanitizedLength: truncated.length,
@@ -103,7 +103,7 @@ export function deriveWireToolNames(declaredTools: readonly { name: string }[]):
             suffix += 1;
         }
         if (candidate !== sanitized) {
-            StructuredLogger.warn("tools.name_collision", { wireName: candidate, sanitizedName: sanitized });
+            StructuredLogger.debug("tools.name_collision", { wireName: candidate, sanitizedName: sanitized });
         }
         used.add(candidate);
         wireNames.push(candidate);

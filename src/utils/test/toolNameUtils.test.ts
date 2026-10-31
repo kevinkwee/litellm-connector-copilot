@@ -1,4 +1,6 @@
 import * as assert from "assert";
+import * as sinon from "sinon";
+import { StructuredLogger } from "../../observability/structuredLogger";
 import { buildToolNameMapping, deriveWireToolNames, sanitizeToolName, TOOL_NAME_MAX_LENGTH } from "../toolNameUtils";
 
 declare const suite: (name: string, fn: () => void) => void;
@@ -82,6 +84,40 @@ suite("deriveWireToolNames", () => {
 
         assert.strictEqual(wireNames[1].length, TOOL_NAME_MAX_LENGTH);
         assert.ok(wireNames[1].endsWith("_2"));
+    });
+
+    test("reports a renamed tool at debug level, not as a warning", () => {
+        const sandbox = sinon.createSandbox();
+        try {
+            const warnStub = sandbox.stub(StructuredLogger, "warn");
+            const debugStub = sandbox.stub(StructuredLogger, "debug");
+
+            deriveWireToolNames([{ name: "github.create_issue" }, { name: "github_create_issue" }]);
+
+            assert.strictEqual(warnStub.called, false, "a name collision is expected, not a problem to escalate");
+            const collisionEvents = debugStub.getCalls().filter((call) => call.args[0] === "tools.name_collision");
+            assert.strictEqual(collisionEvents.length, 1);
+        } finally {
+            sandbox.restore();
+        }
+    });
+});
+
+suite("sanitizeToolName log level", () => {
+    test("reports a truncated name at debug level, not as a warning", () => {
+        const sandbox = sinon.createSandbox();
+        try {
+            const warnStub = sandbox.stub(StructuredLogger, "warn");
+            const debugStub = sandbox.stub(StructuredLogger, "debug");
+
+            sanitizeToolName("a".repeat(TOOL_NAME_MAX_LENGTH + 5));
+
+            assert.strictEqual(warnStub.called, false, "a long declared name is the host's choice, not a fault");
+            const truncatedEvents = debugStub.getCalls().filter((call) => call.args[0] === "tools.name_truncated");
+            assert.strictEqual(truncatedEvents.length, 1);
+        } finally {
+            sandbox.restore();
+        }
     });
 });
 

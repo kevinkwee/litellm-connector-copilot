@@ -131,6 +131,22 @@ export function countOpenAIChatMessagesTokens(
                 total += tokenizer.countTokens(toolCall.function.arguments).tokens;
             }
         }
+
+        // Replayed reasoning travels to the model, so it occupies prompt budget.
+        // Redacted blocks are opaque, so they add nothing.
+        if (typeof message.reasoning_content === "string" && message.reasoning_content.length > 0) {
+            total += tokenizer.countTokens(message.reasoning_content).tokens;
+        }
+        if (Array.isArray(message.thinking_blocks)) {
+            for (const block of message.thinking_blocks) {
+                if (block.type !== "thinking" || typeof block.thinking !== "string") {
+                    continue;
+                }
+                if (block.thinking.length > 0) {
+                    total += tokenizer.countTokens(block.thinking).tokens;
+                }
+            }
+        }
     }
 
     return total;

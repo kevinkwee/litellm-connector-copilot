@@ -7,6 +7,7 @@ import { StructuredLogger } from "../../observability/structuredLogger";
 import type { OpenAIChatCompletionRequest } from "../../types";
 import { Logger } from "../../utils/logger";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
+import { CopilotMdManager } from "../../observability/copilotMdManager";
 import { ReasoningOnlyError, UpstreamStreamError } from "../../utils/transportRetry";
 import {
     collectResponseText,
@@ -24,6 +25,7 @@ import {
     chatTextFrame,
     chatToolCallArgumentsFrame,
     chatToolCallHeaderFrame,
+    createMockSSEStream,
     SSE_DONE_FRAME,
     SteppedSseStream,
 } from "../../test/utils/testStreamUtils";
@@ -51,6 +53,7 @@ function createProvider(sandbox: sinon.SinonSandbox): { provider: LiteLLMChatPro
         url: "http://localhost:4000",
         inactivityTimeout: 60,
         networkRetryDelayMs: 1,
+        emptyResponseRetryDelayMs: 1,
     });
     return { provider, seams };
 }
@@ -366,7 +369,8 @@ suite("LiteLLMChatProvider stream attempt", () => {
             .map((call) => call.args[1] as Record<string, unknown>);
         assert.strictEqual(surfaced.length, 1);
         assert.strictEqual(surfaced[0].caller, "background-summarizer");
-        assert.strictEqual(typeof surfaced[0].errorSummary, "string");
+        assert.strictEqual(surfaced[0].status, 500);
+        assert.strictEqual(surfaced[0].errorMessage, undefined, "upstream error text must not reach the log");
         // The turn still completes as an assistant message.
         assert.ok(collectResponseText(recorder.parts).includes("[litellm-connector]"));
     });
@@ -400,6 +404,233 @@ suite("LiteLLMChatProvider stream attempt", () => {
         const cancelledEvents = infoStub.getCalls().filter((call) => call.args[0] === "request.cancelled");
         assert.strictEqual(cancelledEvents.length, 1);
         assert.strictEqual(structuredErrorStub.called, false);
+    });
+
+    test("reports a stream that was cancelled after it ended cleanly as cancelled", async () => {
+        const { provider, seams } = createProvider(sandbox);
+        sandbox.stub(seams, "sendRequestWithRetry").resolves(createMockSSEStream(["answer"]));
+        const exportEntry = sandbox.stub(CopilotMdManager.instance, "exportEntry").resolves(undefined);
+        const reportMetric = sandbox.stub(LiteLLMTelemetry, "reportMetric");
+        const tokenSource = new vscode.CancellationTokenSource();
+        // The token is cancelled once the stream body has been consumed, which is
+        // the window where a clean stream end would otherwise read as a success.
+        sandbox.stub(seams, "processStreamingResponse").callsFake(async () => {
+            tokenSource.cancel();
+        });
+
+        await assert.rejects(
+            () =>
+                provider.provideLanguageModelChatResponse(
+                    MODEL,
+                    [createMockUserMessage("hi")],
+                    createMockChatResponseOptions(),
+                    createPartRecorder().progress,
+                    tokenSource.token
+                ),
+            (err: Error) => err.name === "CancellationError"
+        );
+
+        const statuses = reportMetric.getCalls().map((call) => call.args[0].status);
+        assert.deepStrictEqual(statuses, ["cancelled"], "a cancelled stream is never reported as a success");
+        sinon.assert.calledOnce(exportEntry);
+        assert.strictEqual(exportEntry.firstCall.args[0].status, "canceled");
+    });
+
+    test("completes a request whose resumed attempt ends with a stop finish", async () => {
+        const { provider, seams } = createProvider(sandbox);
+        const sendStub = sandbox
+            .stub(seams, "sendRequestWithRetry")
+            .onFirstCall()
+            .resolves(createSeveredSseStream([chatTextFrame("answer")], new Error("terminated")))
+            .onSecondCall()
+            .resolves(new SteppedSseStream([chatFinishFrame("stop"), SSE_DONE_FRAME], []).body);
+        const recorder = createPartRecorder();
+
+        await provider.provideLanguageModelChatResponse(
+            MODEL,
+            [createMockUserMessage("hi")],
+            createMockChatResponseOptions(),
+            recorder.progress,
+            new vscode.CancellationTokenSource().token
+        );
+
+        assert.strictEqual(sendStub.callCount, 2, "the dropped attempt must resume once");
+        assert.strictEqual(collectResponseText(recorder.parts), "answer");
+        assert.ok(!collectResponseText(recorder.parts).includes("[litellm-connector]"), "no failure notice is due");
+    });
+
+    test("keeps retrying a resumed attempt that closes without a finish frame", async () => {
+        const { provider, seams } = createProvider(sandbox);
+        const sendStub = sandbox
+            .stub(seams, "sendRequestWithRetry")
+            .onFirstCall()
+            .resolves(createSeveredSseStream([chatTextFrame("answer")], new Error("terminated")))
+            .onSecondCall()
+            .resolves(new SteppedSseStream([chatTextFrame("")], []).body)
+            .onThirdCall()
+            .resolves(new SteppedSseStream([chatTextFrame("!"), chatFinishFrame("stop"), SSE_DONE_FRAME], []).body);
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        const recorder = createPartRecorder();
+
+        await provider.provideLanguageModelChatResponse(
+            MODEL,
+            [createMockUserMessage("hi")],
+            createMockChatResponseOptions(),
+            recorder.progress,
+            new vscode.CancellationTokenSource().token
+        );
+
+        const reasoningRetries = warnStub.getCalls().filter((call) => call.args[0] === "request.reasoning_only_retry");
+        assert.strictEqual(reasoningRetries.length, 1, "a clean close is not proof of a completed answer");
+        assert.strictEqual(sendStub.callCount, 3);
+        assert.strictEqual(collectResponseText(recorder.parts), "answer!");
+    });
+
+    test("keeps retrying a resumed attempt that ends on a cut-short finish", async () => {
+        const { provider, seams } = createProvider(sandbox);
+        sandbox
+            .stub(seams, "sendRequestWithRetry")
+            .onFirstCall()
+            .resolves(createSeveredSseStream([chatTextFrame("answer")], new Error("terminated")))
+            .onSecondCall()
+            .resolves(new SteppedSseStream([chatFinishFrame("length"), SSE_DONE_FRAME], []).body)
+            .onThirdCall()
+            .resolves(new SteppedSseStream([chatTextFrame("!"), chatFinishFrame("stop"), SSE_DONE_FRAME], []).body);
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        const recorder = createPartRecorder();
+
+        await provider.provideLanguageModelChatResponse(
+            MODEL,
+            [createMockUserMessage("hi")],
+            createMockChatResponseOptions(),
+            recorder.progress,
+            new vscode.CancellationTokenSource().token
+        );
+
+        const reasoningRetries = warnStub.getCalls().filter((call) => call.args[0] === "request.reasoning_only_retry");
+        assert.strictEqual(reasoningRetries.length, 1, "a truncated answer is not a completed answer");
+        assert.strictEqual(collectResponseText(recorder.parts), "answer!");
+    });
+
+    test("keeps retrying a resumed attempt that reasons and then stops", async () => {
+        const { provider, seams } = createProvider(sandbox);
+        sandbox
+            .stub(seams, "sendRequestWithRetry")
+            .onFirstCall()
+            .resolves(createSeveredSseStream([chatTextFrame("answer")], new Error("terminated")))
+            .onSecondCall()
+            .resolves(
+                new SteppedSseStream([chatReasoningFrame("more thinking"), chatFinishFrame("stop"), SSE_DONE_FRAME], [])
+                    .body
+            )
+            .onThirdCall()
+            .resolves(new SteppedSseStream([chatTextFrame("!"), chatFinishFrame("stop"), SSE_DONE_FRAME], []).body);
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        const recorder = createPartRecorder();
+
+        await provider.provideLanguageModelChatResponse(
+            MODEL,
+            [createMockUserMessage("hi")],
+            createMockChatResponseOptions(),
+            recorder.progress,
+            new vscode.CancellationTokenSource().token
+        );
+
+        const reasoningRetries = warnStub.getCalls().filter((call) => call.args[0] === "request.reasoning_only_retry");
+        assert.strictEqual(reasoningRetries.length, 1, "an attempt that kept reasoning has not finished the answer");
+        assert.strictEqual(collectResponseText(recorder.parts), "answer!");
+    });
+
+    test("keeps retrying a resumed attempt when no text arrived before it", async () => {
+        // A first attempt that only reasoned never delivered an answer, so a bare
+        // stop finish on the resume cannot complete the turn.
+        const { provider, seams } = createProvider(sandbox);
+        sandbox
+            .stub(seams, "sendRequestWithRetry")
+            .onFirstCall()
+            .resolves(createSeveredSseStream([chatReasoningFrame("thinking")], new Error("terminated")))
+            .onSecondCall()
+            .resolves(new SteppedSseStream([chatFinishFrame("stop"), SSE_DONE_FRAME], []).body)
+            .onThirdCall()
+            .resolves(
+                new SteppedSseStream([chatTextFrame("answer"), chatFinishFrame("stop"), SSE_DONE_FRAME], []).body
+            );
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        const recorder = createPartRecorder();
+
+        await provider.provideLanguageModelChatResponse(
+            MODEL,
+            [createMockUserMessage("hi")],
+            createMockChatResponseOptions(),
+            recorder.progress,
+            new vscode.CancellationTokenSource().token
+        );
+
+        const reasoningRetries = warnStub.getCalls().filter((call) => call.args[0] === "request.reasoning_only_retry");
+        assert.strictEqual(reasoningRetries.length, 1, "completion needs text from the earlier attempt");
+        assert.strictEqual(collectResponseText(recorder.parts), "answer");
+    });
+
+    test("completes a resumed /responses attempt that ends with a completed response", async () => {
+        const { provider, seams } = createProvider(sandbox);
+        const completed = JSON.stringify({ type: "response.completed", response: {} });
+        const sendStub = sandbox
+            .stub(seams, "sendRequestWithRetry")
+            .onFirstCall()
+            .resolves(createSeveredSseStream([chatTextFrame("answer")], new Error("terminated")))
+            .onSecondCall()
+            .resolves(new SteppedSseStream([completed, SSE_DONE_FRAME], []).body);
+        const recorder = createPartRecorder();
+
+        await provider.provideLanguageModelChatResponse(
+            MODEL,
+            [createMockUserMessage("hi")],
+            createMockChatResponseOptions(),
+            recorder.progress,
+            new vscode.CancellationTokenSource().token
+        );
+
+        assert.strictEqual(sendStub.callCount, 2, "a completed response needs no further attempt");
+        assert.strictEqual(collectResponseText(recorder.parts), "answer");
+        assert.ok(!collectResponseText(recorder.parts).includes("[litellm-connector]"), "no failure notice is due");
+    });
+
+    test("reports a cut-short reasoning-only attempt without a normal finish", async () => {
+        const { seams } = createProvider(sandbox);
+        const stream = new SteppedSseStream(
+            [chatReasoningFrame("thinking"), chatFinishFrame("length"), SSE_DONE_FRAME],
+            []
+        );
+
+        await assert.rejects(
+            () =>
+                seams.processStreamingResponse(
+                    stream.body,
+                    IGNORE_PROGRESS,
+                    new vscode.CancellationTokenSource().token,
+                    REQUEST_ID
+                ),
+            (err: unknown) => err instanceof ReasoningOnlyError && !err.normalFinish
+        );
+    });
+
+    test("reports a normally finished reasoning-only attempt as a normal finish", async () => {
+        const { seams } = createProvider(sandbox);
+        const stream = new SteppedSseStream(
+            [chatReasoningFrame("thinking"), chatFinishFrame("stop"), SSE_DONE_FRAME],
+            []
+        );
+
+        await assert.rejects(
+            () =>
+                seams.processStreamingResponse(
+                    stream.body,
+                    IGNORE_PROGRESS,
+                    new vscode.CancellationTokenSource().token,
+                    REQUEST_ID
+                ),
+            (err: unknown) => err instanceof ReasoningOnlyError && err.normalFinish
+        );
     });
 
     test("resumes after a transient upstream error frame instead of failing the turn", async () => {

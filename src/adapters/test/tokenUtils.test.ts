@@ -129,4 +129,56 @@ suite("TokenUtils Unit Tests", () => {
 
         assert.strictEqual(count, 85);
     });
+
+    test("countOpenAIChatMessagesTokens counts a replayed reasoning_content", () => {
+        const withReasoning = countOpenAIChatMessagesTokens(
+            [{ role: "assistant", content: "answer", reasoning_content: "deliberation" }],
+            "m"
+        );
+        const withoutReasoning = countOpenAIChatMessagesTokens([{ role: "assistant", content: "answer" }], "m");
+
+        assert.ok(withReasoning > withoutReasoning, "replayed reasoning occupies prompt budget");
+    });
+
+    test("countOpenAIChatMessagesTokens counts the text of a thinking block", () => {
+        const withBlock = countOpenAIChatMessagesTokens(
+            [
+                {
+                    role: "assistant",
+                    content: "answer",
+                    thinking_blocks: [{ type: "thinking", thinking: "deliberation", signature: "sig" }],
+                },
+            ],
+            "m"
+        );
+        const withoutBlock = countOpenAIChatMessagesTokens([{ role: "assistant", content: "answer" }], "m");
+
+        assert.ok(withBlock > withoutBlock, "a replayed thinking block occupies prompt budget");
+    });
+
+    test("countOpenAIChatMessagesTokens charges nothing for a redacted thinking block", () => {
+        const withRedacted = countOpenAIChatMessagesTokens(
+            [
+                {
+                    role: "assistant",
+                    content: "answer",
+                    thinking_blocks: [{ type: "redacted_thinking", data: "encrypted" }],
+                },
+            ],
+            "m"
+        );
+        const withoutBlock = countOpenAIChatMessagesTokens([{ role: "assistant", content: "answer" }], "m");
+
+        assert.strictEqual(withRedacted, withoutBlock, "an opaque block carries no countable text");
+    });
+
+    test("countOpenAIChatMessagesTokens charges nothing for an empty reasoning_content", () => {
+        const empty = countOpenAIChatMessagesTokens(
+            [{ role: "assistant", content: "answer", reasoning_content: "" }],
+            "m"
+        );
+        const absent = countOpenAIChatMessagesTokens([{ role: "assistant", content: "answer" }], "m");
+
+        assert.strictEqual(empty, absent);
+    });
 });

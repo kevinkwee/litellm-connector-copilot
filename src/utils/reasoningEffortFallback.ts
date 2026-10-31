@@ -133,7 +133,7 @@ export function isReasoningError(error: unknown): boolean {
         return false;
     }
 
-    Logger.debug(`[isReasoningError] status: ${status}, text: ${text}`);
+    Logger.debug(`[isReasoningError] status: ${status}, textLength: ${text.length}`);
     return text.includes("reasoning") && (text.includes("effort") || text.includes("parameter"));
 }
 

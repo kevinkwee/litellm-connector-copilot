@@ -319,7 +319,8 @@ export class LiteLLMClient {
 
         if (!response.ok) {
             const errorText = await response.text();
-            Logger.error(`LiteLLM API error: ${response.status} ${response.statusText}`, errorText);
+            // The body can echo the prompt, so it stays on the error for the
+            // provider to explain; the caller logs the identifiers.
             throw new LiteLLMApiError(
                 response.status,
                 errorText,

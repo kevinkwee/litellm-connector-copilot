@@ -98,6 +98,12 @@ function ensureCurrentThinkingBlockId(state: StreamingState): string {
  * spelling.
  */
 function resolveToolCallName(state: StreamingState, modelName: string): string {
+    if (modelName.length === 0) {
+        // A call that never carried a name cannot be executed, and
+        // `sanitizeToolName("")` would invent the placeholder "tool", which the
+        // agent loop would then try to run. Settlement drops an unnamed buffer.
+        return "";
+    }
     const wireName = sanitizeToolName(modelName);
     return state.wireToDeclaredNames?.get(wireName) ?? wireName;
 }
@@ -259,6 +265,8 @@ interface ResponsesStreamUsage extends RawUsagePayload {
 interface ResponsesStreamResponse {
     usage?: ResponsesStreamUsage;
     incomplete_details?: { reason?: string };
+    /** "incomplete" when the bridge stopped generation early on the model's behalf. */
+    status?: string;
 }
 
 /**
@@ -495,7 +503,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                 // This prevents corruption if finish_reason was missed in a previous turn.
                 // Normalize incoming ID before comparison since buffer stores normalized IDs
                 const incomingId = tc.id ? normalizeToolCallId(tc.id as string) : undefined;
-                if (incomingId && buffer && buffer.id !== incomingId) {
+                if (incomingId && buffer && buffer.id && buffer.id !== incomingId) {
                     logDroppedToolCallBuffer(state, "replaced_by_new_id", index, buffer);
                     state.toolCallBuffers.delete(index);
                     buffer = undefined;
@@ -675,13 +683,20 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
 
         // An incomplete response ends the turn the same way a chat-completions
         // `finish_reason` does, so the provider shows its stopped-early notice
-        // instead of presenting a truncated answer as a finished one.
+        // instead of presenting a truncated answer as a finished one. A completed
+        // response reports `stop`, which is what the provider needs as proof that
+        // the model chose to end its turn. The chat-to-Responses bridge always
+        // ends with `response.completed`, even when a length limit or a content
+        // filter stopped generation, and marks that case with `status`, so the
+        // status decides whether the turn really completed.
         const incompleteReason =
             data.type === "response.incomplete"
                 ? mapIncompleteDetailsReason(response?.incomplete_details?.reason)
                 : undefined;
         if (incompleteReason) {
             finishParts.push({ type: "finish", reason: incompleteReason });
+        } else if (data.type === "response.completed" && response?.status !== "incomplete") {
+            finishParts.push({ type: "finish", reason: "stop" });
         }
     }
     if (data.type === "response.output_item.done") {
