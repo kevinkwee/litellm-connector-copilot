@@ -227,6 +227,42 @@ suite("modelCapabilities", () => {
             assert.ok(result.includes("high"), "should include high");
         });
 
+        test("a forced override leaves an excluded reasoning_effort parameter without a picker", () => {
+            try {
+                stubWorkspaceConfiguration([
+                    { match: "^gpt-5", reasoningEfforts: ["low", "high"], forceMandatory: true },
+                ]);
+                const modelInfo: LiteLLMModelInfo = {
+                    supports_reasoning: true,
+                    supported_openai_params: ["stream"],
+                };
+
+                const result = getSupportedReasoningEfforts(modelInfo, "gpt-5-model");
+
+                assert.deepStrictEqual(result, [], "an excluded parameter has no effort list to replace");
+            } finally {
+                sinon.restore();
+            }
+        });
+
+        test("a forced override replaces the levels the proxy reports", () => {
+            try {
+                stubWorkspaceConfiguration([
+                    { match: "^gpt-5", reasoningEfforts: ["low", "high"], forceMandatory: true },
+                ]);
+                const modelInfo: LiteLLMModelInfo = {
+                    supports_reasoning: true,
+                    supports_medium_reasoning_effort: true,
+                };
+
+                const result = getSupportedReasoningEfforts(modelInfo, "gpt-5-model");
+
+                assert.deepStrictEqual(result, ["low", "high"], "the forced list wins over the proxy's levels");
+            } finally {
+                sinon.restore();
+            }
+        });
+
         test("returns the canonical GPT-5 effort ladder for gpt-5-mini", () => {
             const modelInfo: LiteLLMModelInfo = {
                 id: "gpt-5-mini",

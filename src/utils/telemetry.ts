@@ -20,7 +20,7 @@ export interface IMetrics {
     estimatedTotalCost?: number;
     status: "success" | "failure" | "cancelled";
     error?: string;
-    /** VS Code's `options.requestInitiator`; "unknown" when the host omits it. */
+    /** VS Code's `requestInitiator`, or "unknown" when the host omits it */
     caller?: string;
 }
 

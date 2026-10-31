@@ -253,7 +253,7 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Extended options including internal telemetry fields.
+     * Returns the telemetry context for one request.
      *
      * `caller` is VS Code's `requestInitiator`, the extension that started the
      * request (`"core"` for the Agents window's Copilot SDK harness).

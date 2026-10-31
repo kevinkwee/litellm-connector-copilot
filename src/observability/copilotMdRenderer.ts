@@ -457,8 +457,6 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
             const callPart = part as vscode.LanguageModelToolCallPart;
             lines.push(`🛠️ ${callPart.name} (${callPart.callId}) ${prettyToolArgs(callPart.input)}`);
         } else if (part instanceof vscode.LanguageModelDataPart) {
-            // Data parts are metadata, so they do not belong in the rendered
-            // response body. Skip silently.
             continue;
         } else {
             // Check for LanguageModelThinkingPart (proposed API). The class

@@ -420,13 +420,13 @@ suite("LiteLLMStreamInterpreter: Tool Call Regressions", () => {
         }
     });
 
-    test("produces no part for a marshalled VS Code object", () => {
+    test("produces no part for a marshalled VS Code object carrying usage", () => {
         const state = createInitialStreamingState();
         const parts = interpretStreamEvent(
             {
                 $mid: 1,
-                mimeType: "application/vnd.cache-control+json",
-                data: "ZXBoZW1lcmFs",
+                mimeType: "usage",
+                data: Buffer.from('{"prompt_tokens":1}').toString("base64"),
             },
             state
         );

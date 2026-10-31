@@ -160,7 +160,7 @@ export interface ModelOverride {
     reasoningEfforts?: SupportedReasoningEffort[];
     /** Default reasoning effort when reasoning is supported */
     defaultEffort?: SupportedReasoningEffort;
-    /** Use this override's effort list instead of the levels the proxy reports. The proxy still wins when it reports the model does not reason, excludes the reasoning_effort parameter, or reports its own explicit effort levels. */
+    /** Use this override's list in place of the levels the proxy reports; see `getEffectiveEfforts` for when the proxy still wins. */
     forceMandatory?: boolean;
     /** Additional notes about this override */
     notes?: string;

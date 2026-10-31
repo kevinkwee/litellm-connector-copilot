@@ -182,7 +182,7 @@ suite("modelOverrides", () => {
         assert.deepStrictEqual(result, [...CANONICAL_REASONING_EFFORTS]);
     });
 
-    test("an override that denies reasoning wins over the proxy's effort flags", () => {
+    test("an override that denies reasoning wins over forceMandatory and the proxy's effort flags", () => {
         const override: ModelOverride = {
             match: "^test-.*",
             supportsReasoning: false,

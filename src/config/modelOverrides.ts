@@ -184,12 +184,14 @@ function getExplicitReasoningEfforts(modelInfo?: LiteLLMModelInfo): SupportedRea
 }
 
 /**
- * Resolves the efforts an override asks for.
+ * Resolves a model's reasoning effort levels from its override and the proxy's
+ * reasoning data.
  *
- * An override marked `forceMandatory` supplies the effort list in place of the
- * levels the proxy reports, and supplies the canonical list when it declares no
- * list. It cannot turn reasoning on for a proxy that reports
- * `supports_reasoning: false`: that check runs first.
+ * A proxy that reports `supports_reasoning: false`, or an override that sets
+ * `supportsReasoning: false`, gets no levels. A `forceMandatory` override supplies
+ * its own list, or the canonical list when it declares none. Otherwise the proxy's
+ * explicit effort fields decide, then its `supports_reasoning` flag, and an override
+ * with `supportsReasoning: true` supplies its list only when the proxy reports neither.
  */
 export function getEffectiveEfforts(
     modelId: string,
@@ -212,9 +214,6 @@ export function getEffectiveEfforts(
             return overrideEfforts ?? [...CANONICAL_REASONING_EFFORTS];
         }
 
-        // When the proxy exposes explicit effort flags, prefer those over non-mandatory overrides.
-        // explicitEfforts is undefined when no effort fields are present (fall back to defaults),
-        // or an array (possibly empty) when fields are present — respect explicit false values.
         const explicitEfforts = getExplicitReasoningEfforts(modelInfo)
             ?.filter(isSupportedReasoningEffort)
             .filter((effort, index, arr) => arr.indexOf(effort) === index);
@@ -222,18 +221,10 @@ export function getEffectiveEfforts(
             return explicitEfforts;
         }
 
-        // Non-mandatory overrides do not apply when LiteLLM has valid capability data.
-        // Models with supports_reasoning: true but no explicit effort flags fall back to
-        // canonical efforts, allowing the caller to use DEFAULT_REASONING_EFFORTS or
-        // enforce explicit flags based on their own logic.
-
-        // Next priority: Generic reasoning support flag.
         if (modelInfo?.supports_reasoning) {
             return [...CANONICAL_REASONING_EFFORTS];
         }
 
-        // If there is no model info but override explicitly marks reasoning support,
-        // allow the override to provide canonical efforts.
         if (override.supportsReasoning === true) {
             return overrideEfforts ?? [...CANONICAL_REASONING_EFFORTS];
         }

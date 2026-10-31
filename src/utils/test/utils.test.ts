@@ -1080,7 +1080,7 @@ suite("Utility Unit Tests", () => {
 
         suite("convertMessages tool result images", () => {
             const pngBytes = new Uint8Array([137, 80, 78, 71]);
-            // Values of LanguageModelPartAudience, duplicated because the enum may be absent at runtime.
+            // Values of LanguageModelPartAudience, spelled out because the enum may be absent at runtime.
             const ASSISTANT_AUDIENCE = 0;
             const USER_AUDIENCE = 1;
             type ToolResultContent = ConstructorParameters<typeof vscode.LanguageModelToolResultPart>[1];

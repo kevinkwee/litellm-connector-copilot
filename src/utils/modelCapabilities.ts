@@ -213,7 +213,8 @@ const LITELLM_REASONING_EFFORT_MAPPING: Record<string, SupportedReasoningEffort>
 /**
  * Default supported reasoning efforts when model explicitly supports reasoning
  * but doesn't specify exact effort levels (supports_reasoning: true).
- * Uses a conservative set to avoid unsupported effort flags being exposed in the UI.
+ * Exposing every level keeps the picker usable for a model the proxy describes
+ * with no finer detail.
  */
 const DEFAULT_REASONING_EFFORTS: readonly SupportedReasoningEffort[] = [
     "none",
@@ -275,8 +276,8 @@ function reasoningEffortParamStatus(modelInfo?: LiteLLMModelInfo): boolean | nul
  *
  * The explicit `supports_<level>_reasoning_effort` fields are the base set, and
  * a `forceMandatory` override replaces them. A model that reports only
- * `supports_reasoning` gets the canonical list. An empty result means no effort
- * picker.
+ * `supports_reasoning` gets `DEFAULT_REASONING_EFFORTS`. An empty result means no
+ * effort picker.
  */
 export function getSupportedReasoningEfforts(
     modelInfo?: LiteLLMModelInfo,
@@ -288,8 +289,8 @@ export function getSupportedReasoningEfforts(
         return [];
     }
 
-    // An explicit false wins over any override. Some models still carry explicit
-    // effort fields, which stay authoritative here.
+    // An explicit false wins over any override. Explicit effort fields the proxy
+    // reports alongside it stay authoritative.
     if (modelInfo?.supports_reasoning === false) {
         const explicitEfforts = extractExplicitReasoningEfforts(modelInfo);
         if (explicitEfforts !== undefined) {
@@ -298,29 +299,18 @@ export function getSupportedReasoningEfforts(
         return [];
     }
 
-    // Check if the reasoning_effort parameter is explicitly excluded from supported_openai_params.
-    // When a model advertises supports_reasoning: true but has a populated supported_openai_params
-    // array that does NOT include "reasoning_effort", the backend explicitly rejects the parameter —
-    // hide the effort picker to avoid rejected requests. Explicit effort fields always override this gate.
-    // When supported_openai_params is absent or null (the provider didn't populate this field),
-    // treat it as unknown and do not block effort exposure.
     const paramStatus = reasoningEffortParamStatus(modelInfo);
     const explicitEfforts = extractExplicitReasoningEfforts(modelInfo);
     if (paramStatus === false && explicitEfforts === undefined) {
-        // reasoning_effort explicitly excluded and no fine-grained effort fields — hide picker
         return [];
     }
 
-    // First priority: explicit effort level fields from LiteLLM
-    // Second priority: config overrides (may broaden or narrow explicit sets)
     let overrideEfforts: readonly SupportedReasoningEffort[] = [];
     if (modelId) {
         overrideEfforts = getEffectiveEfforts(modelId, modelInfo, config);
     }
 
     if (explicitEfforts !== undefined) {
-        // Explicit fields present (even if all false → empty array): respect them.
-        // Overrides take precedence only when non-empty.
         if (overrideEfforts.length > 0) {
             return overrideEfforts;
         }
@@ -331,7 +321,6 @@ export function getSupportedReasoningEfforts(
         return overrideEfforts;
     }
 
-    // Third priority: Generic reasoning support flag
     if (hasReasoningSignal(modelInfo)) {
         return DEFAULT_REASONING_EFFORTS;
     }

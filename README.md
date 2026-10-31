@@ -33,7 +33,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - An image returned by a tool now reaches the model instead of being silently dropped.
 - The wire shape follows the provider family. Anthropic, Gemini/Vertex and Bedrock models receive `image_url` parts inside the `role: "tool"` message. OpenAI-compatible models (OpenAI, OpenRouter, DeepSeek, Moonshot, Mistral, SambaNova and anything unknown) receive placeholder text in the tool message plus one following user message with the images, because LiteLLM's transforms for those providers keep only the text of a content list and would drop the image.
 - Images from parallel tool calls are grouped into one user message after the last tool message of the run, so tool-call adjacency is preserved, and each image group is attributed to the tool that produced it.
-- Tool result parts are not filtered by `LanguageModelPartAudience`. A part is converted according to its own content, not the audience it targets.
+- Tool result parts are not filtered by `LanguageModelPartAudience`. Each part is converted according to its own content.
 - Images returned by tools count toward the token budget, and `.copilotmd` transcripts render them as a size placeholder instead of raw bytes.
 
 ### `.copilotmd` session transcripts

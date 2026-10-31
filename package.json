@@ -124,7 +124,7 @@
 							},
 							"forceMandatory": {
 								"type": "boolean",
-								"description": "Use this override's reasoning effort list instead of the levels the proxy reports, or all levels when the override declares none. The proxy still wins when it reports the model does not reason, excludes the reasoning_effort parameter, or reports its own explicit effort levels."
+								"description": "Use this override's reasoningEfforts, or every level when it lists none, in place of the effort levels the proxy reports. The proxy still wins when it reports supports_reasoning false, or when it lists supported_openai_params without reasoning_effort and reports none of the level fields."
 							},
 							"notes": {
 								"type": "string"

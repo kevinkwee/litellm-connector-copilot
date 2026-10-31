@@ -536,7 +536,6 @@ suite("buildCopilotMdFilename", () => {
             startTimeIso: "2026-07-11T09:25:59.651Z",
         });
         const filename = buildCopilotMdFilename(entry);
-        // timestamp strips -, ms, Z.
         assert.strictEqual(filename, "core_20260711_092559_f3af93ab.copilotmd");
     });
 
