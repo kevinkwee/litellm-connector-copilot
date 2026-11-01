@@ -349,7 +349,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
 
         const { chatStub, failedRequestIds } = await respondWithClientFailure(rateLimitError);
 
-        const clientRequestId: unknown = chatStub.firstCall.args[4];
+        const clientRequestId: unknown = chatStub.firstCall.args[3];
         assert.ok(typeof clientRequestId === "string" && clientRequestId.length > 0, "client got no request id");
         assert.deepStrictEqual(failedRequestIds, [clientRequestId]);
     });
@@ -904,7 +904,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         assert.strictEqual(retryRequest.stream_options, undefined, "the retry must not resend stream_options");
 
         // A later request must not pay the same failed round trip. This is what
-        // the memo is for, and it only works when both sides use the raw name.
+        // the memo is for, and it only works when both sides use the same key.
         await provider.provideLanguageModelChatResponse(
             model,
             messages,

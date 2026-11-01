@@ -51,9 +51,11 @@ export interface TransportDeps {
         onUnsupportedParameter?: (model: string, param: string) => void;
     }) => LiteLLMClient;
     /**
-     * Forwarded into every per-request LiteLLMClient. Called by the client's
-     * 400 strip-and-retry path so the owning provider can persist learned
-     * parameter incompatibilities (registry `recordUnsupportedParameter`).
+     * Invoked when a 400 or 403 response rejects a parameter this connector
+     * adds, so the provider can remember the incompatibility and later requests
+     * omit it. The client retries without the parameter itself; the provider
+     * only records it. The model id it receives is the namespaced learned-limits
+     * key, not the wire model name.
      */
     onUnsupportedParameter?: (model: string, param: string) => void;
 }

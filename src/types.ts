@@ -216,9 +216,9 @@ export interface LiteLLMConfig {
     modelCapabilitiesOverrides?: Record<string, ModelCapabilityOverride>;
 
     /**
-     * When true, forces all models to use the `/responses` endpoint instead of per-model mode selection.
-     * This ensures consistent behavior across models, especially for those that require reasoning support.
-     * Default: false (opt-in, JSON-only, not in Settings UI).
+     * When true, models whose proxy mode is `chat` are sent to the `/responses`
+     * endpoint instead. Changing it reloads the model list.
+     * Default: false.
      */
     forceResponsesEndpoint?: boolean;
 
@@ -277,8 +277,8 @@ export interface LiteLLMConfig {
  * Connection-level configuration for a single LiteLLM proxy. Each
  * `LiteLLMClient` is bound to exactly one proxy and carries its baseUrl
  * and API key. The `disableCaching` flag is duplicated here so the client
- * can opt the connection itself out of `Cache-Control` headers without
- * needing access to the workspace-level `LiteLLMConfig`.
+ * can add the proxy cache directive without needing access to the
+ * workspace-level `LiteLLMConfig`.
  */
 export interface LiteLLMClientConfig {
     url: string;
@@ -293,9 +293,10 @@ export interface LiteLLMClientConfig {
      */
     rateLimitMaxDelayMs?: number;
     /**
-     * Observability hook: invoked when a 400 response forces a parameter to
-     * be stripped and the request retried. Lets callers persist the learned
-     * incompatibility so later requests proactively omit the parameter.
+     * Invoked when a 400 or 403 response rejects a parameter this connector adds,
+     * so the provider can remember the incompatibility and later requests omit
+     * it. The client retries without the parameter itself; the provider only
+     * records it.
      */
     onUnsupportedParameter?: (model: string, param: string) => void;
 }

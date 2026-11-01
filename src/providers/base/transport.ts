@@ -114,10 +114,15 @@ export class Transport {
             rateLimitMaxDelayMs,
             // A learned rejection belongs to one proxy's model config, so it is
             // recorded under the namespaced picker id, not the wire model name.
-            // A caller that omits the id falls back to the wire name, which is
-            // still better than dropping the rejection.
-            onUnsupportedParameter: (_wireModel: string, param: string) => {
-                this.onUnsupportedParameter?.(learnedLimitsKey ?? _wireModel, param);
+            // The provider always supplies that id, so a missing one means a
+            // caller bypassed it: the rejection is reported instead of stored
+            // under a key nothing reads.
+            onUnsupportedParameter: (wireModel: string, param: string) => {
+                if (!learnedLimitsKey) {
+                    StructuredLogger.warn("transport.learned_limit_without_key", { param, model: wireModel });
+                    return;
+                }
+                this.onUnsupportedParameter?.(learnedLimitsKey, param);
             },
         });
 
@@ -145,7 +150,7 @@ export class Transport {
             configuration.allowChatCompletionsFallback === true;
 
         try {
-            const stream = await client.chat(request, modelInfo?.mode, token, modelInfo, requestId);
+            const stream = await client.chat(request, modelInfo?.mode, token, requestId);
             this.logger.debug(`[transport.sendRequestToLiteLLM] HTTP stream established for model: ${request.model}`);
             StructuredLogger.debug("transport.http_response_stream_open", {
                 model: request.model,
@@ -173,10 +178,7 @@ export class Transport {
                     caller,
                     ...toErrorLogFields(err),
                 });
-                const chatModelInfo: LiteLLMModelInfo | undefined = modelInfo
-                    ? { ...modelInfo, mode: "chat" }
-                    : modelInfo;
-                return client.chat(request, "chat", token, chatModelInfo, requestId);
+                return client.chat(request, "chat", token, requestId);
             }
 
             // The provider owns the single log for a request failure, so this

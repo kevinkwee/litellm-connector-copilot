@@ -4,7 +4,6 @@ import type {
     LiteLLMModelInfoResponse,
     OpenAIChatCompletionRequest,
     LiteLLMResponsesRequest,
-    LiteLLMModelInfo,
 } from "../types";
 import { transformToResponsesFormat } from "./responsesAdapter";
 import { StructuredLogger } from "../observability/structuredLogger";
@@ -200,7 +199,7 @@ export class LiteLLMClient {
     }
 
     private getModelInfoUrls(): string[] {
-        const base = normalizeProxyBaseUrl(this.config.url);
+        const base = this.config.url;
         const withoutV1 = base.replace(/\/v1$/i, "");
         return [...new Set([base, withoutV1].filter((candidate) => candidate.length > 0))].map(
             (candidate) => `${candidate}/model/info`
@@ -240,7 +239,6 @@ export class LiteLLMClient {
         request: OpenAIChatCompletionRequest,
         mode?: string,
         token?: vscode.CancellationToken,
-        modelInfo?: LiteLLMModelInfo,
         requestId?: string
     ): Promise<ReadableStream<Uint8Array>> {
         const endpoint = this.getEndpoint(mode);
@@ -249,7 +247,7 @@ export class LiteLLMClient {
         if (endpoint === "/responses") {
             body = transformToResponsesFormat(request);
         }
-        // The fork reads the bypass from a top-level `cache` member, and lists
+        // LiteLLM reads the bypass from a top-level `cache` member, and lists
         // `cache` in `all_litellm_params`, so it reaches the proxy but no provider.
         if (this.config.disableCaching) {
             body = this.withNoCacheDirective(body);
@@ -273,21 +271,16 @@ export class LiteLLMClient {
         // reported instead: hiding it would send the same rejected body on
         // every later request.
         if (response.status === 400 || response.status === 403) {
-            const retry = this.planConnectorParameterRetry(
-                await response.clone().text(),
-                body,
-                request.model,
-                modelInfo
-            );
-            if (retry) {
+            const retryBody = this.planConnectorParameterRetry(await response.clone().text(), body, request.model);
+            if (retryBody) {
                 Logger.warn(`Retrying ${request.model} without a connector-added parameter the proxy rejected`);
                 this.discardBody(response);
                 response = await this.fetchWithRateLimit(
                     url,
                     {
                         method: "POST",
-                        headers: retry.headers,
-                        body: JSON.stringify(retry.body),
+                        headers: this.getHeaders(),
+                        body: JSON.stringify(retryBody),
                     },
                     rateLimitOptions
                 );
@@ -314,7 +307,7 @@ export class LiteLLMClient {
     }
 
     /**
-     * Builds the retry body and headers for a 400 that rejects a parameter this
+     * Builds the retry body for a 400 or 403 that rejects a parameter this
      * connector adds itself. Returns undefined when the rejection names no such
      * parameter, in which case the caller must surface the error instead.
      *
@@ -333,9 +326,8 @@ export class LiteLLMClient {
     private planConnectorParameterRetry(
         errorText: string,
         body: OpenAIChatCompletionRequest | LiteLLMResponsesRequest,
-        modelId: string,
-        _modelInfo: LiteLLMModelInfo | undefined
-    ): { body: OpenAIChatCompletionRequest | LiteLLMResponsesRequest; headers: Record<string, string> } | undefined {
+        modelId: string
+    ): OpenAIChatCompletionRequest | LiteLLMResponsesRequest | undefined {
         const errorLower = errorText.toLowerCase();
         const promptCachingRejected = errorLower.includes("cache_control");
         const cacheBypassRejected =
@@ -351,7 +343,6 @@ export class LiteLLMClient {
 
         const retryBody = JSON.parse(JSON.stringify(body)) as OpenAIChatCompletionRequest | LiteLLMResponsesRequest;
         const retryBodyRecord = retryBody as unknown as Record<string, unknown>;
-        const headers = this.getHeaders();
         let strippedSomething = false;
 
         if (promptCachingRejected && "cache_control" in retryBodyRecord) {
@@ -370,7 +361,7 @@ export class LiteLLMClient {
 
         // A body that did not change would be rejected identically, so do not
         // spend a second request on it.
-        return strippedSomething ? { body: retryBody, headers } : undefined;
+        return strippedSomething ? retryBody : undefined;
     }
 
     private getHeaders(): Record<string, string> {

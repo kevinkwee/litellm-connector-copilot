@@ -4,7 +4,7 @@ import { Transport } from "../transport";
 import type { TransportDeps } from "../types";
 import type { ConfigManager } from "../../../config/configManager";
 import type { LiteLLMClient } from "../../../adapters/litellmClient";
-import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../../types";
+import type { OpenAIChatCompletionRequest } from "../../../types";
 
 /**
  * Captures the most recent backend params passed to the factory, so the
@@ -23,7 +23,6 @@ class RateLimitSpyClient {
         _request: OpenAIChatCompletionRequest,
         _mode: string | undefined,
         _token?: vscode.CancellationToken,
-        _modelInfo?: LiteLLMModelInfo,
         requestId?: string
     ): Promise<ReadableStream<Uint8Array>> {
         lastChatRequestId = requestId;

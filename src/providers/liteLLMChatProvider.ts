@@ -192,11 +192,11 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             };
             requestBodyBuilt = requestBody;
             // The model id in `model` is the namespaced `<routing>/<raw>`
-            // form VS Code hands us. The tokenizer heuristics (and the
-            // `isParameterSupported` / `usageOptOutModels` lookups inside the
-            // request builder) key off the raw model family, not the routing
-            // prefix. The request builder extracts the raw name internally
-            // before populating `request.model`.
+            // form VS Code hands us. The tokenizer heuristics and the
+            // `isParameterSupported` lookups key off the raw model family, not
+            // the routing prefix. The request builder extracts the raw name
+            // internally before populating `request.model`, while what a proxy
+            // taught us about a model is stored under the namespaced id.
             const rawModelIdForTokenizers = this.getRawModelName(model.id);
             const estimatedTransportInputTokens =
                 countOpenAIChatMessagesTokens(requestBody.messages, rawModelIdForTokenizers, modelInfo) +

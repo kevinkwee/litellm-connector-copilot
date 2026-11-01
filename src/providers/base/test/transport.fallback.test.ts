@@ -28,7 +28,7 @@ class FakeLiteLLMClient {
         _request: OpenAIChatCompletionRequest,
         mode: string | undefined,
         _token?: vscode.CancellationToken,
-        _modelInfo?: LiteLLMModelInfo
+        _requestId?: string
     ): Promise<ReadableStream<Uint8Array>> {
         this.calls.push(mode ?? "undefined");
         if (this.failFirstResponsesWith500 && !this.firstCallFailed && mode === "responses") {

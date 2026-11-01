@@ -163,7 +163,7 @@ export abstract class LiteLLMProviderBase {
      * Forgets every per-proxy limit learned from a live request: the effort
      * fallback ladder, the `include_usage` opt-out, and the unsupported parameters.
      */
-    protected clearLearnedLimits(): void {
+    private clearLearnedLimits(): void {
         this._effortFallbackCache.clear();
         this._usageOptOutModels.clear();
         this._registry.clearUnsupportedParameters();
@@ -357,9 +357,9 @@ export abstract class LiteLLMProviderBase {
         modelInfo?: LiteLLMModelInfo,
         requestId?: string
     ): Promise<ReadableStream<Uint8Array>> {
+        // A learned limit describes one proxy's model config, so every store is
+        // keyed by the namespaced picker id rather than the wire model name.
         const modelId = model.id;
-        // A learned limit describes one proxy's model config, so the key is the
-        // namespaced picker id rather than the wire model name.
         Logger.debug(`[sendRequestWithRetry] modelId: ${modelId}, reasoning_effort: ${request.reasoning_effort}`);
         const originalEffort = (request as { reasoning_effort?: SupportedReasoningEffort }).reasoning_effort;
         let effectiveEffort = this._effortFallbackCache.getEffectiveEffort(modelId, originalEffort);
@@ -436,7 +436,7 @@ export abstract class LiteLLMProviderBase {
                 this.applyReasoningEffort(request, effectiveEffort);
 
                 if (notificationKeyEffort && previous && previous !== effectiveEffort) {
-                    this.notifyReasoningFallback(modelId, notificationKeyEffort, effectiveEffort);
+                    this.notifyReasoningFallback(modelId, model.name, notificationKeyEffort, effectiveEffort);
                 }
 
                 Logger.info(
@@ -497,6 +497,7 @@ export abstract class LiteLLMProviderBase {
 
     private notifyReasoningFallback(
         modelId: string,
+        modelDisplayName: string,
         originalEffort: SupportedReasoningEffort,
         fallbackEffort: SupportedReasoningEffort | undefined
     ): void {
@@ -506,9 +507,18 @@ export abstract class LiteLLMProviderBase {
 
         const fallbackLabel = fallbackEffort ?? "omitted";
         void vscode.window.showInformationMessage(
-            `Effort '${originalEffort}' is not supported by ${modelId}; using '${fallbackLabel}' for this session.`
+            `Effort '${originalEffort}' is not supported by ${modelDisplayName}; using '${fallbackLabel}' for this session.`
         );
         markReasoningFallbackNotified(modelId, originalEffort);
+    }
+
+    /**
+     * Decides whether a request should carry the proxy cache directive. A key
+     * that already rejected it must not pay for the rejection on every request,
+     * so the learned refusal turns the directive off for that model.
+     */
+    private resolveCacheDirective(cfg: { disableCaching?: boolean }, modelId: string): boolean {
+        return cfg.disableCaching === true && !this._registry.getUnsupportedParameters(modelId).has("cache");
     }
 
     /**
@@ -554,9 +564,7 @@ export abstract class LiteLLMProviderBase {
             return {
                 ...opt.configuration,
                 allowChatCompletionsFallback: cfg.allowChatCompletionsFallback,
-                // A key that already rejected the directive must not pay for it on
-                // every request, so the learned rejection disables it up front.
-                disableCaching: cfg.disableCaching && !this._registry.getUnsupportedParameters(model.id).has("cache"),
+                disableCaching: this.resolveCacheDirective(cfg, model.id),
                 rateLimitMaxDelayMs: cfg.rateLimitMaxDelayMs,
             };
         }
@@ -585,7 +593,7 @@ export abstract class LiteLLMProviderBase {
                 baseUrl: entry.baseUrl,
                 apiKey: entry.apiKey,
                 allowChatCompletionsFallback: cfg.allowChatCompletionsFallback,
-                disableCaching: cfg.disableCaching && !this._registry.getUnsupportedParameters(model.id).has("cache"),
+                disableCaching: this.resolveCacheDirective(cfg, model.id),
                 rateLimitMaxDelayMs: cfg.rateLimitMaxDelayMs,
             };
         }

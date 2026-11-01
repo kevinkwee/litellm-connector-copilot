@@ -169,6 +169,18 @@ suite("ConfigManager Unit Tests", () => {
         assert.strictEqual(clientConfig.discoveryTimeoutMs, 5_000);
     });
 
+    test("a pasted endpoint path is normalized away before it reaches the routing table", () => {
+        const session = configManager.convertProviderConfiguration("group-a", {
+            baseUrl: " https://proxy.example/v1/chat/completions/ ",
+            apiKey: "secret",
+        });
+
+        assert.ok(session);
+        assert.strictEqual(session?.baseUrl, "https://proxy.example/v1");
+        const clientConfig = (session?.client as unknown as { config: { url: string } }).config;
+        assert.strictEqual(clientConfig.url, "https://proxy.example/v1");
+    });
+
     test("should read forceResponsesEndpoint from workspace settings", async () => {
         settingsMap.set("litellm-connector.forceResponsesEndpoint", false);
         const config = await configManager.getConfig();

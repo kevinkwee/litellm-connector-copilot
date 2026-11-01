@@ -30,4 +30,8 @@ suite("normalizeProxyBaseUrl", () => {
     test("strips a terminal model-info path", () => {
         assert.strictEqual(normalizeProxyBaseUrl("https://p/model/info"), "https://p");
     });
+
+    test("strips the slash a doubled separator leaves behind", () => {
+        assert.strictEqual(normalizeProxyBaseUrl("https://p//chat/completions"), "https://p");
+    });
 });
