@@ -165,6 +165,8 @@ export class StreamTokenCapture {
             completionTokens: snapshot.outputTokens,
             cachedTokens: snapshot.cachedTokens,
             cacheCreationInputTokens: snapshot.cacheCreationInputTokens,
+            cacheCreation5mTokens: promptDetails?.cache_creation_token_details?.ephemeral_5m_input_tokens,
+            cacheCreation1hTokens: promptDetails?.cache_creation_token_details?.ephemeral_1h_input_tokens,
             pricing: this._pricing,
         });
         if (this._pricing) {
@@ -341,6 +343,10 @@ export class StreamTokenCapture {
                 completionTokens: enriched.completion_tokens ?? 0,
                 cachedTokens: enriched.prompt_tokens_details?.cached_tokens ?? 0,
                 cacheCreationInputTokens: enriched.prompt_tokens_details?.cache_creation_input_tokens ?? 0,
+                cacheCreation5mTokens:
+                    enriched.prompt_tokens_details?.cache_creation_token_details?.ephemeral_5m_input_tokens,
+                cacheCreation1hTokens:
+                    enriched.prompt_tokens_details?.cache_creation_token_details?.ephemeral_1h_input_tokens,
                 pricing: this._pricing,
             });
             enriched.estimated_input_cost = cost.inputCost;
@@ -370,6 +376,14 @@ export class StreamTokenCapture {
 
         const promptTokens = pick(prev.prompt_tokens, next.prompt_tokens) ?? 0;
         const completionTokens = pick(prev.completion_tokens, next.completion_tokens) ?? 0;
+        const cacheCreation5mTokens = pick(
+            prev.prompt_tokens_details?.cache_creation_token_details?.ephemeral_5m_input_tokens,
+            next.prompt_tokens_details?.cache_creation_token_details?.ephemeral_5m_input_tokens
+        );
+        const cacheCreation1hTokens = pick(
+            prev.prompt_tokens_details?.cache_creation_token_details?.ephemeral_1h_input_tokens,
+            next.prompt_tokens_details?.cache_creation_token_details?.ephemeral_1h_input_tokens
+        );
 
         return {
             prompt_tokens: promptTokens,
@@ -385,6 +399,16 @@ export class StreamTokenCapture {
                     prev.prompt_tokens_details?.cache_creation_input_tokens,
                     next.prompt_tokens_details?.cache_creation_input_tokens
                 ),
+                // The tiers are priced separately, so the split has to survive a
+                // second usage frame; without it every cache write is billed at the
+                // five-minute rate.
+                cache_creation_token_details:
+                    cacheCreation5mTokens === undefined && cacheCreation1hTokens === undefined
+                        ? undefined
+                        : {
+                              ephemeral_5m_input_tokens: cacheCreation5mTokens,
+                              ephemeral_1h_input_tokens: cacheCreation1hTokens,
+                          },
             },
             completion_tokens_details: {
                 reasoning_tokens: pick(

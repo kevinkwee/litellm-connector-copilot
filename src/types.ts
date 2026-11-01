@@ -103,6 +103,15 @@ export interface OpenAIChatMessage {
 export interface OpenAIUsagePromptTokenDetails {
     cached_tokens?: number;
     cache_creation_input_tokens?: number;
+    /**
+     * Anthropic's split of the cache-write tokens by cache tier. The proxy
+     * charges the one-hour tier at its own rate, so the cost estimate needs both
+     * counts rather than their sum.
+     */
+    cache_creation_token_details?: {
+        ephemeral_5m_input_tokens?: number;
+        ephemeral_1h_input_tokens?: number;
+    };
 }
 
 /**
@@ -522,20 +531,7 @@ export type LiteLLMResponseInputItem =
           content: string | OpenAIChatMessageContentItem[];
       }
     | { type: "function_call"; id: string; call_id?: string; name: string; arguments: string }
-    | { type: "function_call_output"; id?: string; call_id: string; output: string }
-    | {
-          /**
-           * Carries an Anthropic `thinking` or `redacted_thinking` block back
-           * to the model. `encrypted_content` is the signature (or the opaque
-           * redacted data) that the API uses to verify reasoning continuity
-           * across turns. `summary` carries the human-readable thinking text
-           * (empty for redacted blocks).
-           */
-          type: "reasoning";
-          id: string;
-          summary: { type: "summary_text"; text: string }[];
-          encrypted_content: string;
-      };
+    | { type: "function_call_output"; id?: string; call_id: string; output: string };
 
 /**
  * Tool definition for LiteLLM /responses endpoint.
@@ -545,6 +541,12 @@ export interface LiteLLMResponseTool {
     name: string;
     description: string;
     parameters: object;
+    /**
+     * The Responses request schema requires this field and documents true as its
+     * default. The connector forwards the caller's schema unchanged, so it states
+     * false explicitly rather than letting the endpoint enforce a stricter schema.
+     */
+    strict: boolean;
 }
 
 /**

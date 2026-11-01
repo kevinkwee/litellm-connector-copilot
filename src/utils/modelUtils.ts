@@ -4,15 +4,31 @@ import type { LiteLLMModelInfo, ToolResultImageMode, ToolResultTextMode } from "
  * Provider families whose LiteLLM transforms read `image_url` parts from a
  * `role: "tool"` message. Providers outside this list stringify list content
  * and keep only the text, so images sent natively would be dropped.
+ *
+ * The names are exact so a substring cannot select the wrong transform. A bare
+ * `vertex_ai` is deliberately absent: the fork uses it for both Gemini and
+ * OpenAI-like partners such as xAI, and hoisting is safe for both.
  */
-const NATIVE_TOOL_RESULT_IMAGE_PROVIDERS: readonly RegExp[] = [/anthropic/i, /gemini/i, /vertex/i, /bedrock/i];
+const NATIVE_TOOL_RESULT_IMAGE_PROVIDERS: ReadonlySet<string> = new Set([
+    "anthropic",
+    "vertex_ai-anthropic_models",
+    "gemini",
+    "vertex_ai-language-models",
+    "bedrock",
+    "bedrock_converse",
+]);
 
 /**
  * Provider families whose LiteLLM transforms keep the text items of a tool
  * result apart instead of concatenating them. Anthropic turns each item into its
  * own content block, and Bedrock keeps the items as separate entries.
  */
-const SEPARATE_TOOL_RESULT_TEXT_PROVIDERS: readonly RegExp[] = [/anthropic/i, /bedrock/i];
+const SEPARATE_TOOL_RESULT_TEXT_PROVIDERS: ReadonlySet<string> = new Set([
+    "anthropic",
+    "vertex_ai-anthropic_models",
+    "bedrock",
+    "bedrock_converse",
+]);
 
 /**
  * Picks the wire shape for the text parts of a tool result.
@@ -32,7 +48,7 @@ export function resolveToolResultTextMode(modelInfo?: LiteLLMModelInfo): ToolRes
         return "joined";
     }
     const provider = modelInfo?.litellm_provider;
-    if (typeof provider === "string" && SEPARATE_TOOL_RESULT_TEXT_PROVIDERS.some((pattern) => pattern.test(provider))) {
+    if (typeof provider === "string" && SEPARATE_TOOL_RESULT_TEXT_PROVIDERS.has(provider.toLowerCase())) {
         return "separate";
     }
     return "joined";
@@ -76,7 +92,7 @@ export function resolveToolResultImageMode(modelInfo?: LiteLLMModelInfo): ToolRe
         return "hoist";
     }
     const provider = modelInfo?.litellm_provider;
-    if (typeof provider === "string" && NATIVE_TOOL_RESULT_IMAGE_PROVIDERS.some((pattern) => pattern.test(provider))) {
+    if (typeof provider === "string" && NATIVE_TOOL_RESULT_IMAGE_PROVIDERS.has(provider.toLowerCase())) {
         return "native";
     }
     return "hoist";

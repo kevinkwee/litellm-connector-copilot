@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -127,12 +127,31 @@ export class StructuredLogFileSink {
         }
         this.activeFilePath = join(this.storageDir as string, name);
         this.currentDayKey = dayKey;
-        this.byteCount = existsSync(this.activeFilePath) ? statSync(this.activeFilePath).size : 0;
+        this.byteCount = this.readFileSize(this.activeFilePath);
         if (rolling) {
             // Retention also runs at every rollover, so a long-running session
             // cannot keep expired files past their window.
             this.pruneExpiredFiles();
             this.enforceTotalCap();
+        }
+    }
+
+    /**
+     * Current size of the file, or 0 when it does not exist.
+     *
+     * A separate existence check races another window that deletes the file
+     * between the check and the `statSync`, which would throw and disable the
+     * sink for the rest of the session. Any other error still propagates, so a
+     * real failure disables the sink the way every other write failure does.
+     */
+    private readFileSize(path: string): number {
+        try {
+            return statSync(path).size;
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+                return 0;
+            }
+            throw err;
         }
     }
 

@@ -339,6 +339,86 @@ suite("StreamTokenCapture", () => {
         assert.strictEqual(snapshot.estimatedOutputCost, 0.000075);
     });
 
+    test("bills one-hour cache writes at their own rate on the forwarded usage part", () => {
+        const { parts, progress } = createInnerProgress();
+        const capture = new StreamTokenCapture("claude-opus", progress, {
+            model: "claude-opus",
+            mode: "chat",
+            litellm_provider: "anthropic",
+            pricing: {
+                inputCostPerToken: 3e-6,
+                cacheCreationCostPerToken: 3.75e-6,
+                // Anthropic bills a one-hour write at twice the input rate.
+                cacheCreation1hCostPerToken: 6e-6,
+            },
+        });
+
+        capture.progress.report(
+            asUsagePart(
+                normalizeUsagePayload({
+                    prompt_tokens: 1000,
+                    completion_tokens: 0,
+                    total_tokens: 1000,
+                    prompt_tokens_details: {
+                        cache_creation_input_tokens: 100,
+                        cache_creation_token_details: {
+                            ephemeral_5m_input_tokens: 40,
+                            ephemeral_1h_input_tokens: 60,
+                        },
+                    },
+                } as RawUsagePayload)
+            )
+        );
+
+        // Non-cached input: (1000 - 0 - 100) * 3e-6 = 0.0027
+        // Writes: 40 * 3.75e-6 = 0.00015, 60 * 6e-6 = 0.00036
+        const usage = parts.find((part) => part instanceof vscode.LanguageModelDataPart) as
+            vscode.LanguageModelDataPart | undefined;
+        assert.ok(usage, "expected the forwarded usage part");
+        const payload = JSON.parse(Buffer.from(usage.data).toString("utf-8")) as { estimated_input_cost?: number };
+        assert.strictEqual(payload.estimated_input_cost, 0.00321);
+        assert.strictEqual(capture.getSnapshot().estimatedInputCost, 0.00321);
+    });
+
+    test("keeps the cache-write split across a second usage frame", () => {
+        // Upstream may report usage mid-stream and again at the end of the same
+        // attempt. The merge must not lose the tiers, or every cache write falls back
+        // to the five-minute rate.
+        const { parts, progress } = createInnerProgress();
+        const capture = new StreamTokenCapture("claude-opus", progress, {
+            model: "claude-opus",
+            mode: "chat",
+            litellm_provider: "anthropic",
+            pricing: {
+                inputCostPerToken: 3e-6,
+                cacheCreationCostPerToken: 3.75e-6,
+                cacheCreation1hCostPerToken: 6e-6,
+            },
+        });
+        const usageFrame = (): vscode.LanguageModelDataPart =>
+            asUsagePart(
+                normalizeUsagePayload({
+                    prompt_tokens: 1000,
+                    completion_tokens: 0,
+                    total_tokens: 1000,
+                    prompt_tokens_details: {
+                        cache_creation_input_tokens: 100,
+                        cache_creation_token_details: {
+                            ephemeral_5m_input_tokens: 40,
+                            ephemeral_1h_input_tokens: 60,
+                        },
+                    },
+                } as RawUsagePayload)
+            );
+
+        capture.progress.report(usageFrame());
+        capture.progress.report(usageFrame());
+
+        const usage = parts[parts.length - 1] as vscode.LanguageModelDataPart;
+        const payload = JSON.parse(Buffer.from(usage.data).toString("utf-8")) as { estimated_input_cost?: number };
+        assert.strictEqual(payload.estimated_input_cost, 0.00321, "the second frame keeps the tiers");
+    });
+
     test("counts ThinkingPart as reasoning and plain TextPart as completion only", () => {
         const thinking = asThinkingPart("ponder");
         if (!thinking) {

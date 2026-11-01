@@ -106,6 +106,35 @@ suite("normalizeUsagePayload", () => {
         assert.strictEqual(usage.prompt_tokens_details?.cached_tokens, 0);
     });
 
+    test("preserves the cache-creation tier split", () => {
+        const usage = normalizeUsagePayload({
+            prompt_tokens: 1_000,
+            completion_tokens: 10,
+            prompt_tokens_details: {
+                cache_creation_input_tokens: 1_000,
+                cache_creation_token_details: {
+                    ephemeral_5m_input_tokens: 400,
+                    ephemeral_1h_input_tokens: 600,
+                },
+            },
+        });
+
+        assert.deepStrictEqual(usage.prompt_tokens_details?.cache_creation_token_details, {
+            ephemeral_5m_input_tokens: 400,
+            ephemeral_1h_input_tokens: 600,
+        });
+    });
+
+    test("omits the tier split when neither count is reported", () => {
+        const usage = normalizeUsagePayload({
+            prompt_tokens: 1_000,
+            completion_tokens: 10,
+            prompt_tokens_details: { cache_creation_input_tokens: 1_000, cache_creation_token_details: {} },
+        });
+
+        assert.strictEqual(usage.prompt_tokens_details?.cache_creation_token_details, undefined);
+    });
+
     test("omits token details when the usage frame has none", () => {
         const usage = normalizeUsagePayload({ prompt_tokens: 5, completion_tokens: 5 });
 

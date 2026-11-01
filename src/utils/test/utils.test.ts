@@ -762,6 +762,20 @@ suite("Utility Unit Tests", () => {
         assert.strictEqual(res.tool_choice?.function.name, "tool_-bad_name");
     });
 
+    test("convertTools leaves the chat-completions function free of strict", () => {
+        // The Responses adapter sets `strict` explicitly. A chat completions tool
+        // leaves the field to the endpoint, whose default is false.
+        const res = convertTools({
+            tools: [{ name: "search", description: "", inputSchema: { type: "object", properties: {} } }],
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+            requestInitiator: "test",
+        });
+
+        const sentTool = res.tools?.[0];
+        assert.ok(sentTool, "the declared tool must survive conversion");
+        assert.strictEqual(Object.hasOwn(sentTool.function, "strict"), false);
+    });
+
     test("convertTools passes a deep-frozen declared schema through untouched", () => {
         const inputSchema = Object.freeze({
             type: "object",

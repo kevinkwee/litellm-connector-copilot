@@ -24,7 +24,7 @@ suite("Responses Adapter Unit Tests", () => {
         assert.strictEqual(functionOutput?.call_id, normalizeToolCallId("call1"));
     });
 
-    test("transformToResponsesFormat synthesizes function_call for orphaned outputs", () => {
+    test("transformToResponsesFormat drops an orphaned output instead of inventing a call", () => {
         const body = transformToResponsesFormat({
             model: "m",
             messages: [
@@ -34,12 +34,17 @@ suite("Responses Adapter Unit Tests", () => {
         });
 
         const input = body.input as Record<string, unknown>[];
-        const functionCall = input.find((i) => i.type === "function_call");
-        const functionOutput = input.find((i) => i.type === "function_call_output");
 
-        assert.ok(functionCall, "Should have synthesized a function_call");
-        assert.strictEqual(functionCall?.id, normalizeToolCallId("orphaned_id"));
-        assert.strictEqual(functionOutput?.call_id, normalizeToolCallId("orphaned_id"));
+        assert.strictEqual(
+            input.some((item) => item.type === "function_call"),
+            false,
+            "an output with no call must not fabricate one"
+        );
+        assert.strictEqual(
+            input.some((item) => item.type === "function_call_output"),
+            false,
+            "the unattributable output is dropped"
+        );
     });
 
     test("transformToResponsesFormat skips empty messages", () => {
@@ -149,11 +154,19 @@ suite("Responses Adapter Unit Tests", () => {
     test("transformToResponsesFormat wraps non-string tool content", () => {
         const body = transformToResponsesFormat({
             model: "m",
-            messages: [{ role: "tool", tool_call_id: "c1", content: { result: "ok" } as unknown as string }],
+            messages: [
+                {
+                    role: "assistant",
+                    content: "",
+                    tool_calls: [{ id: "c1", type: "function", function: { name: "lookup", arguments: "{}" } }],
+                },
+                { role: "tool", tool_call_id: "c1", content: { result: "ok" } as unknown as string },
+            ],
         });
 
-        const input = body.input as { output?: string }[];
-        assert.strictEqual(input[1].output, JSON.stringify({ result: "ok" }));
+        const input = body.input as { type?: string; output?: string }[];
+        const toolOutput = input.find((item) => item.type === "function_call_output");
+        assert.strictEqual(toolOutput?.output, JSON.stringify({ result: "ok" }));
     });
 
     test("transformToResponsesFormat keeps hoisted tool result images after the function_call_output", () => {
@@ -197,6 +210,11 @@ suite("Responses Adapter Unit Tests", () => {
             model: "m",
             messages: [
                 {
+                    role: "assistant",
+                    content: "",
+                    tool_calls: [{ id: "call_1", type: "function", function: { name: "screenshot", arguments: "{}" } }],
+                },
+                {
                     role: "tool",
                     tool_call_id: "call_1",
                     content: [
@@ -226,6 +244,109 @@ suite("Responses Adapter Unit Tests", () => {
         assert.strictEqual(body.input.length, 1);
     });
 
+    test("transformToResponsesFormat joins consecutive leading system messages", () => {
+        const body = transformToResponsesFormat({
+            model: "m",
+            messages: [
+                { role: "system", content: "Be terse." },
+                { role: "system", content: "Answer in English." },
+                { role: "user", content: "hi" },
+            ],
+        });
+
+        assert.strictEqual(body.instructions, "Be terse.\n\nAnswer in English.");
+        assert.strictEqual(body.input.length, 1);
+    });
+
+    test("transformToResponsesFormat keeps a later system message in place", () => {
+        const body = transformToResponsesFormat({
+            model: "m",
+            messages: [
+                { role: "system", content: "You are helpful" },
+                { role: "user", content: "hi" },
+                { role: "system", content: "Now switch to French." },
+                { role: "assistant", content: "Bonjour" },
+            ],
+        });
+
+        const input = body.input as Record<string, unknown>[];
+        assert.strictEqual(body.instructions, "You are helpful");
+        assert.deepStrictEqual(
+            input.map((item) => `${String(item.type)}:${String(item.role ?? "")}`),
+            ["message:user", "message:system", "message:assistant"],
+            "the mid-conversation instruction keeps its position"
+        );
+        assert.strictEqual(input[1].content, "Now switch to French.");
+    });
+
+    test("transformToResponsesFormat keeps a system message that ends the conversation", () => {
+        const body = transformToResponsesFormat({
+            model: "m",
+            messages: [
+                { role: "user", content: "hi" },
+                { role: "assistant", content: "Hello" },
+                { role: "system", content: "Answer only in French from now on." },
+            ],
+        });
+
+        const input = body.input as Record<string, unknown>[];
+        assert.deepStrictEqual(
+            input.map((item) => `${String(item.type)}:${String(item.role ?? "")}`),
+            ["message:user", "message:assistant", "message:system"],
+            "a trailing instruction must survive as the last item"
+        );
+        assert.strictEqual(input[2].content, "Answer only in French from now on.");
+    });
+
+    test("transformToResponsesFormat joins one system message's text items with blank lines", () => {
+        const body = transformToResponsesFormat({
+            model: "m",
+            messages: [
+                {
+                    role: "system",
+                    content: [
+                        { type: "text", text: "Rule one." },
+                        { type: "text", text: "Rule two." },
+                    ] as unknown as string,
+                },
+                { role: "user", content: "hi" },
+            ],
+        });
+
+        assert.strictEqual(body.instructions, "Rule one.\n\nRule two.");
+    });
+
+    test("transformToResponsesFormat sends no reasoning item for Anthropic thinking blocks", () => {
+        const body = transformToResponsesFormat({
+            model: "m",
+            messages: [
+                {
+                    role: "assistant",
+                    content: "answer",
+                    thinking_blocks: [
+                        { type: "thinking", thinking: "deliberation", signature: "sig-abc" },
+                        { type: "redacted_thinking", data: "opaque" },
+                    ],
+                    tool_calls: [{ id: "call_1", type: "function", function: { name: "t", arguments: "{}" } }],
+                } as unknown as OpenAIChatMessage,
+            ],
+        });
+
+        const input = body.input as Record<string, unknown>[];
+        assert.strictEqual(
+            input.some((item) => item.type === "reasoning"),
+            false,
+            "the endpoint has no field for an Anthropic signature"
+        );
+        assert.deepStrictEqual(
+            input.map((item) => item.type),
+            ["message", "function_call"],
+            "the text and the tool call are unchanged"
+        );
+        assert.ok(!JSON.stringify(body).includes("sig-abc"));
+        assert.ok(!JSON.stringify(body).includes("opaque"));
+    });
+
     test("transformToResponsesFormat handles array content in user messages", () => {
         const body = transformToResponsesFormat({
             model: "m",
@@ -234,6 +355,26 @@ suite("Responses Adapter Unit Tests", () => {
 
         const item = body.input[0] as { content?: string };
         assert.strictEqual(item.content, "hello");
+    });
+
+    test("transformToResponsesFormat marks every function tool as not strict", () => {
+        const body = transformToResponsesFormat({
+            model: "m",
+            messages: [{ role: "user", content: "hi" }],
+            tools: [
+                { type: "function", function: { name: "first", parameters: { type: "object", properties: {} } } },
+                { type: "function", function: { name: "second", parameters: { type: "object" } } },
+            ],
+        });
+
+        assert.deepStrictEqual(
+            body.tools?.map((tool) => ({ name: tool.name, strict: tool.strict })),
+            [
+                { name: "first", strict: false },
+                { name: "second", strict: false },
+            ],
+            "the endpoint must not enforce a schema the caller did not write"
+        );
     });
 
     test("transformToResponsesFormat filters out invalid tools", () => {
@@ -269,7 +410,7 @@ suite("Responses Adapter Unit Tests", () => {
         assert.strictEqual(input[1].type, "function_call");
     });
 
-    test("transformToResponsesFormat synthesizes name from tool definitions", () => {
+    test("transformToResponsesFormat drops an orphaned output even when a tool definition could name it", () => {
         const body = transformToResponsesFormat({
             model: "m",
             messages: [{ role: "tool", tool_call_id: "orphaned", content: "ok" }],
@@ -277,8 +418,7 @@ suite("Responses Adapter Unit Tests", () => {
         });
 
         const input = body.input as Record<string, unknown>[];
-        assert.strictEqual(input[0].type, "function_call");
-        assert.strictEqual(input[0].name, "my_tool");
+        assert.deepStrictEqual(input, [], "no call is invented from the tools array");
     });
 
     test("transformToResponsesFormat handles system message with array content", () => {

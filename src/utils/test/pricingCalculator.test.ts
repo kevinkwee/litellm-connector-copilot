@@ -10,6 +10,121 @@ import type { LiteLLMModelInfo } from "../../types";
 
 suite("pricingCalculator", () => {
     suite("extractPricing", () => {
+        test("reads the tiered rates the proxy declares", () => {
+            const modelInfo: LiteLLMModelInfo = {
+                input_cost_per_token: 0.000001,
+                input_cost_per_token_above_200k_tokens: 0.000002,
+                output_cost_per_token_above_200k_tokens: 0.0000075,
+                cache_creation_input_token_cost_above_200k_tokens: 0.000003,
+                cache_creation_input_token_cost_above_1hr_above_200k_tokens: 0.000006,
+                input_cost_per_token_above_500k_tokens: 0.000004,
+            };
+
+            const pricing = extractPricing(modelInfo);
+
+            assert.deepStrictEqual(pricing?.tiers, [
+                {
+                    thresholdTokens: 200_000,
+                    inputCostPerToken: 0.000002,
+                    outputCostPerToken: 0.0000075,
+                    cacheCreationCostPerToken: 0.000003,
+                    cacheCreation1hCostPerToken: 0.000006,
+                },
+                { thresholdTokens: 500_000, inputCostPerToken: 0.000004 },
+            ]);
+        });
+
+        test("reads a tier key written with a bare token count", () => {
+            const modelInfo: LiteLLMModelInfo = {
+                input_cost_per_token_above_1000_tokens: 0.000002,
+            };
+
+            assert.deepStrictEqual(extractPricing(modelInfo)?.tiers, [
+                { thresholdTokens: 1_000, inputCostPerToken: 0.000002 },
+            ]);
+        });
+
+        test("falls back to the base five-minute rate when only the one-hour tiered key is declared", () => {
+            // The one-hour key carries `_above_1hr` before its threshold, so its rate
+            // belongs to the one-hour category and to no other.
+            const modelInfo: LiteLLMModelInfo = {
+                cache_creation_input_token_cost: 0.0000025,
+                input_cost_per_token_above_200k_tokens: 0.000002,
+                cache_creation_input_token_cost_above_1hr_above_200k_tokens: 0.000004,
+            };
+
+            const pricing = extractPricing(modelInfo);
+
+            assert.strictEqual(pricing?.tiers?.[0]?.cacheCreationCostPerToken, undefined);
+            assert.strictEqual(pricing?.tiers?.[0]?.cacheCreation1hCostPerToken, 0.000004);
+        });
+
+        test("creates no tier from another category's threshold key", () => {
+            // LiteLLM declares its thresholds from the input-token keys alone, so an
+            // output-only key must not move the whole request onto a tier.
+            const modelInfo: LiteLLMModelInfo = {
+                output_cost_per_token: 0.000005,
+                output_cost_per_token_above_200k_tokens: 0.000009,
+            };
+
+            const pricing = extractPricing(modelInfo);
+
+            assert.strictEqual(pricing?.tiers, undefined);
+            assert.strictEqual(pricing?.outputCostPerToken, 0.000005);
+        });
+
+        test("reads a decimal threshold", () => {
+            const modelInfo: LiteLLMModelInfo = {
+                "input_cost_per_token_above_1.5k_tokens": 0.000002,
+                "output_cost_per_token_above_1.5k_tokens": 0.000008,
+            };
+
+            assert.deepStrictEqual(extractPricing(modelInfo)?.tiers, [
+                { thresholdTokens: 1_500, inputCostPerToken: 0.000002, outputCostPerToken: 0.000008 },
+            ]);
+        });
+
+        test("reads a zero threshold", () => {
+            // A zero threshold makes the tier apply to every request, which LiteLLM
+            // also accepts.
+            const modelInfo: LiteLLMModelInfo = {
+                input_cost_per_token_above_0_tokens: 0.000002,
+            };
+
+            assert.deepStrictEqual(extractPricing(modelInfo)?.tiers, [
+                { thresholdTokens: 0, inputCostPerToken: 0.000002 },
+            ]);
+        });
+
+        test("ignores a threshold whose input rate the proxy leaves unpriced", () => {
+            // LiteLLM reports every threshold key it knows, filled with null when it
+            // has no rate, and it selects a tier only from a priced input key. Reading
+            // a tier from the output key alone would bill the prompt at the base rate
+            // while the output rate jumped.
+            const modelInfo: LiteLLMModelInfo = {
+                input_cost_per_token: 0.000001,
+                input_cost_per_token_above_200k_tokens: null,
+                output_cost_per_token_above_200k_tokens: 0.000009,
+            };
+
+            assert.strictEqual(extractPricing(modelInfo)?.tiers, undefined);
+        });
+
+        test("ignores the proxy's service-tier pricing keys", () => {
+            const modelInfo: LiteLLMModelInfo = {
+                input_cost_per_token: 0.000001,
+                input_cost_per_token_above_200k_tokens: 0.000002,
+                input_cost_per_token_above_200k_tokens_priority: 0.000009,
+            };
+
+            const pricing = extractPricing(modelInfo);
+
+            // The standard key and its service-tier variant describe the same
+            // threshold, so reading both would produce two 200k tiers.
+            assert.deepStrictEqual(pricing?.tiers, [{ thresholdTokens: 200_000, inputCostPerToken: 0.000002 }]);
+            assert.strictEqual(pricing?.inputCostPerToken, 0.000001);
+        });
+
         test("extracts per-token pricing fields from model info", () => {
             const modelInfo: LiteLLMModelInfo = {
                 input_cost_per_token: 0.000001,
@@ -226,6 +341,185 @@ suite("pricingCalculator", () => {
     });
 
     suite("calculateRequestCost", () => {
+        test("uses the tiered rates once the prompt passes the threshold", () => {
+            const pricing = {
+                inputCostPerToken: 0.000001,
+                outputCostPerToken: 0.000005,
+                tiers: [
+                    {
+                        thresholdTokens: 200_000,
+                        inputCostPerToken: 0.000002,
+                        outputCostPerToken: 0.0000075,
+                    },
+                ],
+            };
+
+            const cost = calculateRequestCost({
+                promptTokens: 250_000,
+                completionTokens: 1_000,
+                cachedTokens: 0,
+                cacheCreationInputTokens: 0,
+                pricing,
+            });
+
+            assert.strictEqual(cost.inputCost, 0.5, "250k * 0.000002");
+            assert.strictEqual(cost.outputCost, 0.0075, "1k * 0.0000075");
+        });
+
+        test("keeps the base rates below the threshold", () => {
+            const pricing = {
+                inputCostPerToken: 0.000001,
+                outputCostPerToken: 0.000005,
+                tiers: [{ thresholdTokens: 200_000, inputCostPerToken: 0.000002 }],
+            };
+
+            const cost = calculateRequestCost({
+                promptTokens: 150_000,
+                completionTokens: 1_000,
+                cachedTokens: 0,
+                cacheCreationInputTokens: 0,
+                pricing,
+            });
+
+            assert.strictEqual(cost.inputCost, 0.15, "150k * 0.000001");
+        });
+
+        test("keeps the base rates exactly at the threshold", () => {
+            // LiteLLM switches tiers only when the prompt is larger than the
+            // threshold, so a prompt of exactly 200k stays on the base rates.
+            const pricing = {
+                inputCostPerToken: 0.000001,
+                tiers: [{ thresholdTokens: 200_000, inputCostPerToken: 0.000002 }],
+            };
+
+            const cost = calculateRequestCost({
+                promptTokens: 200_000,
+                completionTokens: 0,
+                cachedTokens: 0,
+                cacheCreationInputTokens: 0,
+                pricing,
+            });
+
+            assert.strictEqual(cost.inputCost, 0.2, "200k * 0.000001");
+        });
+
+        test("falls back to the base rate for a category the tier omits", () => {
+            const pricing = {
+                inputCostPerToken: 0.000001,
+                outputCostPerToken: 0.000005,
+                tiers: [{ thresholdTokens: 100_000, inputCostPerToken: 0.000002 }],
+            };
+
+            const cost = calculateRequestCost({
+                promptTokens: 200_000,
+                completionTokens: 1_000,
+                cachedTokens: 0,
+                cacheCreationInputTokens: 0,
+                pricing,
+            });
+
+            assert.strictEqual(cost.inputCost, 0.4, "the tier overrides the input rate");
+            assert.strictEqual(cost.outputCost, 0.005, "the tier has no output rate, so the base one applies");
+        });
+
+        test("uses the highest threshold the prompt exceeds", () => {
+            const pricing = {
+                inputCostPerToken: 0.000001,
+                tiers: [
+                    { thresholdTokens: 100_000, inputCostPerToken: 0.000002 },
+                    { thresholdTokens: 500_000, inputCostPerToken: 0.000004 },
+                ],
+            };
+
+            const cost = calculateRequestCost({
+                promptTokens: 600_000,
+                completionTokens: 0,
+                cachedTokens: 0,
+                cacheCreationInputTokens: 0,
+                pricing,
+            });
+
+            assert.strictEqual(cost.inputCost, 2.4, "600k * 0.000004");
+        });
+
+        test("prices a one-hour cache split at its own rate", () => {
+            const pricing = {
+                inputCostPerToken: 0.000003,
+                cacheCreationCostPerToken: 0.00000375,
+                cacheCreation1hCostPerToken: 0.000006,
+            };
+
+            const cost = calculateRequestCost({
+                promptTokens: 1_000,
+                completionTokens: 0,
+                cachedTokens: 0,
+                cacheCreationInputTokens: 1_000,
+                cacheCreation5mTokens: 400,
+                cacheCreation1hTokens: 600,
+                pricing,
+            });
+
+            // 400 * 0.00000375 + 600 * 0.000006
+            assert.strictEqual(cost.inputCost, 0.0051);
+        });
+
+        test("charges nothing for one-hour cache writes when the key is absent", () => {
+            const pricing = {
+                inputCostPerToken: 0.000003,
+                cacheCreationCostPerToken: 0.00000375,
+            };
+
+            const cost = calculateRequestCost({
+                promptTokens: 1_000,
+                completionTokens: 0,
+                cachedTokens: 0,
+                cacheCreationInputTokens: 1_000,
+                cacheCreation5mTokens: 400,
+                cacheCreation1hTokens: 600,
+                pricing,
+            });
+
+            assert.strictEqual(cost.inputCost, 0.0015, "only the five-minute tokens are billable");
+        });
+
+        test("bills only the reported tier when the split omits the five-minute count", () => {
+            // LiteLLM bills a tier the details omit as zero rather than inferring it
+            // from the total, so an unreported remainder is not charged.
+            const pricing = {
+                inputCostPerToken: 0.000003,
+                cacheCreationCostPerToken: 0.00000375,
+                cacheCreation1hCostPerToken: 0.000006,
+            };
+
+            const cost = calculateRequestCost({
+                promptTokens: 1_000,
+                completionTokens: 0,
+                cachedTokens: 0,
+                cacheCreationInputTokens: 1_000,
+                cacheCreation1hTokens: 600,
+                pricing,
+            });
+
+            assert.strictEqual(cost.inputCost, 0.0036, "600 * 0.000006");
+        });
+
+        test("bills every cache-write token at the base rate when no split is reported", () => {
+            const pricing = {
+                inputCostPerToken: 0.000003,
+                cacheCreationCostPerToken: 0.00000375,
+            };
+
+            const cost = calculateRequestCost({
+                promptTokens: 1_000,
+                completionTokens: 0,
+                cachedTokens: 0,
+                cacheCreationInputTokens: 1_000,
+                pricing,
+            });
+
+            assert.strictEqual(cost.inputCost, 0.00375);
+        });
+
         test("calculates cost from token counts and per-token pricing", () => {
             const pricing = {
                 inputCostPerToken: 0.000001,

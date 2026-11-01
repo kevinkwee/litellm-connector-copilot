@@ -19,8 +19,6 @@ import { Logger } from "../utils/logger";
  * empty text block and the image never reaches the model.
  *
  * The content must be an array: LiteLLM rejects a bare content object.
- * @param role Author of the image.
- * @param imageUrl Data URI or remote URL of the image.
  */
 function toResponsesImageMessage(role: "user" | "assistant", imageUrl: string): LiteLLMResponseInputItem {
     return {
@@ -37,7 +35,6 @@ function toResponsesImageMessage(role: "user" | "assistant", imageUrl: string): 
  * Array content only reaches this path when a caller bypasses the image mode
  * decision, so image parts are logged and dropped instead of being serialized
  * into `output` as raw bytes.
- * @param content Tool message content.
  */
 function toToolOutputText(content: unknown): string {
     if (typeof content === "string") {
@@ -66,6 +63,30 @@ function toToolOutputText(content: unknown): string {
 }
 
 /**
+ * Flattens a system message's content into the text the Responses request
+ * carries.
+ *
+ * The text items of one message are separated by a blank line, because the
+ * content parts are distinct instructions rather than words of one sentence.
+ */
+function systemMessageText(content: unknown): string {
+    if (typeof content === "string") {
+        return content.trim();
+    }
+    if (!Array.isArray(content)) {
+        return "";
+    }
+    return (content as OpenAIChatMessageContentItem[])
+        .filter(
+            (item): item is OpenAIChatMessageContentItem & { type: "text"; text: string } =>
+                item.type === "text" && typeof item.text === "string"
+        )
+        .map((item) => item.text)
+        .join("\n\n")
+        .trim();
+}
+
+/**
  * Translates a chat-completions `tool_choice` into the `/responses` shape,
  * where a named tool carries `name` at the top level instead of nesting under
  * `function`. A named tool the sent tools array does not carry is dropped,
@@ -87,11 +108,10 @@ function toResponsesToolChoice(
 }
 
 /**
- * Transform a chat/completions request body to the responses API format.
- * The responses API uses "input" (array format) instead of "messages".
- * Tools use the SAME standard OpenAI format as chat/completions.
- * @param requestBody The original chat/completions request body
- * @returns Transformed request body for the responses endpoint
+ * Translates a chat/completions request body into the Responses request shape,
+ * where the conversation travels as an `input` array instead of `messages` and a
+ * function tool carries `name` at the top level instead of nesting under
+ * `function`.
  */
 export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequest): LiteLLMResponsesRequest {
     const messages = requestBody.messages;
@@ -100,7 +120,6 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
 
     const toolCallIdMap = new Map<string, string>();
 
-    // First pass: normalize and map all tool call IDs from assistant messages AND tool messages
     for (const msg of messages) {
         if (msg.role === "assistant" && msg.tool_calls) {
             for (const tc of msg.tool_calls) {
@@ -116,30 +135,32 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
         }
     }
 
-    // Second pass: process messages and add tool calls
-    // content can be string or ContentItem[] depending on message type
+    let sawNonSystemMessage = false;
     for (const msg of messages) {
         if (msg.role === "system") {
-            if (typeof msg.content === "string") {
-                instructions = msg.content;
-            } else if (Array.isArray(msg.content)) {
-                // Extract text from content items (OpenAI format: { type: "text", text: "..." })
-                instructions = msg.content
-                    .filter(
-                        (item): item is OpenAIChatMessageContentItem & { type: "text"; text: string } =>
-                            "type" in item && item.type === "text" && "text" in item && typeof item.text === "string"
-                    )
-                    .map((item) => item.text)
-                    .join(" ");
+            const text = systemMessageText(msg.content);
+            if (!text) {
+                continue;
             }
+            if (!sawNonSystemMessage) {
+                // The endpoint has one `instructions` slot, so consecutive leading
+                // system messages are joined into it.
+                instructions = instructions === undefined ? text : `${instructions}\n\n${text}`;
+                continue;
+            }
+            // A system message after the conversation started keeps its position,
+            // which LiteLLM's Responses-to-chat bridge
+            // (`_transform_responses_api_input_item_to_chat_completion_message`)
+            // passes through as a system turn.
+            inputArray.push({ type: "message", role: "system", content: text });
             continue;
         }
+        sawNonSystemMessage = true;
 
         if (msg.role === "user") {
             if (typeof msg.content === "string" && msg.content.trim()) {
                 inputArray.push({ type: "message", role: "user", content: msg.content });
             } else if (Array.isArray(msg.content)) {
-                // Unpack content array into individual message items
                 for (const contentItem of msg.content) {
                     if (contentItem.type === "text" && typeof contentItem.text === "string") {
                         inputArray.push({
@@ -154,12 +175,11 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
                 }
             }
         } else if (msg.role === "assistant") {
-            // If assistant has tool calls, we add them.
-            // If it ALSO has content, we add that as a message with text or image_url items.
+            // An assistant turn may carry text, tool calls, or both; each becomes its
+            // own input item in the same order.
             if (typeof msg.content === "string" && msg.content.trim()) {
                 inputArray.push({ type: "message", role: "assistant", content: msg.content });
             } else if (Array.isArray(msg.content)) {
-                // Unpack content array into individual message items
                 for (const contentItem of msg.content) {
                     if (contentItem.type === "text" && typeof contentItem.text === "string") {
                         inputArray.push({
@@ -173,51 +193,16 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
                     }
                 }
             }
-            if ((msg as { thinking_blocks?: unknown[] }).thinking_blocks) {
-                const thinkingBlocks = (
-                    msg as {
-                        thinking_blocks?: {
-                            type?: string;
-                            thinking?: string;
-                            signature?: string;
-                            data?: string;
-                        }[];
-                    }
-                ).thinking_blocks;
-                if (Array.isArray(thinkingBlocks)) {
-                    for (const block of thinkingBlocks) {
-                        if (block && typeof block === "object") {
-                            if (typeof block.signature === "string") {
-                                // Emit a `reasoning` input item carrying the thinking text
-                                // (or empty string for redacted blocks) and the encrypted
-                                // signature. Anthropic uses the signature to verify the
-                                // thinking block was actually produced by the model.
-                                const thinkingText = typeof block.thinking === "string" ? block.thinking : "";
-                                inputArray.push({
-                                    type: "reasoning",
-                                    id: `reasoning_${inputArray.length}`,
-                                    summary: thinkingText ? [{ type: "summary_text", text: thinkingText }] : [],
-                                    encrypted_content: block.signature,
-                                } as unknown as LiteLLMResponseInputItem);
-                                Logger.trace(
-                                    `[responsesAdapter] Preserving thinking_block (${thinkingText.length} chars, sig ${block.signature.length} bytes)`
-                                );
-                            } else if (typeof block.data === "string") {
-                                // redacted_thinking block: opaque data, no text. The API
-                                // still requires it to be passed back unchanged.
-                                inputArray.push({
-                                    type: "reasoning",
-                                    id: `reasoning_${inputArray.length}`,
-                                    summary: [],
-                                    encrypted_content: block.data,
-                                } as unknown as LiteLLMResponseInputItem);
-                                Logger.trace(
-                                    `[responsesAdapter] Preserving redacted_thinking block (${block.data.length} bytes)`
-                                );
-                            }
-                        }
-                    }
-                }
+            const thinkingBlocks = (msg as { thinking_blocks?: unknown[] }).thinking_blocks;
+            if (Array.isArray(thinkingBlocks) && thinkingBlocks.length > 0) {
+                // A signed block carries Anthropic's signature for that reasoning and a
+                // redacted block carries opaque reasoning. The Responses endpoint has no
+                // field for either, LiteLLM's Responses-to-chat bridge drops every input
+                // item that has no content, and replaying a signature as
+                // `encrypted_content` would present Anthropic data under an OpenAI field.
+                Logger.trace(
+                    `[responsesAdapter] Dropping ${thinkingBlocks.length} thinking block(s) for the /responses endpoint`
+                );
             }
             if (msg.tool_calls) {
                 for (const tc of msg.tool_calls) {
@@ -246,9 +231,8 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
         }
     }
 
-    // Third pass: Ensure every function_call_output has a preceding function_call in the inputArray
-    // AND ensure they are in the correct order: [call, output, call, output]
-    // LiteLLM /responses endpoint is strict about the sequence.
+    // The endpoint requires every function_call_output to be preceded by its
+    // function_call, in the order the two were produced.
     const finalInputArray: (OpenAIChatMessageContentItem | LiteLLMResponseInputItem)[] = [];
     const seenCallIds = new Set<string>();
 
@@ -256,8 +240,7 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
         if (item.type === "function_call") {
             const id = item.id;
             seenCallIds.add(id);
-            Logger.trace(`[responsesAdapter] Final pass function_call id: ${id}`);
-            // Ensure both id and call_id are present for compatibility
+            Logger.trace(`[responsesAdapter] function_call id: ${id}`);
             finalInputArray.push({
                 ...item,
                 id: id,
@@ -266,22 +249,13 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
         } else if (item.type === "function_call_output") {
             const call_id = item.call_id;
             if (!seenCallIds.has(call_id)) {
-                // Synthesize missing call
-                Logger.warn(`[responsesAdapter] Synthesizing missing call for output id: ${call_id}`);
-
-                // Try to find the actual tool name from the tools array if possible
-                // This helps avoid generic "Tool 1" labels in the UI
-                const toolDef = requestBody.tools?.find((t) => t.function.name !== undefined);
-                const name = toolDef?.function.name || "previous_tool_call";
-
-                finalInputArray.push({
-                    type: "function_call",
-                    id: call_id,
-                    call_id: call_id,
-                    name: name,
-                    arguments: "{}",
+                // An output with no call before it cannot be attributed to a tool the
+                // model invoked, and inventing a call would fabricate history the model
+                // never produced. Dropping it keeps the sequence valid.
+                Logger.warn("[responsesAdapter] Dropping function_call_output with no matching function_call", {
+                    callId: call_id,
                 });
-                seenCallIds.add(call_id);
+                continue;
             }
             finalInputArray.push({
                 ...item,
@@ -292,11 +266,6 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
             finalInputArray.push(item);
         }
     }
-
-    // Final check: LiteLLM /responses often fails if the LAST item is a function_call
-    // without a corresponding function_call_output in the same request,
-    // UNLESS it's the very end of the conversation and we want the model to generate.
-    // However, if we have a function_call at the end, we should probably ensure it's valid.
 
     const responsesBody: LiteLLMResponsesRequest = {
         model: requestBody.model,
@@ -331,6 +300,11 @@ export function transformToResponsesFormat(requestBody: OpenAIChatCompletionRequ
                     name: func.name,
                     description: func.description || "", // Allow empty description
                     parameters: func.parameters,
+                    // The Responses request schema requires `strict` and documents
+                    // true as its default, while LiteLLM's bridge reads a missing value
+                    // as false. The connector forwards the caller's schema unchanged, so
+                    // it states false explicitly instead of relying on either default.
+                    strict: false,
                 };
             })
             .filter((t): t is LiteLLMResponseTool => t !== null);

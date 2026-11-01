@@ -19,6 +19,10 @@ export interface RawUsagePayload {
         cached_tokens?: number;
         cache_creation_tokens?: number;
         cache_creation_input_tokens?: number;
+        cache_creation_token_details?: {
+            ephemeral_5m_input_tokens?: number;
+            ephemeral_1h_input_tokens?: number;
+        };
     };
     completion_tokens_details?: {
         reasoning_tokens?: number;
@@ -65,6 +69,22 @@ export function normalizeUsagePayload(usage: RawUsagePayload): OpenAIUsagePayloa
         usage.cache_creation_input_tokens;
     if (typeof cacheCreationTokens === "number") {
         promptTokenDetails.cache_creation_input_tokens = cacheCreationTokens;
+    }
+    // Anthropic bills the five-minute and one-hour cache tiers differently, and
+    // the proxy reports the split here. Passing it through lets the cost estimate
+    // price each tier on its own rate.
+    const cacheCreationTokenDetails = usage.prompt_tokens_details?.cache_creation_token_details;
+    if (cacheCreationTokenDetails !== undefined) {
+        const details: OpenAIUsagePromptTokenDetails["cache_creation_token_details"] = {};
+        if (typeof cacheCreationTokenDetails.ephemeral_5m_input_tokens === "number") {
+            details.ephemeral_5m_input_tokens = cacheCreationTokenDetails.ephemeral_5m_input_tokens;
+        }
+        if (typeof cacheCreationTokenDetails.ephemeral_1h_input_tokens === "number") {
+            details.ephemeral_1h_input_tokens = cacheCreationTokenDetails.ephemeral_1h_input_tokens;
+        }
+        if (Object.keys(details).length > 0) {
+            promptTokenDetails.cache_creation_token_details = details;
+        }
     }
 
     const cachedTokens =

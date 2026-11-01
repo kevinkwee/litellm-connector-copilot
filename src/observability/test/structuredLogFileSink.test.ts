@@ -1,5 +1,5 @@
 import * as assert from "assert";
-import {
+import fs, {
     existsSync,
     mkdirSync,
     mkdtempSync,
@@ -12,10 +12,29 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as sinon from "sinon";
 import { StructuredLogFileSink } from "../structuredLogFileSink";
 
 declare const suite: (name: string, fn: () => void) => void;
 declare const test: (name: string, fn: () => void) => void;
+
+/**
+ * Stubs `statSync` so one path fails while every other path keeps working.
+ *
+ * Reaching the `node:fs` module object is the only way to reproduce a file that
+ * disappears between the folder listing and the size read, because the two reads
+ * happen back to back.
+ */
+function failStatSyncFor(path: string, code: string): sinon.SinonStub {
+    const statStub = sinon.stub(fs, "statSync");
+    statStub.callsFake((target, options) => {
+        if (`${target}` === path) {
+            throw Object.assign(new Error(`${code}: ${path}`), { code });
+        }
+        return statStub.wrappedMethod(target, options);
+    });
+    return statStub;
+}
 
 suite("StructuredLogFileSink", () => {
     let dir: string;
@@ -120,6 +139,57 @@ suite("StructuredLogFileSink", () => {
         assert.strictEqual(existsSync(todayFile), true, "the active file is never deleted");
         assert.strictEqual(existsSync(newer), false, "the over-cap file is deleted at startup");
     });
+
+    test("keeps writing when another window deletes the active file", () => {
+        const sink = new StructuredLogFileSink({ maxFileBytes: 1_000 });
+        sink.initialize(dir);
+        const activePath = sink.currentFilePath;
+        assert.ok(activePath);
+        sink.append("first");
+        rmSync(activePath);
+
+        sink.append("after the delete");
+        assert.strictEqual(existsSync(activePath), true, "the sink recreates and keeps writing");
+    });
+
+    test("stays enabled when the daily file disappears before its size is read", () => {
+        // Two windows share the folder: one lists it and finds the daily file, the
+        // other deletes that file, and the size read then finds nothing. An
+        // existence check that passed a moment earlier cannot protect the read.
+        const dayKey = new Date().toISOString().slice(0, 10);
+        const dailyFile = join(dir, "structured-logs", `structured-${dayKey}.jsonl`);
+        mkdirSync(join(dir, "structured-logs"), { recursive: true });
+        writeFileSync(dailyFile, "existing line\n");
+
+        const sink = new StructuredLogFileSink();
+        const statStub = failStatSyncFor(dailyFile, "ENOENT");
+        try {
+            sink.initialize(dir);
+        } finally {
+            statStub.restore();
+        }
+
+        assert.strictEqual(sink.isEnabled, true, "a vanished file must not disable the sink");
+    });
+
+    test("disables the sink when the size read fails for another reason", () => {
+        const sink = new StructuredLogFileSink({ maxFileBytes: 1 });
+        sink.initialize(dir);
+        sink.append("first");
+        assert.strictEqual(sink.isEnabled, true);
+
+        // Any rollover reads the next file's size. A failure that is not an absent
+        // file leaves the sink unusable, exactly like a failed write.
+        const statStub = sinon.stub(fs, "statSync").throws(Object.assign(new Error("denied"), { code: "EACCES" }));
+        try {
+            sink.append("second");
+        } finally {
+            statStub.restore();
+        }
+
+        assert.strictEqual(sink.isEnabled, false, "a size read that fails for another reason disables the sink");
+    });
+
     test("counts a multi-byte line in bytes when enforcing the size cap", () => {
         // 10 three-byte characters are 30 bytes but only 10 UTF-16 units, so a
         // UTF-16 count would leave the cap of 20 unenforced.
