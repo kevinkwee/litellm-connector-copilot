@@ -95,13 +95,11 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         const opts = options as vscode.PrepareLanguageModelChatModelOptions & {
             silent?: boolean;
             configuration?: Record<string, unknown>;
-            groupName?: string;
         };
         return this.discoverModels(
             {
                 silent: opts.silent ?? false,
                 configuration: opts.configuration,
-                groupName: opts.groupName,
             },
             token
         );

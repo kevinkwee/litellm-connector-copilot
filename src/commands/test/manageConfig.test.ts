@@ -83,10 +83,8 @@ suite("Model Commands Unit Tests", () => {
     });
 
     test("showModels: describes each row with the routable id", async () => {
-        const model = { id: "litellm.example/model", name: "model" } as vscode.LanguageModelChatInformation;
-        const provider = {
-            getLastKnownModels: () => [model],
-        } as unknown as LiteLLMChatProvider;
+        const model = { id: "litellm.example/model", name: "model", family: "litellm" } as vscode.LanguageModelChat;
+        const listModels = () => Promise.resolve([model]);
         let items: readonly vscode.QuickPickItem[] | undefined;
         sandbox.stub(vscode.window, "showQuickPick").callsFake(async (candidate) => {
             items = candidate as readonly vscode.QuickPickItem[];
@@ -101,15 +99,13 @@ suite("Model Commands Unit Tests", () => {
             return { dispose: sandbox.stub() } as vscode.Disposable;
         });
 
-        registerShowModelsCommand(provider);
+        registerShowModelsCommand(listModels);
         await handler?.();
 
         assert.strictEqual(items?.[0].description, "litellm.example/model");
     });
-    test("showModels: prompts to reload when cache is empty", async () => {
-        const provider = {
-            getLastKnownModels: () => [],
-        } as unknown as LiteLLMChatProvider;
+    test("showModels: prompts to reload when no models are available", async () => {
+        const listModels = () => Promise.resolve([]);
 
         const infoStub = sandbox.stub(vscode.window, "showInformationMessage");
 
@@ -121,11 +117,11 @@ suite("Model Commands Unit Tests", () => {
             return { dispose: sandbox.stub() } as vscode.Disposable;
         });
 
-        registerShowModelsCommand(provider);
+        registerShowModelsCommand(listModels);
         await handler?.();
 
         assert.strictEqual(infoStub.calledOnce, true);
-        assert.ok(String(infoStub.firstCall.args[0]).includes("No cached models"));
+        assert.ok(String(infoStub.firstCall.args[0]).includes("No LiteLLM models are available"));
     });
 
     test("showModels: quick pick copies model id", async () => {
@@ -134,16 +130,14 @@ suite("Model Commands Unit Tests", () => {
         // assert the user-visible side-effect: the "Copied model id:" information
         // message includes the model id the user selected. The clipboard write itself
         // is exercised manually in development.
-        const provider = {
-            getLastKnownModels: () => [
+        const listModels = () =>
+            Promise.resolve([
                 {
                     id: "backend/model",
                     name: "backend/model",
-                    tooltip: "t",
-                    isUserSelectable: true,
-                },
-            ],
-        } as unknown as LiteLLMChatProvider;
+                    family: "litellm",
+                } as vscode.LanguageModelChat,
+            ]);
 
         const infoStub = sandbox.stub(vscode.window, "showInformationMessage");
         const quickPickStub = sandbox.stub(vscode.window, "showQuickPick");
@@ -157,13 +151,43 @@ suite("Model Commands Unit Tests", () => {
             return { dispose: sandbox.stub() } as vscode.Disposable;
         });
 
-        registerShowModelsCommand(provider);
+        registerShowModelsCommand(listModels);
         await handler?.();
 
         assert.strictEqual(infoStub.calledOnce, true);
         assert.ok(
             String(infoStub.firstCall.args[0]).includes("Copied model id: backend/model"),
             "Information message should announce the copied model id"
+        );
+    });
+
+    test("showModels: lists exactly the models VS Code reports", async () => {
+        const listModels = () =>
+            Promise.resolve([
+                { id: "host-a/model-1", name: "model-1", family: "openai" },
+                { id: "host-b/model-2", name: "model-2", family: "anthropic" },
+            ] as vscode.LanguageModelChat[]);
+        let items: readonly vscode.QuickPickItem[] | undefined;
+        sandbox.stub(vscode.window, "showQuickPick").callsFake(async (candidate) => {
+            items = candidate as readonly vscode.QuickPickItem[];
+            return undefined;
+        });
+
+        let handler: (() => Promise<void>) | undefined;
+        sandbox.stub(vscode.commands, "registerCommand").callsFake((id, cb) => {
+            if (id === "litellm-connector.showModels") {
+                handler = cb as () => Promise<void>;
+            }
+            return { dispose: sandbox.stub() } as vscode.Disposable;
+        });
+
+        registerShowModelsCommand(listModels);
+        await handler?.();
+
+        assert.deepStrictEqual(
+            items?.map((item) => `${item.label}|${item.description}|${item.detail}`),
+            ["model-1|host-a/model-1|openai", "model-2|host-b/model-2|anthropic"],
+            "each row shows the model name, the routable id, and the family"
         );
     });
 });

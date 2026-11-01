@@ -49,8 +49,8 @@ function seedDiscoveredBackend(sandbox: sinon.SinonSandbox, provider: LiteLLMCha
         };
         _configManager: {
             convertProviderConfiguration: (
-                groupName: string,
-                configuration: Record<string, unknown>
+                configuration: Record<string, unknown>,
+                clientOptions: { discoveryTimeoutMs: number; userAgent: string }
             ) => { backendName: string; baseUrl: string; apiKey: string } | undefined;
         };
     }

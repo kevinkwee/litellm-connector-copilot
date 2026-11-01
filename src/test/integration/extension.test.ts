@@ -158,8 +158,8 @@ suite("Extension Activation Unit Tests", () => {
         // Commands registration.
         sandbox.stub(vscode.commands, "registerCommand").returns({ dispose() {} } as vscode.Disposable);
 
-        // Ensure chat provider can be constructed without side effects.
-        sandbox.stub(providers.LiteLLMChatProvider.prototype, "getLastKnownModels").returns([]);
+        // Ensure the provider can be constructed without side effects.
+        sandbox.stub(providers.LiteLLMChatProvider.prototype, "refreshModelInformation");
 
         extension.activate(context);
 

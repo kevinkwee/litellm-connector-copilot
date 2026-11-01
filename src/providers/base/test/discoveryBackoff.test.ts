@@ -234,7 +234,7 @@ suite("Discovery backoff", () => {
         assert.ok(served[0].statusIcon !== undefined);
     });
 
-    test("a cancelled discovery does not wait out the backoff delay", async () => {
+    test("a cancellation after the failure is recorded skips the backoff wait", async () => {
         const stubClient = {
             getModelInfo: sandbox.stub().rejects(new Error("HTTP request failed")),
             getEndpoint: sandbox.stub().returns("http://localhost:4000/v1/chat/completions"),
@@ -246,20 +246,21 @@ suite("Discovery backoff", () => {
             client: stubClient,
         });
         configManager.getConfig.resolves({ discoveryCacheTtlMs: 0 } as never);
-        sandbox.stub(sharedDiscoveryBackoff, "recordFailure").returns({
-            attempt: 9,
-            delayMs: 5_000,
-            shouldBlock: false,
-        });
+        sandbox.stub(sharedDiscoveryBackoff, "recordFailure");
 
         const registry = new LiteLLMProviderRegistry({
             configManager: configManager as unknown as ConfigManager,
             userAgent: "test",
         });
         const tokenSource = new vscode.CancellationTokenSource();
-        tokenSource.cancel();
-
+        // Cancelling from inside the failure decision leaves the token live while
+        // the registry decides, so the wait it starts returns at once.
+        (sharedDiscoveryBackoff.recordFailure as sinon.SinonStub).callsFake(() => {
+            tokenSource.cancel();
+            return { attempt: 9, delayMs: 5_000, shouldBlock: false };
+        });
         const startedAt = Date.now();
+
         const models = await registry.discoverModels(
             { configuration: { baseUrl: "http://localhost:4000", apiKey: "test-key" } },
             tokenSource.token

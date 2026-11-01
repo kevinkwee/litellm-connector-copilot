@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
 import { LiteLLMChatProvider } from "./providers";
-import { ConfigManager } from "./config/configManager";
 import {
     registerManageConfigCommand,
     registerReloadModelsCommand,
@@ -11,7 +10,9 @@ import { StructuredLogger, CopilotMdManager } from "./observability";
 import { EffortFallbackCache } from "./utils/reasoningEffortFallback";
 import { registerOpenCopilotMdFolderCommand } from "./commands/openCopilotMdFolder";
 
-let configManagerInstance: ConfigManager | undefined;
+/** Vendor id this extension registers and lists its models under. */
+export const LITELLM_VENDOR = "litellm-connector";
+
 let activeChatProviderInstance: LiteLLMChatProvider | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -45,8 +46,6 @@ export function activate(context: vscode.ExtensionContext): void {
 
     Logger.info(`UA: ${ua}`);
 
-    configManagerInstance = new ConfigManager(context.secrets);
-
     const effortFallbackCache = new EffortFallbackCache();
 
     const activeProvider = new LiteLLMChatProvider(context.secrets, ua, effortFallbackCache);
@@ -56,11 +55,15 @@ export function activate(context: vscode.ExtensionContext): void {
     try {
         Logger.info("Registering LanguageModelChatProvider...");
         const chatProviderRegistration = vscode.lm.registerLanguageModelChatProvider(
-            "litellm-connector",
+            LITELLM_VENDOR,
             activeProvider as unknown as vscode.LanguageModelChatProvider
         );
         if (chatProviderRegistration) {
             context.subscriptions.push(chatProviderRegistration);
+            // Pushed after the registration so VS Code disposes the registration
+            // before the provider that serves it, since subscriptions dispose in
+            // insertion order.
+            context.subscriptions.push(activeProvider);
             Logger.info("Provider registered successfully.");
         } else {
             Logger.error("registerLanguageModelChatProvider returned undefined/null");
@@ -119,7 +122,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
     try {
         context.subscriptions.push(registerManageConfigCommand());
-        context.subscriptions.push(registerShowModelsCommand(activeProvider));
+        context.subscriptions.push(
+            registerShowModelsCommand(() => vscode.lm.selectChatModels({ vendor: LITELLM_VENDOR }))
+        );
         context.subscriptions.push(registerReloadModelsCommand(activeProvider));
         context.subscriptions.push(registerOpenCopilotMdFolderCommand());
         Logger.info("Config command registered.");
@@ -131,9 +136,5 @@ export function activate(context: vscode.ExtensionContext): void {
 export async function deactivate(): Promise<void> {
     if (activeChatProviderInstance) {
         activeChatProviderInstance.clearSessionCaches();
-    }
-
-    if (configManagerInstance) {
-        await configManagerInstance.dispose();
     }
 }

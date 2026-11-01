@@ -138,10 +138,9 @@ suite("Model Drift Detection & State Persistence", () => {
             } as unknown as BackendSession["client"],
         };
 
-        // Discovery no longer threads groupName through to convertProviderConfiguration —
-        // the URL is the routing identity. The picker's label is derived separately. We
-        // match on the configuration payload (second arg) to return the right session.
-        sandbox.stub(configManager, "convertProviderConfiguration").callsFake((_groupName, config) => {
+        // The URL is the routing identity and the picker label is derived from it,
+        // so discovery matches sessions on the configuration payload alone.
+        sandbox.stub(configManager, "convertProviderConfiguration").callsFake((config) => {
             if (config === config1) {
                 return mockSession1;
             }

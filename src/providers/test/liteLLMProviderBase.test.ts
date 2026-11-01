@@ -108,14 +108,12 @@ function seedBackendForCall(
     session: BackendSession | undefined
 ): void {
     const configManager = access(provider)._configManager;
-    sandbox
-        .stub(configManager, "convertProviderConfiguration")
-        .callsFake((_groupName: string, cfg: Record<string, unknown>) => {
-            if (cfg === configuration) {
-                return session;
-            }
-            return undefined;
-        });
+    sandbox.stub(configManager, "convertProviderConfiguration").callsFake((cfg: Record<string, unknown>) => {
+        if (cfg === configuration) {
+            return session;
+        }
+        return undefined;
+    });
 }
 
 suite("LiteLLMProviderBase", () => {
@@ -750,9 +748,9 @@ suite("LiteLLMProviderBase", () => {
                 apiKey: "k-g",
             };
             const stub = sandbox.stub(configManager, "convertProviderConfiguration");
-            // groupName is "" at the discovery call site (the picker uses the URL-derived
-            // label); we match on the second argument (configuration payload) only.
-            stub.withArgs(sinon.match.string, wolframConfig).returns({
+            // The URL is the routing identity, so the configuration payload alone
+            // selects the session.
+            stub.withArgs(wolframConfig).returns({
                 backendName: "wolfram",
                 baseUrl: "https://wolfram.example",
                 apiKey: "k-w",
@@ -762,7 +760,7 @@ suite("LiteLLMProviderBase", () => {
                     }),
                 } as unknown as BackendSession["client"],
             });
-            stub.withArgs(sinon.match.string, gethConfig).returns({
+            stub.withArgs(gethConfig).returns({
                 backendName: "geth",
                 baseUrl: "https://geth.example",
                 apiKey: "k-g",
@@ -977,7 +975,7 @@ suite("LiteLLMProviderBase", () => {
                 const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
                 const configManager = access(provider)._configManager;
                 const stub = localSandbox.stub(configManager, "convertProviderConfiguration");
-                stub.callsFake((_groupName: string, config: Record<string, unknown>) => {
+                stub.callsFake((config: Record<string, unknown>) => {
                     if (config.baseUrl === "http://a") {
                         return sessionA;
                     }
@@ -1292,6 +1290,28 @@ suite("LiteLLMProviderBase", () => {
 
             assert.ok(access(provider)._registry);
             assert.ok(access(provider)._transport);
+        });
+
+        test("dispose stops forwarding registry changes to VS Code", () => {
+            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const fired: number[] = [];
+            provider.onDidChangeLanguageModelChatInformation(() => fired.push(1));
+            const registryEmitter = access(provider)._registry as unknown as {
+                _onDidChangeEmitter: vscode.EventEmitter<void>;
+            };
+
+            provider.dispose();
+            registryEmitter._onDidChangeEmitter.fire();
+
+            assert.deepStrictEqual(fired, [], "a disposed provider must not answer after deactivation");
+        });
+
+        test("dispose is safe to call twice", () => {
+            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+
+            provider.dispose();
+
+            assert.doesNotThrow(() => provider.dispose());
         });
     });
 

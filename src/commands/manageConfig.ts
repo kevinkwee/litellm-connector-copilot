@@ -27,12 +27,16 @@ export function registerManageConfigCommand(): vscode.Disposable {
     });
 }
 
-export function registerShowModelsCommand(provider: LiteLLMChatProvider): vscode.Disposable {
+export function registerShowModelsCommand(
+    listModels: () => Thenable<readonly vscode.LanguageModelChat[]>
+): vscode.Disposable {
     return vscode.commands.registerCommand("litellm-connector.showModels", async () => {
-        const models = provider.getLastKnownModels();
+        // Ask VS Code for its current list rather than replaying a cached one, so
+        // the command cannot describe models VS Code no longer holds.
+        const models = await listModels();
         if (!models.length) {
             vscode.window.showInformationMessage(
-                "No cached models yet. Run 'LiteLLM: Reload Models' (or open the provider settings) to fetch models from LiteLLM."
+                "No LiteLLM models are available. Add a LiteLLM provider in the Language Models view, or run 'LiteLLM: Reload Models'."
             );
             return;
         }
@@ -42,17 +46,15 @@ export function registerShowModelsCommand(provider: LiteLLMChatProvider): vscode
         const picked = await vscode.window.showQuickPick(
             models
                 .slice()
-                .sort((a: vscode.LanguageModelChatInformation, b: vscode.LanguageModelChatInformation) =>
-                    a.id.localeCompare(b.id)
-                )
+                .sort((a: vscode.LanguageModelChat, b: vscode.LanguageModelChat) => a.id.localeCompare(b.id))
                 .map((m) => ({
                     label: m.name,
                     description: m.id,
-                    detail: m.tooltip,
+                    detail: m.family,
                     modelId: m.id,
                 })) as ModelQuickPickItem[],
             {
-                title: "LiteLLM: Available Models (cached)",
+                title: "LiteLLM: Available Models",
                 placeHolder: "Select a model to copy its id to clipboard",
                 matchOnDescription: true,
                 matchOnDetail: true,

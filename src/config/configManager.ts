@@ -48,12 +48,6 @@ export class ConfigManager {
     private static readonly MAX_RATE_LIMIT_MAX_DELAY_SECONDS = 86_400;
     private static readonly MS_PER_SECOND = 1_000;
 
-    // Last config returned by getConfig(). convertProviderConfiguration is
-    // synchronous but must hand the session client a discovery timeout, so it
-    // reads the most recently loaded workspace config, falling back to the
-    // client default when getConfig() has not run yet.
-    private _lastConfig?: LiteLLMConfig;
-
     private readonly secrets: vscode.SecretStorage;
 
     constructor(secrets: vscode.SecretStorage) {
@@ -175,13 +169,10 @@ export class ConfigManager {
     /**
      * Retrieves the current LiteLLM workspace-level configuration.
      *
-     * Each call refreshes a cached copy that `convertProviderConfiguration()`
-     * reads synchronously when it builds session clients.
-     *
      * Backend connection details (baseUrl, apiKey) are NOT read here. They are
-     * delivered by VS Code 1.120 per-group `options.configuration` payloads on
-     * every provider call. This method now only returns workspace-scoped
-     * ergonomic toggles and overrides.
+     * delivered by VS Code per-group `options.configuration` payloads on every
+     * provider call. This method returns only workspace-scoped ergonomic toggles
+     * and overrides.
      */
     async getConfig(): Promise<LiteLLMConfig> {
         const workspaceConfig = vscode.workspace.getConfiguration();
@@ -300,7 +291,6 @@ export class ConfigManager {
             emptyResponseRetryDelayMs,
             rateLimitMaxDelayMs,
         };
-        this._lastConfig = config;
         // Shallow copy so callers cannot mutate the cached config in place.
         return { ...config };
     }
@@ -312,18 +302,12 @@ export class ConfigManager {
      *   - `baseUrl`: must start with http:// or https://
      *   - `apiKey`: non-empty string (encrypted by VS Code)
      *
-     * `groupName` is the user-entered group label from VS Code 1.120's group
-     * picker. It is NOT required: when absent, `BackendSession.backendName`
-     * falls back to a hostname derived from `baseUrl`. The discovery layer
-     * uses `baseUrl` as the cache key regardless of the group name, so a
-     * missing or stale groupName has no effect on routing.
-     *
      * `providerName` (if present in the payload) is not part of the schema
      * and is ignored.
      */
     convertProviderConfiguration(
-        groupName: string,
-        configuration: Record<string, unknown>
+        configuration: Record<string, unknown>,
+        clientOptions: { discoveryTimeoutMs: number | undefined; userAgent: string }
     ): BackendSession | undefined {
         const baseUrl = normalizeProxyBaseUrl(typeof configuration.baseUrl === "string" ? configuration.baseUrl : "");
         const apiKey = typeof configuration.apiKey === "string" ? configuration.apiKey.trim() : "";
@@ -340,14 +324,10 @@ export class ConfigManager {
             return undefined;
         }
 
-        // Derive a stable backendName from the canonical group name; fall back to a
-        // hostname+port derived from baseUrl when the user has not entered a group
-        // name. Reuse the same helper the discovery layer uses to compute the
-        // picker's category label, so the two stay in sync.
-        const trimmedGroupName = groupName.trim();
-        const backendName = trimmedGroupName || deriveGroupNameFromUrl(baseUrl) || baseUrl;
+        // Stable label for the model `detail` and `tooltip`, derived from the URL
+        // because VS Code does not pass the user's group name to the provider.
+        const backendName = deriveGroupNameFromUrl(baseUrl) || baseUrl;
 
-        const userAgent = "litellm-vscode-chat/vscode-1.120+";
         return {
             backendName,
             baseUrl,
@@ -356,19 +336,10 @@ export class ConfigManager {
                 {
                     url: baseUrl,
                     key: apiKey,
-                    discoveryTimeoutMs:
-                        this._lastConfig?.discoveryTimeoutMs ?? ConfigManager.DEFAULT_DISCOVERY_TIMEOUT_MS,
+                    discoveryTimeoutMs: clientOptions.discoveryTimeoutMs,
                 },
-                userAgent
+                clientOptions.userAgent
             ),
         };
-    }
-
-    /**
-     * Dispose hook to align with ExtensionContext subscription lifecycle.
-     * Drops the cached workspace config; no disposable resources are held.
-     */
-    async dispose(): Promise<void> {
-        this._lastConfig = undefined;
     }
 }

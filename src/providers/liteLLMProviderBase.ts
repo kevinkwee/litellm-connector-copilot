@@ -72,7 +72,9 @@ export abstract class LiteLLMProviderBase {
     // limit describes one proxy's model config. Without this, the request builder
     // would re-send `include_usage: true` on every request to a model that
     // previously rejected it, causing an infinite retry loop.
-    private _usageOptOutModels = new Set<string>();
+    private readonly _usageOptOutModels = new Set<string>();
+    /** Registry subscription forwarded to VS Code; released by `dispose()`. */
+    private _registrySubscription: vscode.Disposable | undefined;
 
     constructor(
         protected readonly secrets: vscode.SecretStorage,
@@ -88,7 +90,7 @@ export abstract class LiteLLMProviderBase {
 
         // Forward the registry's `onDidChange` event to VS Code so the
         // picker refreshes when a backend's model set actually changes.
-        this._registry.onDidChange(() => {
+        this._registrySubscription = this._registry.onDidChange(() => {
             Logger.info("Firing onDidChangeLanguageModelChatInformation (from BackendRegistry.onDidChange)");
             this._onDidChangeLanguageModelChatInformationEmitter.fire();
         });
@@ -179,19 +181,21 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Returns the registry's current, deduplicated model list. The registry is
-     * populated by discovery calls, so before any discovery this is empty and
-     * the show-models command points the user at a reload.
-     */
-    public getLastKnownModels(): LanguageModelChatInformation[] {
-        return this._registry.getAllModels();
-    }
-
-    /**
      * Public access to model info from the registry's capability cache.
      */
     public getModelInfo(modelId: string): LiteLLMModelInfo | undefined {
         return this._registry.getModelInfo(modelId);
+    }
+
+    /**
+     * Releases the subscriptions this provider holds. VS Code calls it when the
+     * extension deactivates.
+     */
+    public dispose(): void {
+        this._registrySubscription?.dispose();
+        this._registrySubscription = undefined;
+        this._onDidChangeLanguageModelChatInformationEmitter.dispose();
+        this._registry.dispose();
     }
 
     /**
@@ -233,7 +237,6 @@ export abstract class LiteLLMProviderBase {
         options: {
             silent?: boolean;
             configuration?: Record<string, unknown>;
-            groupName?: string;
         },
         token: vscode.CancellationToken
     ): Promise<vscode.LanguageModelChatInformation[]> {

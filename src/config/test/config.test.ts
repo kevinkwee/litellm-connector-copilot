@@ -144,36 +144,11 @@ suite("ConfigManager Unit Tests", () => {
         assert.strictEqual("discoveryFireMinIntervalMs" in cfg, false);
     });
 
-    test("convertProviderConfiguration passes the configured discoveryTimeoutMs to the session client", async () => {
-        settingsMap.set("litellm-connector.discoveryTimeoutMs", 15_000);
-        await configManager.getConfig();
-
-        const session = configManager.convertProviderConfiguration("group-a", {
-            baseUrl: "http://localhost:4000",
-            apiKey: "secret",
-        });
-
-        assert.ok(session);
-        const clientConfig = (session?.client as unknown as { config: { discoveryTimeoutMs?: number } }).config;
-        assert.strictEqual(clientConfig.discoveryTimeoutMs, 15_000);
-    });
-
-    test("session client falls back to the 5000ms discovery timeout before the first getConfig", () => {
-        const session = configManager.convertProviderConfiguration("group-a", {
-            baseUrl: "http://localhost:4000",
-            apiKey: "secret",
-        });
-
-        assert.ok(session);
-        const clientConfig = (session?.client as unknown as { config: { discoveryTimeoutMs?: number } }).config;
-        assert.strictEqual(clientConfig.discoveryTimeoutMs, 5_000);
-    });
-
     test("a pasted endpoint path is normalized away before it reaches the routing table", () => {
-        const session = configManager.convertProviderConfiguration("group-a", {
-            baseUrl: " https://proxy.example/v1/chat/completions/ ",
-            apiKey: "secret",
-        });
+        const session = configManager.convertProviderConfiguration(
+            { baseUrl: " https://proxy.example/v1/chat/completions/ ", apiKey: "secret" },
+            { discoveryTimeoutMs: 5_000, userAgent: "test-ua" }
+        );
 
         assert.ok(session);
         assert.strictEqual(session?.baseUrl, "https://proxy.example/v1");
