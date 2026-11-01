@@ -157,8 +157,8 @@ export class Transport {
             // backend-advertised mode) routes a model to /responses and the
             // proxy returns a 5xx (e.g. Azure AI returning a chat-completions
             // schema that LiteLLM cannot parse into ResponsesAPIResponse),
-            // retry exactly once on /chat/completions. Only /responses 5xx
-            // triggers the fallback — 4xx and chat-mode failures propagate as
+            // retry exactly once on /chat/completions. Only a /responses 5xx
+            // triggers the fallback. A 4xx and a chat-mode failure propagate as
             // hard failures. This is the behavior README.md advertises for
             // `litellm-connector.allowChatCompletionsFallback`.
             const isResponsesMode = modelInfo?.mode === "responses";

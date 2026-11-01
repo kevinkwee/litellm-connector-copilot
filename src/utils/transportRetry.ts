@@ -115,7 +115,7 @@ export class ReasoningOnlyError extends Error {
     public constructor(
         public readonly eventCount: number,
         public readonly reasoningChars: number,
-        /** True only when a `stop` finish frame ended the turn normally. */
+        /** True only when a `stop` finish frame proved the model ended its turn. */
         public readonly normalFinish = false
     ) {
         super(

@@ -319,7 +319,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     // A cancelled stream ends without an error, so without this
                     // check the request would be reported and billed as a success.
                     if (token.isCancellationRequested) {
-                        Logger.debug(`[transportRetry] request=${requestId} cancelled after a clean stream end`);
+                        Logger.debug(`[chatRequest] request=${requestId} cancelled after a clean stream end`);
                         throw Object.assign(new Error("Operation cancelled by user"), { name: "CancellationError" });
                     }
 
@@ -339,12 +339,11 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         });
                     }
                     if (err instanceof ReasoningOnlyError) {
-                        // A resumed attempt can legitimately stream nothing but its
-                        // finish frame: the previous attempt already delivered the
-                        // answer. Proof is required, though: the attempt must have
-                        // ended with a `stop` finish, carried no reasoning, and the
-                        // earlier attempt must have delivered text. A clean close, a
-                        // usage-only tail, or a cut-short finish is not proof.
+                        // The previous attempt already delivered the answer, so an
+                        // attempt that streams nothing but its finish frame completed the
+                        // turn. New reasoning means the model was still thinking, so that
+                        // spends the retry budget, and only a `stop` finish proves the
+                        // model chose to end its turn.
                         if (
                             resumed &&
                             accumulator.text.trim().length > 0 &&
@@ -586,8 +585,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     caller,
                     stage: "provideLanguageModelChatResponse",
                 });
-                // Cancellation is not a failure: the metric says cancelled and
-                // the transcript says canceled, which is the state the host renders.
+                // Cancellation is not a failure. The host renders the cancelled state
+                // itself, so the metric and the transcript record that, not a failure.
                 const cancelledDurationMs = LiteLLMTelemetry.endTimer(startTime);
                 LiteLLMTelemetry.reportMetric({
                     requestId,
@@ -629,7 +628,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             }
 
             // Log identifiers only: the message stays in the user-facing notice
-            // and the opt-in transcript, where it may echo the prompt.
+            // and the opt-in transcript, where an echoed prompt is acceptable.
             const errorLogFields = toErrorLogFields(err);
             Logger.error(`Chat request failed | RequestID: ${requestId} | Model: ${model.id}`, errorLogFields);
             StructuredLogger.error("request.failed", {
@@ -753,10 +752,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     reasoningChars += typeof part.value === "string" ? part.value.length : part.value.join("").length;
                 } else if (part.type === "finish") {
                     stoppedEarly = describeStoppedEarly(part.reason) ?? stoppedEarly;
-                    // A normal finish is the only evidence that the model chose to
-                    // stop. A clean close, a usage-only tail, or an unrecognized
-                    // reason leaves this false, so a resumed attempt cannot be
-                    // mistaken for a completed answer.
                     if (part.reason === "stop") {
                         sawNormalFinish = true;
                     }

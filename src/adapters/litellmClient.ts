@@ -297,7 +297,7 @@ export class LiteLLMClient {
         if (!response.ok) {
             const errorText = await response.text();
             // The body can echo the prompt, so it stays on the error for the
-            // provider to explain; the caller logs the identifiers.
+            // user-facing notice; the provider logs identifiers only.
             throw new LiteLLMApiError(
                 response.status,
                 errorText,

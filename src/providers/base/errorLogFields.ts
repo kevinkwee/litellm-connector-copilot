@@ -1,7 +1,7 @@
 import { LiteLLMApiError } from "../../adapters/litellmClient";
 import { UpstreamStreamError } from "../../utils/transportRetry";
 
-/** Fields a log entry may carry about a failure. */
+/** Log fields describing one failure. Each error class contributes the identifiers it can prove, and every consumer spreads them into one event payload. */
 export type ErrorLogFields = Record<string, string | number | undefined>;
 
 /** The prefix the client puts on a proxy rejection, which carries the body in its message. */
@@ -47,11 +47,11 @@ function readUpstreamErrorIdentifiers(bodyText: string): { type?: string; code?:
 /**
  * Builds the log fields for a failure.
  *
- * Upstream error text is model output or proxy internals: a rejected request
- * body can echo the prompt, and a mid-stream failure detail can carry generated
- * content. Logs therefore keep identifiers, sizes, and names only. Connector and
- * network errors keep their message, which the connector itself wrote or the
- * runtime produced.
+ * Upstream error text can echo the prompt or carry generated content: a rejected
+ * request body can echo the prompt, and a mid-stream failure detail can carry
+ * model output. Logs therefore keep identifiers, sizes, and names only. Connector
+ * and network errors also keep their message, root cause, and stack, which the
+ * connector itself wrote or the runtime produced.
  */
 export function toErrorLogFields(err: unknown): ErrorLogFields {
     if (err instanceof UpstreamStreamError) {
@@ -109,10 +109,7 @@ export function toErrorLogFields(err: unknown): ErrorLogFields {
     return { errorName: typeof err };
 }
 
-/**
- * Shortens a failure to a label that names it without disclosing its text.
- * Used where a log line needs a single readable token, such as a retry message.
- */
+/** Renders a failure as a Name[:status] label for log sites that need a single token, without disclosing its text. */
 export function describeFailureForLog(err: unknown): string {
     const fields = toErrorLogFields(err);
     const status = fields.status === undefined ? "" : `:${fields.status}`;

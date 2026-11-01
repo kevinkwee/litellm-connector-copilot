@@ -265,7 +265,7 @@ interface ResponsesStreamUsage extends RawUsagePayload {
 interface ResponsesStreamResponse {
     usage?: ResponsesStreamUsage;
     incomplete_details?: { reason?: string };
-    /** "incomplete" when the bridge stopped generation early on the model's behalf. */
+    /** "incomplete" marks a response cut short, by the bridge or by the Responses API itself. */
     status?: string;
 }
 
@@ -500,8 +500,10 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                 let buffer = state.toolCallBuffers.get(index);
 
                 // If we get a new ID for the same index, it's a new call; clear the old one.
-                // This prevents corruption if finish_reason was missed in a previous turn.
-                // Normalize incoming ID before comparison since buffer stores normalized IDs
+                // A buffer still waiting for its id keeps what it already buffered, so the
+                // id that arrives now attaches to it. This prevents corruption if
+                // finish_reason was missed in a previous turn. Normalize incoming ID before
+                // comparison since buffer stores normalized IDs
                 const incomingId = tc.id ? normalizeToolCallId(tc.id as string) : undefined;
                 if (incomingId && buffer && buffer.id && buffer.id !== incomingId) {
                     logDroppedToolCallBuffer(state, "replaced_by_new_id", index, buffer);
@@ -681,14 +683,11 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
 
         appendResponsesUsage(response?.usage, dataParts, flushedToolCallCount);
 
-        // An incomplete response ends the turn the same way a chat-completions
-        // `finish_reason` does, so the provider shows its stopped-early notice
-        // instead of presenting a truncated answer as a finished one. A completed
-        // response reports `stop`, which is what the provider needs as proof that
-        // the model chose to end its turn. The chat-to-Responses bridge always
-        // ends with `response.completed`, even when a length limit or a content
-        // filter stopped generation, and marks that case with `status`, so the
-        // status decides whether the turn really completed.
+        // A `response.incomplete` ends the turn like a chat `finish_reason`, so the
+        // provider shows its stopped-early notice instead of presenting a truncated
+        // answer as finished. A completed response reports `stop`, the only proof the
+        // provider accepts that the model chose to stop, and the bridge reports every
+        // one of its turns as completed, marking a cut-short one with `status`.
         const incompleteReason =
             data.type === "response.incomplete"
                 ? mapIncompleteDetailsReason(response?.incomplete_details?.reason)

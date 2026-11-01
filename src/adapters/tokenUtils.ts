@@ -133,7 +133,8 @@ export function countOpenAIChatMessagesTokens(
         }
 
         // Replayed reasoning travels to the model, so it occupies prompt budget.
-        // Redacted blocks are opaque, so they add nothing.
+        // A redacted block carries opaque data instead of text, so the estimate
+        // counts only readable thinking.
         if (typeof message.reasoning_content === "string" && message.reasoning_content.length > 0) {
             total += tokenizer.countTokens(message.reasoning_content).tokens;
         }
