@@ -27,12 +27,14 @@ export function registerManageConfigCommand(): vscode.Disposable {
     });
 }
 
+/**
+ * Registers the command that lists the models VS Code holds for this vendor and
+ * copies the id of the one the user picks.
+ */
 export function registerShowModelsCommand(
     listModels: () => Thenable<readonly vscode.LanguageModelChat[]>
 ): vscode.Disposable {
     return vscode.commands.registerCommand("litellm-connector.showModels", async () => {
-        // Ask VS Code for its current list rather than replaying a cached one, so
-        // the command cannot describe models VS Code no longer holds.
         const models = await listModels();
         if (!models.length) {
             vscode.window.showInformationMessage(

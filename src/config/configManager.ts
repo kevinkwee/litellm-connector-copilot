@@ -291,7 +291,6 @@ export class ConfigManager {
             emptyResponseRetryDelayMs,
             rateLimitMaxDelayMs,
         };
-        // Shallow copy so callers cannot mutate the cached config in place.
         return { ...config };
     }
 

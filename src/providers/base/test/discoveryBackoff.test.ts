@@ -253,8 +253,8 @@ suite("Discovery backoff", () => {
             userAgent: "test",
         });
         const tokenSource = new vscode.CancellationTokenSource();
-        // Cancelling from inside the failure decision leaves the token live while
-        // the registry decides, so the wait it starts returns at once.
+        // Cancel after the registry's cancellation check, so the run reaches the
+        // backoff wait, which then returns at once.
         (sharedDiscoveryBackoff.recordFailure as sinon.SinonStub).callsFake(() => {
             tokenSource.cancel();
             return { attempt: 9, delayMs: 5_000, shouldBlock: false };

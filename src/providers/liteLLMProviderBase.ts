@@ -73,7 +73,6 @@ export abstract class LiteLLMProviderBase {
     // would re-send `include_usage: true` on every request to a model that
     // previously rejected it, causing an infinite retry loop.
     private readonly _usageOptOutModels = new Set<string>();
-    /** Registry subscription forwarded to VS Code; released by `dispose()`. */
     private _registrySubscription: vscode.Disposable | undefined;
 
     constructor(
@@ -188,8 +187,8 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Releases the subscriptions this provider holds. VS Code calls it when the
-     * extension deactivates.
+     * Releases everything this provider holds, so nothing outlives deactivation.
+     * Safe to call more than once.
      */
     public dispose(): void {
         this._registrySubscription?.dispose();

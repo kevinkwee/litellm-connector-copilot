@@ -6,7 +6,7 @@ import type { LiteLLMClient } from "../adapters/litellmClient";
  * Populated from VS Code per-group `options.configuration` (VS Code 1.120+).
  */
 export interface BackendSession {
-    /** Human-readable label for the picker, derived from the backend URL hostname */
+    /** Backend label shown in each model row's detail and tooltip, derived from the URL host. */
     readonly backendName: string;
     /** Base URL of the LiteLLM proxy */
     readonly baseUrl: string;

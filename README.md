@@ -54,7 +54,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 ### Model reload
 - **LiteLLM: Reload Models** forgets the limits a live rejection taught the session, clears the discovery response cache and every backend's backoff history, then asks VS Code to re-query every provider group. Routing survives the reload, so a request from a running session keeps resolving its model while the picker refills.
 - Changing a setting that shapes the model list (`modelOverrides`, `enableModelOverrides`, `modelCapabilitiesOverrides`, `displayPricingInPicker`, `forceResponsesEndpoint`) refreshes the model list automatically, without forgetting learned limits, because the limits describe the proxy rather than the settings. Other settings do not trigger a refresh, because they do not change what discovery returns.
-- **LiteLLM: Show Available Models** lists the models VS Code currently reports for this vendor, shows the routable id as the row description, and copies that id when you pick a row. It asks VS Code rather than replaying a cached list, so it reports what VS Code holds rather than what the registry once discovered.
+- **LiteLLM: Show Available Models** lists the models VS Code currently reports for this vendor, shows the routable id as the row description, and copies that id when you pick a row.
 
 ### Streaming resilience
 - Transport-level retry with mid-stream resume: when a stream dies mid-response, the connector rebuilds the request and resumes from the last assistant turn, appending a "Continue" nudge.

@@ -56,7 +56,7 @@
  *
  * Per-group namespacing
  * The namespaced id format `<routingIdentity>/<rawModelName>` lets the response
- * path look up routing in O(1) by id. The routing identity is the URL hostname,
+ * path look up routing in O(1) by id. The routing identity is the URL host,
  * or `LiteLLM` when the URL carries none; the raw model name is the part after
  * the first `/` in the id, preserved unchanged from what the backend returned.
  * Ids are unique per host, not per group: two groups on one host produce
@@ -331,8 +331,7 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     /**
-     * Number of distinct backends currently registered. Used by tests and
-     * by telemetry; not a routing primitive.
+     * Number of distinct backends currently registered. Not a routing primitive.
      */
     public size(): number {
         return this.modelsByBackend.size;
@@ -738,6 +737,11 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         return infos;
     }
 
+    /**
+     * Maps one discovered deployment to the VS Code model object plus the
+     * capability data discovery caches. Nothing is written here: the caller
+     * commits `modelInfo` and `derived` under the discovery epoch guard.
+     */
     private toVSCodeInfo(
         entry: LiteLLMModelInfoEntry,
         backendName: string,

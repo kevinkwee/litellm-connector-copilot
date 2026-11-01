@@ -8,12 +8,6 @@ import { Logger } from "../../utils/logger";
 import { createMockSecrets, createMockOutputChannel, createMockMemento } from "../utils/testMocks";
 
 /**
- * Helper that wires up the common stubs every activation test needs so the
- * individual tests can stay focused on the behavior under test instead of
- * boilerplate. Returns a teardown function that restores sinon state and the
- * captured `vscode.commands.executeCommand` stub for direct assertions.
- */
-/**
  * Wires up the common stubs every activation test needs.  Each test must
  * call this exactly once: a second `sandbox.stub` on the same property
  * throws because sinon sees the prior wrap.
@@ -158,7 +152,7 @@ suite("Extension Activation Unit Tests", () => {
         // Commands registration.
         sandbox.stub(vscode.commands, "registerCommand").returns({ dispose() {} } as vscode.Disposable);
 
-        // Ensure the provider can be constructed without side effects.
+        // Silence the post-registration refresh that activate() schedules on a setImmediate.
         sandbox.stub(providers.LiteLLMChatProvider.prototype, "refreshModelInformation");
 
         extension.activate(context);
