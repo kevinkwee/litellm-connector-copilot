@@ -178,7 +178,7 @@ export class ConfigManager {
      * Each call refreshes a cached copy that `convertProviderConfiguration()`
      * reads synchronously when it builds session clients.
      *
-     * Backend connection details (baseUrl, apiKey) are NOT read here — they are
+     * Backend connection details (baseUrl, apiKey) are NOT read here. They are
      * delivered by VS Code 1.120 per-group `options.configuration` payloads on
      * every provider call. This method now only returns workspace-scoped
      * ergonomic toggles and overrides.
@@ -309,8 +309,8 @@ export class ConfigManager {
      * Converts VS Code per-group provider configuration into a BackendSession.
      *
      * Required fields (per `package.json` `languageModelChatProviders.configuration`):
-     *   - `baseUrl`  — must start with http:// or https://
-     *   - `apiKey`   — non-empty string (encrypted by VS Code)
+     *   - `baseUrl`: must start with http:// or https://
+     *   - `apiKey`: non-empty string (encrypted by VS Code)
      *
      * `groupName` is the user-entered group label from VS Code 1.120's group
      * picker. It is NOT required: when absent, `BackendSession.backendName`
@@ -330,13 +330,13 @@ export class ConfigManager {
 
         if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) {
             Logger.warn(
-                "convertProviderConfiguration: rejected — baseUrl must start with http:// or https:// (got a non-http value)"
+                "convertProviderConfiguration: rejected: baseUrl must start with http:// or https:// (got a non-http value)"
             );
             return undefined;
         }
 
         if (!apiKey) {
-            Logger.warn("convertProviderConfiguration: rejected — apiKey is empty in per-group configuration");
+            Logger.warn("convertProviderConfiguration: rejected: apiKey is empty in per-group configuration");
             return undefined;
         }
 

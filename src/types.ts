@@ -295,8 +295,9 @@ export interface LiteLLMClientConfig {
     /**
      * Invoked when a 400 or 403 response rejects a parameter this connector adds,
      * so the provider can remember the incompatibility and later requests omit
-     * it. The client retries without the parameter itself; the provider only
-     * records it.
+     * it. The client retries without the parameter itself; whoever supplies the
+     * hook only records it. `model` is the wire model name the request carried;
+     * the transport replaces it with the namespaced learned-limits key.
      */
     onUnsupportedParameter?: (model: string, param: string) => void;
 }

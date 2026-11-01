@@ -35,6 +35,11 @@
  *  - `clearDiscoveryCaches()`: wipes the two caches a model reload must refresh,
  *    the discovery response cache and every backend's backoff history. Routing
  *    and the per-model caches survive.
+ *  - `recordUnsupportedParameter(modelId, param)` /
+ *    `getUnsupportedParameters(modelId)`: the learned-parameter store, keyed by
+ *    the namespaced picker id.
+ *  - `clearUnsupportedParameters()`: forgets that store when the user asks for a
+ *    reload, because the proxy's model config may have changed.
  *  - `getAllModels()`: the deduplicated union of every backend's last delivered
  *    list, for the Show Available Models command.
  *  - `onDidChange`: fires when a backend's model set changes.
@@ -394,9 +399,9 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     /**
-     * Records an auto-stripped parameter for a model so future requests can
-     * proactively omit it. Only to be called when the transport detected a failed
-     * request and removed the parameter before retrying.
+     * Records a parameter the client stripped after a rejection, so later
+     * requests omit it. `modelId` is the namespaced picker id the transport
+     * supplies, not the wire model name.
      */
     public recordUnsupportedParameter(modelId: string, param: string): void {
         const trimmed = param.trim();

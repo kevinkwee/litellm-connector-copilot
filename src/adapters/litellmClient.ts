@@ -248,7 +248,8 @@ export class LiteLLMClient {
             body = transformToResponsesFormat(request);
         }
         // LiteLLM reads the bypass from a top-level `cache` member, and lists
-        // `cache` in `all_litellm_params`, so it reaches the proxy but no provider.
+        // `cache` in `all_litellm_params`, so LiteLLM consumes it and never
+        // forwards it upstream.
         if (this.config.disableCaching) {
             body = this.withNoCacheDirective(body);
         }
@@ -309,7 +310,8 @@ export class LiteLLMClient {
     /**
      * Builds the retry body for a 400 or 403 that rejects a parameter this
      * connector adds itself. Returns undefined when the rejection names no such
-     * parameter, in which case the caller must surface the error instead.
+     * parameter or the body does not carry it, in which case the caller must
+     * surface the error instead.
      *
      * Two families qualify:
      * - `cache_control`, the Anthropic prompt-caching marker added by the
