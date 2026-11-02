@@ -1061,6 +1061,9 @@ suite("LiteLLMProviderBase", () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
             const optionsConfig = { baseUrl: "https://from-options", apiKey: "k-options" };
             const modelConfig = { baseUrl: "https://from-model", apiKey: "k-model" };
+            sandbox
+                .stub(access(provider)._configManager, "getConfig")
+                .resolves({ allowChatCompletionsFallback: false, headersTimeoutMs: 45_000 });
             const result = await access(provider).getCallTimeConfiguration(
                 { configuration: optionsConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
                 {
@@ -1076,6 +1079,7 @@ suite("LiteLLMProviderBase", () => {
             assert.strictEqual(result!.apiKey, optionsConfig.apiKey);
             // merged config toggles should also be present
             assert.strictEqual(result!.allowChatCompletionsFallback, false);
+            assert.strictEqual(result!.headersTimeoutMs, 45_000);
         });
 
         test("falls back to the BackendRegistry when options.configuration is missing", async () => {
@@ -1087,6 +1091,9 @@ suite("LiteLLMProviderBase", () => {
             // is the single source of truth.
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
             const registryEntry = { baseUrl: "https://from-registry", apiKey: "k-registry" };
+            sandbox
+                .stub(access(provider)._configManager, "getConfig")
+                .resolves({ allowChatCompletionsFallback: false, headersTimeoutMs: 30_000 });
             sandbox.stub(access(provider)._registry, "lookup").withArgs("m").returns({
                 baseUrl: registryEntry.baseUrl,
                 apiKey: registryEntry.apiKey,
@@ -1107,6 +1114,7 @@ suite("LiteLLMProviderBase", () => {
             assert.strictEqual(result!.apiKey, registryEntry.apiKey);
             // merged config toggles should also be present
             assert.strictEqual(result!.allowChatCompletionsFallback, false);
+            assert.strictEqual(result!.headersTimeoutMs, 30_000);
         });
 
         test("returns undefined when neither options nor model carry configuration", async () => {

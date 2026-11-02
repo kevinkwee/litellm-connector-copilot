@@ -280,6 +280,19 @@ export interface LiteLLMConfig {
      * Set to 0 to disable rate-limit retries.
      */
     rateLimitMaxDelayMs?: number;
+
+    /**
+     * Most time in milliseconds a chat request may wait for response headers.
+     * Default: 120000.
+     */
+    headersTimeoutMs?: number;
+
+    /**
+     * Time budget in milliseconds for retrying one chat request, counted from its
+     * first failure. Once it has elapsed no further attempt starts. Default:
+     * 300000. Set to 0 to disable the budget.
+     */
+    retryBudgetMs?: number;
 }
 
 /**
@@ -301,6 +314,10 @@ export interface LiteLLMClientConfig {
      * Set to 0 to disable rate-limit retries.
      */
     rateLimitMaxDelayMs?: number;
+    /**
+     * Most time in milliseconds to wait for response headers. Default: 120000.
+     */
+    headersTimeoutMs?: number;
     /**
      * Invoked when a 400 or 403 response rejects a parameter this connector adds,
      * so the provider can remember the incompatibility and later requests omit

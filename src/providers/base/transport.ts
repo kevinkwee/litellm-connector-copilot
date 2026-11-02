@@ -23,6 +23,7 @@ export class Transport {
         key?: string;
         disableCaching?: boolean;
         rateLimitMaxDelayMs?: number;
+        headersTimeoutMs?: number;
         onUnsupportedParameter?: (model: string, param: string) => void;
     }) => LiteLLMClient;
 
@@ -40,6 +41,7 @@ export class Transport {
                         key: backend.key,
                         disableCaching: backend.disableCaching,
                         rateLimitMaxDelayMs: backend.rateLimitMaxDelayMs,
+                        headersTimeoutMs: backend.headersTimeoutMs,
                         onUnsupportedParameter: backend.onUnsupportedParameter,
                     },
                     this.userAgent
@@ -97,21 +99,28 @@ export class Transport {
         const disableCaching =
             typeof configuration?.disableCaching === "boolean" ? configuration.disableCaching : undefined;
         // The configuration merge does not guarantee clamped values, so the
-        // guard below must stay self-contained.
+        // guards below must stay self-contained.
         const rateLimitMaxDelayMs =
             typeof configuration?.rateLimitMaxDelayMs === "number" &&
             Number.isFinite(configuration.rateLimitMaxDelayMs) &&
             configuration.rateLimitMaxDelayMs >= 0
                 ? configuration.rateLimitMaxDelayMs
                 : undefined;
+        const headersTimeoutMs =
+            typeof configuration?.headersTimeoutMs === "number" &&
+            Number.isFinite(configuration.headersTimeoutMs) &&
+            configuration.headersTimeoutMs > 0
+                ? configuration.headersTimeoutMs
+                : undefined;
         this.logger.trace(
-            `[transport.sendRequestToLiteLLM] Creating client: baseUrl=${baseUrl}, timeout=${modelInfo?.timeout ?? "default"}ms, disableCaching=${disableCaching}`
+            `[transport.sendRequestToLiteLLM] Creating client: baseUrl=${baseUrl}, timeout=${modelInfo?.timeout ?? "default"}ms, disableCaching=${disableCaching}, headersTimeoutMs=${headersTimeoutMs ?? "default"}`
         );
         const client = this.liteLLMClientFactory({
             url: baseUrl,
             key: apiKey,
             disableCaching,
             rateLimitMaxDelayMs,
+            headersTimeoutMs,
             // A learned rejection belongs to one proxy's model config, so it is
             // recorded under the namespaced picker id, not the wire model name.
             // The provider always supplies that id, so a missing one means a

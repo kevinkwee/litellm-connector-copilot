@@ -10,6 +10,7 @@ import { StructuredLogger } from "../observability/structuredLogger";
 import { Logger } from "../utils/logger";
 import { planRateLimitRetry, type RateLimitFailure, type RateLimitWaitSource } from "../utils/rateLimitRetryPolicy";
 import { normalizeProxyBaseUrl } from "../utils/proxyBaseUrl";
+import { HeadersTimeoutError } from "../utils/transportRetry";
 
 /**
  * Error thrown when a /model/info discovery request times out.
@@ -132,6 +133,11 @@ export class LiteLLMDiscoveryError extends Error {
 export class LiteLLMClient {
     private static readonly DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
     private static readonly DEFAULT_RATE_LIMIT_MAX_DELAY_MS = 120_000;
+    /** Wait for response headers when the setting is absent. */
+    private static readonly DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
+    /** 5xx retries per call. The client is the only layer that retries a 5xx. */
+    private static readonly MAX_SERVER_ERROR_RETRIES = 2;
+    private static readonly SERVER_ERROR_RETRY_DELAY_MS = 1_000;
 
     constructor(
         private readonly config: LiteLLMClientConfig,
@@ -398,64 +404,71 @@ export class LiteLLMClient {
         };
     }
 
-    private async fetchWithRetry(
-        url: string,
-        init: RequestInit,
-        options?: { retries?: number; delayMs?: number; token?: vscode.CancellationToken }
-    ): Promise<Response> {
-        const maxRetries = options?.retries ?? 2;
-        const delayMs = options?.delayMs ?? 1000;
-        let attempt = 0;
+    /**
+     * Sends one request and retries only a 5xx response.
+     *
+     * A connection failure is deliberately NOT retried here: the provider owns
+     * network retries, because only it knows whether the failed attempt produced
+     * output and therefore whether the request should resume or be resent
+     * unchanged. Retrying in both layers would multiply the attempts.
+     *
+     * The wait for response headers is bounded here, because undici's own
+     * header timeout is neither reachable through `fetch` options nor present in
+     * the web build, and because the proxy buffers the first streamed chunk
+     * before it writes headers, which leaves the body watchdog nothing to watch.
+     */
+    private async fetchWithRetry(url: string, init: RequestInit, token?: vscode.CancellationToken): Promise<Response> {
+        const headersTimeoutMs = this.config.headersTimeoutMs ?? LiteLLMClient.DEFAULT_HEADERS_TIMEOUT_MS;
+        let serverErrorAttempt = 0;
         while (true) {
-            if (options?.token?.isCancellationRequested) {
+            if (token?.isCancellationRequested) {
                 throw new Error("Operation cancelled by user");
             }
 
             const controller = new AbortController();
-            const disposable = options?.token?.onCancellationRequested(() => controller.abort());
+            const disposable = token?.onCancellationRequested(() => controller.abort());
+            let headersTimedOut = false;
+            // The timer is armed on the controller whose signal also governs the body,
+            // so it must be cleared as soon as the headers arrive or the attempt ends.
+            // A timer left running would abort a healthy stream.
+            const headersTimer = setTimeout(() => {
+                headersTimedOut = true;
+                controller.abort();
+            }, headersTimeoutMs);
 
             try {
                 const response = await fetch(url, { ...init, signal: controller.signal });
-                if (!response) {
-                    if (attempt >= maxRetries) {
-                        throw new Error("No response returned from fetch");
-                    }
-                    attempt++;
-                    await this.sleep(delayMs, options?.token);
-                    continue;
-                }
-                if (response.ok || attempt >= maxRetries || response.status < 500 || response.status >= 600) {
+                if (response.ok || response.status < 500 || response.status >= 600) {
                     return response;
                 }
-                attempt++;
+                if (serverErrorAttempt >= LiteLLMClient.MAX_SERVER_ERROR_RETRIES) {
+                    return response;
+                }
+                serverErrorAttempt++;
                 this.discardBody(response);
-                await this.sleep(delayMs, options?.token);
             } catch (err: unknown) {
+                if (headersTimedOut) {
+                    throw new HeadersTimeoutError(headersTimeoutMs);
+                }
                 if (err instanceof Error && err.name === "AbortError") {
                     throw new Error("Operation cancelled by user", { cause: err });
                 }
-                // Cancellation raised by the inter-attempt sleep (or any nested
-                // cancellable helper) should propagate as cancellation, not be
-                // caught and re-fed into the retry loop.
-                if (err instanceof Error && err.message === "Operation cancelled by user") {
-                    throw err;
-                }
-                if (attempt >= maxRetries) {
-                    throw err;
-                }
-                attempt++;
-                await this.sleep(delayMs, options?.token);
+                throw err;
             } finally {
+                clearTimeout(headersTimer);
                 disposable?.dispose();
             }
+
+            await this.sleep(LiteLLMClient.SERVER_ERROR_RETRY_DELAY_MS, token);
         }
     }
 
     /**
      * Fetches with retries on 429 rate limiting, within a total wait budget
      * for this call. A budget of 0 disables the retries.
-     * {@link planRateLimitRetry} picks each wait. Other transient failures are
-     * retried by {@link fetchWithRetry}.
+     * {@link planRateLimitRetry} picks each wait. A 5xx response is retried by
+     * {@link fetchWithRetry}; a connection failure is not, because the provider
+     * owns network retries.
      *
      * @throws LiteLLMRateLimitError when the client stops retrying a 429.
      */
@@ -473,7 +486,7 @@ export class LiteLLMClient {
                 throw new Error("Operation cancelled by user");
             }
 
-            const response = await this.fetchWithRetry(url, init, { token: options.token });
+            const response = await this.fetchWithRetry(url, init, options.token);
             if (response.status !== 429) {
                 return response;
             }

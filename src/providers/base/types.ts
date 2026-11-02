@@ -48,6 +48,7 @@ export interface TransportDeps {
         key?: string;
         disableCaching?: boolean;
         rateLimitMaxDelayMs?: number;
+        headersTimeoutMs?: number;
         onUnsupportedParameter?: (model: string, param: string) => void;
     }) => LiteLLMClient;
     /**

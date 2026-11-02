@@ -13,6 +13,7 @@ import { StructuredLogger } from "../../observability/structuredLogger";
 import type { LiteLLMModelInfo, LiteLLMModelInfoResponse } from "../../types";
 import { Logger } from "../../utils/logger";
 import type { RateLimitFailure } from "../../utils/rateLimitRetryPolicy";
+import { HeadersTimeoutError } from "../../utils/transportRetry";
 
 function createRateLimitResponse(retryAfter?: string): Response {
     return new Response("Rate limit exceeded", {
@@ -736,6 +737,84 @@ suite("LiteLLM Client Unit Tests", () => {
         await client.chat({ model: "m", messages: [] });
 
         assert.strictEqual(fetchStub.callCount, 2);
+    });
+
+    test("does not retry a connection failure inside the client", async () => {
+        // The provider owns network retries: only it knows whether the failed
+        // attempt produced output, so only it can decide resend versus resume.
+        const client = new LiteLLMClient(config, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch").rejects(new TypeError("fetch failed"));
+
+        await assert.rejects(() => client.chat({ model: "m", messages: [] }), /fetch failed/);
+
+        assert.strictEqual(fetchStub.callCount, 1, "one wire call, and the provider decides whether to retry");
+    });
+
+    test("retries a 5xx response twice and then surfaces it", async () => {
+        // The client is the only layer that retries a 5xx.
+        const client = new LiteLLMClient(config, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.callsFake(async () => new Response("boom", { status: 503, statusText: "Service Unavailable" }));
+
+        await assert.rejects(() => client.chat({ model: "m", messages: [] }), LiteLLMApiError);
+
+        assert.strictEqual(fetchStub.callCount, 3, "one attempt plus two 5xx retries");
+    });
+
+    test("aborts the attempt and reports a headers timeout when the proxy never answers", async () => {
+        const client = new LiteLLMClient({ ...config, headersTimeoutMs: 5 }, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch").callsFake(
+            (_input: string | URL | Request, init?: RequestInit) =>
+                new Promise<Response>((_resolve, reject) => {
+                    init?.signal?.addEventListener("abort", () =>
+                        reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
+                    );
+                })
+        );
+
+        await assert.rejects(() => client.chat({ model: "m", messages: [] }), HeadersTimeoutError);
+
+        assert.strictEqual(fetchStub.callCount, 1, "the headers timeout is the client's last word");
+    });
+
+    test("keeps a user cancellation distinct from a headers timeout", async () => {
+        const client = new LiteLLMClient({ ...config, headersTimeoutMs: 5_000 }, userAgent);
+        sandbox.stub(global, "fetch").callsFake(
+            (_input: string | URL | Request, init?: RequestInit) =>
+                new Promise<Response>((_resolve, reject) => {
+                    init?.signal?.addEventListener("abort", () =>
+                        reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
+                    );
+                })
+        );
+        const emitter = new vscode.EventEmitter<void>();
+        const token = {
+            isCancellationRequested: false,
+            onCancellationRequested: emitter.event,
+        } as vscode.CancellationToken;
+
+        const request = client.chat({ model: "m", messages: [] }, undefined, token);
+        emitter.fire();
+
+        await assert.rejects(() => request, /Operation cancelled by user/);
+    });
+
+    test("does not abort a response whose headers already arrived", async () => {
+        // The timer is armed on the controller that also governs the body, so a
+        // timer left running would abort a healthy stream once the header bound
+        // passed. The 120 s default hides that, which is why this test sets 5 ms.
+        const client = new LiteLLMClient({ ...config, headersTimeoutMs: 5 }, userAgent);
+        let capturedSignal: AbortSignal | undefined;
+        sandbox.stub(global, "fetch").callsFake((_input: string | URL | Request, init?: RequestInit) => {
+            capturedSignal = init?.signal ?? undefined;
+            return Promise.resolve(new Response(new ReadableStream(), { status: 200, statusText: "OK" }));
+        });
+
+        await client.chat({ model: "m", messages: [] });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        assert.ok(capturedSignal, "the request must carry a signal");
+        assert.strictEqual(capturedSignal.aborted, false, "the header timer must not outlive the headers");
     });
 
     test("rateLimitMaxDelayMs=0 disables 429 retries inside fetchWithRateLimit", async () => {

@@ -155,4 +155,27 @@ suite("Agents Window Compatibility Manifest", () => {
             assert.strictEqual(declared.default, false, `${key} must default to false`);
         }
     });
+
+    test("declares both request time bounds as top-level number settings", () => {
+        const contributes = manifest.contributes as Record<string, unknown>;
+        const properties = (contributes.configuration as Record<string, unknown>).properties as Record<
+            string,
+            ManifestProperty & { default?: unknown; minimum?: unknown; maximum?: unknown }
+        >;
+
+        // A settings entry nested inside another entry is valid JSON and is still
+        // invisible to VS Code, so the shape is asserted, not just the key.
+        const expected: Record<string, { default: number; minimum: number; maximum: number }> = {
+            "litellm-connector.headersTimeout": { default: 120, minimum: 1, maximum: 300 },
+            "litellm-connector.retryBudgetSeconds": { default: 300, minimum: 0, maximum: 3_600 },
+        };
+        for (const [key, bounds] of Object.entries(expected)) {
+            const declared = properties[key];
+            assert.ok(declared, `${key} must be declared as a top-level setting`);
+            assert.strictEqual(declared.type, "number", `${key} must be a number`);
+            assert.strictEqual(declared.default, bounds.default, `${key} default`);
+            assert.strictEqual(declared.minimum, bounds.minimum, `${key} minimum`);
+            assert.strictEqual(declared.maximum, bounds.maximum, `${key} maximum`);
+        }
+    });
 });

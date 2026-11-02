@@ -120,6 +120,7 @@ export abstract class LiteLLMProviderBase {
                         key: backend.key,
                         disableCaching: backend.disableCaching,
                         rateLimitMaxDelayMs: backend.rateLimitMaxDelayMs,
+                        headersTimeoutMs: backend.headersTimeoutMs,
                         onUnsupportedParameter: backend.onUnsupportedParameter,
                     },
                     this.userAgent
@@ -568,6 +569,7 @@ export abstract class LiteLLMProviderBase {
                 allowChatCompletionsFallback: cfg.allowChatCompletionsFallback,
                 disableCaching: this.resolveCacheDirective(cfg, model.id),
                 rateLimitMaxDelayMs: cfg.rateLimitMaxDelayMs,
+                headersTimeoutMs: cfg.headersTimeoutMs,
             };
         }
         if (opt.configuration) {
@@ -597,6 +599,7 @@ export abstract class LiteLLMProviderBase {
                 allowChatCompletionsFallback: cfg.allowChatCompletionsFallback,
                 disableCaching: this.resolveCacheDirective(cfg, model.id),
                 rateLimitMaxDelayMs: cfg.rateLimitMaxDelayMs,
+                headersTimeoutMs: cfg.headersTimeoutMs,
             };
         }
         Logger.warn(

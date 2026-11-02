@@ -184,6 +184,20 @@
 					"maximum": 86400,
 					"description": "Most time in seconds one call to the proxy spends waiting between 429 rate-limit retries. Without Retry-After, waits start at 0.5s and double, each at most 60s. A Retry-After longer than the time left fails that call at once. Default: 120 (2 minutes). Set to 0 to disable rate-limit retries."
 				},
+				"litellm-connector.headersTimeout": {
+					"type": "number",
+					"default": 120,
+					"minimum": 1,
+					"maximum": 300,
+					"description": "Most time in seconds to wait for the proxy's response headers before aborting the attempt. The proxy buffers the first streamed chunk before it writes headers, so this bounds the wait the stream inactivity timeout cannot see. Capped at 300s because the runtime's fetch has its own 300s header limit. Default: 120 (2 minutes)."
+				},
+				"litellm-connector.retryBudgetSeconds": {
+					"type": "number",
+					"default": 300,
+					"minimum": 0,
+					"maximum": 3600,
+					"description": "Most time in seconds one request may spend retrying, counted from its first failure, so the time before that failure, which includes the first attempt however long it runs, is not charged. Once the budget has elapsed no further attempt starts. Default: 300 (5 minutes). Set to 0 to disable the budget."
+				},
 				"litellm-connector.disableCaching": {
 					"type": "boolean",
 					"default": true,

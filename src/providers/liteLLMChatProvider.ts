@@ -48,6 +48,7 @@ import { emitPartsToVSCode } from "../adapters/streaming/vscodePartEmitter";
 import type { EffortFallbackCache } from "../utils/reasoningEffortFallback";
 import { StreamTokenCapture } from "../adapters/streaming/streamTokenCapture";
 import type { OpenAIChatCompletionRequest } from "../types";
+import { DEFAULT_RETRY_BUDGET_MS, RetryBudget, retryBudgetError } from "../utils/retryBudget";
 import {
     StreamedTextAccumulator,
     InactivityTimeoutError,
@@ -234,6 +235,10 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             const retryBaseDelayMs = retryCfg.networkRetryDelayMs ?? 2000;
             const maxEmptyRetries = retryCfg.emptyResponseRetries ?? 2;
             const emptyBaseDelayMs = retryCfg.emptyResponseRetryDelayMs ?? 1000;
+            // Wall-clock bound on the retry phase. The Agents window harness never
+            // cancels a request, so without this bound a retrying turn would keep
+            // starting attempts until a counter ran out.
+            const retryBudget = new RetryBudget(retryCfg.retryBudgetMs ?? DEFAULT_RETRY_BUDGET_MS);
             const accumulator = new StreamedTextAccumulator();
             const trackedProgress: vscode.Progress<vscode.LanguageModelResponsePart> = {
                 report: (part) => {
@@ -258,43 +263,50 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         throw Object.assign(new Error("Operation cancelled by user"), { name: "CancellationError" });
                     }
                     if (resumed) {
-                        // Both retry budgets resume mid-response: the
-                        // already-streamed reasoning + text is appended as
-                        // trailing assistant content so the model continues
-                        // where the previous attempt stopped. The wire body is
-                        // rebuilt because the body built before the loop still
-                        // carries the pre-stream messages. Both state variables
-                        // are committed only after the rebuild succeeds, so a
-                        // failed rebuild leaves the pair consistent.
-                        const resumedMessages = buildResumeMessages(messages, accumulator.text, accumulator.thinking);
-                        const resumedRequestBody = await this.buildOpenAIChatRequest(
-                            resumedMessages,
-                            model,
-                            options,
-                            modelInfo,
-                            caller
-                        );
-                        activeMessages = resumedMessages;
-                        requestBodyBuilt = resumedRequestBody.request;
-                        toolNames = resumedRequestBody.toolNames;
-                        // Carry over the request metadata (which holds the
-                        // session id) so resumed attempts keep per-session
-                        // spend grouping in LiteLLM.
-                        requestBodyBuilt.metadata = { ...(requestBody.metadata ?? {}) };
-                        const resumedInputTokens =
-                            countOpenAIChatMessagesTokens(
-                                requestBodyBuilt.messages,
-                                rawModelIdForTokenizers,
-                                modelInfo
-                            ) + estimateToolTokens(requestBodyBuilt.tools);
-                        tokenCapture.setEstimatedPromptTokens(resumedInputTokens);
-                        tokenCapture.setReservedOutputTokens(
-                            getReservedOutputTokens(model, requestBodyBuilt.max_tokens, {
-                                estimatedInputTokens: resumedInputTokens,
+                        // A resume appends the already-streamed reasoning and text
+                        // as trailing assistant content so the model continues where
+                        // the previous attempt stopped. With nothing to continue, a
+                        // "Continue" nudge would ask the model to carry on with output
+                        // no attempt produced, so the request is resent unchanged.
+                        if (!accumulator.hasResumableOutput) {
+                            Logger.debug(
+                                `[transportRetry] request=${requestId} resending the unchanged request (no attempt produced output)`
+                            );
+                        } else {
+                            const resumedMessages = buildResumeMessages(
+                                messages,
+                                accumulator.text,
+                                accumulator.thinking
+                            );
+                            const resumedRequestBody = await this.buildOpenAIChatRequest(
+                                resumedMessages,
+                                model,
+                                options,
                                 modelInfo,
-                            })
-                        );
-                        tokensIn = resumedInputTokens;
+                                caller
+                            );
+                            activeMessages = resumedMessages;
+                            requestBodyBuilt = resumedRequestBody.request;
+                            toolNames = resumedRequestBody.toolNames;
+                            // Carry over the request metadata (which holds the
+                            // session id) so resumed attempts keep per-session
+                            // spend grouping in LiteLLM.
+                            requestBodyBuilt.metadata = { ...(requestBody.metadata ?? {}) };
+                            const resumedInputTokens =
+                                countOpenAIChatMessagesTokens(
+                                    requestBodyBuilt.messages,
+                                    rawModelIdForTokenizers,
+                                    modelInfo
+                                ) + estimateToolTokens(requestBodyBuilt.tools);
+                            tokenCapture.setEstimatedPromptTokens(resumedInputTokens);
+                            tokenCapture.setReservedOutputTokens(
+                                getReservedOutputTokens(model, requestBodyBuilt.max_tokens, {
+                                    estimatedInputTokens: resumedInputTokens,
+                                    modelInfo,
+                                })
+                            );
+                            tokensIn = resumedInputTokens;
+                        }
                     }
                     stream = await this.sendRequestWithRetry(
                         requestBodyBuilt,
@@ -356,9 +368,14 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                             break;
                         }
                         if (emptyAttempt < maxEmptyRetries && !token.isCancellationRequested) {
+                            if (!retryBudget.markFailure()) {
+                                // The budget, not the reasoning-only count, ends the
+                                // turn, so the user must be told which setting bounded it.
+                                throw retryBudgetError(retryBudget.budgetMs, err);
+                            }
                             emptyAttempt += 1;
                             resumed = true;
-                            const delay = backoffDelayMs(emptyAttempt, emptyBaseDelayMs);
+                            const delay = retryBudget.clipDelay(backoffDelayMs(emptyAttempt, emptyBaseDelayMs));
                             Logger.warn(
                                 `[transportRetry] request=${requestId} reasoning-only response, retry ${emptyAttempt}/${maxEmptyRetries} ` +
                                     `(resuming with ${accumulator.thinking.length} reasoning chars)`
@@ -429,9 +446,15 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         throw err;
                     }
 
+                    if (!retryBudget.markFailure()) {
+                        // The budget, not the attempt count, ends the turn here. The
+                        // boundary handler logs the failure, so this throw does not.
+                        throw retryBudgetError(retryBudget.budgetMs, err);
+                    }
+
                     attempt += 1;
                     resumed = true;
-                    const delay = backoffDelayMs(attempt, retryBaseDelayMs);
+                    const delay = retryBudget.clipDelay(backoffDelayMs(attempt, retryBaseDelayMs));
                     logTransportRetry(
                         requestId,
                         attempt,

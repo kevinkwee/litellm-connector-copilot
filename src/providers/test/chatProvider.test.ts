@@ -1779,7 +1779,8 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         provider: LiteLLMChatProvider,
         reported: vscode.LanguageModelResponsePart[],
         token?: vscode.CancellationToken,
-        modelOptions: Record<string, unknown> = {}
+        modelOptions: Record<string, unknown> = {},
+        messages?: vscode.LanguageModelChatRequestMessage[]
     ): Promise<void> {
         return provider.provideLanguageModelChatResponse(
             {
@@ -1792,7 +1793,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
                 maxOutputTokens: 1000,
                 capabilities: { toolCalling: true, imageInput: false },
             },
-            [
+            messages ?? [
                 {
                     role: vscode.LanguageModelChatMessageRole.User,
                     name: undefined,
@@ -1912,6 +1913,334 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         const exhaustedErrorText = findErrorTextPart(reported);
         assert.ok(exhaustedErrorText, "exhausted transport retries must surface as an error text part");
         assert.match(exhaustedErrorText, /terminated/);
+    });
+
+    test("transport retry resends the unchanged request when the attempt produced nothing", async () => {
+        // The history ends with an assistant turn, which is the case where a resume
+        // would append a "Continue" nudge even though the failed attempt produced
+        // nothing to continue.
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const encoder = new TextEncoder();
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const sent: OpenAIChatCompletionRequest[] = [];
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sent.push(request);
+            if (sent.length === 1) {
+                return new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.error(new Error("fetch failed"));
+                    },
+                });
+            }
+            return new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"done"}}]}\n\n'));
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                },
+            });
+        });
+
+        await runChatRequest(provider, reported, undefined, {}, [
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                name: undefined,
+                content: [new vscode.LanguageModelTextPart("hi")],
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                name: undefined,
+                content: [new vscode.LanguageModelTextPart("an earlier answer")],
+            },
+        ]);
+
+        assert.strictEqual(sent.length, 2, "Expected two HTTP attempts");
+        assert.deepStrictEqual(
+            sent[1].messages,
+            sent[0].messages,
+            "an attempt that produced nothing has nothing to continue, so the request is resent unchanged"
+        );
+    });
+
+    test("retry budget stops starting attempts once the time is spent", async () => {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 5,
+            networkRetryDelayMs: 1,
+            retryBudgetMs: 5,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const sent: OpenAIChatCompletionRequest[] = [];
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sent.push(request);
+            // Spend the budget before failing, so the next attempt is refused.
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            throw new Error("terminated");
+        });
+
+        await runChatRequest(provider, reported);
+
+        // The first failure starts the clock, so one retry is allowed. The second
+        // failure spends the budget and no third attempt starts.
+        assert.strictEqual(sent.length, 2, "no attempt may start after the retry budget is spent");
+        const budgetText = findErrorTextPart(reported);
+        assert.ok(budgetText, "the exhausted budget must surface as an error text part");
+        assert.match(budgetText, /retryBudgetSeconds/);
+    });
+
+    test("clips the transport backoff to the time the budget has left", async () => {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 1,
+            networkRetryDelayMs: 60_000,
+            retryBudgetMs: 100,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        // A fixed clock keeps the two reads inside markFailure/clipDelay identical.
+        sandbox.stub(Date, "now").returns(1_000);
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async () => {
+            throw new Error("terminated");
+        });
+
+        await runChatRequest(provider, reported);
+
+        const retryLog = warnStub
+            .getCalls()
+            .find((call) => call.args[0] === "request.transport_retry" && typeof call.args[1] === "object");
+        assert.ok(retryLog, "the retry must be logged");
+        assert.strictEqual(
+            (retryLog.args[1] as { delayMs: number }).delayMs,
+            100,
+            "the 60s backoff is clipped to the 100ms the budget allows"
+        );
+    });
+
+    test("clips the reasoning-only backoff to the time the budget has left", async () => {
+        const encoder = new TextEncoder();
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            emptyResponseRetries: 1,
+            emptyResponseRetryDelayMs: 60_000,
+            retryBudgetMs: 100,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        // A fixed clock keeps the two reads inside markFailure/clipDelay identical.
+        sandbox.stub(Date, "now").returns(1_000);
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async () => {
+            return new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(
+                        encoder.encode('data: {"choices":[{"delta":{"reasoning_content":"more thought"}}]}\n\n')
+                    );
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                },
+            });
+        });
+
+        await runChatRequest(provider, reported);
+
+        const retryLog = warnStub
+            .getCalls()
+            .find((call) => call.args[0] === "request.reasoning_only_retry" && typeof call.args[1] === "object");
+        assert.ok(retryLog, "the reasoning-only retry must be logged");
+        assert.strictEqual(
+            (retryLog.args[1] as { delayMs: number }).delayMs,
+            100,
+            "the 60s backoff is clipped to the 100ms the budget allows"
+        );
+    });
+
+    test("reports the retry budget, not the reasoning-only count, when the budget stops that retry", async () => {
+        const encoder = new TextEncoder();
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            emptyResponseRetries: 5,
+            emptyResponseRetryDelayMs: 1,
+            retryBudgetMs: 5,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        // The clock advances per attempt, so the budget is spent deterministically.
+        let now = 1_000;
+        sandbox.stub(Date, "now").callsFake(() => now);
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async () => {
+            now += 10;
+            return new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(
+                        encoder.encode('data: {"choices":[{"delta":{"reasoning_content":"more thought"}}]}\n\n')
+                    );
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                },
+            });
+        });
+
+        await runChatRequest(provider, reported);
+
+        const text = findErrorTextPart(reported);
+        assert.ok(text, "the failure must surface as an error text part");
+        assert.match(text, /retryBudgetSeconds/, "the user must learn which setting ended the turn");
+        assert.doesNotMatch(text, /reasoning-only response persisted/);
+    });
+
+    test("resends an unchanged request when the attempt streamed only whitespace", async () => {
+        // Whitespace trims to nothing, so the attempt produced no output to continue.
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const encoder = new TextEncoder();
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const sent: OpenAIChatCompletionRequest[] = [];
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sent.push(request);
+            if (sent.length === 1) {
+                return new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"\\n\\n"}}]}\n\n'));
+                    },
+                    pull(controller) {
+                        controller.error(new Error("terminated"));
+                    },
+                });
+            }
+            return new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"done"}}]}\n\n'));
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                },
+            });
+        });
+
+        await runChatRequest(provider, reported, undefined, {}, [
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                name: undefined,
+                content: [new vscode.LanguageModelTextPart("hi")],
+            },
+            {
+                role: vscode.LanguageModelChatMessageRole.Assistant,
+                name: undefined,
+                content: [new vscode.LanguageModelTextPart("an earlier answer")],
+            },
+        ]);
+
+        assert.strictEqual(sent.length, 2, "Expected two HTTP attempts");
+        assert.deepStrictEqual(
+            sent[1].messages,
+            sent[0].messages,
+            "whitespace-only output is nothing to continue, so the request is resent unchanged"
+        );
+    });
+
+    test("surfaces the headers timeout setting when the proxy never answers", async () => {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 0,
+            retryBudgetMs: 0,
+            headersTimeoutMs: 5,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        // The request only settles when the connector's header timer aborts it.
+        sandbox.stub(global, "fetch").callsFake(
+            (_input: string | URL | Request, init?: RequestInit) =>
+                new Promise<Response>((_resolve, reject) => {
+                    init?.signal?.addEventListener("abort", () =>
+                        reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
+                    );
+                })
+        );
+
+        await runChatRequest(provider, reported);
+
+        const text = findErrorTextPart(reported);
+        assert.ok(text, "the timeout must surface as an error text part");
+        assert.match(text, /litellm-connector\.headersTimeout/);
+        assert.match(text, /after 5ms/, "the connector timer produced the failure, not the runner timeout");
+    });
+
+    test("retryBudgetMs 0 leaves the attempt count as the only bound", async () => {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 1,
+            networkRetryDelayMs: 1,
+            retryBudgetMs: 0,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const sent: OpenAIChatCompletionRequest[] = [];
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sent.push(request);
+            throw new Error("terminated");
+        });
+
+        await runChatRequest(provider, reported);
+
+        assert.strictEqual(sent.length, 2, "a disabled budget must not shorten the attempt count");
+        const text = findErrorTextPart(reported);
+        assert.ok(text, "the failure must surface as an error text part");
+        assert.match(text, /terminated/, "the real failure is reported, not a budget stop");
+        assert.doesNotMatch(text, /retryBudgetSeconds/);
     });
 
     test("reasoning-only retries exhausted after the budget surfaces the descriptive error", async () => {

@@ -6,6 +6,7 @@ import { Logger } from "../utils/logger";
 import { normalizeAnthropicPromptCachingMode } from "../utils/promptCaching";
 import { deriveGroupNameFromUrl } from "../utils";
 import { normalizeProxyBaseUrl } from "../utils/proxyBaseUrl";
+import { DEFAULT_RETRY_BUDGET_MS } from "../utils/retryBudget";
 
 export class ConfigManager {
     private static readonly INACTIVITY_TIMEOUT_KEY = "litellm-connector.inactivityTimeout";
@@ -28,6 +29,8 @@ export class ConfigManager {
     private static readonly EMPTY_RESPONSE_RETRIES_KEY = "litellm-connector.emptyResponseRetries";
     private static readonly EMPTY_RESPONSE_RETRY_DELAY_MS_KEY = "litellm-connector.emptyResponseRetryDelayMs";
     private static readonly RATE_LIMIT_MAX_DELAY_SECONDS_KEY = "litellm-connector.rateLimitMaxDelaySeconds";
+    private static readonly HEADERS_TIMEOUT_KEY = "litellm-connector.headersTimeout";
+    private static readonly RETRY_BUDGET_SECONDS_KEY = "litellm-connector.retryBudgetSeconds";
 
     // Discovery config defaults and bounds
     private static readonly DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
@@ -47,6 +50,21 @@ export class ConfigManager {
     private static readonly MIN_RATE_LIMIT_MAX_DELAY_SECONDS = 0;
     private static readonly MAX_RATE_LIMIT_MAX_DELAY_SECONDS = 86_400;
     private static readonly MS_PER_SECOND = 1_000;
+
+    // Time bounds for one chat request. Both are expressed in seconds because
+    // they describe a user-observable wait; the internal pipeline works in
+    // milliseconds. The headers bound is the connector's own guard on the phase
+    // before the body watchdog starts. The retry budget bounds the time spent
+    // retrying a request the host never cancels.
+    //
+    // The headers ceiling matches the 300 s header limit of the runtime's fetch,
+    // which would clamp a larger value anyway, so the setting does not accept one.
+    private static readonly DEFAULT_HEADERS_TIMEOUT_SECONDS = 120;
+    private static readonly MIN_HEADERS_TIMEOUT_SECONDS = 1;
+    private static readonly MAX_HEADERS_TIMEOUT_SECONDS = 300;
+    private static readonly DEFAULT_RETRY_BUDGET_SECONDS = DEFAULT_RETRY_BUDGET_MS / 1_000;
+    private static readonly MIN_RETRY_BUDGET_SECONDS = 0;
+    private static readonly MAX_RETRY_BUDGET_SECONDS = 3_600;
 
     private readonly secrets: vscode.SecretStorage;
 
@@ -274,6 +292,22 @@ export class ConfigManager {
         );
         const rateLimitMaxDelayMs = Math.round(rateLimitMaxDelaySeconds * ConfigManager.MS_PER_SECOND);
 
+        const headersTimeoutSeconds = this.clampRange(
+            workspaceConfig.get<number>(ConfigManager.HEADERS_TIMEOUT_KEY),
+            ConfigManager.MIN_HEADERS_TIMEOUT_SECONDS,
+            ConfigManager.MAX_HEADERS_TIMEOUT_SECONDS,
+            ConfigManager.DEFAULT_HEADERS_TIMEOUT_SECONDS
+        );
+        const headersTimeoutMs = Math.round(headersTimeoutSeconds * ConfigManager.MS_PER_SECOND);
+
+        const retryBudgetSeconds = this.clampRange(
+            workspaceConfig.get<number>(ConfigManager.RETRY_BUDGET_SECONDS_KEY),
+            ConfigManager.MIN_RETRY_BUDGET_SECONDS,
+            ConfigManager.MAX_RETRY_BUDGET_SECONDS,
+            ConfigManager.DEFAULT_RETRY_BUDGET_SECONDS
+        );
+        const retryBudgetMs = Math.ceil(retryBudgetSeconds * ConfigManager.MS_PER_SECOND);
+
         const config: LiteLLMConfig = {
             inactivityTimeout,
             disableCaching,
@@ -290,6 +324,8 @@ export class ConfigManager {
             emptyResponseRetries,
             emptyResponseRetryDelayMs,
             rateLimitMaxDelayMs,
+            headersTimeoutMs,
+            retryBudgetMs,
         };
         return { ...config };
     }

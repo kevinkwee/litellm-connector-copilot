@@ -206,6 +206,66 @@ suite("ConfigManager Unit Tests", () => {
         assert.strictEqual((await configManager.getConfig()).rateLimitMaxDelayMs, 500);
     });
 
+    test("should read headersTimeout from workspace settings", async () => {
+        settingsMap.set("litellm-connector.headersTimeout", 45);
+        assert.strictEqual((await configManager.getConfig()).headersTimeoutMs, 45_000);
+    });
+
+    test("should default headersTimeout to 120 seconds", async () => {
+        settingsMap.delete("litellm-connector.headersTimeout");
+
+        assert.strictEqual((await configManager.getConfig()).headersTimeoutMs, 120_000);
+    });
+
+    test("should raise a headersTimeout below one second to one second", async () => {
+        // A zero or negative value would abort every request immediately.
+        settingsMap.set("litellm-connector.headersTimeout", 0);
+
+        assert.strictEqual((await configManager.getConfig()).headersTimeoutMs, 1_000);
+    });
+
+    test("should cap headersTimeout at the HTTP stack's own 300 second header limit", async () => {
+        settingsMap.set("litellm-connector.headersTimeout", 100_000);
+
+        assert.strictEqual((await configManager.getConfig()).headersTimeoutMs, 300_000);
+    });
+
+    test("should fall back to the default for a non-numeric headersTimeout", async () => {
+        settingsMap.set("litellm-connector.headersTimeout", Number.NaN);
+
+        assert.strictEqual((await configManager.getConfig()).headersTimeoutMs, 120_000);
+    });
+
+    test("should read retryBudgetSeconds from workspace settings", async () => {
+        settingsMap.set("litellm-connector.retryBudgetSeconds", 90);
+
+        assert.strictEqual((await configManager.getConfig()).retryBudgetMs, 90_000);
+    });
+
+    test("should default the retry budget to 300 seconds", async () => {
+        settingsMap.delete("litellm-connector.retryBudgetSeconds");
+
+        assert.strictEqual((await configManager.getConfig()).retryBudgetMs, 300_000);
+    });
+
+    test("should keep a zero retry budget as disabled", async () => {
+        settingsMap.set("litellm-connector.retryBudgetSeconds", 0);
+
+        assert.strictEqual((await configManager.getConfig()).retryBudgetMs, 0);
+    });
+
+    test("should raise a negative retry budget to zero", async () => {
+        settingsMap.set("litellm-connector.retryBudgetSeconds", -5);
+
+        assert.strictEqual((await configManager.getConfig()).retryBudgetMs, 0);
+    });
+
+    test("should cap the retry budget at one hour", async () => {
+        settingsMap.set("litellm-connector.retryBudgetSeconds", 99_999);
+
+        assert.strictEqual((await configManager.getConfig()).retryBudgetMs, 3_600_000);
+    });
+
     test("should read large networkRetries values without capping", async () => {
         settingsMap.set("litellm-connector.networkRetries", 1000);
         assert.strictEqual((await configManager.getConfig()).networkRetries, 1000);
@@ -294,6 +354,8 @@ suite("ConfigManager Unit Tests", () => {
             "forceResponsesEndpoint",
             "allowChatCompletionsFallback",
             "rateLimitMaxDelayMs",
+            "headersTimeoutMs",
+            "retryBudgetMs",
             "discoveryTimeoutMs",
             "discoveryCacheTtlMs",
             "networkRetries",

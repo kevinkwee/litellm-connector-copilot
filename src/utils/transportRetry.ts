@@ -34,6 +34,21 @@ export class InactivityTimeoutError extends Error {
     }
 }
 
+/**
+ * Sentinel for a request that produced no response headers within its budget.
+ *
+ * The proxy buffers the first streamed chunk before it writes headers, so a slow
+ * upstream spends the whole time to first token in this phase. The body watchdog
+ * starts only after headers and cannot see it. A fresh request is worth trying
+ * because nothing was generated from the connector's point of view.
+ */
+export class HeadersTimeoutError extends Error {
+    public constructor(public readonly timeoutMs: number) {
+        super(`No response headers after ${timeoutMs}ms (litellm-connector.headersTimeout)`);
+        this.name = "HeadersTimeoutError";
+    }
+}
+
 /** HTTP statuses whose mid-stream failure a fresh request can plausibly survive. */
 const RETRIABLE_UPSTREAM_STATUS = new Set([408, 409, 425, 429]);
 
@@ -134,11 +149,17 @@ export class ReasoningOnlyError extends Error {
  * identically or produce duplicated content. `UpstreamStreamError` is the
  * upstream failure this function consults directly: it returns its `retriable`
  * flag, so a transient mid-stream death resumes like a dropped socket while a
- * rejected request surfaces its message. `ReasoningOnlyError` is NOT classified
- * here because it has its own, separate retry budget (`emptyResponseRetries`).
+ * rejected request surfaces its message. `InactivityTimeoutError` and
+ * `HeadersTimeoutError` are the connector's own timeouts for this class of
+ * failure, and both are worth a fresh attempt. `ReasoningOnlyError` is NOT
+ * classified here because it has its own, separate retry budget
+ * (`emptyResponseRetries`).
  */
 export function isTransportRetriableError(err: unknown): boolean {
     if (err instanceof InactivityTimeoutError) {
+        return true;
+    }
+    if (err instanceof HeadersTimeoutError) {
         return true;
     }
     if (err instanceof UpstreamStreamError) {
@@ -246,6 +267,17 @@ export class StreamedTextAccumulator {
 
     public get sawToolCall(): boolean {
         return this._sawToolCall;
+    }
+
+    /**
+     * True when the attempt streamed text or reasoning a resume could continue.
+     *
+     * Whitespace alone does not count: leading and trailing whitespace is trimmed
+     * before the check, so an attempt that produced only blank lines is resent
+     * unchanged instead of being continued.
+     */
+    public get hasResumableOutput(): boolean {
+        return this._text.trim().length > 0 || this._thinking.trim().length > 0;
     }
 
     public get isEmpty(): boolean {

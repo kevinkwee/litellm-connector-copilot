@@ -51,7 +51,7 @@ suite("LiteLLM Client Cancellation Tests", () => {
         }
     });
 
-    test("fetchWithRetry should respect cancellation during sleep", async () => {
+    test("fetchWithRetry does not call fetch when the token is already cancelled", async () => {
         const cts = new vscode.CancellationTokenSource();
 
         // Track calls to ensure early exit
@@ -67,33 +67,17 @@ suite("LiteLLM Client Cancellation Tests", () => {
         }) as typeof fetch;
 
         const clientAny = client as unknown as {
-            fetchWithRetry: (
-                url: string,
-                init: RequestInit,
-                opts: { retries: number; delayMs: number; token: vscode.CancellationToken }
-            ) => Promise<Response>;
+            fetchWithRetry: (url: string, init: RequestInit, token?: vscode.CancellationToken) => Promise<Response>;
         };
 
         try {
-            // Test 1: Verify normal behavior works (immediate success)
-            const response = await clientAny.fetchWithRetry(
-                "http://url",
-                {},
-                { retries: 2, delayMs: 100, token: cts.token }
-            );
+            const response = await clientAny.fetchWithRetry("http://url", {}, cts.token);
             assert.strictEqual(response.status, 200);
             assert.strictEqual(callCount, 1, "Should succeed immediately");
 
-            // Reset counter
             callCount = 0;
-
-            // Test 2: Cancel the token and verify immediate error
             cts.cancel();
-            const retryPromise = clientAny.fetchWithRetry(
-                "http://url",
-                {},
-                { retries: 2, delayMs: 100, token: cts.token }
-            );
+            const retryPromise = clientAny.fetchWithRetry("http://url", {}, cts.token);
 
             try {
                 await retryPromise;
@@ -103,7 +87,6 @@ suite("LiteLLM Client Cancellation Tests", () => {
                     assert.fail("Error should be an instance of Error");
                 }
                 assert.strictEqual(err.message, "Operation cancelled by user");
-                // Should not have called fetch when already cancelled
                 assert.strictEqual(callCount, 0, "Should not call fetch when token is already cancelled");
             }
         } finally {

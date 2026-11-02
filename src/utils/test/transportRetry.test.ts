@@ -5,6 +5,7 @@ import { LiteLLMRateLimitError } from "../../adapters/litellmClient";
 import {
     StreamedTextAccumulator,
     ReasoningOnlyError,
+    HeadersTimeoutError,
     InactivityTimeoutError,
     UpstreamStreamError,
     isTransportRetriableError,
@@ -78,6 +79,10 @@ suite("Transport Retry Utilities", () => {
             assert.ok(isTransportRetriableError(new Error(message)), `expected retriable: ${message}`);
         }
         assert.ok(isTransportRetriableError(new InactivityTimeoutError(60_000, 3)));
+        assert.ok(
+            isTransportRetriableError(new HeadersTimeoutError(120_000)),
+            "a request that never got headers is worth a fresh attempt"
+        );
         assert.ok(isTransportRetriableError(new Error("Some prefix, then terminated")));
         // non-Error values are not retriable
         assert.strictEqual(isTransportRetriableError("terminated"), false);
@@ -178,6 +183,20 @@ suite("Transport Retry Utilities", () => {
         const usagePart = new vscode.LanguageModelDataPart(new TextEncoder().encode("{}"), "usage");
         accumulator.add(usagePart);
         assert.ok(accumulator.isEmpty, "data parts must not affect resume content");
+    });
+
+    test("hasResumableOutput treats whitespace-only text and reasoning as nothing", () => {
+        // Leading and trailing whitespace is trimmed, so blank output counts as
+        // nothing to continue.
+        const accumulator = new StreamedTextAccumulator();
+        accumulator.add(new vscode.LanguageModelTextPart("\n\n"));
+        assert.strictEqual(accumulator.hasResumableOutput, false);
+
+        accumulator.add(thinkingPart("   "));
+        assert.strictEqual(accumulator.hasResumableOutput, false);
+
+        accumulator.add(new vscode.LanguageModelTextPart("answer"));
+        assert.strictEqual(accumulator.hasResumableOutput, true);
     });
 
     test("buildResumeMessages appends one assistant turn with text and reasoning", () => {
