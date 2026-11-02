@@ -20,8 +20,7 @@ import { LiteLLMProviderBase } from "./liteLLMProviderBase";
 import { describeFailureForLog, toErrorLogFields } from "./base/errorLogFields";
 import { StructuredLogger } from "../observability/structuredLogger";
 import { logFinalUsageEnvelope } from "../observability/finalUsageEnvelope";
-import { ResponsePartCollector, exportCopilotMdEntry } from "../observability";
-import type { CopilotMdEntry } from "../observability";
+import { ResponsePartCollector } from "../observability";
 import { resolveChatSessionId } from "../utils/chatSessionId";
 import {
     countOpenAIChatMessagesTokens,
@@ -48,6 +47,9 @@ import { emitPartsToVSCode } from "../adapters/streaming/vscodePartEmitter";
 import type { EffortFallbackCache } from "../utils/reasoningEffortFallback";
 import { StreamTokenCapture } from "../adapters/streaming/streamTokenCapture";
 import type { OpenAIChatCompletionRequest } from "../types";
+import { RequestCancellation } from "../utils/requestCancellation";
+import { exportRequestOutcome, recordCancelledTurn, type RequestOutcomeContext } from "./base/requestOutcome";
+import type { ActiveRequestRegistry } from "./activeRequests";
 import { DEFAULT_RETRY_BUDGET_MS, RetryBudget, retryBudgetError } from "../utils/retryBudget";
 import {
     StreamedTextAccumulator,
@@ -82,8 +84,13 @@ function cancelUpstreamBody(body: ReadableStream<Uint8Array>): void {
  * buffers live for one upstream attempt, and the token capture lives for one request.
  */
 export class LiteLLMChatProvider extends LiteLLMProviderBase implements LanguageModelChatProvider {
-    constructor(secrets: vscode.SecretStorage, userAgent: string, effortFallbackCache?: EffortFallbackCache) {
-        super(secrets, userAgent, effortFallbackCache);
+    constructor(
+        secrets: vscode.SecretStorage,
+        userAgent: string,
+        effortFallbackCache?: EffortFallbackCache,
+        activeRequests?: ActiveRequestRegistry
+    ) {
+        super(secrets, userAgent, effortFallbackCache, activeRequests);
     }
 
     async provideLanguageModelChatInformation(
@@ -166,6 +173,38 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             { sessionId, sessionIdSource: resolvedSession.source },
             { requestId, model: model.id, caller }
         );
+
+        // Created here, immediately before the `try`, so nothing between their
+        // creation and the `finally` can leave a registry entry or a host listener
+        // behind. The composite token is what every inner layer sees, so the
+        // connector's cancel command reaches all of them and a host cancellation
+        // propagates.
+        const requestCancellation = new RequestCancellation(token);
+        const activeRequest = this.activeRequests.register({
+            requestId,
+            model: model.id,
+            caller,
+            startedAt: requestStartDate.getTime(),
+            phase: "sending",
+            cancel: () => requestCancellation.cancelByConnector(),
+        });
+
+        // The fields every outcome of this request shares. Built on demand so the
+        // usage snapshot and the response parts are read when the turn ends, not
+        // when it starts.
+        const outcomeContext = (): RequestOutcomeContext => ({
+            requestId,
+            model,
+            caller,
+            endpointUrl,
+            requestBodyBuilt,
+            activeMessages,
+            requestStartDate,
+            usage: tokenCapture.getSnapshot(),
+            responseParts: responsePartCollector.parts,
+            sessionId,
+            sessionIdSource: resolvedSession.source,
+        });
 
         try {
             // Resolve the backend baseUrl for the `.copilotmd` metadata `url:` line.
@@ -253,15 +292,17 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             let resumed = false;
             while (true) {
                 try {
-                    // VS Code may cancel (Stop/steer) during the backoff sleep.
-                    // A post-cancel request is pointless: the ext-host progress
-                    // wrapper drops all subsequently reported parts anyway.
-                    if (token.isCancellationRequested) {
+                    // A cancel that landed before this attempt stops here, so a
+                    // cancelled turn sends no further request.
+                    if (requestCancellation.isCancellationRequested) {
                         Logger.debug(
                             `[transportRetry] request=${requestId} cancelled before attempt ${attempt}; aborting`
                         );
                         throw Object.assign(new Error("Operation cancelled by user"), { name: "CancellationError" });
                     }
+                    // A retry starts a fresh header wait, so the request is back in the
+                    // phase the picker labels "waiting for headers".
+                    activeRequest.setPhase("sending");
                     if (resumed) {
                         // A resume appends the already-streamed reasoning and text
                         // as trailing assistant content so the model continues where
@@ -313,22 +354,24 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         model,
                         options,
                         trackedProgress,
-                        token,
+                        requestCancellation,
                         caller,
                         modelInfo,
                         requestId
                     );
+                    // Headers have arrived, so the request is now reading a body.
+                    activeRequest.setPhase("streaming");
                     await this.processStreamingResponse(
                         stream,
                         trackedProgress,
-                        token,
+                        requestCancellation,
                         requestId,
                         toolNames.wireToDeclared
                     );
 
                     // A cancelled stream ends without an error, so without this
                     // check the request would be reported and billed as a success.
-                    if (token.isCancellationRequested) {
+                    if (requestCancellation.isCancellationRequested) {
                         Logger.debug(`[chatRequest] request=${requestId} cancelled after a clean stream end`);
                         throw Object.assign(new Error("Operation cancelled by user"), { name: "CancellationError" });
                     }
@@ -337,12 +380,13 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     tokenCapture.flushUsage();
                     break;
                 } catch (err: unknown) {
-                    if (token.isCancellationRequested) {
-                        // VS Code cancels mid-stream for its own reasons (user
-                        // Stop, agent-loop retries). The resulting abort ends
-                        // decodeSSE cleanly, which the reasoning-only detector
-                        // then misreads as empty content. Surfacing that would
-                        // falsely blame the upstream provider.
+                    if (requestCancellation.isCancellationRequested) {
+                        // A cancellation mid-stream ends the body without an error,
+                        // whether the host asked for it (user Stop, agent-loop
+                        // retries) or the user cancelled from the connector's cancel
+                        // command. decodeSSE returns cleanly, which the
+                        // reasoning-only detector would otherwise misread as empty
+                        // content and blame on the upstream provider.
                         throw Object.assign(new Error("Operation cancelled by user"), {
                             name: "CancellationError",
                             cause: err,
@@ -367,7 +411,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                             tokenCapture.flushUsage();
                             break;
                         }
-                        if (emptyAttempt < maxEmptyRetries && !token.isCancellationRequested) {
+                        if (emptyAttempt < maxEmptyRetries && !requestCancellation.isCancellationRequested) {
                             if (!retryBudget.markFailure()) {
                                 // The budget, not the reasoning-only count, ends the
                                 // turn, so the user must be told which setting bounded it.
@@ -388,7 +432,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                                 resumedReasoningChars: accumulator.thinking.length,
                             });
                             tokenCapture.resetAccumulation();
-                            await sleepWithCancellation(delay, token);
+                            await sleepWithCancellation(delay, requestCancellation);
                             // Do NOT count this against the transport attempt
                             // budget; treat the next iteration as a fresh resume.
                             continue;
@@ -413,7 +457,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
 
                     const isLastAttempt = attempt >= maxTransportRetries;
                     if (
-                        token.isCancellationRequested ||
+                        requestCancellation.isCancellationRequested ||
                         accumulator.sawToolCall ||
                         !isTransportRetriableError(err) ||
                         isLastAttempt
@@ -473,7 +517,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     // Fresh attempt: drop partial-response token accounting so
                     // the next usage snapshot reflects only the resumed stream.
                     tokenCapture.resetAccumulation();
-                    await sleepWithCancellation(delay, token);
+                    await sleepWithCancellation(delay, requestCancellation);
                 }
             }
 
@@ -535,33 +579,10 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 estimatedTotalCost,
             });
 
-            // Fire-and-forget `.copilotmd` export. Reads the opt-in setting
-            // inside `exportCopilotMdEntry`; when disabled this is a single
-            // config read + early return, negligible on the request hot path.
-            // Never awaited: a failed/slow export must not delay the user's
-            // already-streamed response.
-            void exportCopilotMdEntry({
-                debugName: caller,
-                id: requestId.slice(0, 8),
-                model: model.id,
-                url: endpointUrl ?? "litellm-connector",
-                maxPromptTokens: model.maxInputTokens,
-                maxResponseTokens: requestBodyBuilt.max_tokens,
-                location: undefined,
-                body: requestBodyBuilt,
-                requestMessages: activeMessages,
-                startTimeIso: requestStartDate.toISOString(),
-                endTimeIso: new Date().toISOString(),
-                durationMs: metric.durationMs,
-                ourRequestId: requestId,
-                timeToFirstTokenMs: undefined,
-                resolvedModel: model.id,
-                usage: snapshot,
-                responseParts: responsePartCollector.parts,
-                status: "success",
-                sessionId,
-                sessionIdSource: resolvedSession.source,
-            } satisfies CopilotMdEntry);
+            // Fire-and-forget `.copilotmd` export: it reads the opt-in setting
+            // itself and is never awaited, so a slow write cannot delay a response
+            // the user already has.
+            exportRequestOutcome(outcomeContext(), { status: "success", durationMs: metric.durationMs });
 
             // Usage data flows through StreamTokenCapture, which intercepts
             // usage DataParts during streaming and enriches them.
@@ -596,6 +617,34 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         ". This model may not support certain parameters like temperature. Please check your model settings.";
                 }
             }
+            if (requestCancellation.cancelledByConnector) {
+                // The connector ended this turn, not the host: VS Code is still
+                // waiting on the promise, so returning with a notice closes the turn
+                // and keeps whatever streamed. Throwing here would make the Agents
+                // window handler answer with a 502 and discard that output.
+                StructuredLogger.info("request.cancelled_by_connector", {
+                    requestId,
+                    model: model.id,
+                    caller,
+                    stage: "provideLanguageModelChatResponse",
+                    responseParts: responsePartCollector.parts.length,
+                });
+                Logger.info(
+                    `Chat request cancelled from the connector | RequestID: ${requestId} | Model: ${model.id} | Caller: ${caller}`
+                );
+                recordCancelledTurn(outcomeContext(), {
+                    tokensIn,
+                    durationMs: LiteLLMTelemetry.endTimer(startTime),
+                    statusReason: "Cancelled from the LiteLLM connector",
+                });
+                trackingProgress.report(
+                    new LanguageModelTextPart(
+                        `\n\n${formatConnectorNotice("Request cancelled from the LiteLLM connector.")}`
+                    )
+                );
+                return;
+            }
+
             if (token.isCancellationRequested) {
                 Logger.info(
                     `Chat request cancelled | RequestID: ${requestId} | Model: ${model.id} | Caller: ${caller}`
@@ -608,40 +657,11 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 });
                 // Cancellation is not a failure. The host renders the cancelled state
                 // itself, so the metric and the transcript record that, not a failure.
-                const cancelledDurationMs = LiteLLMTelemetry.endTimer(startTime);
-                LiteLLMTelemetry.reportMetric({
-                    requestId,
-                    model: model.id,
-                    durationMs: cancelledDurationMs,
+                recordCancelledTurn(outcomeContext(), {
                     tokensIn,
-                    status: "cancelled",
-                    caller,
+                    durationMs: LiteLLMTelemetry.endTimer(startTime),
+                    statusReason: "Cancelled by the user",
                 });
-                if (requestBodyBuilt && endpointUrl) {
-                    void exportCopilotMdEntry({
-                        debugName: caller,
-                        id: requestId.slice(0, 8),
-                        model: model.id,
-                        url: endpointUrl,
-                        maxPromptTokens: model.maxInputTokens,
-                        maxResponseTokens: requestBodyBuilt.max_tokens,
-                        location: undefined,
-                        body: requestBodyBuilt,
-                        requestMessages: activeMessages,
-                        startTimeIso: requestStartDate.toISOString(),
-                        endTimeIso: new Date().toISOString(),
-                        durationMs: cancelledDurationMs,
-                        ourRequestId: requestId,
-                        timeToFirstTokenMs: undefined,
-                        resolvedModel: model.id,
-                        usage: tokenCapture.getSnapshot(),
-                        responseParts: responsePartCollector.parts,
-                        status: "canceled",
-                        statusReason: "Cancelled by the user",
-                        sessionId,
-                        sessionIdSource: resolvedSession.source,
-                    } satisfies CopilotMdEntry);
-                }
                 throw Object.assign(new Error("Operation cancelled by user"), {
                     name: "CancellationError",
                     cause: err,
@@ -671,41 +691,20 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             };
             LiteLLMTelemetry.reportMetric(metric);
 
-            // Fire-and-forget `.copilotmd` export for the failure case. Only
-            // emits when the request got far enough to have a built body; a
-            // failure before `buildOpenAIChatRequest` (e.g. a config error) has
-            // nothing meaningful to render and is skipped.
-            if (requestBodyBuilt && endpointUrl) {
-                void exportCopilotMdEntry({
-                    debugName: caller,
-                    id: requestId.slice(0, 8),
-                    model: model.id,
-                    url: endpointUrl,
-                    maxPromptTokens: model.maxInputTokens,
-                    maxResponseTokens: requestBodyBuilt.max_tokens,
-                    location: undefined,
-                    body: requestBodyBuilt,
-                    requestMessages: activeMessages,
-                    startTimeIso: requestStartDate.toISOString(),
-                    endTimeIso: new Date().toISOString(),
-                    durationMs: metric.durationMs,
-                    ourRequestId: requestId,
-                    timeToFirstTokenMs: undefined,
-                    resolvedModel: model.id,
-                    usage: tokenCapture.getSnapshot(),
-                    responseParts: responsePartCollector.parts,
-                    status: "failure",
-                    statusReason: errorMessage,
-                    sessionId,
-                    sessionIdSource: resolvedSession.source,
-                } satisfies CopilotMdEntry);
-            }
+            // A failure before the body exists has nothing to render, which the
+            // context reports by leaving the body undefined.
+            exportRequestOutcome(outcomeContext(), {
+                status: "failure",
+                durationMs: metric.durationMs,
+                statusReason: errorMessage,
+            });
 
             // The Agents window handler answers a thrown error with a 502 and
             // discards the parts already reported, which would lose everything
             // the model said this turn. Completing with the notice as an
-            // assistant text part keeps the partial answer in the conversation;
-            // cancellation stays a throw because the host renders that state.
+            // assistant text part keeps the partial answer in the conversation.
+            // Only a host cancellation is thrown, because the host renders that
+            // state itself.
             trackingProgress.report(new LanguageModelTextPart(`\n\n${formatConnectorNotice(errorMessage)}`));
             // The reply now looks like model output, so record that it was a
             // failure notice and which initiator triggered it.
@@ -717,6 +716,10 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 stage: "provideLanguageModelChatResponse",
                 ...toErrorLogFields(err),
             });
+        } finally {
+            // Nothing outlives the turn: neither a listed request nor a host listener.
+            activeRequest.dispose();
+            requestCancellation.dispose();
         }
     }
 
@@ -820,11 +823,12 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         const cancellationListener = token.onCancellationRequested(() => {
             // The listener runs synchronously inside whoever called cancel(),
             // so this stack is the only fingerprint of the canceller, e.g.
-            // user action, Copilot agent-loop retry, or session teardown,
-            // which the CancellationToken API itself does not expose.
+            // user action, Copilot agent-loop retry, session teardown, or the
+            // connector's own command, which the CancellationToken API itself
+            // does not expose.
             const cancellationStack = new Error().stack;
             Logger.warn(
-                `[processStreamingResponse] request=${requestId} Cancellation requested from VS Code after ${eventCount} events (text=${sawTextPart}, toolCall=${sawToolCallPart}, usage=${sawUsagePart})`
+                `[processStreamingResponse] request=${requestId} Cancellation requested after ${eventCount} events (text=${sawTextPart}, toolCall=${sawToolCallPart}, usage=${sawUsagePart})`
             );
             StructuredLogger.warn("stream.cancellation_requested", {
                 requestId,
@@ -888,8 +892,9 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 throw new InactivityTimeoutError(timeoutMs, eventCount);
             }
 
-            // A cancelled stream's output is discarded by VS Code, so only a
-            // stream that ended on its own delivers its buffered tool calls.
+            // A cancelled stream delivers no tool calls: the host drops the parts
+            // reported after it cancels, and after a connector cancel a recovered
+            // call would reach the agent loop and run a tool the user just stopped.
             if (!token.isCancellationRequested && hasBufferedToolCalls(streamingState)) {
                 recoverBufferedToolCalls("stream_completed_without_finish");
             }

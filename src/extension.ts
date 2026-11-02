@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { LiteLLMChatProvider } from "./providers";
+import { ActiveRequestRegistry } from "./providers/activeRequests";
 import {
     registerManageConfigCommand,
     registerReloadModelsCommand,
@@ -9,6 +10,7 @@ import { Logger } from "./utils/logger";
 import { StructuredLogger, CopilotMdManager } from "./observability";
 import { EffortFallbackCache } from "./utils/reasoningEffortFallback";
 import { registerOpenCopilotMdFolderCommand } from "./commands/openCopilotMdFolder";
+import { registerCancelActiveRequestCommand } from "./commands/cancelActiveRequest";
 
 /** Vendor id this extension registers and lists its models under. */
 export const LITELLM_VENDOR = "litellm-connector";
@@ -47,8 +49,9 @@ export function activate(context: vscode.ExtensionContext): void {
     Logger.info(`UA: ${ua}`);
 
     const effortFallbackCache = new EffortFallbackCache();
+    const activeRequests = new ActiveRequestRegistry();
 
-    const activeProvider = new LiteLLMChatProvider(context.secrets, ua, effortFallbackCache);
+    const activeProvider = new LiteLLMChatProvider(context.secrets, ua, effortFallbackCache, activeRequests);
     activeChatProviderInstance = activeProvider; // Store for cleanup on deactivation
 
     // Register provider immediately (do not await config)
@@ -127,6 +130,7 @@ export function activate(context: vscode.ExtensionContext): void {
         );
         context.subscriptions.push(registerReloadModelsCommand(activeProvider));
         context.subscriptions.push(registerOpenCopilotMdFolderCommand());
+        context.subscriptions.push(registerCancelActiveRequestCommand(activeRequests));
         Logger.info("Config command registered.");
     } catch (cmdErr) {
         Logger.error("Failed to register commands", cmdErr);

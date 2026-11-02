@@ -72,6 +72,10 @@
 			{
 				"command": "litellm-connector.openCopilotMdFolder",
 				"title": "LiteLLM: Open .copilotmd Export Folder"
+			},
+			{
+				"command": "litellm-connector.cancelActiveRequest",
+				"title": "LiteLLM: Cancel Active Request"
 			}
 		],
 		"configuration": {

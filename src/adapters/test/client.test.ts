@@ -766,9 +766,7 @@ suite("LiteLLM Client Unit Tests", () => {
         const fetchStub = sandbox.stub(global, "fetch").callsFake(
             (_input: string | URL | Request, init?: RequestInit) =>
                 new Promise<Response>((_resolve, reject) => {
-                    init?.signal?.addEventListener("abort", () =>
-                        reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
-                    );
+                    init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
                 })
         );
 
@@ -782,9 +780,7 @@ suite("LiteLLM Client Unit Tests", () => {
         sandbox.stub(global, "fetch").callsFake(
             (_input: string | URL | Request, init?: RequestInit) =>
                 new Promise<Response>((_resolve, reject) => {
-                    init?.signal?.addEventListener("abort", () =>
-                        reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
-                    );
+                    init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
                 })
         );
         const emitter = new vscode.EventEmitter<void>();

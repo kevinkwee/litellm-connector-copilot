@@ -441,7 +441,7 @@ suite("LiteLLMChatProvider stream attempt", () => {
         const sendStub = sandbox
             .stub(seams, "sendRequestWithRetry")
             .onFirstCall()
-            .resolves(createSeveredSseStream([chatTextFrame("answer")], new Error("terminated")))
+            .resolves(createSeveredSseStream([chatTextFrame("answer")], new TypeError("terminated")))
             .onSecondCall()
             .resolves(new SteppedSseStream([chatFinishFrame("stop"), SSE_DONE_FRAME], []).body);
         const recorder = createPartRecorder();
@@ -464,7 +464,7 @@ suite("LiteLLMChatProvider stream attempt", () => {
         const sendStub = sandbox
             .stub(seams, "sendRequestWithRetry")
             .onFirstCall()
-            .resolves(createSeveredSseStream([chatTextFrame("answer")], new Error("terminated")))
+            .resolves(createSeveredSseStream([chatTextFrame("answer")], new TypeError("terminated")))
             .onSecondCall()
             .resolves(new SteppedSseStream([chatTextFrame("")], []).body)
             .onThirdCall()
@@ -491,7 +491,7 @@ suite("LiteLLMChatProvider stream attempt", () => {
         sandbox
             .stub(seams, "sendRequestWithRetry")
             .onFirstCall()
-            .resolves(createSeveredSseStream([chatTextFrame("answer")], new Error("terminated")))
+            .resolves(createSeveredSseStream([chatTextFrame("answer")], new TypeError("terminated")))
             .onSecondCall()
             .resolves(new SteppedSseStream([chatFinishFrame("length"), SSE_DONE_FRAME], []).body)
             .onThirdCall()
@@ -517,7 +517,7 @@ suite("LiteLLMChatProvider stream attempt", () => {
         sandbox
             .stub(seams, "sendRequestWithRetry")
             .onFirstCall()
-            .resolves(createSeveredSseStream([chatTextFrame("answer")], new Error("terminated")))
+            .resolves(createSeveredSseStream([chatTextFrame("answer")], new TypeError("terminated")))
             .onSecondCall()
             .resolves(
                 new SteppedSseStream([chatReasoningFrame("more thinking"), chatFinishFrame("stop"), SSE_DONE_FRAME], [])
@@ -548,7 +548,7 @@ suite("LiteLLMChatProvider stream attempt", () => {
         sandbox
             .stub(seams, "sendRequestWithRetry")
             .onFirstCall()
-            .resolves(createSeveredSseStream([chatReasoningFrame("thinking")], new Error("terminated")))
+            .resolves(createSeveredSseStream([chatReasoningFrame("thinking")], new TypeError("terminated")))
             .onSecondCall()
             .resolves(new SteppedSseStream([chatFinishFrame("stop"), SSE_DONE_FRAME], []).body)
             .onThirdCall()
@@ -577,7 +577,7 @@ suite("LiteLLMChatProvider stream attempt", () => {
         const sendStub = sandbox
             .stub(seams, "sendRequestWithRetry")
             .onFirstCall()
-            .resolves(createSeveredSseStream([chatTextFrame("answer")], new Error("terminated")))
+            .resolves(createSeveredSseStream([chatTextFrame("answer")], new TypeError("terminated")))
             .onSecondCall()
             .resolves(new SteppedSseStream([completed, SSE_DONE_FRAME], []).body);
         const recorder = createPartRecorder();

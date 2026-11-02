@@ -4,14 +4,18 @@ import * as vscode from "vscode";
 
 import { LiteLLMChatProvider } from "../";
 import { LiteLLMApiError, LiteLLMClient, LiteLLMRateLimitError } from "../../adapters/litellmClient";
+import { ActiveRequestRegistry, type ActiveRequestPhase } from "../activeRequests";
 import { StructuredLogger } from "../../observability/structuredLogger";
-import { CopilotMdManager } from "../../observability";
+import { CopilotMdManager, type CopilotMdEntry } from "../../observability";
 import type { OpenAIChatCompletionRequest } from "../../types";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
 import { createMockSecrets } from "../../test/utils/testMocks";
 import { createMockSSEStream } from "../../test/utils/testStreamUtils";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** Retry backoff long enough that only a cancellation can end the request promptly. */
+const BACKOFF_MS = 5_000;
 
 /**
  * Seeds a provider with a known backend and configuration session so the
@@ -1560,7 +1564,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
                 'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n',
                 'data: {"choices":[{"delta":{"content":"lo wor"}}]}\n\n',
             ],
-            firstAttemptError: new Error("terminated"),
+            firstAttemptError: new TypeError("terminated"),
         });
 
         await provider.provideLanguageModelChatResponse(
@@ -1628,7 +1632,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
                 'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n',
                 'data: {"choices":[{"delta":{"reasoning_content":"thinking hard"}}]}\n\n',
             ],
-            firstAttemptError: new Error("terminated"),
+            firstAttemptError: new TypeError("terminated"),
         });
 
         await provider.provideLanguageModelChatResponse(
@@ -1775,6 +1779,48 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         return undefined;
     }
 
+    /** Waits until `predicate` holds, failing the test after `timeoutMs`. */
+    async function waitFor(predicate: () => boolean, message: string, timeoutMs = 2_000): Promise<void> {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            if (predicate()) {
+                return;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        assert.fail(message);
+    }
+
+    /** Waits until the provider has reported a text part containing `fragment`. */
+    function waitForReportedText(reported: vscode.LanguageModelResponsePart[], fragment: string): Promise<void> {
+        return waitFor(
+            () =>
+                reported.some((part) => part instanceof vscode.LanguageModelTextPart && part.value.includes(fragment)),
+            `the provider never reported text containing "${fragment}"`
+        );
+    }
+
+    /** Every text the provider reported, joined in report order. */
+    function reportedText(reported: vscode.LanguageModelResponsePart[]): string {
+        return reported
+            .filter((part): part is vscode.LanguageModelTextPart => part instanceof vscode.LanguageModelTextPart)
+            .map((part) => part.value)
+            .join("");
+    }
+
+    /** Awaits `work`, failing the test if it has not settled within `timeoutMs`. */
+    async function settleWithin(work: Promise<void>, timeoutMs: number, message: string): Promise<void> {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const deadline = new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+        });
+        try {
+            await Promise.race([work, deadline]);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
     function runChatRequest(
         provider: LiteLLMChatProvider,
         reported: vscode.LanguageModelResponsePart[],
@@ -1862,7 +1908,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
                     );
                 },
                 pull(controller) {
-                    controller.error(new Error("terminated"));
+                    controller.error(new TypeError("terminated"));
                 },
             });
         });
@@ -1902,7 +1948,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
                     controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"par"}}]}\n\n'));
                 },
                 pull(controller) {
-                    controller.error(new Error("terminated"));
+                    controller.error(new TypeError("terminated"));
                 },
             });
         });
@@ -1991,7 +2037,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
             sent.push(request);
             // Spend the budget before failing, so the next attempt is refused.
             await new Promise((resolve) => setTimeout(resolve, 10));
-            throw new Error("terminated");
+            throw new TypeError("terminated");
         });
 
         await runChatRequest(provider, reported);
@@ -2022,7 +2068,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         // A fixed clock keeps the two reads inside markFailure/clipDelay identical.
         sandbox.stub(Date, "now").returns(1_000);
         sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async () => {
-            throw new Error("terminated");
+            throw new TypeError("terminated");
         });
 
         await runChatRequest(provider, reported);
@@ -2148,7 +2194,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
                         controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"\\n\\n"}}]}\n\n'));
                     },
                     pull(controller) {
-                        controller.error(new Error("terminated"));
+                        controller.error(new TypeError("terminated"));
                     },
                 });
             }
@@ -2200,9 +2246,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         sandbox.stub(global, "fetch").callsFake(
             (_input: string | URL | Request, init?: RequestInit) =>
                 new Promise<Response>((_resolve, reject) => {
-                    init?.signal?.addEventListener("abort", () =>
-                        reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
-                    );
+                    init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
                 })
         );
 
@@ -2212,6 +2256,348 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         assert.ok(text, "the timeout must surface as an error text part");
         assert.match(text, /litellm-connector\.headersTimeout/);
         assert.match(text, /after 5ms/, "the connector timer produced the failure, not the runner timeout");
+    });
+
+    /**
+     * Cancels a request from the connector once its stream has delivered one delta,
+     * and returns the stubs that recorded the outcome. The stream never finishes on
+     * its own, so the cancellation is the only thing that can end this request.
+     */
+    async function runConnectorCancelledRequest(): Promise<{
+        registry: ActiveRequestRegistry;
+        reported: vscode.LanguageModelResponsePart[];
+        phaseAtCancel: ActiveRequestPhase | undefined;
+        metricStub: sinon.SinonStub;
+        exportStub: sinon.SinonStub;
+        chatCalls: number;
+    }> {
+        const registry = new ActiveRequestRegistry();
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent, undefined, registry);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const encoder = new TextEncoder();
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const metricStub = sandbox.stub(LiteLLMTelemetry, "reportMetric");
+        const exportStub = sandbox.stub(CopilotMdManager.instance, "exportEntry").resolves(undefined);
+        let chatCalls = 0;
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async () => {
+            chatCalls += 1;
+            return new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+                },
+            });
+        });
+
+        const host = new vscode.CancellationTokenSource();
+        const request = runChatRequest(provider, reported, host.token).catch(() => undefined);
+        let phaseAtCancel: ActiveRequestPhase | undefined;
+        try {
+            // The cancel has to land mid-stream rather than during request construction.
+            await waitForReportedText(reported, "partial");
+            const [entry] = registry.list();
+            assert.ok(entry, "the live request must be listed while it streams");
+            phaseAtCancel = entry.phase;
+            entry.cancel();
+            await request;
+        } finally {
+            // Settles the request if the precondition failed before the cancel landed.
+            host.cancel();
+            await request;
+            host.dispose();
+        }
+
+        return { registry, reported, phaseAtCancel, metricStub, exportStub, chatCalls };
+    }
+
+    /** The entry the provider wrote to the `.copilotmd` transcript. */
+    function transcriptOf(exportStub: sinon.SinonStub): CopilotMdEntry {
+        const transcript = exportStub.firstCall?.args[0] as CopilotMdEntry | undefined;
+        assert.ok(transcript, "the turn must be written to the transcript");
+        return transcript;
+    }
+
+    test("ends the turn with a notice when the connector cancels the request", async () => {
+        const { reported } = await runConnectorCancelledRequest();
+
+        assert.match(reportedText(reported), /cancelled from the LiteLLM connector/i);
+    });
+
+    test("does not retry a request the connector cancelled", async () => {
+        const { chatCalls } = await runConnectorCancelledRequest();
+
+        assert.strictEqual(chatCalls, 1);
+    });
+
+    test("lists a request as streaming once its stream starts", async () => {
+        const { phaseAtCancel } = await runConnectorCancelledRequest();
+
+        assert.strictEqual(phaseAtCancel, "streaming");
+    });
+
+    test("reports a connector cancellation as cancelled, not failed", async () => {
+        const { metricStub } = await runConnectorCancelledRequest();
+
+        const statuses = metricStub.getCalls().map((call) => (call.args[0] as { status?: string }).status);
+        assert.deepStrictEqual(statuses, ["cancelled"]);
+    });
+
+    test("records a connector cancellation in the transcript", async () => {
+        const { exportStub } = await runConnectorCancelledRequest();
+
+        const transcript = transcriptOf(exportStub);
+        assert.strictEqual(transcript.status, "canceled");
+        assert.match(String(transcript.statusReason), /Cancelled from the LiteLLM connector/);
+    });
+
+    test("keeps the connector notice out of the transcript", async () => {
+        const { exportStub } = await runConnectorCancelledRequest();
+
+        // The transcript records what the model produced, before the notice is added.
+        const parts = transcriptOf(exportStub).responseParts;
+        assert.deepStrictEqual(
+            parts.map((part) => (part instanceof vscode.LanguageModelTextPart ? part.value : "<not text>")),
+            ["partial"]
+        );
+    });
+
+    test("releases its host cancellation listener when the request ends", async () => {
+        let registrations = 0;
+        let disposeCalls = 0;
+        const hostToken: vscode.CancellationToken = {
+            isCancellationRequested: false,
+            onCancellationRequested: () => {
+                registrations += 1;
+                return {
+                    dispose: (): void => {
+                        disposeCalls += 1;
+                    },
+                };
+            },
+        };
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        stubConfigAndDiscovery(sandbox, provider);
+        stubCleanChatStream(sandbox, []);
+        const reported: vscode.LanguageModelResponsePart[] = [];
+
+        await runChatRequest(provider, reported, hostToken);
+
+        assert.ok(registrations > 0, "the request must register a host listener");
+        assert.strictEqual(disposeCalls, registrations, "every listener left on the host token must be released");
+    });
+
+    test("leaves the registry empty after a connector cancellation", async () => {
+        const { registry } = await runConnectorCancelledRequest();
+
+        assert.deepStrictEqual(registry.list(), []);
+    });
+
+    /**
+     * Runs a request whose attempts end the way `attemptBehaviour` decides, and
+     * cancels it from the connector while the provider sits in its backoff. Only a
+     * cancellation that reaches that sleep can end the turn inside 500 ms.
+     */
+    async function runBackoffCancelledRequest(
+        attemptBehaviour: () => ReadableStream<Uint8Array>
+    ): Promise<{ reported: vscode.LanguageModelResponsePart[]; chatCalls: number }> {
+        const registry = new ActiveRequestRegistry();
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent, undefined, registry);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: BACKOFF_MS,
+            emptyResponseRetries: 3,
+            emptyResponseRetryDelayMs: BACKOFF_MS,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        let chatCalls = 0;
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async () => {
+            chatCalls += 1;
+            return attemptBehaviour();
+        });
+
+        const host = new vscode.CancellationTokenSource();
+        const request = runChatRequest(provider, reported, host.token).catch(() => undefined);
+        try {
+            await waitFor(() => chatCalls === 1, "the first attempt was never sent");
+            // The cancel has to land once the backoff is armed. Cancelling before it
+            // starts would end the turn without ever exercising the sleep.
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            const [entry] = registry.list();
+            assert.ok(entry, "a request waiting to retry must still be listed");
+            entry.cancel();
+            await settleWithin(request, 500, "the backoff ignored the cancellation");
+        } finally {
+            host.cancel();
+            await request;
+            host.dispose();
+        }
+
+        return { reported, chatCalls };
+    }
+
+    test("ends the transport backoff at once when the connector cancels", async () => {
+        const { reported } = await runBackoffCancelledRequest(() => {
+            throw new TypeError("terminated");
+        });
+
+        assert.match(reportedText(reported), /cancelled from the LiteLLM connector/i);
+    });
+
+    test("sends no further request after a backoff cancel", async () => {
+        const { chatCalls } = await runBackoffCancelledRequest(() => {
+            throw new TypeError("terminated");
+        });
+
+        assert.strictEqual(chatCalls, 1);
+    });
+
+    test("ends the reasoning-only backoff at once when the connector cancels", async () => {
+        const encoder = new TextEncoder();
+        const { reported } = await runBackoffCancelledRequest(
+            () =>
+                new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.enqueue(
+                            encoder.encode('data: {"choices":[{"delta":{"reasoning_content":"thought"}}]}\n\n')
+                        );
+                        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                        controller.close();
+                    },
+                })
+        );
+
+        assert.match(reportedText(reported), /cancelled from the LiteLLM connector/i);
+    });
+
+    test("cancels a request that is still waiting for response headers", async () => {
+        const registry = new ActiveRequestRegistry();
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent, undefined, registry);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            headersTimeoutMs: 60_000,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const host = new vscode.CancellationTokenSource();
+        // A request that only settles when its signal is aborted, so nothing but a
+        // cancellation that reaches the client can end it.
+        let fetchStarted = false;
+        let fetchSignal: AbortSignal | undefined;
+        sandbox.stub(global, "fetch").callsFake(
+            (_input: string | URL | Request, init?: RequestInit) =>
+                new Promise<Response>((_resolve, reject) => {
+                    fetchSignal = init?.signal ?? undefined;
+                    fetchStarted = true;
+                    fetchSignal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+                })
+        );
+
+        const request = runChatRequest(provider, reported, host.token).catch(() => undefined);
+        try {
+            await waitFor(() => fetchStarted, "the request never reached fetch");
+            const [entry] = registry.list();
+            assert.ok(entry, "a request that has not received headers must still be listed");
+            entry.cancel();
+
+            // Asserted directly, so a wiring that leaves the fetch with the host
+            // token fails here instead of hanging until the runner gives up.
+            await waitFor(() => fetchSignal?.aborted === true, "the fetch was never aborted", 500);
+            await request;
+
+            assert.match(reportedText(reported), /cancelled from the LiteLLM connector/i);
+            assert.deepStrictEqual(registry.list(), []);
+        } finally {
+            // Settles the request if an assertion above failed before the cancel
+            // reached the client.
+            host.cancel();
+            await request;
+            host.dispose();
+        }
+    });
+
+    test("reports the sending phase again when a retry starts a new header wait", async () => {
+        const registry = new ActiveRequestRegistry();
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent, undefined, registry);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 2,
+            networkRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const encoder = new TextEncoder();
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        const phasesAtSend: (string | undefined)[] = [];
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async () => {
+            phasesAtSend.push(registry.list()[0]?.phase);
+            if (phasesAtSend.length === 1) {
+                // A stream that dies without output, so the retry resends it.
+                return new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.error(new TypeError("terminated"));
+                    },
+                });
+            }
+            return new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"done"}}]}\n\n'));
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                },
+            });
+        });
+
+        await runChatRequest(provider, reported);
+
+        assert.deepStrictEqual(
+            phasesAtSend,
+            ["sending", "sending"],
+            "the second attempt must be listed as waiting for headers, not as streaming"
+        );
+    });
+
+    test("leaves the registry empty after a failed request", async () => {
+        const registry = new ActiveRequestRegistry();
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent, undefined, registry);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async () => {
+            throw new LiteLLMApiError(400, "bad request", "LiteLLM API error: 400 Bad Request\nbad request");
+        });
+
+        await runChatRequest(provider, reported);
+
+        assert.deepStrictEqual(registry.list(), [], "a thrown error must not leave a phantom entry");
     });
 
     test("retryBudgetMs 0 leaves the attempt count as the only bound", async () => {
@@ -2231,7 +2617,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         const sent: OpenAIChatCompletionRequest[] = [];
         sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async (request: OpenAIChatCompletionRequest) => {
             sent.push(request);
-            throw new Error("terminated");
+            throw new TypeError("terminated");
         });
 
         await runChatRequest(provider, reported);
@@ -2356,7 +2742,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
                     controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"a"}}]}\n\n'));
                 },
                 pull(controller) {
-                    controller.error(new Error("terminated"));
+                    controller.error(new TypeError("terminated"));
                 },
             });
         sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async (request: OpenAIChatCompletionRequest) => {
@@ -2444,7 +2830,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
                     controller.enqueue(encoder.encode(`data: {"choices":[{"delta":{"content":"${chunk}"}}]}\n\n`));
                 },
                 pull(controller) {
-                    controller.error(new Error("terminated"));
+                    controller.error(new TypeError("terminated"));
                 },
             });
         const doneStream = () =>
@@ -2508,7 +2894,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
                     controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"a"}}]}\n\n'));
                 },
                 pull(controller) {
-                    controller.error(new Error("terminated"));
+                    controller.error(new TypeError("terminated"));
                 },
             });
         });

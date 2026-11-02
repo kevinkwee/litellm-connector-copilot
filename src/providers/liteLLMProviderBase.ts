@@ -25,6 +25,7 @@ import { Transport } from "./base/transport";
 import type { RequestBuilderDeps, TransportDeps } from "./base/types";
 import type { ToolNameMapping } from "../utils/toolNameUtils";
 import { LiteLLMProviderRegistry } from "./liteLLMProviderRegistry";
+import { ActiveRequestRegistry } from "./activeRequests";
 
 /**
  * Shared orchestration base for all LiteLLM-backed VS Code language model providers.
@@ -78,7 +79,8 @@ export abstract class LiteLLMProviderBase {
     constructor(
         protected readonly secrets: vscode.SecretStorage,
         protected readonly userAgent: string,
-        effortFallbackCache?: EffortFallbackCache
+        effortFallbackCache?: EffortFallbackCache,
+        protected readonly activeRequests: ActiveRequestRegistry = new ActiveRequestRegistry()
     ) {
         this._configManager = new ConfigManager(secrets);
         this._effortFallbackCache = effortFallbackCache ?? new EffortFallbackCache();

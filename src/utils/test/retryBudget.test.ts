@@ -91,7 +91,7 @@ suite("RetryBudget", () => {
 
 suite("retryBudgetError", () => {
     test("names the setting that bounded the retries", () => {
-        const error = retryBudgetError(300_000, new Error("terminated"));
+        const error = retryBudgetError(300_000, new TypeError("terminated"));
 
         assert.match(error.message, /litellm-connector\.retryBudgetSeconds/);
         assert.match(error.message, /300s/);
@@ -121,19 +121,19 @@ suite("retryBudgetError", () => {
     });
 
     test("renders a fractional budget without losing it", () => {
-        const error = retryBudgetError(400, new Error("terminated"));
+        const error = retryBudgetError(400, new TypeError("terminated"));
 
         assert.match(error.message, /400ms/);
     });
 
     test("renders a whole-second budget as seconds", () => {
-        const error = retryBudgetError(90_000, new Error("terminated"));
+        const error = retryBudgetError(90_000, new TypeError("terminated"));
 
         assert.match(error.message, /90s/);
     });
 
     test("renders a fractional second budget with one decimal", () => {
-        const error = retryBudgetError(1_500, new Error("terminated"));
+        const error = retryBudgetError(1_500, new TypeError("terminated"));
 
         assert.match(error.message, /1\.5s/);
     });

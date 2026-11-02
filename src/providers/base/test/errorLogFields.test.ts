@@ -98,7 +98,7 @@ suite("describeFailureForLog", () => {
     });
 
     test("omits a status the error does not carry", () => {
-        assert.strictEqual(describeFailureForLog(new Error("terminated")), "Error");
+        assert.strictEqual(describeFailureForLog(new TypeError("terminated")), "TypeError");
     });
 
     test("names a give-up rate limit by its status", () => {
