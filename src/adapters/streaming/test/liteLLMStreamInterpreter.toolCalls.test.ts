@@ -603,6 +603,109 @@ suite("Dropped tool call buffer logging", () => {
     });
 });
 
+suite("Tool call drops", () => {
+    test("records a /responses call dropped for unparseable arguments", () => {
+        const state = createInitialStreamingState("req-dropped");
+
+        const parts = interpretStreamEvent(
+            {
+                type: "response.output_item.done",
+                item: { type: "function_call", call_id: "call-bad", name: "search_files", arguments: "{not json" },
+            },
+            state
+        );
+
+        assert.strictEqual(
+            parts.filter((part) => part.type === "tool_call").length,
+            0,
+            "an unreadable call must not reach VS Code"
+        );
+        assert.deepStrictEqual(state.droppedToolCalls, [{ id: "call-bad", name: "search_files" }]);
+    });
+
+    test("records a /responses call dropped while flushing for a completed response", () => {
+        const state = createInitialStreamingState("req-completed");
+
+        interpretStreamEvent(
+            {
+                type: "response.output_item.delta",
+                item: { type: "function_call", call_id: "call-keyed", name: "search_files", arguments: "{not json" },
+            },
+            state
+        );
+        interpretStreamEvent({ type: "response.completed", response: {} }, state);
+
+        assert.deepStrictEqual(
+            state.droppedToolCalls.map((call) => call.name),
+            ["search_files"],
+            "the completed-response flush records what it drops"
+        );
+    });
+
+    test("records an anonymous /responses call dropped on output_item.done", () => {
+        const state = createInitialStreamingState("req-anon-done");
+
+        interpretStreamEvent(
+            {
+                type: "response.output_item.done",
+                item: { type: "function_call", name: "search_files", arguments: "{not json" },
+            },
+            state
+        );
+
+        assert.deepStrictEqual(state.droppedToolCalls, [{ id: "anonymous", name: "search_files" }]);
+    });
+
+    test("records every /responses call dropped while flushing buffers", () => {
+        const state = createInitialStreamingState("req-flush");
+
+        state.anonymousResponseToolName = "search_files";
+        state.anonymousResponseToolArgs = "{not json";
+        state.responseToolCallBuffers.set("call-keyed", { id: "call-keyed", name: "read_file", args: "[1," });
+        state.responseToolCallOrder.push("call-keyed");
+
+        const parts = flushPendingBuffers(state);
+
+        assert.strictEqual(parts.filter((part) => part.type === "tool_call").length, 0);
+        assert.deepStrictEqual(state.droppedToolCalls.map((call) => call.name).sort(), ["read_file", "search_files"]);
+    });
+
+    test("records a chat call dropped for unparseable arguments", () => {
+        const state = createInitialStreamingState("req-dropped-chat");
+
+        interpretStreamEvent(
+            {
+                choices: [
+                    {
+                        delta: {
+                            tool_calls: [{ index: 0, id: "call-x", function: { name: "read_file", arguments: "" } }],
+                        },
+                    },
+                ],
+            },
+            state
+        );
+        const parts = interpretStreamEvent(
+            {
+                choices: [
+                    {
+                        delta: { tool_calls: [{ index: 0, function: { arguments: "{not json" } }] },
+                        finish_reason: "stop",
+                    },
+                ],
+            },
+            state
+        );
+
+        assert.strictEqual(parts.filter((part) => part.type === "tool_call").length, 0);
+        assert.deepStrictEqual(
+            state.droppedToolCalls.map((call) => call.name),
+            ["read_file"],
+            "the dropped call is recorded so the turn can explain it"
+        );
+    });
+});
+
 suite("Declared tool name mapping", () => {
     test("emits the declared name when the wire name was sanitized", () => {
         const state = createInitialStreamingState("req-names", new Map([["search_files", "search files"]]));

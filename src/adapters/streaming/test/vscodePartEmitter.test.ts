@@ -16,12 +16,9 @@ suite("vscodePartEmitter", () => {
         sandbox.restore();
     });
 
-    test("logs warning and emits empty args on tool-call argument parse failure", () => {
+    test("logs the dropped call", () => {
         const warnStub = sandbox.stub(Logger, "warn");
-        const reported: unknown[] = [];
-        const progress = {
-            report: (p: unknown) => reported.push(p),
-        } as vscode.Progress<vscode.LanguageModelResponsePart>;
+        const progress = { report: () => undefined } as vscode.Progress<vscode.LanguageModelResponsePart>;
 
         emitPartsToVSCode([{ type: "tool_call", index: 0, id: "call_1", name: "t1", args: "{invalid json" }], progress);
 
@@ -31,21 +28,44 @@ suite("vscodePartEmitter", () => {
         const fields = callArgs[1] as Record<string, unknown>;
         assert.strictEqual(fields.toolName, "t1");
         assert.strictEqual(fields.id, "call_1");
-
-        assert.strictEqual(reported.length, 1);
-        assert.ok(reported[0] instanceof vscode.LanguageModelToolCallPart);
-        const part = reported[0] as vscode.LanguageModelToolCallPart;
-        assert.strictEqual(part.name, "t1");
-        assert.strictEqual(part.callId, "call_1");
-        assert.deepStrictEqual(part.input, {});
     });
 
-    test("logs an error-level structured event on tool-call argument parse failure", () => {
-        const errorStub = sandbox.stub(StructuredLogger, "error");
+    test("returns the dropped calls so the caller can explain the loss", () => {
+        const progress = { report: () => undefined } as vscode.Progress<vscode.LanguageModelResponsePart>;
+
+        const dropped = emitPartsToVSCode(
+            [{ type: "tool_call", index: 0, id: "call_1", name: "t1", args: "{invalid json" }],
+            progress
+        );
+
+        assert.deepStrictEqual(dropped, [{ id: "call_1", name: "t1" }]);
+    });
+
+    test("delivers the readable parts before and after a dropped call", () => {
         const reported: unknown[] = [];
         const progress = {
             report: (p: unknown) => reported.push(p),
         } as vscode.Progress<vscode.LanguageModelResponsePart>;
+
+        emitPartsToVSCode(
+            [
+                { type: "text", value: "before" },
+                { type: "tool_call", index: 0, id: "call_1", name: "t1", args: "{invalid json" },
+                { type: "text", value: "after" },
+            ],
+            progress
+        );
+
+        assert.deepStrictEqual(
+            reported.map((part) => (part as { value?: string }).value),
+            ["before", "after"],
+            "a dropped call must not cost the text beside it"
+        );
+    });
+
+    test("logs an error-level structured event on tool-call argument parse failure", () => {
+        const errorStub = sandbox.stub(StructuredLogger, "error");
+        const progress = { report: () => undefined } as vscode.Progress<vscode.LanguageModelResponsePart>;
 
         emitPartsToVSCode([{ type: "tool_call", index: 0, id: "call_1", name: "t1", args: "{invalid json" }], progress);
 
@@ -55,8 +75,6 @@ suite("vscodePartEmitter", () => {
         assert.strictEqual(fields.toolName, "t1");
         assert.strictEqual(fields.argsLength, "{invalid json".length);
         assert.strictEqual(fields.argsPreview, "{invalid json");
-        assert.strictEqual(reported.length, 1);
-        assert.deepStrictEqual((reported[0] as vscode.LanguageModelToolCallPart).input, {});
     });
 
     test("reports every data part without dropping any", () => {

@@ -2,7 +2,7 @@ import type { CancellationToken, LanguageModelResponsePart, Progress } from "vsc
 import { LanguageModelTextPart } from "vscode";
 
 import { tryParseJSONObject } from "../../utils";
-import { describeStoppedEarly } from "../../utils/connectorNotice";
+import { describeDroppedToolCalls, describeStoppedEarly } from "../../utils/connectorNotice";
 import { Logger } from "../../utils/logger";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import { toErrorLogFields } from "../base/errorLogFields";
@@ -90,7 +90,9 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
                 }
             }
         }
-        emitPartsToVSCode(parts, progress);
+        // The state also holds the drops the interpreter made, so one notice can name
+        // them all.
+        streamingState.droppedToolCalls.push(...emitPartsToVSCode(parts, progress));
     };
 
     // A stream that stops without a finish frame, whether it closes cleanly
@@ -111,6 +113,24 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
         return recoveredToolCalls.length;
     };
 
+    /**
+     * Tells the user about the tool calls dropped for unreadable arguments. They never
+     * ran, so without it the turn would read as a complete answer. Each attempt owns its
+     * own state, so the notice is reported once per attempt and a replaced attempt's drops
+     * are discarded with it.
+     */
+    const reportDroppedToolCalls = (): void => {
+        if (streamingState.droppedToolCalls.length === 0) {
+            return;
+        }
+        Logger.warn(`[chatStream] request=${requestId} ${streamingState.droppedToolCalls.length} tool call(s) dropped`);
+        StructuredLogger.warn("stream.tool_calls_dropped", {
+            requestId,
+            eventCount,
+            droppedToolCalls: streamingState.droppedToolCalls.map((call) => ({ id: call.id, name: call.name })),
+        });
+        progress.report(new LanguageModelTextPart(describeDroppedToolCalls(streamingState.droppedToolCalls)));
+    };
     const resetWatchdog = () => {
         if (watchdog) {
             clearTimeout(watchdog);
@@ -206,13 +226,18 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
             recoverBufferedToolCalls("stream_completed_without_finish");
         }
 
-        // Reasoning-only detection: a cleanly-completed stream that emitted
-        // ONLY thinking parts (plus perhaps a usage data part) contains
-        // nothing the agent loop can act on. VS Code renders it as
-        // "no response was returned" and kills the turn. Surface it to the
-        // retry loop as resumable: the partial reasoning is appended to the
-        // request so the model continues its thought.
-        if (eventCount > 0 && !sawTextPart && !sawToolCallPart) {
+        // `sawNormalFinish` is the `stop` proof, and it is the only proof this flag reads.
+        // A chat `tool_calls` finish never needs it: that call set `sawToolCallPart` before
+        // the emitter dropped it, so the reasoning-only guard below already leaves that turn
+        // alone. Apart from that finish, a call dropped without a `stop` was cut short by a
+        // length limit, a content filter or a closed stream.
+        const dropIsTheAnswer = streamingState.droppedToolCalls.length > 0 && sawNormalFinish;
+
+        // Reasoning-only detection needs all of: an event, no text, no call part either way,
+        // and no drop the `stop` proved. A turn that streamed text, or that produced such a
+        // drop, continues to its notices instead. It runs before the stop notice because a
+        // retried turn must not carry the notice of the attempt it replaced.
+        if (eventCount > 0 && !sawTextPart && !sawToolCallPart && !dropIsTheAnswer) {
             Logger.warn(
                 `[chatStream] request=${requestId} Reasoning-only stream detected (${eventCount} events, ` +
                     `no text/tool parts); surfacing as resumable empty-content error`
@@ -225,9 +250,8 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
             throw new ReasoningOnlyError(eventCount, reasoningChars, sawNormalFinish);
         }
 
-        // Deliberately after the reasoning-only check: if the model only
-        // reasoned before hitting its limit, the retry path is the better
-        // answer than a notice about a response that never appeared.
+        // The stop notice comes first: it names the cause, and the drop notice reads
+        // as a consequence of it.
         if (stoppedEarly) {
             Logger.warn(`[chatStream] request=${requestId} Stream stopped by finish reason "${stoppedEarly.reason}"`);
             StructuredLogger.warn("stream.stopped_early", {
@@ -237,6 +261,8 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
             });
             progress.report(new LanguageModelTextPart(stoppedEarly.notice));
         }
+
+        reportDroppedToolCalls();
     } catch (error: unknown) {
         // Every error leaving this function is handled by the caller, which
         // retries the recoverable sentinels and logs the final outcome. Log the
@@ -264,6 +290,7 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
         if (isStreamEndError && hasBufferedToolCalls(streamingState)) {
             const recoveredCount = recoverBufferedToolCalls("stream_incomplete");
             if (recoveredCount > 0) {
+                reportDroppedToolCalls();
                 return;
             }
         }

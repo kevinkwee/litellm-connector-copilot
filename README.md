@@ -48,7 +48,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 ### Structured log persistence
 - The "LiteLLM Structured" output channel is mirrored to daily JSONL files in extension global storage with 14-day retention (toggle via `litellm-connector.debug.structuredLogFile.enabled`), so diagnostics survive VS Code's output-channel rotation.
 - The file mirror stays bounded: lines are counted in bytes, expired files are pruned at startup and at every rollover, and the whole folder is capped at 256 MB, deleting the oldest files first and never the file being written.
-- Corrupt tool-call arguments now emit error-level structured events at every detection point (finish gate, recovery flush, emission fallback) with argument length and a preview, instead of leaving no durable evidence.
+- Corrupt tool-call arguments now emit error-level structured events at the chat-completions finish gate, the recovery flush and VS Code part emission, with argument length and a preview, instead of leaving no durable evidence.
 - Log-level pre-filtering guards on hot paths avoid message-formatting costs during long streaming responses.
 
 ### Model reload
@@ -64,6 +64,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Reasoning-only streaming responses are retried instead of surfacing as empty replies.
 - Cancellation and watchdog aborts are surfaced correctly on clean stream completion instead of being masked by retry exhaustion.
 - Complete tool calls still buffered when a stream ends without a finish frame are delivered instead of discarded, and each concurrent session keeps its own stream state, so one session's tool calls never reach another.
+- A tool call whose arguments cannot be read is dropped, so no tool ever executes on input the model did not produce. When the attempt streamed no text and delivered no other call, and a length limit, a content filter or a closed stream cut the arguments short, the turn is retried as a reasoning-only reply. Otherwise a turn that completes ends with a notice naming the tools that did not run.
 - An abandoned upstream response body is cancelled, so a retried or failed request stops generating and billing.
 - Configurable 429 retry budget via `litellm-connector.rateLimitMaxDelaySeconds`, the most time one call to the proxy spends waiting between rate-limit retries (default 120s). Without `Retry-After`, waits start at 0.5s and double, each at most 60s. A `Retry-After` that fits in the time left is honored exactly, and a longer one fails that call at once with a chat notice naming the setting instead of waiting for a retry that would be refused. Each wait is logged as `[rateLimitRetry]` in the output channel and as `request.rate_limit_retry` in the structured log.
 - `networkRetries` and `networkRetryDelayMs` bound the resume attempts for dropped connections and transient upstream errors.

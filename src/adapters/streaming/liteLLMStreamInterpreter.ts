@@ -5,6 +5,7 @@ import { StructuredLogger } from "../../observability/structuredLogger";
 import { redactedThinkingMetadata, signedThinkingMetadata } from "../../utils/thinkingBlocks";
 import { normalizeUsagePayload, type RawUsagePayload } from "./usagePayload";
 import { extractUpstreamStreamError } from "./upstreamStreamError";
+import type { DroppedToolCall } from "../../types";
 
 /**
  * Discriminated union of response parts the stream interpreter emits toward
@@ -56,6 +57,12 @@ export interface StreamingState {
      */
     thinkingBlockCounter: number;
     currentThinkingBlockId: string | undefined;
+    /**
+     * Calls dropped because their arguments could not be parsed. The stream reader names
+     * them in a notice when the attempt completes; an attempt that throws, for a retry or a
+     * failure, discards them.
+     */
+    readonly droppedToolCalls: DroppedToolCall[];
 }
 
 export function createInitialStreamingState(
@@ -74,6 +81,7 @@ export function createInitialStreamingState(
         anonymousResponseToolArgs: "",
         thinkingBlockCounter: 0,
         currentThinkingBlockId: undefined,
+        droppedToolCalls: [],
     };
 }
 
@@ -140,9 +148,9 @@ function requestTag(state: StreamingState): string {
 type DroppedToolCallReason = "replaced_by_new_id" | "incomplete_at_finish" | "invalid_json_args";
 
 /**
- * Logs a chat-completions tool call discarded before it reaches VS Code. Without
- * this log the loss only surfaces downstream, as a missing tool call or a stream
- * misread as reasoning-only.
+ * Logs a chat-completions tool call discarded before it reaches VS Code. Without this
+ * log the drop notice names the tool but gives no reason, index, finish reason or
+ * argument length.
  */
 function logDroppedToolCallBuffer(
     state: StreamingState,
@@ -167,10 +175,14 @@ function logDroppedToolCallBuffer(
 }
 
 /**
- * Returns a tool call part for each deliverable chat-completions buffer, logs
- * undeliverable ones as dropped, skips ids already emitted, and clears the
- * buffers. A call with invalid JSON arguments is deliverable only at a
- * `tool_calls` finish, where the model declares its calls complete.
+ * Returns a tool call part for each deliverable chat-completions buffer, logs the
+ * undeliverable ones, skips ids already emitted, and clears the buffers.
+ *
+ * A call with invalid JSON arguments is returned only at a `tool_calls` finish, where
+ * the model declares its calls complete, and the emitter drops it there because its
+ * arguments still do not parse. At any other finish it is dropped here and recorded on
+ * the state, and the stream reader judges from the finish whether the drop answered the
+ * turn.
  */
 function settleChatToolCallBuffers(state: StreamingState, finishReason: string): EmittedPart[] {
     const parts: EmittedPart[] = [];
@@ -199,6 +211,7 @@ function settleChatToolCallBuffers(state: StreamingState, finishReason: string):
         }
         if (!isJsonValid && finishReason !== "tool_calls") {
             logDroppedToolCallBuffer(state, "invalid_json_args", index, buffer, finishReason);
+            state.droppedToolCalls.push({ id: buffer.id, name: buffer.name });
             continue;
         }
         parts.push({ type: "tool_call", index, id: buffer.id, name: buffer.name, args: buffer.args });
@@ -325,7 +338,6 @@ function flushResponsesToolCalls(state: StreamingState, toolCallParts: EmittedPa
                 });
                 flushedToolCallCount++;
             } catch {
-                // drop malformed tool call
                 Logger.warn(
                     `[interpretStreamEvent] ${requestTag(state)} Dropped malformed tool call args for ${buffer.name}`
                 );
@@ -335,6 +347,7 @@ function flushResponsesToolCalls(state: StreamingState, toolCallParts: EmittedPa
                     id: buffer.id,
                     argsLength: buffer.args.length,
                 });
+                state.droppedToolCalls.push({ id: buffer.id, name: buffer.name });
             }
         }
     }
@@ -731,8 +744,8 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                             argsLength: args.length,
                         });
                     } catch {
-                        // drop malformed tool call
                         Logger.warn(`[interpretStreamEvent] Dropped malformed tool call ${name} on output_item.done`);
+                        state.droppedToolCalls.push({ id: callId, name });
                     }
                 }
                 state.responseToolCallBuffers.delete(callId);
@@ -758,7 +771,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
                             argsLength: args.length,
                         });
                     } catch {
-                        // drop malformed tool call
+                        state.droppedToolCalls.push({ id: "anonymous", name });
                         Logger.warn(`[interpretStreamEvent] Dropped malformed anonymous tool call ${name}`);
                     }
                 }
@@ -845,6 +858,9 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
  * - The chat-completions tool calls a non-`tool_calls` finish frame would emit
  * - A finish part with reason "incomplete_stream_end"
  *
+ *
+ * A call with unreadable arguments is logged and recorded on `droppedToolCalls`
+ * instead of emitted, so the turn can explain what did not run.
  * Returns an array of emitted parts in emission order.
  */
 export function flushPendingBuffers(state: StreamingState): EmittedPart[] {
@@ -877,6 +893,7 @@ export function flushPendingBuffers(state: StreamingState): EmittedPart[] {
                 argsLength: buffer.args.length,
                 argsPreview: buffer.args.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS),
             });
+            state.droppedToolCalls.push({ id, name: buffer.name });
         }
     }
     state.responseToolCallBuffers.clear();
@@ -903,6 +920,10 @@ export function flushPendingBuffers(state: StreamingState): EmittedPart[] {
                 toolName: state.anonymousResponseToolName,
                 argsLength: state.anonymousResponseToolArgs.length,
                 argsPreview: state.anonymousResponseToolArgs.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS),
+            });
+            state.droppedToolCalls.push({
+                id: `anonymous_${state.requestId ?? "stream"}`,
+                name: state.anonymousResponseToolName,
             });
         }
     }

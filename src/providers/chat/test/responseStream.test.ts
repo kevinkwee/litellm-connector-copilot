@@ -426,4 +426,180 @@ suite("processResponseStream", () => {
 
         assert.strictEqual(disposed.length, 1, "the cancellation listener must be disposed exactly once");
     });
+
+    test("drops a tool call whose arguments do not parse and explains it", async () => {
+        const { parts, progress } = createPartRecorder();
+        const stream = new SteppedSseStream(
+            [
+                chatToolCallHeaderFrame("call_bad", "read_file"),
+                chatToolCallArgumentsFrame("{not json"),
+                chatFinishFrame("tool_calls"),
+                SSE_DONE_FRAME,
+            ],
+            []
+        ).body;
+
+        await processResponseStream({
+            responseBody: stream,
+            progress,
+            token: new vscode.CancellationTokenSource().token,
+            requestId: REQUEST_ID,
+            inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+        });
+
+        assert.deepStrictEqual(collectToolCalls(parts), [], "the tool must not run on guessed arguments");
+        assert.match(collectResponseText(parts), /\[litellm-connector\].*"read_file" tool was not run/);
+    });
+
+    test("treats a dropped call as the answer when the stream stopped", async () => {
+        // Nothing but an unreadable call arrives, and the stop finish proves the model
+        // finished writing it, so the turn is answered rather than resumed.
+        const { parts, progress } = createPartRecorder();
+        const stream = new SteppedSseStream(
+            [
+                chatToolCallHeaderFrame("call_bad", "read_file"),
+                chatToolCallArgumentsFrame("{not json"),
+                chatFinishFrame("stop"),
+                SSE_DONE_FRAME,
+            ],
+            []
+        ).body;
+
+        await processResponseStream({
+            responseBody: stream,
+            progress,
+            token: new vscode.CancellationTokenSource().token,
+            requestId: REQUEST_ID,
+            inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+        });
+
+        assert.match(collectResponseText(parts), /was not run/);
+    });
+
+    test("explains a /responses call dropped for unreadable arguments", async () => {
+        const { parts, progress } = createPartRecorder();
+        const done = JSON.stringify({
+            type: "response.output_item.done",
+            item: { type: "function_call", call_id: "call_bad", name: "search_files", arguments: "{not json" },
+        });
+        const completed = JSON.stringify({ type: "response.completed", response: {} });
+        const stream = new SteppedSseStream([done, completed, SSE_DONE_FRAME], []).body;
+
+        await processResponseStream({
+            responseBody: stream,
+            progress,
+            token: new vscode.CancellationTokenSource().token,
+            requestId: REQUEST_ID,
+            inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+        });
+
+        assert.deepStrictEqual(collectToolCalls(parts), []);
+        assert.match(collectResponseText(parts), /"search_files" tool was not run/);
+    });
+
+    test("reports the stop notice before the dropped-call notice", async () => {
+        const { parts, progress } = createPartRecorder();
+        const stream = new SteppedSseStream(
+            [
+                chatTextFrame("the answer starts"),
+                chatToolCallHeaderFrame("call_bad", "search_files"),
+                chatToolCallArgumentsFrame("{not json"),
+                chatFinishFrame("length"),
+                SSE_DONE_FRAME,
+            ],
+            []
+        ).body;
+
+        await processResponseStream({
+            responseBody: stream,
+            progress,
+            token: new vscode.CancellationTokenSource().token,
+            requestId: REQUEST_ID,
+            inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+        });
+
+        const text = collectResponseText(parts);
+        assert.ok(text.includes("output token limit"), "the stop notice must be present");
+        assert.ok(
+            text.indexOf("output token limit") < text.indexOf("was not run"),
+            "the cause has to read before the loss it explains"
+        );
+    });
+
+    for (const [label, frames] of [
+        [
+            "a length finish",
+            [
+                chatReasoningFrame("thinking"),
+                chatToolCallHeaderFrame("call_bad", "read_file"),
+                chatToolCallArgumentsFrame("{not json"),
+                chatFinishFrame("length"),
+                SSE_DONE_FRAME,
+            ],
+        ],
+        [
+            "a close with no finish frame",
+            [
+                chatReasoningFrame("thinking"),
+                chatToolCallHeaderFrame("call_bad", "read_file"),
+                chatToolCallArgumentsFrame("{not json"),
+                SSE_DONE_FRAME,
+            ],
+        ],
+    ] as const) {
+        test(`retries a call that ${label} cut short instead of reporting it`, async () => {
+            const { progress } = createPartRecorder();
+            const stream = new SteppedSseStream(frames, []).body;
+
+            await assert.rejects(
+                () =>
+                    processResponseStream({
+                        responseBody: stream,
+                        progress,
+                        token: new vscode.CancellationTokenSource().token,
+                        requestId: REQUEST_ID,
+                        inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+                    }),
+                ReasoningOnlyError,
+                "a truncated call is not an answer, so the turn has to be resumable"
+            );
+        });
+    }
+
+    test("reports the loss after recovering a call from a truncated stream", async () => {
+        const { parts, progress } = createPartRecorder();
+        const encoder = new TextEncoder();
+        // One readable call is recovered when the stream dies mid-frame. The other call
+        // arrived complete but its arguments do not parse, so it is dropped and explained.
+        const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+                for (const frame of [
+                    chatToolCallHeaderFrame("call_good", "read_file"),
+                    chatToolCallArgumentsFrame('{"path":"a.ts"}'),
+                    chatToolCallHeaderFrame("call_bad", "search_files", 1),
+                    chatToolCallArgumentsFrame("{not json", 1),
+                ]) {
+                    controller.enqueue(encoder.encode(`data: ${frame}\n\n`));
+                }
+                // A frame with no closing blank line: decodeSSE reports a truncated stream.
+                controller.enqueue(encoder.encode(`data: {"choices":[{"delta":`));
+                controller.close();
+            },
+        });
+
+        await processResponseStream({
+            responseBody: stream,
+            progress,
+            token: new vscode.CancellationTokenSource().token,
+            requestId: REQUEST_ID,
+            inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+        });
+
+        assert.deepStrictEqual(
+            collectToolCalls(parts).map((call) => call.name),
+            ["read_file"],
+            "the readable call survives the truncation"
+        );
+        assert.match(collectResponseText(parts), /"search_files" tool was not run/);
+    });
 });

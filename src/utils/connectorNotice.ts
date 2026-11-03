@@ -1,3 +1,5 @@
+import type { DroppedToolCall } from "../types";
+
 /**
  * Prefix that marks text the connector writes into a response itself, such as a
  * failure explanation or a stop notice. It keeps those messages distinguishable
@@ -12,6 +14,25 @@ export const CONNECTOR_NOTICE_PREFIX = "[litellm-connector]";
  */
 export function formatConnectorNotice(message: string): string {
     return `${CONNECTOR_NOTICE_PREFIX} ${message}`;
+}
+
+/**
+ * Returns the notice that explains tool calls the connector dropped because their
+ * arguments could not be parsed. The notice already starts with the blank line that
+ * puts it in its own block, so a caller must not prepend another.
+ */
+export function describeDroppedToolCalls(calls: readonly DroppedToolCall[]): string {
+    const names = [...new Set(calls.map((call) => call.name))];
+    const subject =
+        names.length === 1 ? `the "${names[0]}" tool` : `the ${names.map((name) => `"${name}"`).join(", ")} tools`;
+    const outcome = names.length === 1 ? "was not run" : "were not run";
+    const count = calls.length === 1 ? "a tool call" : `${calls.length} tool calls`;
+    return (
+        "\n\n" +
+        formatConnectorNotice(
+            `The model returned ${count} whose arguments could not be read, so ${subject} ${outcome}.`
+        )
+    );
 }
 
 /**

@@ -579,6 +579,12 @@ export interface TransformedModelItem {
     model_info?: LiteLLMModelInfo;
 }
 
+/** A tool call the connector dropped because its arguments could not be parsed. */
+export interface DroppedToolCall {
+    readonly id: string;
+    readonly name: string;
+}
+
 /**
  * Buffer used to accumulate streamed tool call parts until arguments are valid JSON.
  */

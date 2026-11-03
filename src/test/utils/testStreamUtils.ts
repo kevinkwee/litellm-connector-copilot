@@ -31,15 +31,15 @@ export function chatReasoningFrame(reasoning: string): string {
     return JSON.stringify({ choices: [{ delta: { reasoning_content: reasoning } }] });
 }
 
-export function chatToolCallHeaderFrame(id: string, name: string): string {
+export function chatToolCallHeaderFrame(id: string, name: string, index = 0): string {
     return JSON.stringify({
-        choices: [{ delta: { tool_calls: [{ index: 0, id, type: "function", function: { name, arguments: "" } }] } }],
+        choices: [{ delta: { tool_calls: [{ index, id, type: "function", function: { name, arguments: "" } }] } }],
     });
 }
 
-export function chatToolCallArgumentsFrame(argumentsJson: string): string {
+export function chatToolCallArgumentsFrame(argumentsJson: string, index = 0): string {
     return JSON.stringify({
-        choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: argumentsJson } }] } }],
+        choices: [{ delta: { tool_calls: [{ index, function: { arguments: argumentsJson } }] } }],
     });
 }
 

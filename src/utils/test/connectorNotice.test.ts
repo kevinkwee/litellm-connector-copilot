@@ -1,6 +1,11 @@
 import * as assert from "assert";
 
-import { CONNECTOR_NOTICE_PREFIX, describeStoppedEarly, formatConnectorNotice } from "../connectorNotice";
+import {
+    CONNECTOR_NOTICE_PREFIX,
+    describeDroppedToolCalls,
+    describeStoppedEarly,
+    formatConnectorNotice,
+} from "../connectorNotice";
 
 suite("connectorNotice", () => {
     test("formatConnectorNotice prefixes the message", () => {
@@ -39,6 +44,27 @@ suite("connectorNotice", () => {
 
         test("returns nothing when the stream reported no finish reason", () => {
             assert.strictEqual(describeStoppedEarly(undefined), undefined);
+        });
+    });
+
+    suite("describeDroppedToolCalls", () => {
+        test("names the single tool it dropped", () => {
+            const notice = describeDroppedToolCalls([{ id: "call_1", name: "read_file" }]);
+
+            assert.ok(notice.startsWith(`\n\n${CONNECTOR_NOTICE_PREFIX} `));
+            assert.ok(notice.includes(`the "read_file" tool was not run`));
+        });
+
+        test("names each tool once and counts the calls", () => {
+            const notice = describeDroppedToolCalls([
+                { id: "call_1", name: "read_file" },
+                { id: "call_2", name: "read_file" },
+                { id: "call_3", name: "search_files" },
+            ]);
+
+            assert.ok(notice.includes("3 tool calls"), "the count matches the calls, not the names");
+            assert.ok(notice.includes(`the "read_file", "search_files" tools were not run`));
+            assert.strictEqual(notice.split(`"read_file"`).length - 1, 1, "a repeated name is named once");
         });
     });
 });

@@ -3,11 +3,21 @@ import { Logger } from "../../utils/logger";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import { TOOL_ARGS_PREVIEW_MAX_CHARS } from "./liteLLMStreamInterpreter";
 import type { EmittedPart } from "./liteLLMStreamInterpreter";
+import type { DroppedToolCall } from "../../types";
 
+/**
+ * Reports `parts` to VS Code and returns every tool call whose arguments failed to parse.
+ *
+ * Such a call is not reported: a tool must only ever run on the arguments the model
+ * supplied. A part missing its id or name is skipped without being returned, because a
+ * call with no id or name can neither run nor be named in a notice. The caller decides how
+ * to explain a returned drop, so nothing here writes user-facing text.
+ */
 export function emitPartsToVSCode(
     parts: EmittedPart[],
     progress: vscode.Progress<vscode.LanguageModelResponsePart | vscode.LanguageModelDataPart>
-): void {
+): readonly DroppedToolCall[] {
+    const droppedToolCalls: DroppedToolCall[] = [];
     Logger.trace(`[vscodePartEmitter] Emitting ${parts.length} parts to VS Code`);
     StructuredLogger.trace("vscode.emit_parts_start", {
         partCount: parts.length,
@@ -128,8 +138,7 @@ export function emitPartsToVSCode(
                                     : "<non-string>",
                             error: parseErr instanceof Error ? parseErr.message : String(parseErr),
                         });
-                        // Fallback: emit with raw string if the consumer can handle it, or empty object
-                        progress.report(new vscode.LanguageModelToolCallPart(part.id, part.name, {}));
+                        droppedToolCalls.push({ id: part.id, name: part.name });
                         StructuredLogger.error("vscode.tool_call_parse_failed", {
                             partIndex: idx,
                             toolName: part.name,
@@ -169,5 +178,7 @@ export function emitPartsToVSCode(
     Logger.trace(`[vscodePartEmitter] Finished emitting ${parts.length} parts to VS Code`);
     StructuredLogger.trace("vscode.emit_parts_complete", {
         partCount: parts.length,
+        droppedToolCalls: droppedToolCalls.length,
     });
+    return droppedToolCalls;
 }
