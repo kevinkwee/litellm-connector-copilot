@@ -2,119 +2,10 @@ import * as assert from "assert";
 import * as vscode from "vscode";
 import * as sinon from "sinon";
 import { LiteLLMChatProvider } from "../";
-import type { ConfigManager } from "../../config/configManager";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types";
-import type { ToolNameMapping } from "../../utils/toolNameUtils";
-import { createMockSecrets } from "../../test/utils/testMocks";
+import { createMockSecrets, TEST_USER_AGENT } from "../../test/utils/testMocks";
+import { access, apiError, seedBackendForCall } from "../../test/utils/providerBaseTestUtils";
 import { EffortFallbackCache } from "../../utils/reasoningEffortFallback";
-import type { BackendSession } from "../backendSession";
-
-/**
- * Typed view of protected/private members and methods used in tests. We cast
- * once to eliminate per-call `any` casts while keeping the production class
- * API hidden from callers.
- */
-interface BaseTestAccess {
-    _configManager: ConfigManager;
-    _registry: {
-        lookup: (
-            id: string
-        ) => { baseUrl: string; apiKey: string; rawModelName: string; routingIdentity: string } | undefined;
-        getModelInfo: (id: string) => LiteLLMModelInfo | undefined;
-        clearCaches: () => void;
-        size: () => number;
-        recordUnsupportedParameter: (modelId: string, param: string) => void;
-        getUnsupportedParameters: (modelId: string) => ReadonlySet<string>;
-    };
-    _transport: {
-        sendRequestToLiteLLM: (
-            request: OpenAIChatCompletionRequest,
-            progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-            token: vscode.CancellationToken,
-            caller?: string,
-            modelInfo?: LiteLLMModelInfo,
-            configuration?: Record<string, unknown>,
-            requestId?: string,
-            learnedLimitsKey?: string
-        ) => Promise<ReadableStream<Uint8Array>>;
-    };
-    _effortFallbackCache: EffortFallbackCache;
-    _usageOptOutModels: Set<string>;
-    refreshModelInformation: () => void;
-    buildOpenAIChatRequest: (
-        messages: vscode.LanguageModelChatRequestMessage[],
-        model: vscode.LanguageModelChatInformation,
-        options: vscode.ProvideLanguageModelChatResponseOptions,
-        modelInfo?: LiteLLMModelInfo,
-        caller?: string
-    ) => Promise<{ request: OpenAIChatCompletionRequest; toolNames: ToolNameMapping }>;
-    buildCapabilities: (modelInfo: LiteLLMModelInfo | undefined) => vscode.LanguageModelChatCapabilities;
-    parseApiError: (statusCode: number, errorText: string) => string;
-    stripUnsupportedParametersFromRequest: (
-        requestBody: Record<string, unknown>,
-        modelInfo: LiteLLMModelInfo | undefined,
-        modelId?: string
-    ) => void;
-    isParameterSupported: (param: string, modelInfo: LiteLLMModelInfo | undefined, modelId?: string) => boolean;
-    sendRequestWithRetry: (
-        request: OpenAIChatCompletionRequest,
-        model: vscode.LanguageModelChatInformation,
-        options: vscode.ProvideLanguageModelChatResponseOptions,
-        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-        token: vscode.CancellationToken,
-        caller?: string,
-        modelInfo?: LiteLLMModelInfo
-    ) => Promise<ReadableStream<Uint8Array>>;
-    sendRequestToLiteLLM: (
-        request: OpenAIChatCompletionRequest,
-        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-        token: vscode.CancellationToken,
-        caller?: string,
-        modelInfo?: LiteLLMModelInfo,
-        configuration?: Record<string, unknown>
-    ) => Promise<ReadableStream<Uint8Array>>;
-    getCallTimeConfiguration: (
-        options: vscode.ProvideLanguageModelChatResponseOptions,
-        model: vscode.LanguageModelChatInformation
-    ) => Promise<Record<string, unknown> | undefined>;
-    applyReasoningEffort: (
-        request: OpenAIChatCompletionRequest,
-        effort: OpenAIChatCompletionRequest["reasoning_effort"] | undefined
-    ) => void;
-}
-
-function access(provider: LiteLLMChatProvider): BaseTestAccess {
-    return provider as unknown as BaseTestAccess;
-}
-/**
- * Creates an Error with a `status` property attached, which the
- * reasoning-effort fallback detects as a 4xx error worth retrying.
- */
-function apiError(message: string, status: number): Error & { status: number } {
-    const err = new Error(message) as Error & { status: number };
-    err.status = status;
-    return err;
-}
-
-/**
- * Stubs the config manager so `convertProviderConfiguration` returns a known
- * session for the given configuration. Use this when a test exercises the
- * chat flow and we don't want to stub an HTTP fetch.
- */
-function seedBackendForCall(
-    sandbox: sinon.SinonSandbox,
-    provider: LiteLLMChatProvider,
-    configuration: Record<string, unknown> | undefined,
-    session: BackendSession | undefined
-): void {
-    const configManager = access(provider)._configManager;
-    sandbox.stub(configManager, "convertProviderConfiguration").callsFake((cfg: Record<string, unknown>) => {
-        if (cfg === configuration) {
-            return session;
-        }
-        return undefined;
-    });
-}
 
 suite("LiteLLMProviderBase", () => {
     let sandbox: sinon.SinonSandbox;
@@ -124,7 +15,7 @@ suite("LiteLLMProviderBase", () => {
         "litellm-connector.apiKey": "test-api-key",
     });
 
-    const userAgent = "GitHubCopilotChat/test VSCode/test";
+    const userAgent = TEST_USER_AGENT;
 
     setup(() => {
         sandbox = sinon.createSandbox();
@@ -552,507 +443,79 @@ suite("LiteLLMProviderBase", () => {
         });
     });
 
-    suite("discoverModels", () => {
-        const config: Record<string, unknown> = {
-            providerName: "test-group",
-            baseUrl: "http://localhost:4000",
-            apiKey: "test-key",
-        };
-
-        // Factory: created lazily so `sandbox` is in scope.
-        const makeMockSession = (): BackendSession => ({
-            backendName: "test-group",
-            baseUrl: "http://localhost:4000",
-            apiKey: "test-key",
-            client: {
-                getModelInfo: sandbox.stub().resolves({
-                    data: [
-                        {
-                            model_name: "gpt-4",
-                            model_info: {
-                                litellm_provider: "openai",
-                                supports_reasoning: true,
-                                supports_reasoning_effort: true,
-                                max_input_tokens: 128000,
-                                max_output_tokens: 4096,
-                                mode: "chat",
-                            },
-                        },
-                    ],
-                }),
-            } as unknown as BackendSession["client"],
-        });
-
-        test("returns the same model id on subsequent calls (stateless re-fetch, not cached reference)", async () => {
-            // The discovery layer is stateless: every call performs a fresh
-            // `/model/info` HTTP request. Two calls produce two independent
-            // fetches, so the returned array references differ. The model
-            // id is stable across calls because the routing identity
-            // (derived from the URL hostname) does not change.
+    suite("constructor", () => {
+        test("constructing a provider creates its registry and transport", () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const configManager = access(provider)._configManager;
-            const mockSession = makeMockSession();
-            sandbox.stub(configManager, "convertProviderConfiguration").returns(mockSession);
 
-            const models1 = await provider.discoverModels(
-                { silent: true, configuration: config },
-                new vscode.CancellationTokenSource().token
-            );
-            const models2 = await provider.discoverModels(
-                { silent: true, configuration: config },
-                new vscode.CancellationTokenSource().token
-            );
-
-            assert.strictEqual(models1.length, 1);
-            assert.strictEqual(models2.length, 1);
-            assert.strictEqual(models1[0].id, models2[0].id, "model id is stable across calls");
+            assert.ok(access(provider)._registry);
+            assert.ok(access(provider)._transport);
         });
 
-        test("returns model objects without tags", async () => {
+        test("dispose stops forwarding registry changes to VS Code", () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const configManager = access(provider)._configManager;
-            const mockSession = makeMockSession();
-            sandbox.stub(configManager, "convertProviderConfiguration").returns(mockSession);
-
-            const models = await provider.discoverModels(
-                { silent: true, configuration: config },
-                new vscode.CancellationTokenSource().token
-            );
-
-            assert.strictEqual(models.length, 1);
-            // VS Code's model metadata mapping has no `tags` field, so the
-            // connector does not compute them.
-            assert.strictEqual("tags" in models[0], false);
-        });
-
-        test("attaches reasoning configuration schema when supported", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const configManager = access(provider)._configManager;
-            const mockSession = makeMockSession();
-            sandbox.stub(configManager, "convertProviderConfiguration").returns(mockSession);
-
-            const models = await provider.discoverModels(
-                { silent: true, configuration: config },
-                new vscode.CancellationTokenSource().token
-            );
-
-            assert.ok(models[0].configurationSchema, "schema should be attached for reasoning models");
-        });
-
-        test("surfaces temperature configuration when the model supports the parameter", async () => {
-            const sessionWithTemperature: BackendSession = {
-                ...makeMockSession(),
-                client: {
-                    getModelInfo: sandbox.stub().resolves({
-                        data: [
-                            {
-                                model_name: "glm-5.3-flash",
-                                model_info: {
-                                    litellm_provider: "openai",
-                                    supports_reasoning: true,
-                                    supports_reasoning_effort: true,
-                                    max_input_tokens: 872000,
-                                    max_output_tokens: 128000,
-                                    mode: "chat",
-                                    supported_openai_params: ["stream", "temperature", "reasoning_effort"],
-                                },
-                            },
-                        ],
-                    }),
-                } as unknown as BackendSession["client"],
+            const fired: number[] = [];
+            provider.onDidChangeLanguageModelChatInformation(() => fired.push(1));
+            const registryEmitter = access(provider)._registry as unknown as {
+                _onDidChangeEmitter: vscode.EventEmitter<void>;
             };
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const configManager = access(provider)._configManager;
-            sandbox.stub(configManager, "convertProviderConfiguration").returns(sessionWithTemperature);
 
-            const models = await provider.discoverModels(
-                { silent: true, configuration: config },
-                new vscode.CancellationTokenSource().token
-            );
+            provider.dispose();
+            registryEmitter._onDidChangeEmitter.fire();
 
-            const schema = models[0].configurationSchema;
-            const temperatureProp = schema?.properties?.temperature;
-            assert.ok(temperatureProp, "temperature property must be advertised for supporting models");
-            assert.strictEqual(temperatureProp.type, "number");
+            assert.deepStrictEqual(fired, [], "a disposed provider must not answer after deactivation");
         });
 
-        test("omits temperature configuration when supported_openai_params excludes it", async () => {
-            const sessionWithoutTemperature: BackendSession = {
-                ...makeMockSession(),
-                client: {
-                    getModelInfo: sandbox.stub().resolves({
-                        data: [
-                            {
-                                model_name: "gpt-4",
-                                model_info: {
-                                    litellm_provider: "openai",
-                                    supports_reasoning: true,
-                                    supports_reasoning_effort: true,
-                                    max_input_tokens: 128000,
-                                    max_output_tokens: 4096,
-                                    mode: "chat",
-                                    supported_openai_params: ["stream", "reasoning_effort"],
-                                },
-                            },
-                        ],
-                    }),
-                } as unknown as BackendSession["client"],
-            };
+        test("dispose is safe to call twice", () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const configManager = access(provider)._configManager;
-            sandbox.stub(configManager, "convertProviderConfiguration").returns(sessionWithoutTemperature);
 
-            const models = await provider.discoverModels(
-                { silent: true, configuration: config },
-                new vscode.CancellationTokenSource().token
-            );
+            provider.dispose();
 
-            assert.strictEqual(
-                models[0].configurationSchema?.properties?.temperature,
-                undefined,
-                "temperature must not be advertised when the model does not support the parameter"
-            );
-        });
-
-        test("returns [] when no configuration is provided (vendor-level call)", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const token = new vscode.CancellationTokenSource().token;
-            const models = await provider.discoverModels({ silent: true }, token);
-            assert.deepStrictEqual(models, []);
-        });
-
-        test("throws a LanguageModelError when configuration is invalid", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const token = new vscode.CancellationTokenSource().token;
-            const configManager = access(provider)._configManager;
-            sandbox.stub(configManager, "convertProviderConfiguration").returns(undefined);
-            await assert.rejects(
-                () =>
-                    provider.discoverModels(
-                        { silent: true, configuration: { baseUrl: "http://x", apiKey: "k" } },
-                        token
-                    ),
-                (err: unknown) => err instanceof vscode.LanguageModelError
-            );
-        });
-
-        test("per-group model lists are isolated: one group refresh does not trample another", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const configManager = access(provider)._configManager;
-            const wolframConfig: Record<string, unknown> = {
-                baseUrl: "https://wolfram.example",
-                apiKey: "k-w",
-            };
-            const gethConfig: Record<string, unknown> = {
-                baseUrl: "https://geth.example",
-                apiKey: "k-g",
-            };
-            const stub = sandbox.stub(configManager, "convertProviderConfiguration");
-            // The URL is the routing identity, so the configuration payload alone
-            // selects the session.
-            stub.withArgs(wolframConfig).returns({
-                backendName: "wolfram",
-                baseUrl: "https://wolfram.example",
-                apiKey: "k-w",
-                client: {
-                    getModelInfo: async () => ({
-                        data: [{ model_name: "wolfram-only", model_info: { litellm_provider: "openai" } }],
-                    }),
-                } as unknown as BackendSession["client"],
-            });
-            stub.withArgs(gethConfig).returns({
-                backendName: "geth",
-                baseUrl: "https://geth.example",
-                apiKey: "k-g",
-                client: {
-                    getModelInfo: async () => ({
-                        data: [{ model_name: "geth-only", model_info: { litellm_provider: "openai" } }],
-                    }),
-                } as unknown as BackendSession["client"],
-            });
-
-            const wolframModels = await provider.discoverModels(
-                { silent: true, configuration: wolframConfig },
-                new vscode.CancellationTokenSource().token
-            );
-            const gethModels = await provider.discoverModels(
-                { silent: true, configuration: gethConfig },
-                new vscode.CancellationTokenSource().token
-            );
-
-            // The BackendRegistry is the source of truth. Each backend's
-            // model list is keyed by its baseUrl, so a refresh of one
-            // backend does not trample another.
-            const registry = access(provider)._registry;
-            const wolframIds = registry.lookup("wolfram.example/wolfram-only")?.rawModelName;
-            const gethIds = registry.lookup("geth.example/geth-only")?.rawModelName;
-            assert.strictEqual(wolframIds, "wolfram-only");
-            assert.strictEqual(gethIds, "geth-only");
-            // The namespaced id reflects the URL-derived routing identity.
-            assert.strictEqual(wolframModels[0].id, "wolfram.example/wolfram-only");
-            assert.strictEqual(gethModels[0].id, "geth.example/geth-only");
-        });
-
-        test("returns the live result every call (no ghost cache from prior delivery)", async () => {
-            // The discovery layer is stateless: every call performs a fresh
-            // `/model/info` HTTP request. An empty result is surfaced
-            // honestly (so the picker reflects the live state of the
-            // backend); it is NOT replaced by the prior delivery's list.
-            // This is a deliberate behavior change from the previous
-            // 5-minute-TTL design, which kept stale entries.
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const configManager = access(provider)._configManager;
-            const mockSession = makeMockSession();
-            sandbox.stub(configManager, "convertProviderConfiguration").returns(mockSession);
-            // Disable discovery caching for this test, because the test verifies the HTTP client
-            // is called again (not that the response cache is disabled)
-            sandbox.stub(configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
-
-            // First discovery returns models
-            const first = await provider.discoverModels(
-                { silent: true, configuration: config },
-                new vscode.CancellationTokenSource().token
-            );
-            assert.strictEqual(first.length, 1);
-
-            // Now stub the client to return empty
-            (mockSession.client.getModelInfo as sinon.SinonStub).resolves({ data: [] });
-
-            const second = await provider.discoverModels(
-                { silent: true, configuration: config },
-                new vscode.CancellationTokenSource().token
-            );
-            // Empty result is surfaced; the previous list is NOT reused.
-            assert.strictEqual(second.length, 0);
-        });
-
-        test("registers the backend in the BackendRegistry with the per-group credentials", async () => {
-            // The BackendRegistry is the source of truth for response-time
-            // routing. After a successful discovery, the registry's
-            // `lookup(modelId)` MUST resolve to the same `baseUrl` /
-            // `apiKey` that was passed in on the originating call. The
-            // model object on the wire does not need to carry
-            // `configuration` because the registry is the source of truth.
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const configManager = access(provider)._configManager;
-            const mockSession = makeMockSession();
-            sandbox.stub(configManager, "convertProviderConfiguration").returns(mockSession);
-
-            const models = await provider.discoverModels(
-                { silent: true, configuration: config },
-                new vscode.CancellationTokenSource().token
-            );
-
-            assert.strictEqual(models.length, 1);
-            const registry = access(provider)._registry;
-            const looked = registry.lookup(models[0].id);
-            assert.ok(looked, "registry should resolve the namespaced id back to a routing entry");
-            assert.strictEqual(looked!.baseUrl, "http://localhost:4000");
-            assert.strictEqual(looked!.apiKey, "test-key");
+            assert.doesNotThrow(() => provider.dispose());
         });
     });
 
-    suite("discoverModels: change detection (no discovery loop)", () => {
-        // VS Code re-queries provideLanguageModelChatInformation on every
-        // onDidChangeLanguageModelChatInformation event. Firing the event
-        // unconditionally from discoverModels caused an infinite loop:
-        // discover → fire → VS Code re-queries → discover → fire → ...
-        // The loop is broken by firing ONLY when the model id set returned
-        // for a given baseUrl differs from the prior delivery.
-
-        const makeSession = (models: { model_name: string; litellm_provider: string }[]) =>
-            ({
-                backendName: "test-group",
-                baseUrl: "http://localhost:4000",
-                apiKey: "test-key",
-                client: {
-                    getModelInfo: async () => ({ data: models }),
-                } as unknown as { getModelInfo: sinon.SinonStub },
-            }) as unknown as BackendSession;
-
-        const makeProvider = (session: ReturnType<typeof makeSession>, sandbox: sinon.SinonSandbox) => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            sandbox.stub(access(provider)._configManager, "convertProviderConfiguration").returns(session);
-            return provider;
+    suite("provideTokenCount", () => {
+        const model: vscode.LanguageModelChatInformation = {
+            id: "gpt-4",
+            name: "gpt-4",
+            tooltip: "",
+            family: "litellm",
+            version: "1.0.0",
+            maxInputTokens: 1000,
+            maxOutputTokens: 1000,
+            capabilities: { toolCalling: true, imageInput: false },
         };
 
-        test("fires onDidChange on the first discovery (no prior delivery)", async () => {
-            const localSandbox = sinon.createSandbox();
-            try {
-                const provider = makeProvider(
-                    makeSession([{ model_name: "gpt-4", litellm_provider: "openai" }]),
-                    localSandbox
-                );
-                const fired: number[] = [];
-                provider.onDidChangeLanguageModelChatInformation(() => fired.push(1));
-
-                await provider.discoverModels(
-                    { silent: true, configuration: { baseUrl: "http://localhost:4000", apiKey: "k" } },
-                    new vscode.CancellationTokenSource().token
-                );
-
-                assert.strictEqual(fired.length, 1, "first delivery must fire");
-            } finally {
-                localSandbox.restore();
-            }
-        });
-
-        test("does NOT fire onDidChange when the model set is unchanged", async () => {
-            const localSandbox = sinon.createSandbox();
-            try {
-                const provider = makeProvider(
-                    makeSession([{ model_name: "gpt-4", litellm_provider: "openai" }]),
-                    localSandbox
-                );
-                const fired: number[] = [];
-                provider.onDidChangeLanguageModelChatInformation(() => fired.push(1));
-
-                const token = new vscode.CancellationTokenSource().token;
-                const cfg = { baseUrl: "http://localhost:4000", apiKey: "k" };
-
-                // First call: fires.
-                await provider.discoverModels({ silent: true, configuration: cfg }, token);
-                // Second call: same models, must NOT fire.
-                await provider.discoverModels({ silent: true, configuration: cfg }, token);
-                // Third call: still no change.
-                await provider.discoverModels({ silent: true, configuration: cfg }, token);
-
-                assert.strictEqual(fired.length, 1, "only the first delivery should fire");
-            } finally {
-                localSandbox.restore();
-            }
-        });
-
-        test("fires onDidChange again when the model set changes", async () => {
-            const localSandbox = sinon.createSandbox();
-            try {
-                const getModelInfoStub = localSandbox.stub().resolves({
-                    data: [{ model_name: "gpt-4", model_info: { litellm_provider: "openai" } }],
-                });
-                const session = {
-                    backendName: "test-group",
-                    baseUrl: "http://localhost:4000",
-                    apiKey: "test-key",
-                    client: { getModelInfo: getModelInfoStub },
-                } as unknown as BackendSession;
-                const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-                const configManager = access(provider)._configManager;
-                localSandbox.stub(configManager, "convertProviderConfiguration").returns(session);
-                // Disable discovery caching so subsequent calls actually call the client
-                localSandbox.stub(configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
-                const fired: number[] = [];
-                provider.onDidChangeLanguageModelChatInformation(() => fired.push(1));
-
-                const token = new vscode.CancellationTokenSource().token;
-                const cfg = { baseUrl: "http://localhost:4000", apiKey: "k" };
-
-                await provider.discoverModels({ silent: true, configuration: cfg }, token);
-                assert.strictEqual(fired.length, 1);
-
-                // The LiteLLM client now returns a different model set.
-                getModelInfoStub.resolves({
-                    data: [{ model_name: "claude-3", model_info: { litellm_provider: "anthropic" } }],
-                });
-                await provider.discoverModels({ silent: true, configuration: cfg }, token);
-                assert.strictEqual(fired.length, 2, "second call with different ids must fire");
-
-                // Same ids again, so no fire.
-                await provider.discoverModels({ silent: true, configuration: cfg }, token);
-                assert.strictEqual(fired.length, 2);
-            } finally {
-                localSandbox.restore();
-            }
-        });
-
-        test("treats different baseUrls independently", async () => {
-            // Two distinct baseUrls should each have their own change-detection
-            // fingerprint. A change in baseUrl A must not reset baseUrl B's
-            // fingerprint, and vice versa.
-            const localSandbox = sinon.createSandbox();
-            try {
-                const sessionA = makeSession([{ model_name: "gpt-4", litellm_provider: "openai" }]);
-                const sessionB = makeSession([{ model_name: "claude-3", litellm_provider: "anthropic" }]);
-                const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-                const configManager = access(provider)._configManager;
-                const stub = localSandbox.stub(configManager, "convertProviderConfiguration");
-                stub.callsFake((config: Record<string, unknown>) => {
-                    if (config.baseUrl === "http://a") {
-                        return sessionA;
-                    }
-                    if (config.baseUrl === "http://b") {
-                        return sessionB;
-                    }
-                    return undefined;
-                });
-                // Disable discovery caching so subsequent calls actually call the client
-                localSandbox.stub(configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
-
-                const fired: number[] = [];
-                provider.onDidChangeLanguageModelChatInformation(() => fired.push(1));
-
-                const token = new vscode.CancellationTokenSource().token;
-                // A first → fires
-                await provider.discoverModels(
-                    { silent: true, configuration: { baseUrl: "http://a", apiKey: "k" } },
-                    token
-                );
-                assert.strictEqual(fired.length, 1);
-                // A again (same ids) → does not fire
-                await provider.discoverModels(
-                    { silent: true, configuration: { baseUrl: "http://a", apiKey: "k" } },
-                    token
-                );
-                assert.strictEqual(fired.length, 1);
-                // B first time → fires (its own fingerprint is fresh)
-                await provider.discoverModels(
-                    { silent: true, configuration: { baseUrl: "http://b", apiKey: "k" } },
-                    token
-                );
-                assert.strictEqual(fired.length, 2);
-                // B again → does not fire
-                await provider.discoverModels(
-                    { silent: true, configuration: { baseUrl: "http://b", apiKey: "k" } },
-                    token
-                );
-                assert.strictEqual(fired.length, 2);
-            } finally {
-                localSandbox.restore();
-            }
-        });
-    });
-
-    suite("buildCapabilities and parseApiError", () => {
-        test("buildCapabilities maps model_info flags correctly", () => {
+        test("returns the local estimate for small strings", async () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const caps = access(provider).buildCapabilities({
-                supports_function_calling: true,
-                supports_vision: true,
-            } as LiteLLMModelInfo);
-            assert.strictEqual(caps.toolCalling, true);
-            assert.strictEqual(caps.imageInput, true);
+            const tokenSource = new vscode.CancellationTokenSource();
+            const count = await provider.provideTokenCount(model, "hi", tokenSource.token, {
+                baseUrl: "https://wolfram.example",
+                apiKey: "k",
+            });
+            assert.strictEqual(count, 2);
         });
 
-        test("buildCapabilities defaults to { toolCalling: true, imageInput: false } when no model_info", () => {
+        test("returns the same local estimate when cancellation is already requested", async () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const caps = access(provider).buildCapabilities(undefined);
-            assert.strictEqual(caps.toolCalling, true);
-            assert.strictEqual(caps.imageInput, false);
+            const tokenSource = new vscode.CancellationTokenSource();
+            tokenSource.cancel();
+            const count = await provider.provideTokenCount(model, "hi", tokenSource.token, {
+                baseUrl: "https://wolfram.example",
+                apiKey: "k",
+            });
+            assert.strictEqual(count, 2);
         });
 
-        test("parseApiError extracts meaningful error messages", () => {
+        test("estimates a large string from its character count", async () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const text = JSON.stringify({ error: { message: "Invalid API key" } });
-            assert.strictEqual(access(provider).parseApiError(401, text), "Invalid API key");
-        });
+            const tokenSource = new vscode.CancellationTokenSource();
 
-        test("parseApiError handles non-JSON error text", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            assert.strictEqual(access(provider).parseApiError(500, "Internal server error"), "Internal server error");
-        });
-
-        test("parseApiError returns generic message when errorText is empty", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            assert.strictEqual(access(provider).parseApiError(500, ""), "API request failed with status 500");
+            const count = await provider.provideTokenCount(model, "x".repeat(1000), tokenSource.token, {
+                baseUrl: "https://wolfram.example",
+                apiKey: "k",
+            });
+            assert.strictEqual(count, 286);
         });
     });
 
@@ -1247,245 +710,22 @@ suite("LiteLLMProviderBase", () => {
         });
     });
 
-    suite("provideTokenCount", () => {
-        const model: vscode.LanguageModelChatInformation = {
-            id: "gpt-4",
-            name: "gpt-4",
-            tooltip: "",
-            family: "litellm",
-            version: "1.0.0",
-            maxInputTokens: 1000,
-            maxOutputTokens: 1000,
-            capabilities: { toolCalling: true, imageInput: false },
-        };
-
-        test("returns the local estimate for small strings", async () => {
+    suite("buildCapabilities", () => {
+        test("buildCapabilities maps model_info flags correctly", () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const tokenSource = new vscode.CancellationTokenSource();
-            const count = await provider.provideTokenCount(model, "hi", tokenSource.token, {
-                baseUrl: "https://wolfram.example",
-                apiKey: "k",
-            });
-            assert.strictEqual(count, 2);
+            const caps = access(provider).buildCapabilities({
+                supports_function_calling: true,
+                supports_vision: true,
+            } as LiteLLMModelInfo);
+            assert.strictEqual(caps.toolCalling, true);
+            assert.strictEqual(caps.imageInput, true);
         });
 
-        test("returns the same local estimate when cancellation is already requested", async () => {
+        test("buildCapabilities defaults to { toolCalling: true, imageInput: false } when no model_info", () => {
             const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const tokenSource = new vscode.CancellationTokenSource();
-            tokenSource.cancel();
-            const count = await provider.provideTokenCount(model, "hi", tokenSource.token, {
-                baseUrl: "https://wolfram.example",
-                apiKey: "k",
-            });
-            assert.strictEqual(count, 2);
-        });
-
-        test("estimates a large string from its character count", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const tokenSource = new vscode.CancellationTokenSource();
-
-            const count = await provider.provideTokenCount(model, "x".repeat(1000), tokenSource.token, {
-                baseUrl: "https://wolfram.example",
-                apiKey: "k",
-            });
-            assert.strictEqual(count, 286);
-        });
-    });
-
-    suite("constructor", () => {
-        test("constructing a provider creates its registry and transport", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-
-            assert.ok(access(provider)._registry);
-            assert.ok(access(provider)._transport);
-        });
-
-        test("dispose stops forwarding registry changes to VS Code", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const fired: number[] = [];
-            provider.onDidChangeLanguageModelChatInformation(() => fired.push(1));
-            const registryEmitter = access(provider)._registry as unknown as {
-                _onDidChangeEmitter: vscode.EventEmitter<void>;
-            };
-
-            provider.dispose();
-            registryEmitter._onDidChangeEmitter.fire();
-
-            assert.deepStrictEqual(fired, [], "a disposed provider must not answer after deactivation");
-        });
-
-        test("dispose is safe to call twice", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-
-            provider.dispose();
-
-            assert.doesNotThrow(() => provider.dispose());
-        });
-    });
-
-    suite("learned unsupported parameters", () => {
-        const model: vscode.LanguageModelChatInformation = {
-            id: "model-reasoning",
-            name: "model-reasoning",
-            tooltip: "",
-            family: "litellm",
-            version: "1.0.0",
-            maxInputTokens: 1000,
-            maxOutputTokens: 1000,
-            capabilities: { toolCalling: true, imageInput: false },
-        };
-
-        test("base forwards transport strip callbacks into the registry", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const record = sandbox.stub(access(provider)._registry, "recordUnsupportedParameter");
-            const transport = access(provider)._transport as unknown as {
-                onUnsupportedParameter?: (model: string, param: string) => void;
-            };
-
-            transport.onUnsupportedParameter?.("claude-opus", "cache_control");
-
-            sinon.assert.calledOnceWithExactly(record, "claude-opus", "cache_control");
-        });
-
-        test("reloadModels forgets every learned limit", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent, new EffortFallbackCache());
-            const internals = access(provider);
-            internals._effortFallbackCache.recordFailure("host-a.example/model", "high");
-            internals._usageOptOutModels.add("host-a.example/model");
-            internals._registry.recordUnsupportedParameter("host-a.example/model", "cache_control");
-            sandbox.stub(internals, "refreshModelInformation");
-
-            provider.reloadModels();
-
-            assert.strictEqual(
-                internals._effortFallbackCache.getEffectiveEffort("host-a.example/model", "high"),
-                "high"
-            );
-            assert.strictEqual(internals._usageOptOutModels.size, 0);
-            assert.strictEqual(internals._registry.getUnsupportedParameters("host-a.example/model").size, 0);
-        });
-
-        test("a settings-triggered reload keeps every learned limit", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent, new EffortFallbackCache());
-            const internals = access(provider);
-            internals._effortFallbackCache.recordFailure("host-a.example/model", "high");
-            internals._usageOptOutModels.add("host-a.example/model");
-            internals._registry.recordUnsupportedParameter("host-a.example/model", "cache_control");
-            sandbox.stub(internals, "refreshModelInformation");
-
-            provider.reloadModelDiscovery();
-
-            assert.notStrictEqual(
-                internals._effortFallbackCache.getEffectiveEffort("host-a.example/model", "high"),
-                "high",
-                "the effort ladder learns nothing from the settings"
-            );
-            assert.strictEqual(internals._usageOptOutModels.has("host-a.example/model"), true);
-            assert.strictEqual(
-                internals._registry.getUnsupportedParameters("host-a.example/model").has("cache_control"),
-                true,
-                "learned limits describe the proxy, not the settings"
-            );
-        });
-
-        test("the effort ladder learns under the namespaced id, not the wire model name", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent, new EffortFallbackCache());
-            const internals = access(provider);
-            const namespacedModel = { ...model, id: "host-a.example/model-reasoning", name: "model-reasoning" };
-            const baseConfig = { baseUrl: "https://host-a.example", apiKey: "k", reasoningEffort: "high" };
-            seedBackendForCall(sandbox, provider, baseConfig, {
-                backendName: "host-a.example",
-                baseUrl: "https://host-a.example",
-                apiKey: "k",
-                client: {} as never,
-            });
-            sandbox
-                .stub(internals._transport, "sendRequestToLiteLLM")
-                .onCall(0)
-                .rejects(apiError("LiteLLM API error 400: reasoning_effort not supported", 400))
-                .onCall(1)
-                .resolves(new ReadableStream());
-
-            await internals.sendRequestWithRetry(
-                { model: "model-reasoning", messages: [], stream: true, max_tokens: 100, reasoning_effort: "high" },
-                namespacedModel,
-                { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
-                new vscode.CancellationTokenSource().token
-            );
-
-            assert.notStrictEqual(
-                internals._effortFallbackCache.getEffectiveEffort("host-a.example/model-reasoning", "high"),
-                "high",
-                "the namespaced id is where the ladder records the failure"
-            );
-            assert.strictEqual(
-                internals._effortFallbackCache.getEffectiveEffort("model-reasoning", "high"),
-                "high",
-                "the wire name must not become a second key"
-            );
-        });
-
-        test("the usage opt-out learns under the namespaced id, not the wire model name", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent, new EffortFallbackCache());
-            const internals = access(provider);
-            const namespacedModel = { ...model, id: "host-a.example/model-usage", name: "model-usage" };
-            const baseConfig = { baseUrl: "https://host-a.example", apiKey: "k" };
-            seedBackendForCall(sandbox, provider, baseConfig, {
-                backendName: "host-a.example",
-                baseUrl: "https://host-a.example",
-                apiKey: "k",
-                client: {} as never,
-            });
-            sandbox
-                .stub(internals._transport, "sendRequestToLiteLLM")
-                .onCall(0)
-                .rejects(apiError("LiteLLM API error 400: Unsupported parameter: stream_options", 400))
-                .onCall(1)
-                .resolves(new ReadableStream());
-
-            await internals.sendRequestWithRetry(
-                { model: "model-usage", messages: [], stream: true, max_tokens: 100 },
-                namespacedModel,
-                { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
-                new vscode.CancellationTokenSource().token
-            );
-
-            assert.strictEqual(internals._usageOptOutModels.has("host-a.example/model-usage"), true);
-            assert.strictEqual(
-                internals._usageOptOutModels.has("model-usage"),
-                false,
-                "the wire name must not become a second key"
-            );
-        });
-
-        test("sendRequestWithRetry hands the transport the namespaced id as the learned-limits key", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent, new EffortFallbackCache());
-            const internals = access(provider);
-            const namespacedModel = { ...model, id: "host-a.example/model-key", name: "model-key" };
-            const baseConfig = { baseUrl: "https://host-a.example", apiKey: "k" };
-            seedBackendForCall(sandbox, provider, baseConfig, {
-                backendName: "host-a.example",
-                baseUrl: "https://host-a.example",
-                apiKey: "k",
-                client: {} as never,
-            });
-            const sendStub = sandbox.stub(internals._transport, "sendRequestToLiteLLM").resolves(new ReadableStream());
-
-            await internals.sendRequestWithRetry(
-                { model: "model-key", messages: [], stream: true, max_tokens: 100 },
-                namespacedModel,
-                { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
-                new vscode.CancellationTokenSource().token
-            );
-
-            assert.strictEqual(
-                sendStub.firstCall.args[7],
-                "host-a.example/model-key",
-                "a learned rejection must be readable under the id the builder looks up"
-            );
+            const caps = access(provider).buildCapabilities(undefined);
+            assert.strictEqual(caps.toolCalling, true);
+            assert.strictEqual(caps.imageInput, false);
         });
     });
 });

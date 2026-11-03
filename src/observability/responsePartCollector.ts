@@ -8,14 +8,14 @@ import type * as vscode from "vscode";
  * Why a separate collector instead of adding collection to
  * `StreamTokenCapture`? `StreamTokenCapture` already wraps the inner
  * progress for token-counting reasons, and its `progress` getter is what
- * the chat provider passes to `processStreamingResponse`/`emitPartsToVSCode`.
+ * the chat provider passes to the stream reader and to `emitPartsToVSCode`.
  * Wrapping that *again* here keeps the collector's concerns (response
  * rendering) separate from the token capturer's concerns (usage tracking),
  * and avoids a cross-cutting change to `StreamTokenCapture`'s shape.
  *
  * The parts array is exposed read-only via {@link parts} after the request
- * completes. The collector never mutates the parts themselves — it only
- * pushes references — so the same part instances VS Code received are the
+ * completes. The collector never mutates the parts themselves. It only
+ * pushes references, so the same part instances VS Code received are the
  * ones the exporter renders.
  */
 export class ResponsePartCollector {

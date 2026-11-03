@@ -10,16 +10,20 @@ import type {
 } from "vscode";
 import { LanguageModelTextPart } from "vscode";
 
-import { tryParseJSONObject } from "../utils";
-import { describeStoppedEarly, formatConnectorNotice } from "../utils/connectorNotice";
+import { formatConnectorNotice } from "../utils/connectorNotice";
 import { Logger } from "../utils/logger";
-import { appendRateLimitHint } from "../utils/rateLimitNotice";
 import type { ToolNameMapping } from "../utils/toolNameUtils";
 import { LiteLLMTelemetry } from "../utils/telemetry";
 import { LiteLLMProviderBase } from "./liteLLMProviderBase";
+import { processResponseStream } from "./chat/responseStream";
+import {
+    reportConnectorCancellation,
+    reportHostCancellation,
+    reportTurnFailure,
+    reportTurnSuccess,
+} from "./chat/turnReport";
 import { describeFailureForLog, toErrorLogFields } from "./base/errorLogFields";
 import { StructuredLogger } from "../observability/structuredLogger";
-import { logFinalUsageEnvelope } from "../observability/finalUsageEnvelope";
 import { ResponsePartCollector } from "../observability";
 import { resolveChatSessionId } from "../utils/chatSessionId";
 import {
@@ -29,49 +33,23 @@ import {
     getReservedOutputTokens,
     getTotalTokenLimit,
 } from "../adapters/tokenUtils";
-import { decodeSSE } from "../adapters/sse/sseDecoder";
-import {
-    findRejectedParameter,
-    isUnsupportedParameterError,
-    LiteLLMApiError,
-    LiteLLMRateLimitError,
-} from "../adapters/litellmClient";
-import {
-    createInitialStreamingState,
-    interpretStreamEvent,
-    flushPendingBuffers,
-    hasBufferedToolCalls,
-} from "../adapters/streaming/liteLLMStreamInterpreter";
-import type { EmittedPart } from "../adapters/streaming/liteLLMStreamInterpreter";
-import { emitPartsToVSCode } from "../adapters/streaming/vscodePartEmitter";
+
 import type { EffortFallbackCache } from "../utils/reasoningEffortFallback";
 import { StreamTokenCapture } from "../adapters/streaming/streamTokenCapture";
 import type { OpenAIChatCompletionRequest } from "../types";
 import { RequestCancellation } from "../utils/requestCancellation";
-import { exportRequestOutcome, recordCancelledTurn, type RequestOutcomeContext } from "./base/requestOutcome";
+import type { RequestOutcomeContext } from "./base/requestOutcome";
 import type { ActiveRequestRegistry } from "./activeRequests";
 import { DEFAULT_RETRY_BUDGET_MS, RetryBudget, retryBudgetError } from "../utils/retryBudget";
 import {
     StreamedTextAccumulator,
-    InactivityTimeoutError,
     ReasoningOnlyError,
-    UpstreamStreamError,
     isTransportRetriableError,
     buildResumeMessages,
     sleepWithCancellation,
     backoffDelayMs,
     logTransportRetry,
 } from "../utils/transportRetry";
-
-/**
- * Closes an upstream response body the stream loop may have stopped reading.
- * `decodeSSE` releases its reader lock before returning, so this is safe for an
- * open body (cancels the transfer), a closed one (no-op), or a locked or errored
- * one (the rejection is ignored, because there is nothing else to do about it).
- */
-function cancelUpstreamBody(body: ReadableStream<Uint8Array>): void {
-    void body.cancel().catch(() => undefined);
-}
 
 /**
  * Chat provider implementation for VS Code's LanguageModelChatProvider.
@@ -349,6 +327,10 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                             tokensIn = resumedInputTokens;
                         }
                     }
+                    // Read before the body exists: a config failure here cannot strand
+                    // an open upstream response. A setting changed mid-turn still
+                    // applies to the next attempt.
+                    const streamCfg = await this._configManager.getConfig();
                     stream = await this.sendRequestWithRetry(
                         requestBodyBuilt,
                         model,
@@ -361,13 +343,14 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     );
                     // Headers have arrived, so the request is now reading a body.
                     activeRequest.setPhase("streaming");
-                    await this.processStreamingResponse(
-                        stream,
-                        trackedProgress,
-                        requestCancellation,
+                    await processResponseStream({
+                        responseBody: stream,
+                        progress: trackedProgress,
+                        token: requestCancellation,
                         requestId,
-                        toolNames.wireToDeclared
-                    );
+                        wireToDeclaredNames: toolNames.wireToDeclared,
+                        inactivityTimeoutMs: (streamCfg.inactivityTimeout ?? 60) * 1000,
+                    });
 
                     // A cancelled stream ends without an error, so without this
                     // check the request would be reported and billed as a success.
@@ -521,121 +504,38 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 }
             }
 
-            const snapshot = tokenCapture.getSnapshot();
-
-            const tokensOut = snapshot.outputTokens;
-            const tokensInForTelemetry = snapshot.promptTokens ?? tokensIn;
-            const reasoningTokens = snapshot.reasoningTokens || undefined;
-            const cachedTokens = snapshot.cachedTokens || undefined;
-            const systemPromptTokens = snapshot.systemPromptTokens || undefined;
-            const toolTokens = snapshot.toolTokens || undefined;
-            const acceptedPredictionTokens = snapshot.acceptedPredictionTokens || undefined;
-            const rejectedPredictionTokens = snapshot.rejectedPredictionTokens || undefined;
-            const cacheCreationInputTokens = snapshot.cacheCreationInputTokens || undefined;
-            const estimatedInputCost = snapshot.estimatedInputCost;
-            const estimatedOutputCost = snapshot.estimatedOutputCost;
-            const estimatedTotalCost = snapshot.estimatedTotalCost;
-
-            const metric = {
-                requestId,
-                model: model.id,
-                durationMs: LiteLLMTelemetry.endTimer(startTime),
-                tokensIn: tokensInForTelemetry,
-                tokensOut,
-                promptCacheTokens: cachedTokens,
-                cacheCreationInputTokens,
-                reasoningTokens,
-                toolTokens,
-                acceptedPredictionTokens,
-                rejectedPredictionTokens,
-                reservedOutputTokens,
-                totalTokenMax,
-                estimatedInputCost,
-                estimatedOutputCost,
-                estimatedTotalCost,
-                status: "success" as const,
-                caller,
-                cacheReadRatio:
-                    cachedTokens !== undefined && tokensInForTelemetry
-                        ? cachedTokens / tokensInForTelemetry
-                        : undefined,
-            };
-            LiteLLMTelemetry.reportMetric(metric);
-            logFinalUsageEnvelope(requestId, model.id, caller, {
-                tokensIn: tokensInForTelemetry,
-                tokensOut,
-                cachedTokens,
-                cacheCreationInputTokens,
-                reasoningTokens,
-                toolTokens,
-                acceptedPredictionTokens,
-                rejectedPredictionTokens,
-                systemPromptTokens,
-                reservedOutputTokens,
-                totalTokenMax,
-                sawUsageDataPart: snapshot.sawUpstreamUsage,
-                estimatedInputCost,
-                estimatedOutputCost,
-                estimatedTotalCost,
-            });
-
-            // Fire-and-forget `.copilotmd` export: it reads the opt-in setting
+            // Usage data flows through StreamTokenCapture, which intercepts
+            // usage DataParts during streaming and enriches them. The transcript
+            // export it drives is fire-and-forget: it reads the opt-in setting
             // itself and is never awaited, so a slow write cannot delay a response
             // the user already has.
-            exportRequestOutcome(outcomeContext(), { status: "success", durationMs: metric.durationMs });
-
-            // Usage data flows through StreamTokenCapture, which intercepts
-            // usage DataParts during streaming and enriches them.
+            reportTurnSuccess({
+                requestId,
+                modelId: model.id,
+                caller,
+                durationMs: LiteLLMTelemetry.endTimer(startTime),
+                tokensIn,
+                snapshot: tokenCapture.getSnapshot(),
+                reservedOutputTokens,
+                totalTokenMax,
+                outcomeContext,
+            });
         } catch (err: unknown) {
-            let errorMessage = err instanceof Error ? err.message : String(err);
+            const durationMs = LiteLLMTelemetry.endTimer(startTime);
 
-            if (errorMessage.includes("LiteLLM API error")) {
-                const statusMatch = errorMessage.match(/error: (\d+)/);
-                const statusCode = statusMatch ? parseInt(statusMatch[1], 10) : 400;
-                const errorParts = errorMessage.split("\n");
-                const errorText = errorParts.length > 1 ? errorParts.slice(1).join("\n") : "";
-                const parsedMessage = this.parseApiError(statusCode, errorText);
-                errorMessage = `LiteLLM Error (${model.id}): ${parsedMessage}`;
-
-                const rejectionBody = err instanceof LiteLLMApiError ? err.bodyText : errorText;
-                if (err instanceof LiteLLMRateLimitError) {
-                    errorMessage = appendRateLimitHint(errorMessage, err.failure);
-                } else if (isUnsupportedParameterError(rejectionBody)) {
-                    // Resending the identical body would fail the same way, so the
-                    // rejection is reported once with the proxy-side fix. Only
-                    // parameters the connector adds itself are ever stripped.
-                    const rejectedParameter = findRejectedParameter(rejectionBody);
-                    const subject = rejectedParameter ? `"${rejectedParameter}"` : "a model parameter";
-                    errorMessage +=
-                        `. The proxy rejected ${subject}: drop it there with additional_drop_params ` +
-                        `or drop_params in the LiteLLM model config, then reload the models.`;
-                } else if (
-                    parsedMessage.toLowerCase().includes("temperature") ||
-                    parsedMessage.toLowerCase().includes("unsupported value")
-                ) {
-                    errorMessage +=
-                        ". This model may not support certain parameters like temperature. Please check your model settings.";
-                }
-            }
             if (requestCancellation.cancelledByConnector) {
                 // The connector ended this turn, not the host: VS Code is still
                 // waiting on the promise, so returning with a notice closes the turn
                 // and keeps whatever streamed. Throwing here would make the Agents
                 // window handler answer with a 502 and discard that output.
-                StructuredLogger.info("request.cancelled_by_connector", {
+                reportConnectorCancellation({
                     requestId,
-                    model: model.id,
+                    modelId: model.id,
                     caller,
-                    stage: "provideLanguageModelChatResponse",
-                    responseParts: responsePartCollector.parts.length,
-                });
-                Logger.info(
-                    `Chat request cancelled from the connector | RequestID: ${requestId} | Model: ${model.id} | Caller: ${caller}`
-                );
-                recordCancelledTurn(outcomeContext(), {
+                    durationMs,
                     tokensIn,
-                    durationMs: LiteLLMTelemetry.endTimer(startTime),
-                    statusReason: "Cancelled from the LiteLLM connector",
+                    responsePartCount: responsePartCollector.parts.length,
+                    outcomeContext,
                 });
                 trackingProgress.report(
                     new LanguageModelTextPart(
@@ -646,21 +546,13 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             }
 
             if (token.isCancellationRequested) {
-                Logger.info(
-                    `Chat request cancelled | RequestID: ${requestId} | Model: ${model.id} | Caller: ${caller}`
-                );
-                StructuredLogger.info("request.cancelled", {
+                reportHostCancellation({
                     requestId,
-                    model: model.id,
+                    modelId: model.id,
                     caller,
-                    stage: "provideLanguageModelChatResponse",
-                });
-                // Cancellation is not a failure. The host renders the cancelled state
-                // itself, so the metric and the transcript record that, not a failure.
-                recordCancelledTurn(outcomeContext(), {
+                    durationMs,
                     tokensIn,
-                    durationMs: LiteLLMTelemetry.endTimer(startTime),
-                    statusReason: "Cancelled by the user",
+                    outcomeContext,
                 });
                 throw Object.assign(new Error("Operation cancelled by user"), {
                     name: "CancellationError",
@@ -668,321 +560,20 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 });
             }
 
-            // Log identifiers only: the message stays in the user-facing notice
-            // and the opt-in transcript, where an echoed prompt is acceptable.
-            const errorLogFields = toErrorLogFields(err);
-            Logger.error(`Chat request failed | RequestID: ${requestId} | Model: ${model.id}`, errorLogFields);
-            StructuredLogger.error("request.failed", {
+            reportTurnFailure({
                 requestId,
-                model: model.id,
+                modelId: model.id,
                 caller,
-                stage: "provideLanguageModelChatResponse",
-                ...errorLogFields,
-            });
-
-            const metric = {
-                requestId,
-                model: model.id,
-                durationMs: LiteLLMTelemetry.endTimer(startTime),
+                durationMs,
                 tokensIn,
-                status: "failure" as const,
-                error: describeFailureForLog(err),
-                caller,
-            };
-            LiteLLMTelemetry.reportMetric(metric);
-
-            // A failure before the body exists has nothing to render, which the
-            // context reports by leaving the body undefined.
-            exportRequestOutcome(outcomeContext(), {
-                status: "failure",
-                durationMs: metric.durationMs,
-                statusReason: errorMessage,
-            });
-
-            // The Agents window handler answers a thrown error with a 502 and
-            // discards the parts already reported, which would lose everything
-            // the model said this turn. Completing with the notice as an
-            // assistant text part keeps the partial answer in the conversation.
-            // Only a host cancellation is thrown, because the host renders that
-            // state itself.
-            trackingProgress.report(new LanguageModelTextPart(`\n\n${formatConnectorNotice(errorMessage)}`));
-            // The reply now looks like model output, so record that it was a
-            // failure notice and which initiator triggered it.
-            Logger.warn(`Chat request surfaced as assistant error text instead of throwing | RequestID: ${requestId}`);
-            StructuredLogger.warn("request.error_surfaced_as_text", {
-                requestId,
-                model: model.id,
-                caller,
-                stage: "provideLanguageModelChatResponse",
-                ...toErrorLogFields(err),
+                error: err,
+                progress: trackingProgress,
+                outcomeContext,
             });
         } finally {
             // Nothing outlives the turn: neither a listed request nor a host listener.
             activeRequest.dispose();
             requestCancellation.dispose();
-        }
-    }
-
-    /**
-     * Processes an SSE streaming response from LiteLLM and emits VS Code response parts.
-     *
-     * Kept as `protected` to allow unit tests (and potential subclasses) to exercise the
-     * streaming pipeline deterministically without stubbing network layers.
-     */
-    protected async processStreamingResponse(
-        responseBody: ReadableStream<Uint8Array>,
-        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-        token: vscode.CancellationToken,
-        requestId: string,
-        wireToDeclaredNames?: ReadonlyMap<string, string>
-    ): Promise<void> {
-        Logger.info(`[processStreamingResponse] request=${requestId} Starting stream processing`);
-        StructuredLogger.info("stream.processing_start", {
-            requestId,
-            timestamp: new Date().toISOString(),
-        });
-
-        const config = await this._configManager.getConfig();
-        const timeoutMs = (config.inactivityTimeout ?? 60) * 1000;
-        // Scoped to one upstream attempt: a resumed retry is a new upstream
-        // response, so nothing buffered by the failed attempt belongs to it.
-        const streamingState = createInitialStreamingState(requestId, wireToDeclaredNames);
-        let watchdog: NodeJS.Timeout | undefined;
-        let eventCount = 0;
-        let wasWatchdogAbort = false;
-        // Content tracking for the reasoning-only detection: a cleanly-completed
-        // stream whose ONLY emissions were thinking parts is not a success for
-        // the agent loop (VS Code renders "no response was returned").
-        let sawTextPart = false;
-        let sawToolCallPart = false;
-        let sawUsagePart = false;
-        let reasoningChars = 0;
-        // Set by a `finish` part that ends the turn without completing it.
-        let stoppedEarly: { reason: string; notice: string } | undefined;
-        // Proof that the model chose to end its turn, not merely that bytes stopped.
-        let sawNormalFinish = false;
-        // Create an AbortController to actually cancel the stream on timeout
-        const controller = new AbortController();
-
-        const emitParts = (parts: EmittedPart[]): void => {
-            for (const part of parts) {
-                if (part.type === "text") {
-                    sawTextPart = true;
-                } else if (part.type === "tool_call") {
-                    sawToolCallPart = true;
-                } else if (part.type === "data" && part.mimeType === "usage") {
-                    sawUsagePart = true;
-                } else if (part.type === "thinking") {
-                    reasoningChars += typeof part.value === "string" ? part.value.length : part.value.join("").length;
-                } else if (part.type === "finish") {
-                    stoppedEarly = describeStoppedEarly(part.reason) ?? stoppedEarly;
-                    if (part.reason === "stop") {
-                        sawNormalFinish = true;
-                    }
-                }
-            }
-            emitPartsToVSCode(parts, progress);
-        };
-
-        // A stream that stops without a finish frame, whether it closes cleanly
-        // or is truncated, still holds tool calls the model fully streamed.
-        // Delivering them keeps the agent loop going instead of stalling it.
-        const recoverBufferedToolCalls = (reason: "stream_completed_without_finish" | "stream_incomplete"): number => {
-            const recoveredToolCalls = flushPendingBuffers(streamingState).filter((part) => part.type === "tool_call");
-            emitParts(recoveredToolCalls);
-            Logger.info(
-                `[processStreamingResponse] request=${requestId} Recovered ${recoveredToolCalls.length} buffered tool calls (${reason})`
-            );
-            StructuredLogger.info("stream.tool_calls_recovered", {
-                requestId,
-                reason,
-                eventCount,
-                toolCallsRecovered: recoveredToolCalls.length,
-            });
-            return recoveredToolCalls.length;
-        };
-
-        const resetWatchdog = () => {
-            if (watchdog) {
-                clearTimeout(watchdog);
-            }
-            watchdog = setTimeout(() => {
-                Logger.warn(
-                    `[processStreamingResponse] request=${requestId} Inactivity timeout after ${timeoutMs}ms (after ${eventCount} events)`
-                );
-                StructuredLogger.warn("stream.inactivity_timeout", {
-                    requestId,
-                    timeoutMs,
-                    eventCount,
-                });
-                wasWatchdogAbort = true;
-                controller.abort();
-            }, timeoutMs);
-        };
-
-        const cancellationListener = token.onCancellationRequested(() => {
-            // The listener runs synchronously inside whoever called cancel(),
-            // so this stack is the only fingerprint of the canceller, e.g.
-            // user action, Copilot agent-loop retry, session teardown, or the
-            // connector's own command, which the CancellationToken API itself
-            // does not expose.
-            const cancellationStack = new Error().stack;
-            Logger.warn(
-                `[processStreamingResponse] request=${requestId} Cancellation requested after ${eventCount} events (text=${sawTextPart}, toolCall=${sawToolCallPart}, usage=${sawUsagePart})`
-            );
-            StructuredLogger.warn("stream.cancellation_requested", {
-                requestId,
-                eventCount,
-                sawTextPart,
-                sawToolCallPart,
-                sawUsagePart,
-                stack: cancellationStack,
-            });
-            if (watchdog) {
-                clearTimeout(watchdog);
-            }
-            controller.abort();
-        });
-
-        try {
-            resetWatchdog();
-            Logger.debug(`[processStreamingResponse] Starting SSE decoder loop`);
-
-            for await (const payload of decodeSSE(responseBody, token, controller.signal)) {
-                resetWatchdog();
-                eventCount++;
-
-                Logger.trace(`[processStreamingResponse] Event #${eventCount} received, length=${payload.length}`);
-
-                const jsonResult = tryParseJSONObject(payload);
-                if (!jsonResult.ok) {
-                    Logger.trace(`[processStreamingResponse] Event #${eventCount}: Skipped (JSON parse failed)`);
-                    StructuredLogger.trace("stream.event_parse_skipped", {
-                        eventNumber: eventCount,
-                        payloadLength: payload.length,
-                    });
-                    continue;
-                }
-                const json = jsonResult.value;
-
-                Logger.trace(`[processStreamingResponse] Event #${eventCount}: Interpreting event`);
-                const parts = interpretStreamEvent(json, streamingState);
-                Logger.trace(
-                    `[processStreamingResponse] Event #${eventCount}: Got ${parts.length} parts, emitting to VS Code`
-                );
-                StructuredLogger.trace("stream.event_processed", {
-                    eventNumber: eventCount,
-                    partCount: parts.length,
-                });
-                emitParts(parts);
-            }
-
-            Logger.info(`[processStreamingResponse] Stream loop completed after ${eventCount} events`);
-            StructuredLogger.info("stream.processing_complete", {
-                eventCount,
-                reason: "stream_ended",
-            });
-
-            // A watchdog abort causes decodeSSE to END CLEANLY (the aborted flag
-            // there suppresses its endError), so the abort lands HERE on the
-            // normal path, not in the catch block. Surface it as the retryable
-            // sentinel BEFORE reasoning-only detection: a watchdog abort kills
-            // the stream regardless of whether reasoning was emitted.
-            if (wasWatchdogAbort) {
-                throw new InactivityTimeoutError(timeoutMs, eventCount);
-            }
-
-            // A cancelled stream delivers no tool calls: the host drops the parts
-            // reported after it cancels, and after a connector cancel a recovered
-            // call would reach the agent loop and run a tool the user just stopped.
-            if (!token.isCancellationRequested && hasBufferedToolCalls(streamingState)) {
-                recoverBufferedToolCalls("stream_completed_without_finish");
-            }
-
-            // Reasoning-only detection: a cleanly-completed stream that emitted
-            // ONLY thinking parts (plus perhaps a usage data part) contains
-            // nothing the agent loop can act on. VS Code renders it as
-            // "no response was returned" and kills the turn. Surface it to the
-            // retry loop as resumable: the partial reasoning is appended to the
-            // request so the model continues its thought.
-            if (eventCount > 0 && !sawTextPart && !sawToolCallPart) {
-                Logger.warn(
-                    `[processStreamingResponse] request=${requestId} Reasoning-only stream detected (${eventCount} events, ` +
-                        `no text/tool parts); surfacing as resumable empty-content error`
-                );
-                StructuredLogger.warn("stream.reasoning_only_response", {
-                    requestId,
-                    eventCount,
-                    sawUsagePart,
-                });
-                throw new ReasoningOnlyError(eventCount, reasoningChars, sawNormalFinish);
-            }
-
-            // Deliberately after the reasoning-only check: if the model only
-            // reasoned before hitting its limit, the retry path is the better
-            // answer than a notice about a response that never appeared.
-            if (stoppedEarly) {
-                Logger.warn(
-                    `[processStreamingResponse] request=${requestId} Stream stopped by finish reason "${stoppedEarly.reason}"`
-                );
-                StructuredLogger.warn("stream.stopped_early", {
-                    requestId,
-                    reason: stoppedEarly.reason,
-                    eventCount,
-                });
-                progress.report(new LanguageModelTextPart(stoppedEarly.notice));
-            }
-        } catch (error: unknown) {
-            // Every error leaving this method is handled by the caller, which
-            // retries the recoverable sentinels and logs the final outcome. Log
-            // the attempt at warn so a recovered retry does not read as a
-            // failure in the channel.
-            Logger.warn(
-                `[processStreamingResponse] request=${requestId} Stream attempt failed after ${eventCount} events`,
-                toErrorLogFields(error)
-            );
-            StructuredLogger.warn("stream.attempt_failed", {
-                requestId,
-                eventCount,
-                ...toErrorLogFields(error),
-            });
-
-            const isStreamEndError =
-                !(error instanceof UpstreamStreamError) &&
-                error instanceof Error &&
-                (error.message.includes("Stream ended before [DONE] marker") ||
-                    error.message.includes("stream ended") ||
-                    error.message.includes("unexpected end"));
-
-            // A partial response with its tool calls beats a hard failure, so a
-            // truncated stream that recovers any call completes normally.
-            if (isStreamEndError && hasBufferedToolCalls(streamingState)) {
-                const recoveredCount = recoverBufferedToolCalls("stream_incomplete");
-                if (recoveredCount > 0) {
-                    return;
-                }
-            }
-
-            // Belt-and-suspenders: if a watchdog abort coincided with an actual
-            // stream error, classify it as the retryable inactivity sentinel.
-            if (wasWatchdogAbort) {
-                throw new InactivityTimeoutError(timeoutMs, eventCount);
-            }
-
-            throw error;
-        } finally {
-            // The retry loop in provideLanguageModelChatResponse re-enters
-            // this method per attempt on the same token, so the listener must
-            // not outlive this call, or earlier attempts would log duplicate
-            // cancellation events.
-            cancellationListener.dispose();
-            if (watchdog) {
-                clearTimeout(watchdog);
-            }
-            // Every exit path releases the reader, but an early exit (error
-            // frame, reasoning-only retry, recovered tool calls) would otherwise
-            // leave the upstream generating and billing until it finishes.
-            cancelUpstreamBody(responseBody);
         }
     }
 }

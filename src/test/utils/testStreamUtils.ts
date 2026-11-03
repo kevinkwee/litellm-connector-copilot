@@ -1,3 +1,5 @@
+import type * as vscode from "vscode";
+
 export function createMockSSEStream(chunks: string[]): ReadableStream<Uint8Array> {
     return new ReadableStream({
         start(controller) {
@@ -140,4 +142,32 @@ export function createMockToolCallStream(toolName: string, args: string): Readab
             controller.close();
         },
     });
+}
+
+/** Streams `frames`, then fails the next read the way a dropped socket does. */
+export function createSeveredSseStream(frames: readonly string[], failure: Error): ReadableStream<Uint8Array> {
+    const encoder = new TextEncoder();
+    let nextFrameIndex = 0;
+    return new ReadableStream<Uint8Array>(
+        {
+            pull(controller) {
+                if (nextFrameIndex >= frames.length) {
+                    controller.error(failure);
+                    return;
+                }
+                controller.enqueue(encoder.encode(`data: ${frames[nextFrameIndex]}\n\n`));
+                nextFrameIndex += 1;
+            },
+        },
+        { highWaterMark: 0 }
+    );
+}
+
+/** Records every reported part and returns the progress that received them. */
+export function createPartRecorder(): {
+    parts: vscode.LanguageModelResponsePart[];
+    progress: vscode.Progress<vscode.LanguageModelResponsePart>;
+} {
+    const parts: vscode.LanguageModelResponsePart[] = [];
+    return { parts, progress: { report: (part) => parts.push(part) } };
 }

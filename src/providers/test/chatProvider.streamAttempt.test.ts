@@ -3,12 +3,14 @@ import * as sinon from "sinon";
 import * as vscode from "vscode";
 
 import { LiteLLMChatProvider } from "../";
+import * as responseStreamModule from "../chat/responseStream";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import type { OpenAIChatCompletionRequest } from "../../types";
+import { LiteLLMClient } from "../../adapters/litellmClient";
+import { findErrorTextPart, seedDiscoveredBackend } from "../../test/utils/chatProviderTestUtils";
 import { Logger } from "../../utils/logger";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
 import { CopilotMdManager } from "../../observability/copilotMdManager";
-import { ReasoningOnlyError, UpstreamStreamError } from "../../utils/transportRetry";
 import {
     collectResponseText,
     collectToolCalls,
@@ -16,7 +18,6 @@ import {
     createMockModel,
     createMockSecrets,
     createMockUserMessage,
-    noop,
     TEST_USER_AGENT,
 } from "../../test/utils/testMocks";
 import {
@@ -28,21 +29,14 @@ import {
     createMockSSEStream,
     SSE_DONE_FRAME,
     SteppedSseStream,
+    createPartRecorder,
+    createSeveredSseStream,
 } from "../../test/utils/testStreamUtils";
 
-const DROPPED_EVENT = "stream.tool_call_buffer_dropped";
-const REQUEST_ID = "req-9";
 const MODEL = createMockModel({ maxOutputTokens: 4096, capabilities: { toolCalling: true, imageInput: false } });
-const IGNORE_PROGRESS: vscode.Progress<vscode.LanguageModelResponsePart> = { report: noop };
 
 interface ProviderSeams {
     _configManager: { getConfig: () => Promise<unknown> };
-    processStreamingResponse: (
-        body: ReadableStream<Uint8Array>,
-        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-        token: vscode.CancellationToken,
-        requestId: string
-    ) => Promise<void>;
     sendRequestWithRetry: (body: OpenAIChatCompletionRequest) => Promise<ReadableStream<Uint8Array>>;
 }
 
@@ -58,52 +52,11 @@ function createProvider(sandbox: sinon.SinonSandbox): { provider: LiteLLMChatPro
     return { provider, seams };
 }
 
-/** Streams `frames`, then fails the next read the way a dropped socket does. */
-function createSeveredSseStream(frames: readonly string[], failure: Error): ReadableStream<Uint8Array> {
-    const encoder = new TextEncoder();
-    let nextFrameIndex = 0;
-    return new ReadableStream<Uint8Array>(
-        {
-            pull(controller) {
-                if (nextFrameIndex >= frames.length) {
-                    controller.error(failure);
-                    return;
-                }
-                controller.enqueue(encoder.encode(`data: ${frames[nextFrameIndex]}\n\n`));
-                nextFrameIndex += 1;
-            },
-        },
-        { highWaterMark: 0 }
-    );
-}
-
-/** Wraps one frame without its closing blank line, so decodeSSE treats the stream as truncated. */
-function createUnterminatedSseStream(frame: string): ReadableStream<Uint8Array> {
-    return new ReadableStream<Uint8Array>({
-        start(controller) {
-            controller.enqueue(new TextEncoder().encode(`data: ${frame}\n`));
-            controller.close();
-        },
-    });
-}
-
-function droppedEventsOf(warnStub: sinon.SinonStub): Record<string, unknown>[] {
-    return warnStub
-        .getCalls()
-        .filter((call) => call.args[0] === DROPPED_EVENT)
-        .map((call) => call.args[1] as Record<string, unknown>);
-}
-
-function createPartRecorder(): {
-    parts: vscode.LanguageModelResponsePart[];
-    progress: vscode.Progress<vscode.LanguageModelResponsePart>;
-} {
-    const parts: vscode.LanguageModelResponsePart[] = [];
-    return { parts, progress: { report: (part) => parts.push(part) } };
-}
-
 suite("LiteLLMChatProvider stream attempt", () => {
     let sandbox: sinon.SinonSandbox;
+
+    const mockSecrets = createMockSecrets();
+    const userAgent = TEST_USER_AGENT;
 
     setup(() => {
         sandbox = sinon.createSandbox();
@@ -111,50 +64,6 @@ suite("LiteLLMChatProvider stream attempt", () => {
 
     teardown(() => {
         sandbox.restore();
-    });
-
-    test("delivers a complete tool call when the stream completes without a finish frame", async () => {
-        const { seams } = createProvider(sandbox);
-        const recorder = createPartRecorder();
-        const stream = new SteppedSseStream(
-            [
-                chatTextFrame("Checking"),
-                chatToolCallHeaderFrame("call_open", "read_file"),
-                chatToolCallArgumentsFrame('{"path":"a.ts"}'),
-                SSE_DONE_FRAME,
-            ],
-            []
-        );
-
-        await seams.processStreamingResponse(
-            stream.body,
-            recorder.progress,
-            new vscode.CancellationTokenSource().token,
-            REQUEST_ID
-        );
-
-        assert.deepStrictEqual(collectToolCalls(recorder.parts), [{ name: "read_file", input: { path: "a.ts" } }]);
-    });
-
-    test("completes a stream whose only output is a tool call left without a finish frame", async () => {
-        const { seams } = createProvider(sandbox);
-        const stream = new SteppedSseStream(
-            [
-                chatToolCallHeaderFrame("call_open", "read_file"),
-                chatToolCallArgumentsFrame('{"path":"a.ts"}'),
-                SSE_DONE_FRAME,
-            ],
-            []
-        );
-
-        await assert.doesNotReject(
-            seams.processStreamingResponse(
-                stream.body,
-                IGNORE_PROGRESS,
-                new vscode.CancellationTokenSource().token,
-                REQUEST_ID
-            )
-        );
     });
 
     test("emits the declared tool name when the advertised name had to change", async () => {
@@ -186,103 +95,6 @@ suite("LiteLLMChatProvider stream attempt", () => {
         );
 
         assert.deepStrictEqual(collectToolCalls(recorder.parts), [{ name: "search files", input: { q: "x" } }]);
-    });
-
-    test("tags a tool call dropped at stream end with its request id", async () => {
-        const { seams } = createProvider(sandbox);
-        const warnStub = sandbox.stub(StructuredLogger, "warn");
-        const stream = new SteppedSseStream(
-            [
-                chatTextFrame("Writing"),
-                chatToolCallHeaderFrame("call_cut", "write_file"),
-                chatToolCallArgumentsFrame('{"path":"a.ts","con'),
-                SSE_DONE_FRAME,
-            ],
-            []
-        );
-
-        await seams.processStreamingResponse(
-            stream.body,
-            IGNORE_PROGRESS,
-            new vscode.CancellationTokenSource().token,
-            REQUEST_ID
-        );
-
-        assert.deepStrictEqual(
-            droppedEventsOf(warnStub).map((fields) => [fields.requestId, fields.reason]),
-            [[REQUEST_ID, "invalid_json_args"]]
-        );
-    });
-
-    test("rethrows a truncated stream whose buffered fragment cannot be recovered", async () => {
-        const { seams } = createProvider(sandbox);
-        const stream = createUnterminatedSseStream(chatToolCallArgumentsFrame('{"mode":"background"}'));
-
-        await assert.rejects(
-            seams.processStreamingResponse(
-                stream,
-                IGNORE_PROGRESS,
-                new vscode.CancellationTokenSource().token,
-                REQUEST_ID
-            ),
-            /Stream ended before \[DONE\] marker/
-        );
-    });
-
-    test("skips tool call recovery for a cancelled stream", async () => {
-        const { seams } = createProvider(sandbox);
-        const recorder = createPartRecorder();
-        const tokenSource = new vscode.CancellationTokenSource();
-        const stream = new SteppedSseStream(
-            [
-                chatTextFrame("Checking"),
-                chatToolCallHeaderFrame("call_open", "read_file"),
-                chatToolCallArgumentsFrame('{"path":"a.ts"}'),
-                SSE_DONE_FRAME,
-            ],
-            [3]
-        );
-
-        const processing = seams.processStreamingResponse(
-            stream.body,
-            recorder.progress,
-            tokenSource.token,
-            REQUEST_ID
-        );
-        await stream.reached(3);
-        tokenSource.cancel();
-        await processing;
-
-        assert.deepStrictEqual(collectToolCalls(recorder.parts), []);
-    });
-
-    test("reports the streamed reasoning length when a stream carries only reasoning", async () => {
-        const { seams } = createProvider(sandbox);
-        // The sealing frame carries the block text only in its metadata, so the
-        // count must come from the reasoning deltas.
-        const sealingFrame = JSON.stringify({
-            choices: [{ delta: { thinking_blocks: [{ type: "thinking", thinking: "abcdef", signature: "SIG" }] } }],
-        });
-        const stream = new SteppedSseStream(
-            [
-                chatReasoningFrame("abcd"),
-                chatReasoningFrame("ef"),
-                sealingFrame,
-                chatFinishFrame("stop"),
-                SSE_DONE_FRAME,
-            ],
-            []
-        );
-
-        await assert.rejects(
-            seams.processStreamingResponse(
-                stream.body,
-                IGNORE_PROGRESS,
-                new vscode.CancellationTokenSource().token,
-                REQUEST_ID
-            ),
-            (error: unknown) => error instanceof ReasoningOnlyError && error.reasoningChars === "abcdef".length
-        );
     });
 
     test("starts a resumed attempt without the failed attempt's open tool call", async () => {
@@ -317,32 +129,6 @@ suite("LiteLLMChatProvider stream attempt", () => {
         );
 
         assert.deepStrictEqual(collectToolCalls(recorder.parts), [{ name: "view", input: { path: "README.md" } }]);
-    });
-
-    test("logs a failed attempt at warn", async () => {
-        const { seams } = createProvider(sandbox);
-        const warnStub = sandbox.stub(StructuredLogger, "warn");
-        const errorStub = sandbox.stub(StructuredLogger, "error");
-        const loggerErrorStub = sandbox.stub(Logger, "error");
-        const stream = createSeveredSseStream([chatTextFrame("partial")], new TypeError("terminated"));
-
-        await assert.rejects(() =>
-            seams.processStreamingResponse(
-                stream,
-                IGNORE_PROGRESS,
-                new vscode.CancellationTokenSource().token,
-                REQUEST_ID
-            )
-        );
-
-        const attempts = warnStub
-            .getCalls()
-            .filter((call) => call.args[0] === "stream.attempt_failed")
-            .map((call) => call.args[1] as Record<string, unknown>);
-        assert.strictEqual(attempts.length, 1);
-        assert.strictEqual(attempts[0].requestId, REQUEST_ID);
-        assert.strictEqual(errorStub.called, false);
-        assert.strictEqual(loggerErrorStub.called, false);
     });
 
     test("logs a failure that is surfaced as chat text", async () => {
@@ -414,7 +200,7 @@ suite("LiteLLMChatProvider stream attempt", () => {
         const tokenSource = new vscode.CancellationTokenSource();
         // The token is cancelled once the stream body has been consumed, which is
         // the window where a clean stream end would otherwise read as a success.
-        sandbox.stub(seams, "processStreamingResponse").callsFake(async () => {
+        sandbox.stub(responseStreamModule, "processResponseStream").callsFake(async () => {
             tokenSource.cancel();
         });
 
@@ -595,44 +381,6 @@ suite("LiteLLMChatProvider stream attempt", () => {
         assert.ok(!collectResponseText(recorder.parts).includes("[litellm-connector]"), "no failure notice is due");
     });
 
-    test("reports a cut-short reasoning-only attempt without a normal finish", async () => {
-        const { seams } = createProvider(sandbox);
-        const stream = new SteppedSseStream(
-            [chatReasoningFrame("thinking"), chatFinishFrame("length"), SSE_DONE_FRAME],
-            []
-        );
-
-        await assert.rejects(
-            () =>
-                seams.processStreamingResponse(
-                    stream.body,
-                    IGNORE_PROGRESS,
-                    new vscode.CancellationTokenSource().token,
-                    REQUEST_ID
-                ),
-            (err: unknown) => err instanceof ReasoningOnlyError && !err.normalFinish
-        );
-    });
-
-    test("reports a normally finished reasoning-only attempt as a normal finish", async () => {
-        const { seams } = createProvider(sandbox);
-        const stream = new SteppedSseStream(
-            [chatReasoningFrame("thinking"), chatFinishFrame("stop"), SSE_DONE_FRAME],
-            []
-        );
-
-        await assert.rejects(
-            () =>
-                seams.processStreamingResponse(
-                    stream.body,
-                    IGNORE_PROGRESS,
-                    new vscode.CancellationTokenSource().token,
-                    REQUEST_ID
-                ),
-            (err: unknown) => err instanceof ReasoningOnlyError && err.normalFinish
-        );
-    });
-
     test("resumes after a transient upstream error frame instead of failing the turn", async () => {
         const { provider, seams } = createProvider(sandbox);
         const overloadedFrame = JSON.stringify({
@@ -723,118 +471,6 @@ suite("LiteLLMChatProvider stream attempt", () => {
         assert.deepStrictEqual(collectToolCalls(recorder.parts), [{ name: "view", input: { path: "README.md" } }]);
     });
 
-    test("tells the user when the model stops at its output token limit", async () => {
-        const { seams } = createProvider(sandbox);
-        const recorder = createPartRecorder();
-        const stream = new SteppedSseStream(
-            [chatTextFrame("Half an answer"), chatFinishFrame("length"), SSE_DONE_FRAME],
-            []
-        );
-
-        await seams.processStreamingResponse(
-            stream.body,
-            recorder.progress,
-            new vscode.CancellationTokenSource().token,
-            REQUEST_ID
-        );
-
-        const text = collectResponseText(recorder.parts);
-        assert.ok(text.startsWith("Half an answer"), `unexpected text: ${text}`);
-        assert.match(text, /output token limit/);
-        const notice = recorder.parts.find(
-            (part) => part instanceof vscode.LanguageModelTextPart && part.value.includes("output token limit")
-        );
-        assert.ok(notice instanceof vscode.LanguageModelTextPart);
-        assert.ok(
-            notice.value.startsWith("\n\n[litellm-connector] "),
-            "the notice must start a new block, not stick to the last word"
-        );
-    });
-
-    test("tells the user when a content filter ends the response", async () => {
-        const { seams } = createProvider(sandbox);
-        const recorder = createPartRecorder();
-        const stream = new SteppedSseStream(
-            [chatTextFrame("Half an answer"), chatFinishFrame("content_filter"), SSE_DONE_FRAME],
-            []
-        );
-
-        await seams.processStreamingResponse(
-            stream.body,
-            recorder.progress,
-            new vscode.CancellationTokenSource().token,
-            REQUEST_ID
-        );
-
-        assert.match(collectResponseText(recorder.parts), /content filter/);
-        const notice = recorder.parts.find(
-            (part) => part instanceof vscode.LanguageModelTextPart && part.value.includes("content filter")
-        );
-        assert.ok(notice instanceof vscode.LanguageModelTextPart);
-        assert.ok(notice.value.startsWith("\n\n[litellm-connector] "));
-    });
-
-    test("does not recover buffered tool calls from an upstream failure that mentions a stream end", async () => {
-        const { seams } = createProvider(sandbox);
-        const recorder = createPartRecorder();
-        const failureFrame = JSON.stringify({
-            error: { message: "stream ended unexpectedly", type: "invalid_request_error", code: 400 },
-        });
-        const stream = new SteppedSseStream(
-            [
-                chatToolCallHeaderFrame("toolu_done", "view"),
-                chatToolCallArgumentsFrame('{"path":"README.md"}'),
-                failureFrame,
-            ],
-            []
-        );
-
-        await assert.rejects(
-            seams.processStreamingResponse(
-                stream.body,
-                recorder.progress,
-                new vscode.CancellationTokenSource().token,
-                REQUEST_ID
-            ),
-            UpstreamStreamError
-        );
-
-        assert.deepStrictEqual(
-            collectToolCalls(recorder.parts),
-            [],
-            "a failed attempt must not deliver its buffered tool call"
-        );
-    });
-
-    test("cancels the upstream body when the stream ends on an error frame", async () => {
-        const { seams } = createProvider(sandbox);
-        const rejectedFrame = JSON.stringify({
-            error: { message: "bad request", type: "invalid_request_error", code: 400 },
-        });
-        let bodyCancelled = false;
-        const encoder = new TextEncoder();
-        const body = new ReadableStream<Uint8Array>({
-            start(controller) {
-                controller.enqueue(encoder.encode(`data: ${rejectedFrame}\n\n`));
-            },
-            cancel() {
-                bodyCancelled = true;
-            },
-        });
-
-        await assert.rejects(
-            seams.processStreamingResponse(
-                body,
-                IGNORE_PROGRESS,
-                new vscode.CancellationTokenSource().token,
-                REQUEST_ID
-            ),
-            UpstreamStreamError
-        );
-
-        assert.strictEqual(bodyCancelled, true, "an abandoned upstream must stop generating");
-    });
-
     test("resumes an error frame that follows reasoning-only output instead of treating it as empty", async () => {
         const { provider, seams } = createProvider(sandbox);
         const overloadedFrame = JSON.stringify({
@@ -868,5 +504,152 @@ suite("LiteLLMChatProvider stream attempt", () => {
             .filter((call) => call.args[0] === "request.reasoning_only_retry");
         assert.deepStrictEqual(reasoningOnlyRetries, [], "an upstream error is not an empty response");
         assert.strictEqual(collectResponseText(recorder.parts), "answer");
+    });
+
+    test("reports a truncated stream as an error instead of a blank reply", async () => {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+
+        interface ProviderWithConfigManager {
+            _configManager: {
+                getConfig: () => Promise<{ url: string }>;
+            };
+        }
+        const providerWithConfig = provider as unknown as ProviderWithConfigManager;
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+
+        sandbox.stub(LiteLLMClient.prototype, "chat").resolves(
+            new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.close();
+                },
+            })
+        );
+
+        const reported: vscode.LanguageModelResponsePart[] = [];
+
+        await provider.provideLanguageModelChatResponse(
+            {
+                id: "model-1",
+                name: "model-1",
+                tooltip: "",
+                family: "litellm",
+                version: "1.0.0",
+                maxInputTokens: 1000,
+                maxOutputTokens: 1000,
+                capabilities: { toolCalling: true, imageInput: false },
+            },
+            [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart("hi")],
+                },
+            ],
+            {
+                modelOptions: {},
+                tools: [],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+                requestInitiator: "test",
+                configuration: { baseUrl: "http://localhost:4000", apiKey: "test-api-key" } as unknown as Record<
+                    string,
+                    unknown
+                >,
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            { report: (part) => reported.push(part) },
+            new vscode.CancellationTokenSource().token
+        );
+
+        // The provider completes gracefully with the failure as an error
+        // text part so VS Code keeps the turn in the conversation history.
+        const errorText = findErrorTextPart(reported);
+        assert.ok(errorText, "a stream ending before [DONE] must surface as an error text part");
+        assert.match(errorText, /Stream ended before \[DONE\] marker/);
+    });
+
+    test("delivers a complete buffered tool call when the stream closes without [DONE]", async () => {
+        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+
+        interface ProviderWithConfigManager {
+            _configManager: {
+                getConfig: () => Promise<{ url: string }>;
+            };
+        }
+        const providerWithConfig = provider as unknown as ProviderWithConfigManager;
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+
+        // A stream that closes after a complete tool call, without the [DONE] marker.
+        const { ReadableStream } = await import("node:stream/web");
+        const encoder = new TextEncoder();
+        sandbox.stub(LiteLLMClient.prototype, "chat").resolves(
+            new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(
+                        encoder.encode(
+                            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"my_tool","arguments":"{}"}}]}}]}\n'
+                        )
+                    );
+
+                    controller.close();
+                },
+            })
+        );
+
+        const reported: vscode.LanguageModelResponsePart[] = [];
+        await provider.provideLanguageModelChatResponse(
+            {
+                id: "model-1",
+                name: "model-1",
+                tooltip: "",
+                family: "litellm",
+                version: "1.0.0",
+                maxInputTokens: 1000,
+                maxOutputTokens: 1000,
+                capabilities: { toolCalling: true, imageInput: false },
+            },
+            [
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    name: undefined,
+                    content: [new vscode.LanguageModelTextPart("hi")],
+                },
+            ],
+            {
+                modelOptions: {},
+                tools: [
+                    {
+                        name: "my_tool",
+                        description: "A test tool",
+                        inputSchema: { type: "object", properties: { param: { type: "string" } } },
+                    },
+                ],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+                requestInitiator: "test",
+                configuration: { baseUrl: "http://localhost:4000", apiKey: "test-api-key" } as unknown as Record<
+                    string,
+                    unknown
+                >,
+            } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            { report: (part) => reported.push(part) },
+            new vscode.CancellationTokenSource().token
+        );
+
+        // The buffered call was complete, so the clean close settles it and reports it
+        // instead of failing the turn for the missing marker.
+        const toolCallParts = reported.filter(
+            (part): part is vscode.LanguageModelToolCallPart =>
+                part instanceof vscode.LanguageModelToolCallPart ||
+                typeof (part as unknown as Record<string, unknown>)?.name === "string"
+        );
+        assert.deepStrictEqual(
+            toolCallParts.map((part) => part.name),
+            ["my_tool"],
+            "the buffered call reaches VS Code instead of ending the turn"
+        );
     });
 });

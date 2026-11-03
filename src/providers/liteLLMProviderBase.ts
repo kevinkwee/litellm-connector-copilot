@@ -739,25 +739,4 @@ export abstract class LiteLLMProviderBase {
             imageInput: modelInfo.supports_vision === true,
         };
     }
-
-    protected parseApiError(statusCode: number, errorText: string): string {
-        try {
-            const parsed: unknown = JSON.parse(errorText);
-            if (parsed && typeof parsed === "object" && "error" in (parsed as Record<string, unknown>)) {
-                const errorObj = (parsed as Record<string, unknown>).error as unknown;
-                if (errorObj && typeof errorObj === "object" && "message" in errorObj) {
-                    const message = (errorObj as Record<string, unknown>).message;
-                    if (typeof message === "string") {
-                        return message;
-                    }
-                }
-            }
-        } catch {
-            // ignore
-        }
-        if (errorText) {
-            return errorText.slice(0, 200);
-        }
-        return `API request failed with status ${statusCode}`;
-    }
 }

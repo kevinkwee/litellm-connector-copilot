@@ -195,7 +195,8 @@ src/
 ├── extension.ts         # activation, provider registration, command wiring
 ├── types.ts             # shared extension types
 ├── providers/           # Language Model provider implementations
-│   └── base/            # shared support modules for the orchestrator and the registry
+│   ├── base/            # shared support modules for the orchestrator and the registry
+│   └── chat/            # chat-protocol modules the chat provider delegates to
 ├── adapters/            # HTTP client, payload shaping, SSE and stream parsing, tokenizers
 ├── config/              # configuration and secrets
 ├── commands/            # command registrations and UI entry points
@@ -255,7 +256,7 @@ This structure can be updated as the project evolves. If you add new files or mo
 
 Folder ownership (unit tests are co-located with the module under test in `src/**/test/`):
 
-- `src/providers/`: Language Model provider implementations (`liteLLMProviderBase.ts`, `liteLLMChatProvider.ts`, `activeRequests.ts`, `index.ts`) and `base/`, the shared modules behind the provider orchestrator and the discovery registry: `requestBuilder.ts`, `transport.ts`, `requestOutcome.ts`, `types.ts`, `errorLogFields.ts`, `discoveryBackoff.ts`, `backendIdentity.ts`, `discoveryFailure.ts`, `pausedModelListing.ts`
+- `src/providers/`: Language Model provider implementations (`liteLLMProviderBase.ts`, `liteLLMChatProvider.ts`, `activeRequests.ts`, `index.ts`), `chat/`, the chat-protocol modules the chat provider delegates to (`responseStream.ts`, `turnReport.ts`), and `base/`, the shared modules behind the provider orchestrator and the discovery registry: `requestBuilder.ts`, `transport.ts`, `requestOutcome.ts`, `types.ts`, `errorLogFields.ts`, `apiErrorMessage.ts`, `discoveryBackoff.ts`, `backendIdentity.ts`, `discoveryFailure.ts`, `pausedModelListing.ts`
 - `src/adapters/`: HTTP clients, payload shaping, endpoint-specific parsing, SSE and streaming (`sse/`, `streaming/`), tokenizers
 - `src/utils/`: shared utilities (logging, local request metrics, model helpers, pricing, `chatSessionId`, `thinkingBlocks`, `promptCaching`, `connectorNotice`, `transportRetry`, `retryBudget`, `requestCancellation`, `rateLimitRetryPolicy`, `rateLimitNotice`, `toolNameUtils`, `byteEncoding`, `proxyBaseUrl`)
 - `src/config/`: configuration and secrets
@@ -353,7 +354,7 @@ A proxy rejection body can echo the prompt, and a mid-stream failure detail can 
 
 ### Core Principles
 
-- Write unit tests for all core logic. Unit tests are co-located with the module under test in `src/**/test/` as `*.test.ts` files. Integration tests live in `src/test/`.
+- Write unit tests for all core logic. Unit tests are co-located with the module under test in `src/**/test/` as `*.test.ts` files. Integration tests live in `src/test/`. A suite that covers one unit but grows large splits by behaviour into aspect-suffixed files next to it (`chatProvider.retry.test.ts`, `chatProvider.cancellation.test.ts`), with the helpers they share in `src/test/utils/`.
 - Write integration tests for external integrations (the LiteLLM HTTP surface, VS Code protocol wiring).
 - Distribute tests as a pyramid: many fast unit tests at the base, focused integration tests at the boundaries, and only a few end-to-end tests for critical user journeys.
 - Follow Arrange-Act-Assert (AAA) structure. ONE act per test, ONE logical assertion per test.
@@ -613,7 +614,7 @@ This extension integrates LiteLLM proxies into VS Code's Language Model APIs. It
   - Extends `LiteLLMProviderBase` and adds chat-protocol behavior only.
   - Handles chat-specific streaming, tool call buffering, response part emission (text, thinking, data, tool calls), and message parsing.
   - One instance serves every concurrent request (chat sessions, subagents, and background requests such as title generation), so request state never lives in instance fields. Shared instance state would let one session's tool calls, text, or usage reach another session's response.
-    - The stream interpreter state is created per upstream attempt in `processStreamingResponse`, because a resumed retry is a new upstream response.
+    - The stream interpreter state is created per upstream attempt in `processResponseStream` (`src/providers/chat/responseStream.ts`), because a resumed retry is a new upstream response.
     - `StreamTokenCapture` and the retry accumulators are locals of `provideLanguageModelChatResponse`, because they span every attempt of one request.
   - Reads the per-group credentials from the model object VS Code passes back (see [Configuration Flow](#configuration-flow-per-group)); the per-model picker configuration still arrives on `options.configuration`.
   - Resolves the session id once per request through `resolveChatSessionId` and attaches it to `metadata.session_id` and the `.copilotmd` entry (see [Session Identity](#session-identity)).
@@ -664,10 +665,11 @@ Keep this pipeline shared unless the change is intentionally protocol-specific a
 ### Chat-Specific Logic (Chat Provider)
 
 - **Request part conversion**: handle `LanguageModelTextPart` and `LanguageModelBinaryPart` (vision). Images must be encoded for OpenAI-compatible payloads. Tool result images follow the provider-specific shapes described in [Multimodal Tool Results](#multimodal-tool-results).
+- **Module layout**: the provider is the wiring and the retry loop. The per-attempt stream read lives in `src/providers/chat/responseStream.ts` (`processResponseStream`, given the body and the inactivity bound), and the success, cancellation, and failure reports live in `src/providers/chat/turnReport.ts` (`reportTurnSuccess`, `reportConnectorCancellation`, `reportHostCancellation`, `reportTurnFailure`, `describeTurnFailure`). The user-facing message for an upstream rejection is built there too, over `parseApiError` in `src/providers/base/apiErrorMessage.ts`.
 - **Streaming state management**: buffer partial tool calls when SSE frames arrive fragmented. When a stream ends without a finish frame, either closing cleanly or closing before `[DONE]` with an unterminated frame, its buffered chat-completions tool calls are settled by the rules of a non-`tool_calls` finish frame: complete calls reach VS Code, incomplete or invalid ones are dropped with a `stream.tool_call_buffer_dropped` warning tagged with the request id, and ids already emitted are skipped. If an unterminated-frame ending recovers no call, the retry loop resumes the request. A transport read error such as `terminated` and an inactivity abort resume the request without recovery, and a cancelled stream discards its buffers.
 - **Upstream failures inside the stream**: the interpreter throws `UpstreamStreamError` for a chat-completions `{"error": ...}` frame (the proxy's mid-stream failure shape) and for the Responses API `error` and `response.failed` events. The retry loop treats a transient one (408, 409, 425, 429, 5xx including Anthropic's 529, or an overloaded / rate-limit / timeout / unavailable code) exactly like a dropped socket: it resumes, except when a tool call was already delivered. A rejected request surfaces the upstream message instead. Never let one of these frames fall through to the reasoning-only detector, which would retry a hard failure.
 - **Visible stop reasons**: a `length` or `content_filter` finish reason reports a `stream.stopped_early` warning and appends a connector notice text part to the response, because an incomplete answer is otherwise indistinguishable from a finished one. A `/responses` turn that ends with `response.incomplete` produces the same notice: a reason of `max_output_tokens` maps to `length`, `content_filter` maps to itself, and an unrecognized reason emits no finish part at all rather than claiming a cause. An incomplete turn still reports its usage and still settles buffered tool calls.
-- **A response only ever ends when its body is closed**: `processStreamingResponse` cancels the upstream body in `finally`; every exit path (error frame, retry, recovered tool calls) must stop the provider from generating and billing.
+- **A response only ever ends when its body is closed**: `processResponseStream` cancels the upstream body in `finally`; every exit path (error frame, retry, recovered tool calls) must stop the provider from generating and billing.
 - **A resumed turn needs proof of a `stop`**: the interpreter emits `reason: "stop"` for a chat `finish_reason` of `stop`, and for a `/responses` `response.completed` whose `status` is not `incomplete`, because the chat-to-Responses bridge reports every one of its turns as completed, including the ones a length limit or content filter cut short. The provider treats only that reason as proof the model chose to end its turn, so a resumed attempt that adds nothing can complete the turn only when the attempt ended that way. A clean close without a finish frame, a usage-only tail on chat completions, an unrecognized incomplete reason, or a cut-short finish is not proof on either endpoint. One `/responses` case differs: the bridge settles its own function calls before it completes, so a call the connector drops for unparseable arguments still arrives as a finished response.
 - **Response emission**: emit `LanguageModelResponsePart`, `LanguageModelToolCallPart`, `LanguageModelToolResultPart` to the progress callback.
 - **Tool call parsing**: extract and validate tool calls from the structured streaming fields only. Text that looks like a tool call (`<tool_call>`, `<|tool_call_begin|>`) is model output and is emitted verbatim: turning it into a `LanguageModelToolCallPart` would let a model's explanation of a tool-call format execute a real tool.
