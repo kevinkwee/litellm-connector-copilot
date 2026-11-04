@@ -662,6 +662,8 @@ No message is dropped to fit a token budget. A context-overflow rejection from t
 
 Keep this pipeline shared unless the change is intentionally protocol-specific and cannot be expressed in the common path.
 
+A message with no parts is rejected before routing, except an assistant turn VS Code sends with none, which carries nothing to forward; VS Code can send one after it strips the thinking parts of a reasoning-only reply on replay. Every assistant tool call must be answered: each following user message, until every call is answered, has to contribute at least one matching `LanguageModelToolResultPart`, and it may carry text or images beside the results, because a tool result is not the whole turn. A message that contributes no match ends the pairing window, so a result has to follow its call directly. What a result message carries beside its results waits until the run of tool messages ends, so no user message ever sits between two `tool` messages. Text parts of a user or system message join with a blank line, so two blocks stay apart, and empty parts are dropped first; an assistant message's parts concatenate, because they are streamed deltas of one sentence.
+
 ### Chat-Specific Logic (Chat Provider)
 
 - **Request part conversion**: handle `LanguageModelTextPart` and `LanguageModelBinaryPart` (vision). Images must be encoded for OpenAI-compatible payloads. Tool result images follow the provider-specific shapes described in [Multimodal Tool Results](#multimodal-tool-results).
@@ -697,7 +699,7 @@ DeepSeek thinking mode requires `reasoning_content` on every assistant turn in t
 - **Gating**: `isDeepSeekModel` (`src/utils/modelUtils.ts`) matches `litellm_provider` or the raw model id. `RequestBuilder` enables the fill only for a DeepSeek model whose request carries tools. No other model receives the field.
 - **Scope**: the fill targets chat-completions requests. `transformToResponsesFormat` (`src/adapters/responsesAdapter.ts`) drops `reasoning_content`, so a DeepSeek model forced onto `/responses` receives no fill and can return the same 400.
 - **Empty-string safety**: the two `reasoning_content` spreads test `!== undefined`, not truthiness; `""` is a valid value and must reach the wire.
-- **Tests**: `src/utils/test/utils.test.ts` covers the active-turn boundary, completed-turn isolation, reasoning preservation, hoisted tool-result images, and the empty-string regression. `src/utils/test/isDeepSeekModel.test.ts` covers DeepSeek detection, and `src/providers/test/liteLLMProviderBase.requestBuilder.test.ts` covers the tools-present gate.
+- **Tests**: `src/utils/test/convertMessages.reasoning.test.ts` covers the active-turn boundary, completed-turn isolation, reasoning preservation, hoisted tool-result images, and the empty-string regression. `src/utils/test/isDeepSeekModel.test.ts` covers DeepSeek detection, and `src/providers/test/liteLLMProviderBase.requestBuilder.test.ts` covers the tools-present gate.
 
 ### Multimodal Tool Results
 

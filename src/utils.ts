@@ -183,40 +183,53 @@ export function convertMessages(
     const lastRealUserMessageIndex = ensureReasoningContent ? findLastRealUserMessageIndex(messages) : -1;
     const out: OpenAIChatMessage[] = [];
     let pendingToolResultImages: PendingToolResultImages[] = [];
+    // A user message may carry text or images beside its results. They are held
+    // here and emitted once the run of tool results ends, so the run stays
+    // contiguous, which is the only order providers accept.
+    let deferredUserTextParts: string[] = [];
+    let deferredUserContentItems: OpenAIChatMessageContentItem[] = [];
     // Tool names resolved from the assistant tool calls, keyed by normalized id.
     // Hoisted images are attributed to their tool so the model can tell apart
     // images from parallel calls whose results all arrive in one turn.
     const toolNamesByCallId = new Map<string, string>();
 
-    const flushPendingToolResultImages = (): void => {
-        if (pendingToolResultImages.length === 0) {
-            return;
+    /**
+     * Emits the content held back while a run of tool messages was in progress. The
+     * hoisted image groups come first, because the tool message they belong to tells
+     * the model that the images follow in the next user message. A user message's own
+     * words and images follow them.
+     */
+    const flushPendingToolResultContent = (): void => {
+        if (pendingToolResultImages.length > 0) {
+            const parts: OpenAIChatMessageContentItem[] = [{ type: "text", text: TOOL_RESULT_IMAGE_BOUNDARY_TEXT }];
+            for (const group of pendingToolResultImages) {
+                parts.push({ type: "text", text: toolResultImagesAttribution(group.toolName) });
+                parts.push(...group.images);
+            }
+            out.push({ role: "user", content: parts });
+            Logger.trace(
+                `[convertMessages] Emitted ${pendingToolResultImages.length} tool result image group(s) as a user message`
+            );
+            pendingToolResultImages = [];
         }
-        const parts: OpenAIChatMessageContentItem[] = [{ type: "text", text: TOOL_RESULT_IMAGE_BOUNDARY_TEXT }];
-        for (const group of pendingToolResultImages) {
-            parts.push({ type: "text", text: toolResultImagesAttribution(group.toolName) });
-            parts.push(...group.images);
+
+        const deferredContent = buildMessageContent("user", deferredUserTextParts, deferredUserContentItems);
+        if (deferredContent !== undefined) {
+            out.push({ role: "user", content: deferredContent });
         }
-        out.push({ role: "user", content: parts });
-        Logger.trace(
-            `[convertMessages] Emitted ${pendingToolResultImages.length} tool result image group(s) as a user message`
-        );
-        pendingToolResultImages = [];
+        deferredUserTextParts = [];
+        deferredUserContentItems = [];
     };
 
     for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
         const m = messages[messageIndex];
         const carriesToolResults = messageCarriesToolResults(m);
         // Results for one assistant turn can arrive across consecutive messages,
-        // so the flush waits until a message that adds no more tool messages.
-        // Emitting earlier would place the images between tool messages and break
-        // the tool-call adjacency that strict providers require.
+        // so the flush waits for a message that adds no more tool messages.
         if (!carriesToolResults) {
-            flushPendingToolResultImages();
+            flushPendingToolResultContent();
         }
-        // `lmcr_toString` returns "system" | "user" | "assistant" for the supported
-        // VS Code roles, which matches `Exclude<OpenAIChatRole, "tool">` exactly.
-        // Casting keeps the downstream string narrowing in line 315 typed correctly.
+        // `lmcr_toString` declares `string`, but returns only "user", "assistant" or "system".
         const role = lmcr_toString(m.role as vscode.LanguageModelChatMessageRole) as Exclude<OpenAIChatRole, "tool">;
         const textParts: string[] = [];
         const contentItems: OpenAIChatMessageContentItem[] = [];
@@ -343,7 +356,7 @@ export function convertMessages(
         const thinkingBlocks = sealedThinkingBlocks.length > 0 ? sealedThinkingBlocks : undefined;
 
         if (toolCalls.length > 0) {
-            const messageContent = buildMessageContent(textParts, contentItems);
+            const messageContent = buildMessageContent(role, textParts, contentItems);
             out.push({
                 role: "assistant",
                 content: messageContent || undefined,
@@ -372,11 +385,14 @@ export function convertMessages(
         // key.
         const hasReasoning = role === "assistant" && (Boolean(reasoningContent) || Boolean(thinkingBlocks));
         if (text || contentItems.length > 0 || hasReasoning) {
-            if (role === "system" || role === "user" || (role === "assistant" && !emittedAssistantToolCall)) {
-                const messageContent = buildMessageContent(textParts, contentItems);
+            if (carriesToolResults && role === "user") {
+                deferredUserTextParts.push(...textParts);
+                deferredUserContentItems.push(...contentItems);
+            } else if (role === "system" || role === "user" || (role === "assistant" && !emittedAssistantToolCall)) {
+                const messageContent = buildMessageContent(role, textParts, contentItems);
                 if (messageContent || hasReasoning) {
                     out.push({
-                        role: role || "user",
+                        role,
                         content: messageContent ?? "",
                         ...(reasoningContent !== undefined && role === "assistant"
                             ? { reasoning_content: reasoningContent }
@@ -387,26 +403,31 @@ export function convertMessages(
             }
         }
     }
-    flushPendingToolResultImages();
+    flushPendingToolResultContent();
     return out;
 }
 
 /**
- * Build message content from text and content items.
- * If there are content items (images), return an array format.
- * Otherwise, return a simple string.
+ * Builds one message's content, as a plain string unless the message carries images.
+ *
+ * A user or system turn is one message the caller wrote, so its text parts stay
+ * separate blocks and join with `BLOCK_SEPARATOR`. An assistant turn's parts are
+ * streamed deltas that belong to one sentence, so they concatenate. Empty parts are
+ * dropped first, so a separator never wraps one and an image-only message carries no
+ * blank text.
  */
 function buildMessageContent(
-    textParts: string[],
+    role: Exclude<OpenAIChatRole, "tool">,
+    textParts: readonly string[],
     contentItems: readonly OpenAIChatMessageContentItem[]
 ): string | OpenAIChatMessageContentItem[] | undefined {
-    const text = textParts.join("");
+    const nonEmptyParts = textParts.filter((part) => part.length > 0);
+    const text = nonEmptyParts.join(role === "assistant" ? "" : BLOCK_SEPARATOR);
 
     if (contentItems.length === 0) {
         return text || undefined;
     }
 
-    // If we have content items (images), create an array with both text and images
     const items: OpenAIChatMessageContentItem[] = [];
     if (text) {
         items.push({ type: "text", text });
@@ -484,6 +505,14 @@ export function convertTools(options: vscode.ProvideLanguageModelChatResponseOpt
 
 /**
  * Validate the request message sequence for correct tool call/result pairing.
+ *
+ * A message with no parts is rejected, except an assistant turn that carries
+ * nothing by design, which is what VS Code sends after it strips the thinking parts
+ * of a reasoning-only reply on replay. Every assistant tool call must be answered:
+ * each following user message, until every call is answered, has to contribute at
+ * least one matching `LanguageModelToolResultPart`, and it may carry text or images
+ * beside the results, because a tool result is not required to be the whole turn.
+ *
  * @param messages The full request message list.
  */
 export function validateRequest(messages: readonly vscode.LanguageModelChatRequestMessage[]): void {
@@ -492,52 +521,83 @@ export function validateRequest(messages: readonly vscode.LanguageModelChatReque
         throw new Error("Invalid request: no messages.");
     }
 
-    for (const message of messages) {
+    messages.forEach((message, index) => {
+        if (isEmptyAssistantTurn(message)) {
+            return;
+        }
         if (!message.content || message.content.length === 0) {
-            Logger.error("Empty message content in request");
+            Logger.error(`Validation failed: message at index ${index} has empty content`);
             throw new Error("Invalid request: empty message content.");
         }
-    }
-
-    messages.forEach((message, i) => {
-        if (message.content.length === 0) {
-            Logger.error(`Validation failed: message at index ${i} has empty content`);
-            throw new Error("Invalid request: empty message content.");
+        if (message.role !== vscode.LanguageModelChatMessageRole.Assistant) {
+            return;
         }
-        if (message.role === vscode.LanguageModelChatMessageRole.Assistant) {
-            const toolCallIds = new Set(
-                message.content
-                    .filter((part) => part instanceof vscode.LanguageModelToolCallPart)
-                    .map((part) => (part as unknown as vscode.LanguageModelToolCallPart).callId)
-            );
-            if (toolCallIds.size === 0) {
-                return;
-            }
-
-            let nextMessageIdx = i + 1;
-            const errMsg =
-                "Invalid request: Tool call part must be followed by a User message with a LanguageModelToolResultPart with a matching callId.";
-            while (toolCallIds.size > 0) {
-                const nextMessage = messages[nextMessageIdx++];
-                if (!nextMessage || nextMessage.role !== vscode.LanguageModelChatMessageRole.User) {
-                    Logger.error("Validation failed: missing tool result for call IDs:", Array.from(toolCallIds));
-                    throw new Error(errMsg);
-                }
-
-                nextMessage.content.forEach((part) => {
-                    if (!isToolResultPart(part)) {
-                        const ctorName =
-                            (Object.getPrototypeOf(part as object) as { constructor?: { name?: string } } | undefined)
-                                ?.constructor?.name ?? typeof part;
-                        Logger.error("Validation failed: expected tool result part, got:", ctorName);
-                        throw new Error(errMsg);
-                    }
-                    const callId = (part as { callId: string }).callId;
-                    toolCallIds.delete(callId);
-                });
-            }
+        const callIds = collectToolCallIds(message);
+        if (callIds.size > 0) {
+            assertToolResultsFollow(messages, index, callIds);
         }
     });
+}
+
+/**
+ * True for an assistant turn VS Code sends with no parts, which carries nothing to
+ * forward and so is not an invalid request. VS Code can send one after it strips the
+ * thinking parts of a reasoning-only reply on replay.
+ */
+function isEmptyAssistantTurn(message: vscode.LanguageModelChatRequestMessage): boolean {
+    return (
+        message.role === vscode.LanguageModelChatMessageRole.Assistant &&
+        (!message.content || message.content.length === 0)
+    );
+}
+
+/** The call ids an assistant message declares, each of which needs a tool result. */
+function collectToolCallIds(message: vscode.LanguageModelChatRequestMessage): Set<string> {
+    const callIds = new Set<string>();
+    for (const part of message.content ?? []) {
+        if (part instanceof vscode.LanguageModelToolCallPart) {
+            callIds.add(part.callId);
+        }
+    }
+    return callIds;
+}
+
+/**
+ * Throws unless the messages after `callIndex` answer every pending call.
+ *
+ * Results for one assistant turn may arrive over several user messages, so each
+ * following user message is read for matches until none remain. A user message
+ * that contributes no match ends the window: the results have to follow their
+ * calls directly, which is the shape every provider accepts.
+ */
+function assertToolResultsFollow(
+    messages: readonly vscode.LanguageModelChatRequestMessage[],
+    callIndex: number,
+    callIds: ReadonlySet<string>
+): void {
+    const pendingCallIds = new Set(callIds);
+    let nextIndex = callIndex + 1;
+    while (pendingCallIds.size > 0) {
+        const nextMessage = messages[nextIndex++];
+        if (!nextMessage || nextMessage.role !== vscode.LanguageModelChatMessageRole.User) {
+            failMissingToolResult(pendingCallIds);
+        }
+        let matched = 0;
+        for (const part of nextMessage.content ?? []) {
+            if (isToolResultPart(part) && pendingCallIds.delete(part.callId)) {
+                matched += 1;
+            }
+        }
+        if (matched === 0) {
+            failMissingToolResult(pendingCallIds);
+        }
+    }
+}
+
+/** Logs the calls still waiting for a result and reports the pairing failure. */
+function failMissingToolResult(pendingCallIds: ReadonlySet<string>): never {
+    Logger.error("Validation failed: missing tool result for call IDs:", Array.from(pendingCallIds));
+    throw new Error(TOOL_RESULT_PAIRING_ERROR);
 }
 
 /**
@@ -625,6 +685,21 @@ const TOOL_RESULT_IMAGE_MIME_TYPES: ReadonlySet<string> = new Set([
     "image/webp",
     "image/bmp",
 ]);
+
+/**
+ * The failure a request with a tool call but no matching result reports. Every
+ * provider rejects such a sequence, so the connector refuses it before sending.
+ */
+const TOOL_RESULT_PAIRING_ERROR =
+    "Invalid request: Tool call part must be followed by a User message with a LanguageModelToolResultPart with a matching callId.";
+
+/**
+ * Separates the blocks of one message. A blank line keeps two separate blocks
+ * from reading as one run-on sentence, and LiteLLM's text-only transforms
+ * concatenate several text items with no separator, so the connector joins them
+ * itself.
+ */
+const BLOCK_SEPARATOR = "\n\n";
 
 /**
  * Opens the user message that carries hoisted tool result images. It frames the
@@ -738,7 +813,7 @@ function buildToolResultMessageContent(
     textMode: ToolResultTextMode
 ): string | OpenAIChatMessageContentItem[] {
     if (images.length === 0 && textMode === "joined") {
-        return textParts.join("\n\n") || "Success";
+        return textParts.join(BLOCK_SEPARATOR) || "Success";
     }
     if (images.length === 0 && textParts.length <= 1) {
         return textParts[0] || "Success";
@@ -746,7 +821,7 @@ function buildToolResultMessageContent(
     const textItems: OpenAIChatMessageContentItem[] =
         textMode === "separate"
             ? textParts.map((text) => ({ type: "text", text }))
-            : [{ type: "text", text: textParts.join("\n\n") }];
+            : [{ type: "text", text: textParts.join(BLOCK_SEPARATOR) }];
     if (images.length === 0) {
         return textItems;
     }

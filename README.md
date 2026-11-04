@@ -98,6 +98,8 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Tool schemas are sent as the caller declared them, with no rewriting, no dropped keywords, and no composite flattening. LiteLLM's transforms convert a schema where a provider needs a different shape (Gemini, Anthropic, Bedrock, vLLM, watsonx). A tool that declares no schema, or one that is not a JSON object, receives an empty object schema, which every endpoint accepts.
 - The separate text parts of one tool result stay distinguishable: Claude and Bedrock receive one text item per part, and every other provider receives the parts joined with a blank line instead of running together.
 - No chat history is dropped to fit a token budget: a context-overflow rejection from the proxy reaches the turn as an error with the proxy's message.
+- A tool result may share its message with text or images. What it carries beside the results waits until the run of tool messages ends, so no user message ever sits between two tool messages, and a request is refused only when a message answers none of the calls or a call is never answered at all.
+- The text parts of one user or system message stay separate blocks: they join with a blank line instead of running together, and empty parts are dropped first so a separator never wraps one. An assistant message keeps plain concatenation, because its parts are streamed deltas of one sentence.
 
 ### New settings
 - `litellm-connector.anthropicPromptCaching` (Anthropic prompt caching, default `5m`): see the dedicated section above.
