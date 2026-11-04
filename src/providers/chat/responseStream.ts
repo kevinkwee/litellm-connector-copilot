@@ -177,8 +177,10 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
         resetWatchdog();
         Logger.debug(`[chatStream] Starting SSE decoder loop`);
 
-        for await (const payload of decodeSSE(responseBody, token, controller.signal)) {
-            resetWatchdog();
+        // Only a chunk read resets the watchdog. The loop must not reset it per payload:
+        // a payload carries no new bytes, and a chunk that yields several events would push
+        // the deadline past the last byte that justifies it.
+        for await (const payload of decodeSSE(responseBody, token, controller.signal, resetWatchdog)) {
             eventCount++;
 
             Logger.trace(`[chatStream] Event #${eventCount} received, length=${payload.length}`);

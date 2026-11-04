@@ -16,6 +16,7 @@ import {
     SSE_DONE_FRAME,
     SteppedSseStream,
     createPartRecorder,
+    createKeepAliveSseStream,
     createSeveredSseStream,
 } from "../../../test/utils/testStreamUtils";
 
@@ -601,5 +602,29 @@ suite("processResponseStream", () => {
             "the readable call survives the truncation"
         );
         assert.match(collectResponseText(parts), /"search_files" tool was not run/);
+    });
+
+    test("keeps reading while keep-alive comments arrive and no event completes", async () => {
+        // Comment frames yield no payload, so only a per-chunk reset keeps a healthy
+        // stream that outlasts the bound from being aborted. Twenty frames, one every
+        // KEEP_ALIVE_GAP_MS, span twice the bound set below, and no gap exceeds a tenth
+        // of it.
+        const KEEP_ALIVE_COUNT = 20;
+        const KEEP_ALIVE_GAP_MS = 25;
+        const { parts, progress } = createPartRecorder();
+        const stream = createKeepAliveSseStream(KEEP_ALIVE_COUNT, KEEP_ALIVE_GAP_MS, [
+            chatTextFrame("Still here"),
+            SSE_DONE_FRAME,
+        ]);
+
+        await processResponseStream({
+            responseBody: stream,
+            progress,
+            token: new vscode.CancellationTokenSource().token,
+            requestId: REQUEST_ID,
+            inactivityTimeoutMs: KEEP_ALIVE_GAP_MS * 10,
+        });
+
+        assert.strictEqual(collectResponseText(parts), "Still here");
     });
 });

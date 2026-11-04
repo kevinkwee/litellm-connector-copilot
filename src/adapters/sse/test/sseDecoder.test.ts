@@ -219,4 +219,27 @@ suite("SSE Decoder Unit Tests", () => {
         // Only the complete payload should be yielded
         assert.deepStrictEqual(results, ['{"text": "hello"}']);
     });
+
+    test("reports activity for a chunk that yields no payload", async () => {
+        // A keep-alive comment frame carries bytes but no event, so a caller that
+        // resets an inactivity bound per payload would see silence here.
+        let activityReports = 0;
+        const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode(": keep-alive\n\n"));
+                controller.enqueue(new TextEncoder().encode('data: {"text": "hi"}\n\n'));
+                controller.close();
+            },
+        });
+
+        const results: string[] = [];
+        for await (const payload of decodeSSE(stream, undefined, undefined, () => {
+            activityReports++;
+        })) {
+            results.push(payload);
+        }
+
+        assert.deepStrictEqual(results, ['{"text": "hi"}']);
+        assert.strictEqual(activityReports, 2, "one report per chunk read, including the keep-alive");
+    });
 });

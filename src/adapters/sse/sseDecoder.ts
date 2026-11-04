@@ -5,11 +5,17 @@ import { StructuredLogger } from "../../observability/structuredLogger";
 /**
  * Decodes a ReadableStream of SSE data into raw payload strings.
  * Handles chunk boundaries, partial lines, and [DONE] marker.
+ *
+ * `onActivity` fires as soon as a chunk arrives, before it is decoded. A payload is
+ * only yielded once its event is complete, so a caller that resets an inactivity
+ * bound per payload would treat a keep-alive comment frame, which yields nothing, as
+ * silence and abort a healthy stream.
  */
 export async function* decodeSSE(
     stream: ReadableStream<Uint8Array>,
     token?: CancellationToken,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    onActivity?: () => void
 ): AsyncGenerator<string> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
@@ -107,6 +113,7 @@ export async function* decodeSSE(
                 break;
             }
             chunkCount++;
+            onActivity?.();
             Logger.trace("[decodeSSE] Chunk #" + chunkCount + " received, length=", value?.length);
             StructuredLogger.trace("stream.chunk_received", {
                 chunkNumber: chunkCount,

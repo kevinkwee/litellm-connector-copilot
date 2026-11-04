@@ -163,6 +163,41 @@ export function createSeveredSseStream(frames: readonly string[], failure: Error
     );
 }
 
+/**
+ * SSE body held open by comment frames before the given data frames. A comment frame
+ * carries bytes but completes no event, which is what a gateway in front of the proxy
+ * sends while its upstream is still working.
+ */
+export function createKeepAliveSseStream(
+    keepAliveCount: number,
+    gapMs: number,
+    frames: readonly string[]
+): ReadableStream<Uint8Array> {
+    const encoder = new TextEncoder();
+    let keepAlivesSent = 0;
+    let frameIndex = 0;
+    return new ReadableStream<Uint8Array>(
+        {
+            async pull(controller) {
+                if (keepAlivesSent < keepAliveCount) {
+                    keepAlivesSent += 1;
+                    await new Promise((resolve) => setTimeout(resolve, gapMs));
+                    controller.enqueue(encoder.encode(": keep-alive\n\n"));
+                    return;
+                }
+                if (frameIndex >= frames.length) {
+                    controller.close();
+                    return;
+                }
+                const frame = frames[frameIndex];
+                frameIndex += 1;
+                controller.enqueue(encoder.encode(`data: ${frame}\n\n`));
+            },
+        },
+        { highWaterMark: 0 }
+    );
+}
+
 /** Records every reported part and returns the progress that received them. */
 export function createPartRecorder(): {
     parts: vscode.LanguageModelResponsePart[];
