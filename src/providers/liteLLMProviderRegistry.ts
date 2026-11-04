@@ -14,10 +14,9 @@
  *  3. **Change detection**: emits `onDidChange` when a backend's model set
  *     actually differs from the prior delivery, so VS Code only refreshes
  *     the picker when the set has really changed.
- *  4. **Capability caches**: per-model `LiteLLMModelInfo` and derived
- *     capabilities. These are populated as a side effect of discovery and
- *     feed the request hot path. They are NOT a model-list cache: they
- *     cache the capability info for known models.
+ *  4. **Capability cache**: the per-model `LiteLLMModelInfo`, populated as a
+ *     side effect of discovery and read on the request hot path. It is NOT a
+ *     model-list cache: it holds the capability info for known models.
  *
  * Public surface (read + ingress)
  *  - `discoverModels(options, token)`: the only way for VS Code (or any
@@ -26,15 +25,13 @@
  *  - `lookupInfo(info)`: resolve the exact model object VS Code passed back,
  *    which is what distinguishes two groups on the same host.
  *  - `extractRawName(id)`: strip the routing prefix from a namespaced id.
- *  - `getModelInfo(id)` / `getDerivedCapabilities(id)`: read the
- *    capability caches populated during discovery.
+ *  - `getModelInfo(id)`: read the model info cache populated during discovery.
  *  - `size()`: number of distinct backends currently registered.
- *  - `clearCaches()`: wipe the per-model caches (model info, derived
- *    capabilities, unsupported parameters), the discovery response cache, and
- *    every backend's backoff history.
- *  - `clearDiscoveryCaches()`: wipes the two caches a model reload must refresh,
- *    the discovery response cache and every backend's backoff history. Routing
- *    and the per-model caches survive.
+ *  - `clearCaches()`: wipe the per-model caches (model info, unsupported
+ *    parameters), the discovery response cache, and every backend's backoff
+ *    history.
+ *  - `clearDiscoveryCaches()`: wipes the discovery response cache and every
+ *    backend's backoff history. Routing and the per-model caches survive.
  *  - `recordUnsupportedParameter(modelId, param)` /
  *    `getUnsupportedParameters(modelId)`: the learned-parameter store, keyed by
  *    the namespaced picker id.
@@ -184,13 +181,12 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     private readonly unsupportedParamsByModel = new Map<string, Set<string>>();
 
     /**
-     * Per-model capability caches. These are populated as a side effect of
-     * discovery and feed the request hot path (`buildOpenAIChatRequest`,
-     * token utilities, capability derivation). They are NOT a model list
-     * cache: they cache the capability info for known models.
+     * Per-model capability cache. It is populated as a side effect of discovery and
+     * read on the request hot path (`buildOpenAIChatRequest`, the token utilities and
+     * the provider's request-time lookup). It is NOT a model list cache: it holds the
+     * `LiteLLMModelInfo` of the models the proxy currently lists.
      */
     private readonly modelInfoCache = new Map<string, LiteLLMModelInfo | undefined>();
-    private readonly derivedCapabilitiesCache = new Map<string, ReturnType<typeof deriveCapabilitiesFromModelInfo>>();
 
     private readonly _onDidChangeEmitter = new vscode.EventEmitter<void>();
 
@@ -323,14 +319,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     /**
-     * Returns the derived capabilities cached during the most recent
-     * discovery for this id, or `undefined` if the id has not been seen.
-     */
-    public getDerivedCapabilities(id: string): ReturnType<typeof deriveCapabilitiesFromModelInfo> | undefined {
-        return this.derivedCapabilitiesCache.get(id);
-    }
-
-    /**
      * Number of distinct backends currently registered. Not a routing primitive.
      */
     public size(): number {
@@ -338,22 +326,21 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     /**
-     * Wipes the per-model caches (model info, derived capabilities, unsupported
-     * parameters), the discovery response cache, and every backend's backoff
-     * history. Does NOT touch the routing table.
+     * Wipes the per-model caches (model info, unsupported parameters), the discovery
+     * response cache, and every backend's backoff history. Does NOT touch the routing
+     * table.
      */
     public clearCaches(): void {
         this.modelInfoCache.clear();
-        this.derivedCapabilitiesCache.clear();
         this.unsupportedParamsByModel.clear();
         this.clearDiscoveryCaches();
     }
 
     /**
-     * Wipes the two caches a model reload must refresh, the discovery response
-     * cache and every backend's backoff history. The routing table and the
-     * per-model capability caches survive, so an in-flight request keeps resolving
-     * while VS Code re-queries each group.
+     * Wipes the discovery response cache and every backend's backoff history, the
+     * two pieces a model reload must refresh. The routing table and the per-model
+     * capability cache survive, so an in-flight request keeps resolving while VS
+     * Code re-queries each group.
      */
     public clearDiscoveryCaches(): void {
         this.discoveryEpoch += 1;
@@ -502,7 +489,7 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             const displayLabel = urlHostname.length > 0 ? urlHostname : "LiteLLM";
 
             // Read once per discovery so the session client, the response cache
-            // and the capability caches all see the same workspace settings.
+            // and the capability cache all see the same workspace settings.
             const config = await this.configManager.getConfig();
             const session = this.resolveBackendForCall(options.configuration, config);
             if (!session) {
@@ -609,6 +596,17 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             // Blocking only matters when there is nothing to serve, so the
             // stale-while-error contract above always wins.
             if (decision.shouldBlock) {
+                // The throw is the last thing this failure does, so this is the layer that
+                // has to record it; nothing above logs a blocked group's cause.
+                const blockedReason = describeDiscoveryFailure(err);
+                Logger.warn(
+                    `LiteLLMProviderRegistry.discoverModels: blocking baseUrl="${failureBaseUrl ?? "unknown"}" after ${decision.attempt} consecutive failures (${blockedReason})`
+                );
+                StructuredLogger.warn("discovery.blocked", {
+                    baseUrl: failureBaseUrl,
+                    reason: blockedReason,
+                    attempt: decision.attempt,
+                });
                 throw vscode.LanguageModelError.Blocked(
                     `Discovery blocked after ${decision.attempt} consecutive failures. ` +
                         `The LiteLLM endpoint appears to be unhealthy. ` +
@@ -708,7 +706,7 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         const infos = selectable.map((item) => item.info);
 
         // A reload during the fetch invalidates everything this call derived, so
-        // both the response cache and the per-model capability caches are
+        // both the response cache and the per-model capability cache are
         // skipped. Writing them would let a pre-reload answer overwrite the
         // newer one. The hash is computed before the guard so no await sits
         // between the epoch check and the writes it protects.
@@ -716,7 +714,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         if (this.discoveryEpoch === epochAtFetchStart) {
             for (const item of selectable) {
                 this.modelInfoCache.set(item.info.id, item.modelInfo);
-                this.derivedCapabilitiesCache.set(item.info.id, item.derived);
             }
             if (ttlMs > 0 && bodyHash !== undefined) {
                 this.discoveryResponseCache.set(cacheKey, {
@@ -738,9 +735,9 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     /**
-     * Maps one discovered deployment to the VS Code model object plus the
-     * capability data discovery caches. Nothing is written here: the caller
-     * commits `modelInfo` and `derived` under the discovery epoch guard.
+     * Maps one discovered deployment to the VS Code model object plus the model info
+     * the request path reads. Nothing is written here: the caller commits `modelInfo`
+     * under the discovery epoch guard.
      */
     private toVSCodeInfo(
         entry: LiteLLMModelInfoEntry,
@@ -754,7 +751,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     ): {
         info: vscode.LanguageModelChatInformation;
         modelInfo: LiteLLMModelInfo | undefined;
-        derived: ReturnType<typeof deriveCapabilitiesFromModelInfo>;
     } {
         if (!entry.model_name) {
             Logger.warn(
@@ -778,7 +774,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             return {
                 info,
                 modelInfo: entry.model_info,
-                derived: deriveCapabilitiesFromModelInfo("unknown", entry.model_info),
             };
         }
 
@@ -896,6 +891,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             }
         }
 
-        return { info, modelInfo, derived };
+        return { info, modelInfo };
     }
 }

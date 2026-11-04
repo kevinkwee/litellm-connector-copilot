@@ -178,7 +178,7 @@ export class LiteLLMClient {
         Logger.trace(`Fetching model info from ${urls[0]}`);
         try {
             let lastResponse: Response | undefined;
-            for (const url of urls) {
+            for (const [urlIndex, url] of urls.entries()) {
                 const resp = await fetch(url, {
                     headers: this.getHeaders(),
                     signal: controller.signal,
@@ -191,24 +191,27 @@ export class LiteLLMClient {
 
                 lastResponse = resp;
                 if (resp.status === 404) {
-                    Logger.warn(`Model info endpoint returned 404, trying fallback URL: ${url}`);
                     this.discardBody(resp);
-                    continue;
+                    // A fallback that does not exist is not worth a warning: the throw
+                    // below is the failure the registry reports.
+                    if (urlIndex < urls.length - 1) {
+                        Logger.warn(`Model info endpoint returned 404, trying fallback URL: ${urls[urlIndex + 1]}`);
+                        continue;
+                    }
+                    break;
                 }
 
-                Logger.error(`Failed to fetch model info: ${resp.status} ${resp.statusText}`);
                 this.discardBody(resp);
                 throw new LiteLLMDiscoveryError(resp.status, resp.statusText);
             }
 
+            // The registry terminates this failure and logs it with the backend it belongs
+            // to, which this client does not know.
             const status = lastResponse?.status ?? 404;
             const statusText = lastResponse?.statusText ?? "Not Found";
-            Logger.error(`Failed to fetch model info after trying fallback URLs: ${status} ${statusText}`);
             throw new LiteLLMDiscoveryError(status, statusText);
         } catch (err) {
-            // Check if the error was caused by our timeout
             if (controller.signal.aborted && controller.signal.reason instanceof DiscoveryTimeoutError) {
-                Logger.warn(`Discovery timeout after ${timeoutMs}ms`);
                 throw controller.signal.reason;
             }
 
@@ -225,29 +228,6 @@ export class LiteLLMClient {
         return [...new Set([base, withoutV1].filter((candidate) => candidate.length > 0))].map(
             (candidate) => `${candidate}/model/info`
         );
-    }
-
-    /**
-     * Checks the connection to the LiteLLM proxy.
-     */
-    async checkConnection(
-        token?: vscode.CancellationToken
-    ): Promise<{ latencyMs: number; modelCount: number; sampleModelIds: string[] }> {
-        const startTime = Date.now();
-        const { data } = await this.getModelInfo(token);
-        const latencyMs = Date.now() - startTime;
-
-        const modelCount = Array.isArray(data) ? data.length : 0;
-        const sampleModelIds = Array.isArray(data)
-            ? data
-                  .slice(0, 5)
-                  .map(
-                      (entry: { model_info?: { key?: string }; model_name?: string }) =>
-                          entry.model_info?.key ?? entry.model_name ?? "unknown"
-                  )
-            : [];
-
-        return { latencyMs, modelCount, sampleModelIds };
     }
 
     /**

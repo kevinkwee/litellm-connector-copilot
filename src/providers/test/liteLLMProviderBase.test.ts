@@ -3,17 +3,12 @@ import * as vscode from "vscode";
 import * as sinon from "sinon";
 import { LiteLLMChatProvider } from "../";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types";
-import { createMockSecrets, TEST_USER_AGENT } from "../../test/utils/testMocks";
+import { TEST_USER_AGENT } from "../../test/utils/testMocks";
 import { access, apiError, seedBackendForCall } from "../../test/utils/providerBaseTestUtils";
 import { EffortFallbackCache } from "../../utils/reasoningEffortFallback";
 
 suite("LiteLLMProviderBase", () => {
     let sandbox: sinon.SinonSandbox;
-
-    const mockSecrets = createMockSecrets({
-        "litellm-connector.baseUrl": "http://localhost:4000",
-        "litellm-connector.apiKey": "test-api-key",
-    });
 
     const userAgent = TEST_USER_AGENT;
 
@@ -39,7 +34,7 @@ suite("LiteLLMProviderBase", () => {
 
         suite("applyReasoningEffort", () => {
             test("sends reasoning_effort='none' as a real value", () => {
-                const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+                const provider = new LiteLLMChatProvider(userAgent);
                 const request = { model: "test-model", messages: [] } as OpenAIChatCompletionRequest;
 
                 access(provider).applyReasoningEffort(request, "none");
@@ -49,7 +44,7 @@ suite("LiteLLMProviderBase", () => {
             });
 
             test("sets reasoning_effort field for non-none values", () => {
-                const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+                const provider = new LiteLLMChatProvider(userAgent);
                 const request = { model: "test-model", messages: [] } as OpenAIChatCompletionRequest;
 
                 access(provider).applyReasoningEffort(request, "high");
@@ -60,7 +55,7 @@ suite("LiteLLMProviderBase", () => {
         });
 
         test("applies reasoning effort from modelConfiguration", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const request = (
                 await access(provider).buildOpenAIChatRequest(
                     [
@@ -83,7 +78,7 @@ suite("LiteLLMProviderBase", () => {
         });
 
         test("applies picker xhigh when fallback cache is empty", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const modelInfo: LiteLLMModelInfo = {
                 mode: "chat",
                 supports_reasoning: true,
@@ -111,7 +106,7 @@ suite("LiteLLMProviderBase", () => {
         });
 
         test("omits reasoning_effort when user has not picked one", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const request = (
                 await access(provider).buildOpenAIChatRequest(
                     [
@@ -133,7 +128,7 @@ suite("LiteLLMProviderBase", () => {
         });
 
         test("sends picker 'none' as reasoning_effort value", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const request = (
                 await access(provider).buildOpenAIChatRequest(
                     [
@@ -168,7 +163,7 @@ suite("LiteLLMProviderBase", () => {
         };
 
         function setupProvider(): LiteLLMChatProvider {
-            return new LiteLLMChatProvider(mockSecrets, userAgent, new EffortFallbackCache());
+            return new LiteLLMChatProvider(userAgent, new EffortFallbackCache());
         }
 
         test("retries once on reasoning 4xx and succeeds", async () => {
@@ -445,14 +440,14 @@ suite("LiteLLMProviderBase", () => {
 
     suite("constructor", () => {
         test("constructing a provider creates its registry and transport", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
 
             assert.ok(access(provider)._registry);
             assert.ok(access(provider)._transport);
         });
 
         test("dispose stops forwarding registry changes to VS Code", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const fired: number[] = [];
             provider.onDidChangeLanguageModelChatInformation(() => fired.push(1));
             const registryEmitter = access(provider)._registry as unknown as {
@@ -466,7 +461,7 @@ suite("LiteLLMProviderBase", () => {
         });
 
         test("dispose is safe to call twice", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
 
             provider.dispose();
 
@@ -487,7 +482,7 @@ suite("LiteLLMProviderBase", () => {
         };
 
         test("returns the local estimate for small strings", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const tokenSource = new vscode.CancellationTokenSource();
             const count = await provider.provideTokenCount(model, "hi", tokenSource.token, {
                 baseUrl: "https://wolfram.example",
@@ -497,7 +492,7 @@ suite("LiteLLMProviderBase", () => {
         });
 
         test("returns the same local estimate when cancellation is already requested", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const tokenSource = new vscode.CancellationTokenSource();
             tokenSource.cancel();
             const count = await provider.provideTokenCount(model, "hi", tokenSource.token, {
@@ -508,7 +503,7 @@ suite("LiteLLMProviderBase", () => {
         });
 
         test("estimates a large string from its character count", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const tokenSource = new vscode.CancellationTokenSource();
 
             const count = await provider.provideTokenCount(model, "x".repeat(1000), tokenSource.token, {
@@ -521,7 +516,7 @@ suite("LiteLLMProviderBase", () => {
 
     suite("getCallTimeConfiguration: per-group config at response time", () => {
         test("prefers options.configuration when present", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const optionsConfig = { baseUrl: "https://from-options", apiKey: "k-options" };
             const modelConfig = { baseUrl: "https://from-model", apiKey: "k-model" };
             sandbox
@@ -552,7 +547,7 @@ suite("LiteLLMProviderBase", () => {
             // by the namespaced model id. The model object on the wire no
             // longer needs to carry `configuration` because the registry
             // is the single source of truth.
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const registryEntry = { baseUrl: "https://from-registry", apiKey: "k-registry" };
             sandbox
                 .stub(access(provider)._configManager, "getConfig")
@@ -581,7 +576,7 @@ suite("LiteLLMProviderBase", () => {
         });
 
         test("returns undefined when neither options nor model carry configuration", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const result = await access(provider).getCallTimeConfiguration(
                 {} as vscode.ProvideLanguageModelChatResponseOptions,
                 {
@@ -595,7 +590,7 @@ suite("LiteLLMProviderBase", () => {
         });
 
         test("a learned cache rejection turns the directive off for that model", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const internals = access(provider);
             sandbox.stub(internals._configManager, "getConfig").resolves({ disableCaching: true });
             internals._registry.recordUnsupportedParameter("host.example/m", "cache");
@@ -622,7 +617,7 @@ suite("LiteLLMProviderBase", () => {
 
     suite("stripUnsupportedParametersFromRequest", () => {
         test("removes known unsupported params", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const body: Record<string, unknown> = { temperature: 0.5, top_p: 1, model: "claude-3-5-sonnet" };
             access(provider).stripUnsupportedParametersFromRequest(
                 body,
@@ -633,7 +628,7 @@ suite("LiteLLMProviderBase", () => {
         });
 
         test("handles o1 models", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const body: Record<string, unknown> = { temperature: 0.5, top_p: 1, model: "o1-mini" };
             access(provider).stripUnsupportedParametersFromRequest(body, {} as LiteLLMModelInfo, "o1-mini");
             assert.strictEqual(body.temperature, undefined);
@@ -641,14 +636,14 @@ suite("LiteLLMProviderBase", () => {
         });
 
         test("handles gpt-5-mini models", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const body: Record<string, unknown> = { temperature: 0.5, top_p: 1, frequency_penalty: 0 };
             access(provider).stripUnsupportedParametersFromRequest(body, {} as LiteLLMModelInfo, "gpt-5-mini");
             assert.strictEqual(body.temperature, undefined);
         });
 
         test("leaves extra_body and a top-level cache key untouched", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const cache = { "no-cache": true, other: "x" };
             const extraBody = { cache };
             const body: Record<string, unknown> = { extra_body: extraBody, cache };
@@ -665,14 +660,14 @@ suite("LiteLLMProviderBase", () => {
         });
 
         test("preserves supported fields when model has no limitations", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const body: Record<string, unknown> = { temperature: 0.5 };
             access(provider).stripUnsupportedParametersFromRequest(body, {} as LiteLLMModelInfo, "any-model");
             assert.strictEqual(body.temperature, 0.5);
         });
 
         test("removes tool_choice when not in supported_openai_params", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const body: Record<string, unknown> = { tools: [], tool_choice: "auto", model: "gpt-5.6" };
             const modelInfo: LiteLLMModelInfo = { model: "gpt-5.6", supported_openai_params: ["tools"] };
             access(provider).stripUnsupportedParametersFromRequest(body, modelInfo, "gpt-5.6");
@@ -680,7 +675,7 @@ suite("LiteLLMProviderBase", () => {
         });
 
         test("preserves tool_choice when model supports it", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const body: Record<string, unknown> = { tools: [], tool_choice: "auto", model: "gpt-4" };
             const modelInfo: LiteLLMModelInfo = { model: "gpt-4", supported_openai_params: ["tools", "tool_choice"] };
             access(provider).stripUnsupportedParametersFromRequest(body, modelInfo, "gpt-4");
@@ -690,7 +685,7 @@ suite("LiteLLMProviderBase", () => {
 
     suite("isParameterSupported", () => {
         test("returns false when modelId matches known model limitations substring", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             assert.strictEqual(
                 access(provider).isParameterSupported("temperature", undefined, "claude-3-5-sonnet-2024"),
                 false
@@ -698,7 +693,7 @@ suite("LiteLLMProviderBase", () => {
         });
 
         test("returns true when parameter is explicitly supported and not blocked", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             assert.strictEqual(
                 access(provider).isParameterSupported(
                     "temperature",
@@ -707,25 +702,6 @@ suite("LiteLLMProviderBase", () => {
                 ),
                 true
             );
-        });
-    });
-
-    suite("buildCapabilities", () => {
-        test("buildCapabilities maps model_info flags correctly", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const caps = access(provider).buildCapabilities({
-                supports_function_calling: true,
-                supports_vision: true,
-            } as LiteLLMModelInfo);
-            assert.strictEqual(caps.toolCalling, true);
-            assert.strictEqual(caps.imageInput, true);
-        });
-
-        test("buildCapabilities defaults to { toolCalling: true, imageInput: false } when no model_info", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
-            const caps = access(provider).buildCapabilities(undefined);
-            assert.strictEqual(caps.toolCalling, true);
-            assert.strictEqual(caps.imageInput, false);
         });
     });
 });

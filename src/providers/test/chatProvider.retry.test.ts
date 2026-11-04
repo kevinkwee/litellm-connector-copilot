@@ -6,7 +6,7 @@ import { LiteLLMChatProvider } from "../";
 import { LiteLLMClient } from "../../adapters/litellmClient";
 import type { OpenAIChatCompletionRequest } from "../../types";
 import { StructuredLogger } from "../../observability/structuredLogger";
-import { createMockSecrets, TEST_USER_AGENT } from "../../test/utils/testMocks";
+import { TEST_USER_AGENT } from "../../test/utils/testMocks";
 import {
     findErrorTextPart,
     runChatRequest,
@@ -16,11 +16,6 @@ import {
 
 suite("LiteLLM Chat Provider Retry", () => {
     let sandbox: sinon.SinonSandbox;
-
-    const mockSecrets = createMockSecrets({
-        "litellm-connector.baseUrl": "http://localhost:4000",
-        "litellm-connector.apiKey": "test-api-key",
-    });
 
     const userAgent = TEST_USER_AGENT;
 
@@ -81,7 +76,7 @@ suite("LiteLLM Chat Provider Retry", () => {
     }
 
     test("transport retry sends the streamed text as the trailing assistant message", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfigManager {
             _configManager: {
@@ -149,7 +144,7 @@ suite("LiteLLM Chat Provider Retry", () => {
     });
 
     test("transport retry sends the streamed reasoning as reasoning_content", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfigManager {
             _configManager: {
@@ -215,7 +210,7 @@ suite("LiteLLM Chat Provider Retry", () => {
     });
 
     test("reasoning-only retry sends the streamed reasoning as reasoning_content", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfigManager {
             _configManager: {
@@ -304,7 +299,7 @@ suite("LiteLLM Chat Provider Retry", () => {
 
     test("tool call already emitted before a transport error blocks the retry", async () => {
         const encoder = new TextEncoder();
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -348,7 +343,7 @@ suite("LiteLLM Chat Provider Retry", () => {
 
     test("transport retries exhausted after the budget surfaces the transport error", async () => {
         const encoder = new TextEncoder();
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -385,7 +380,7 @@ suite("LiteLLM Chat Provider Retry", () => {
         // The history ends with an assistant turn, which is the case where a resume
         // would append a "Continue" nudge even though the failed attempt produced
         // nothing to continue.
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -439,7 +434,7 @@ suite("LiteLLM Chat Provider Retry", () => {
     });
 
     test("retry budget stops starting attempts once the time is spent", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -471,7 +466,7 @@ suite("LiteLLM Chat Provider Retry", () => {
     });
 
     test("clips the transport backoff to the time the budget has left", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -506,7 +501,7 @@ suite("LiteLLM Chat Provider Retry", () => {
 
     test("clips the reasoning-only backoff to the time the budget has left", async () => {
         const encoder = new TextEncoder();
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -551,7 +546,7 @@ suite("LiteLLM Chat Provider Retry", () => {
 
     test("reports the retry budget, not the reasoning-only count, when the budget stops that retry", async () => {
         const encoder = new TextEncoder();
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -592,7 +587,7 @@ suite("LiteLLM Chat Provider Retry", () => {
 
     test("resends an unchanged request when the attempt streamed only whitespace", async () => {
         // Whitespace trims to nothing, so the attempt produced no output to continue.
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -649,7 +644,7 @@ suite("LiteLLM Chat Provider Retry", () => {
     });
 
     test("surfaces the headers timeout setting when the proxy never answers", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -679,7 +674,7 @@ suite("LiteLLM Chat Provider Retry", () => {
     });
 
     test("retryBudgetMs 0 leaves the attempt count as the only bound", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -709,7 +704,7 @@ suite("LiteLLM Chat Provider Retry", () => {
 
     test("reasoning-only retries exhausted after the budget surfaces the descriptive error", async () => {
         const encoder = new TextEncoder();
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -750,7 +745,7 @@ suite("LiteLLM Chat Provider Retry", () => {
 
     test("reasoning-only retries do not consume the transport retry budget", async () => {
         const encoder = new TextEncoder();
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -801,7 +796,7 @@ suite("LiteLLM Chat Provider Retry", () => {
 
     test("inactivity timeout mid-stream triggers a resume attempt", async () => {
         const encoder = new TextEncoder();
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -850,7 +845,7 @@ suite("LiteLLM Chat Provider Retry", () => {
 
     test("transport retry resumes across consecutive attempts without duplicating the assistant turn", async () => {
         const encoder = new TextEncoder();
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };

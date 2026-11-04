@@ -51,7 +51,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const effortFallbackCache = new EffortFallbackCache();
     const activeRequests = new ActiveRequestRegistry();
 
-    const activeProvider = new LiteLLMChatProvider(context.secrets, ua, effortFallbackCache, activeRequests);
+    const activeProvider = new LiteLLMChatProvider(ua, effortFallbackCache, activeRequests);
     activeChatProviderInstance = activeProvider; // Store for cleanup on deactivation
 
     // Register provider immediately (do not await config)

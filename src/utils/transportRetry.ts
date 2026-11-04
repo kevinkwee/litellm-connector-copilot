@@ -12,17 +12,6 @@ import { Logger } from "./logger";
  * the chat UI.
  */
 
-/** Sentinel thrown to the retry loop when a transport error is retryable. */
-export class TransportErrorBeforeRetry extends Error {
-    public constructor(
-        message: string,
-        public readonly cause: unknown
-    ) {
-        super(message);
-        this.name = "TransportErrorBeforeRetry";
-    }
-}
-
 /** Sentinel for a stream-inactivity watchdog abort (retryable via resume). */
 export class InactivityTimeoutError extends Error {
     public constructor(
@@ -209,22 +198,6 @@ export function sleepWithCancellation(ms: number, token?: vscode.CancellationTok
     });
 }
 
-export interface TransportRetryConfig {
-    /** Maximum number of retry attempts for a single request. */
-    networkRetries: number;
-    /** Base delay in ms; doubles per attempt, capped at 30s. */
-    networkRetryDelayMs: number;
-    /**
-     * Maximum retries for a clean-but-contentless (reasoning-only) stream.
-     * Separate budget from networkRetries because the failure domains differ:
-     * transport deaths are per-connection, contentless responses cluster in
-     * upstream bursts.
-     */
-    emptyResponseRetries: number;
-    /** Base delay in ms for reasoning-only retries; doubles per attempt, capped at 30s. */
-    emptyResponseRetryDelayMs: number;
-}
-
 const MAX_BACKOFF_MS = 30_000;
 
 export function backoffDelayMs(attempt: number, baseMs: number): number {
@@ -278,16 +251,6 @@ export class StreamedTextAccumulator {
      */
     public get hasResumableOutput(): boolean {
         return this._text.trim().length > 0 || this._thinking.trim().length > 0;
-    }
-
-    public get isEmpty(): boolean {
-        return this._text.length === 0 && !this._sawToolCall;
-    }
-
-    public reset(): void {
-        this._text = "";
-        this._thinking = "";
-        this._sawToolCall = false;
     }
 }
 

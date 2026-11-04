@@ -161,7 +161,7 @@ suite("Extension Activation Unit Tests", () => {
         assert.ok(context.subscriptions.length >= 2);
     });
 
-    test("activate constructs chat provider with secrets and UA", async () => {
+    test("activate registers exactly one chat provider", async () => {
         const mockSecrets = createMockSecrets();
         const context = {
             subscriptions: [],

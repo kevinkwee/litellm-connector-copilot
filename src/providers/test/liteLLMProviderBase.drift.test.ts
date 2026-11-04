@@ -10,19 +10,11 @@ suite("Model Drift Detection & State Persistence", () => {
     let sandbox: sinon.SinonSandbox;
     let provider: LiteLLMChatProvider;
     let configManager: ConfigManager;
-    let mockSecrets: vscode.SecretStorage;
 
     setup(() => {
         sandbox = sinon.createSandbox();
-        mockSecrets = {
-            get: sandbox.stub().resolves(undefined),
-            store: sandbox.stub().resolves(undefined),
-            delete: sandbox.stub().resolves(undefined),
-            keys: sandbox.stub().resolves([]),
-            onDidChange: new vscode.EventEmitter<vscode.SecretStorageChangeEvent>().event,
-        } as unknown as vscode.SecretStorage;
 
-        provider = new LiteLLMChatProvider(mockSecrets, "test-agent");
+        provider = new LiteLLMChatProvider("test-agent");
         configManager = (provider as unknown as { _configManager: ConfigManager })._configManager;
     });
 

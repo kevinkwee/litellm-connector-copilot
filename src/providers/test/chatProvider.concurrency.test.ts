@@ -9,7 +9,6 @@ import {
     collectToolCalls,
     createMockChatResponseOptions,
     createMockModel,
-    createMockSecrets,
     createMockUserMessage,
     TEST_USER_AGENT,
 } from "../../test/utils/testMocks";
@@ -53,7 +52,7 @@ interface ProviderSeams {
  * gets an empty completed stream so a misclassified retry ends quickly.
  */
 class ConcurrentSessionsHarness {
-    private readonly provider = new LiteLLMChatProvider(createMockSecrets(), TEST_USER_AGENT);
+    private readonly provider = new LiteLLMChatProvider(TEST_USER_AGENT);
     private readonly partsBySession = new Map<string, vscode.LanguageModelResponsePart[]>();
     private readonly upstreamCallsBySession = new Map<string, number>();
 

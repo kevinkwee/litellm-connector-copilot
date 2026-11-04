@@ -119,6 +119,43 @@ suite("Discovery backoff", () => {
         assert.ok(recordFailureStub.calledOnce);
     });
 
+    test("logs the reason a blocked group's failure is never served", async () => {
+        // The Blocked error is thrown by the layer that also has to record it: nothing
+        // above logs a blocked group's cause.
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        sandbox.stub(sharedDiscoveryBackoff, "recordFailure").callsFake(() => ({
+            attempt: 10,
+            delayMs: 0,
+            shouldBlock: true,
+        }));
+        const stubClient = {
+            getModelInfo: sandbox.stub().rejects(new Error("HTTP request failed")),
+            getEndpoint: sandbox.stub().returns("http://localhost:4000/v1/chat/completions"),
+        };
+        (configManager.convertProviderConfiguration as sinon.SinonStub).returns({
+            backendName: "test-backend",
+            baseUrl: "http://localhost:4000",
+            apiKey: "test-key",
+            client: stubClient,
+        });
+        const registry = new LiteLLMProviderRegistry({
+            configManager: configManager as unknown as ConfigManager,
+            userAgent: "test",
+        });
+
+        await assert.rejects(
+            registry.discoverModels(
+                { silent: false, configuration: { baseUrl: "http://localhost:4000", apiKey: "test-key" } },
+                new vscode.CancellationTokenSource().token
+            ),
+            /Discovery blocked/
+        );
+
+        const blockedCall = warnStub.getCalls().find((call) => call.args[0] === "discovery.blocked");
+        assert.ok(blockedCall, "a blocked group must record why it was blocked");
+        assert.match(String((blockedCall.args[1] as { reason: string }).reason), /HTTP request failed/);
+    });
+
     test("clearCaches resets the shared backoff state", () => {
         const registry = new LiteLLMProviderRegistry({
             configManager: configManager as unknown as ConfigManager,

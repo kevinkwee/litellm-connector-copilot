@@ -7,17 +7,12 @@ import { LiteLLMApiError, LiteLLMClient } from "../../adapters/litellmClient";
 import { CopilotMdManager } from "../../observability";
 import type { OpenAIChatCompletionRequest } from "../../types";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
-import { createMockSecrets, TEST_USER_AGENT } from "../../test/utils/testMocks";
+import { TEST_USER_AGENT } from "../../test/utils/testMocks";
 import { createMockSSEStream } from "../../test/utils/testStreamUtils";
 import { seedDiscoveredBackend } from "../../test/utils/chatProviderTestUtils";
 
 suite("LiteLLM Chat Provider Usage", () => {
     let sandbox: sinon.SinonSandbox;
-
-    const mockSecrets = createMockSecrets({
-        "litellm-connector.baseUrl": "http://localhost:4000",
-        "litellm-connector.apiKey": "test-api-key",
-    });
 
     const userAgent = TEST_USER_AGENT;
 
@@ -30,7 +25,7 @@ suite("LiteLLM Chat Provider Usage", () => {
     });
 
     test("provideLanguageModelChatResponse emits usage data part via StreamTokenCapture after streaming", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfigManager {
             _configManager: {
@@ -105,7 +100,7 @@ suite("LiteLLM Chat Provider Usage", () => {
     });
 
     test("requests usage by default and suppresses include_usage after upstream rejects stream_options", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerAny = provider as unknown as {
             buildOpenAIChatRequest: (typeof LiteLLMChatProvider.prototype)["buildOpenAIChatRequest"];
             _configManager: { getConfig: () => Promise<{ url: string }> };
@@ -188,7 +183,7 @@ suite("LiteLLM Chat Provider Usage", () => {
     });
 
     test("prefers streamed usage metrics over estimated counts", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         sandbox
             .stub(
                 (
@@ -276,7 +271,7 @@ suite("LiteLLM Chat Provider Usage", () => {
     });
 
     test("reports the request initiator as the caller", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const model = {
             id: "model-caller",
             name: "model-caller",
@@ -316,7 +311,7 @@ suite("LiteLLM Chat Provider Usage", () => {
     });
 
     test("reports an unknown caller when VS Code sends no initiator", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const model = {
             id: "model-caller-missing",
             name: "model-caller-missing",
@@ -355,7 +350,7 @@ suite("LiteLLM Chat Provider Usage", () => {
     });
 
     test("names the .copilotmd export after the caller", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const model = {
             id: "model-caller-export",
             name: "model-caller-export",
@@ -394,7 +389,7 @@ suite("LiteLLM Chat Provider Usage", () => {
     });
 
     test("merges partial usage frames to avoid dropping previously reported token details", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         sandbox
             .stub(
                 (
@@ -495,7 +490,7 @@ suite("LiteLLM Chat Provider Usage", () => {
     });
 
     test("counts tool-call only responses in fallback token reporting", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         sandbox
             .stub(
                 (

@@ -10,7 +10,6 @@ import {
 import * as sinon from "sinon";
 import * as vscode from "vscode";
 import { StructuredLogger } from "../../observability/structuredLogger";
-import type { LiteLLMModelInfo, LiteLLMModelInfoResponse } from "../../types";
 import { Logger } from "../../utils/logger";
 import type { RateLimitFailure } from "../../utils/rateLimitRetryPolicy";
 import { HeadersTimeoutError } from "../../utils/transportRetry";
@@ -498,6 +497,29 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.strictEqual(fetchStub.getCall(1).args[0], "http://localhost:4000/model/info");
     });
 
+    test("getModelInfo names the URL it will try next in its fallback warning", async () => {
+        const warnStub = sandbox.stub(Logger, "warn");
+        const client = new LiteLLMClient({ url: "http://localhost:4000/v1", key: "test-key" }, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.onCall(0).resolves({ ok: false, status: 404, statusText: "Not Found" } as unknown as Response);
+        fetchStub.onCall(1).resolves({
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            json: sandbox.stub().resolves({ data: [] }),
+        } as unknown as Response);
+
+        await client.getModelInfo();
+
+        const fallbackWarnings = warnStub
+            .getCalls()
+            .filter((call) => String(call.args[0]).includes("trying fallback URL"))
+            .map((call) => String(call.args[0]));
+        assert.deepStrictEqual(fallbackWarnings, [
+            "Model info endpoint returned 404, trying fallback URL: http://localhost:4000/model/info",
+        ]);
+    });
+
     test("getModelInfo cancels the 404 body before trying the next URL", async () => {
         const client = new LiteLLMClient({ url: "http://localhost:4000/v1", key: "test-key" }, userAgent);
         const cancel = sandbox.stub().resolves();
@@ -592,6 +614,26 @@ suite("LiteLLM Client Unit Tests", () => {
                 err.message.includes("Failed to fetch model info")
         );
         assert.ok(fetchStub.callCount > 1, "every candidate URL is tried before giving up");
+    });
+
+    test("getModelInfo does not promise a fallback when none remains", async () => {
+        const warnStub = sandbox.stub(Logger, "warn");
+        const client = new LiteLLMClient({ url: "http://localhost:4000", key: "test-key" }, userAgent);
+        sandbox.stub(global, "fetch").resolves({
+            ok: false,
+            status: 404,
+            statusText: "Not Found",
+        } as unknown as Response);
+
+        await assert.rejects(
+            () => client.getModelInfo(),
+            (err: unknown) => err instanceof LiteLLMDiscoveryError && err.status === 404
+        );
+
+        const fallbackWarnings = warnStub
+            .getCalls()
+            .filter((call) => String(call.args[0]).includes("trying fallback URL"));
+        assert.deepStrictEqual(fallbackWarnings, [], "a base URL without a fallback promises none");
     });
 
     test("chat does not resend a body when the rejection names nothing strippable", async () => {
@@ -1045,28 +1087,6 @@ suite("LiteLLM Client Unit Tests", () => {
 
         await assert.rejects(() => client.chat({ model: "m", messages: [] }));
         assert.strictEqual(fetchStub.callCount, 1);
-    });
-
-    test("checkConnection handles empty or invalid data", async () => {
-        const client = new LiteLLMClient(config, userAgent);
-        sandbox.stub(client, "getModelInfo").resolves({
-            data: [] as { model_name?: string; model_info?: LiteLLMModelInfo }[],
-        } as unknown as LiteLLMModelInfoResponse);
-
-        const res = await client.checkConnection();
-        assert.strictEqual(res.modelCount, 0);
-        assert.deepStrictEqual(res.sampleModelIds, []);
-    });
-
-    test("checkConnection extracts model IDs correctly", async () => {
-        const client = new LiteLLMClient(config, userAgent);
-        sandbox.stub(client, "getModelInfo").resolves({
-            data: [{ model_name: "m1", model_info: { key: "k1" } }, { model_name: "m2" }, {}],
-        } as unknown as LiteLLMModelInfoResponse);
-
-        const res = await client.checkConnection();
-        assert.strictEqual(res.modelCount, 3);
-        assert.deepStrictEqual(res.sampleModelIds, ["k1", "m2", "unknown"]);
     });
 
     test("chat handles missing response body", async () => {

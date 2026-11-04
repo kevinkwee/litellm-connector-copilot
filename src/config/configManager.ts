@@ -66,53 +66,6 @@ export class ConfigManager {
     private static readonly MIN_RETRY_BUDGET_SECONDS = 0;
     private static readonly MAX_RETRY_BUDGET_SECONDS = 3_600;
 
-    private readonly secrets: vscode.SecretStorage;
-
-    constructor(secrets: vscode.SecretStorage) {
-        this.secrets = ConfigManager.ensureSecretStorage(secrets);
-    }
-
-    /**
-     * Ensures a usable SecretStorage implementation even in tests that provide partial stubs.
-     */
-    private static ensureSecretStorage(secrets: vscode.SecretStorage | undefined): vscode.SecretStorage {
-        if (secrets && typeof secrets.get === "function" && typeof secrets.store === "function") {
-            return secrets;
-        }
-
-        // Provide a minimal stub for testing to avoid empty method warnings
-        const stubStorage: vscode.SecretStorage = {
-            get: async () => undefined,
-            store: async (_key: string): Promise<void> => {
-                /* no-op: stub for testing */
-            },
-            delete: async (_key: string): Promise<void> => {
-                /* no-op: stub for testing */
-            },
-            keys: async () => [],
-            onDidChange: new vscode.EventEmitter<vscode.SecretStorageChangeEvent>().event,
-        };
-        return stubStorage;
-    }
-
-    /**
-     * Store a secret in the extension's secret storage.
-     */
-    public async store(key: string, value: string): Promise<void> {
-        await this.secrets.store(key, value);
-    }
-
-    /**
-     * Delete a secret from the extension's secret storage.
-     */
-    public async delete(key: string): Promise<void> {
-        await this.secrets.delete(key);
-    }
-
-    public async getSecret(key: string): Promise<string | undefined> {
-        return this.secrets.get(key);
-    }
-
     /**
      * Clamps the inactivity timeout to the range the manifest declares. A value
      * of 0 or less would otherwise fire the stream watchdog as soon as a

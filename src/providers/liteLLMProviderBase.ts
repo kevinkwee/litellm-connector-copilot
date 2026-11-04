@@ -60,7 +60,7 @@ export abstract class LiteLLMProviderBase {
      * associated models. The base provider subscribes to its `onDidChange`
      * event and forwards it to VS Code. The provider does NOT have a
      * separate discovery class; the registry owns discovery, namespacing,
-     * change detection, and the per-model capability caches.
+     * change detection, and the per-model capability cache.
      */
     protected readonly _registry: LiteLLMProviderRegistry;
 
@@ -77,12 +77,11 @@ export abstract class LiteLLMProviderBase {
     private _registrySubscription: vscode.Disposable | undefined;
 
     constructor(
-        protected readonly secrets: vscode.SecretStorage,
         protected readonly userAgent: string,
         effortFallbackCache?: EffortFallbackCache,
         protected readonly activeRequests: ActiveRequestRegistry = new ActiveRequestRegistry()
     ) {
-        this._configManager = new ConfigManager(secrets);
+        this._configManager = new ConfigManager();
         this._effortFallbackCache = effortFallbackCache ?? new EffortFallbackCache();
         this._registry = new LiteLLMProviderRegistry({
             configManager: this._configManager,
@@ -129,11 +128,6 @@ export abstract class LiteLLMProviderBase {
                 ),
         };
         this._transport = new Transport(transportDeps);
-    }
-
-    /** Exposes the ConfigManager for external access (e.g., commands that need configuration). */
-    public getConfigManager(): ConfigManager {
-        return this._configManager;
     }
 
     /** Signals VS Code to refresh the Language Models view for this provider. */
@@ -723,20 +717,6 @@ export abstract class LiteLLMProviderBase {
             messages: summarizeMessages,
             toolCount: request.tools?.length ?? 0,
             tools: summarizeTools,
-        };
-    }
-
-    protected buildCapabilities(modelInfo: LiteLLMModelInfo | undefined): vscode.LanguageModelChatCapabilities {
-        if (!modelInfo) {
-            return {
-                toolCalling: true,
-                imageInput: false,
-            };
-        }
-
-        return {
-            toolCalling: modelInfo.supports_function_calling !== false,
-            imageInput: modelInfo.supports_vision === true,
         };
     }
 }

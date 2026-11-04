@@ -5,16 +5,11 @@ import * as vscode from "vscode";
 import { LiteLLMChatProvider } from "../";
 import { LiteLLMApiError, LiteLLMClient, LiteLLMRateLimitError } from "../../adapters/litellmClient";
 import { StructuredLogger } from "../../observability/structuredLogger";
-import { createMockSecrets, TEST_USER_AGENT } from "../../test/utils/testMocks";
+import { TEST_USER_AGENT } from "../../test/utils/testMocks";
 import { findErrorTextPart, seedDiscoveredBackend } from "../../test/utils/chatProviderTestUtils";
 
 suite("LiteLLM Chat Provider Unit Tests", () => {
     let sandbox: sinon.SinonSandbox;
-
-    const mockSecrets = createMockSecrets({
-        "litellm-connector.baseUrl": "http://localhost:4000",
-        "litellm-connector.apiKey": "test-api-key",
-    });
 
     const userAgent = TEST_USER_AGENT;
 
@@ -27,7 +22,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
     });
 
     test("reports a request that has no base URL as an error", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfigManager {
             _configManager: { getConfig: () => Promise<{ url?: string }> };
@@ -73,7 +68,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
     });
 
     test("provideLanguageModelChatResponse reports an unsupported model parameter once", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfigManager {
             _configManager: {
@@ -146,7 +141,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
         chatStub: sinon.SinonStub;
         failedRequestIds: unknown[];
     }> {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<{ url: string }> };
         };
@@ -240,7 +235,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
     });
 
     test("provideLanguageModelChatResponse uses the model VS Code selected without a settings override", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfigManager {
             _configManager: {
@@ -303,7 +298,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
     });
 
     test("provideLanguageModelChatResponse surfaces parsed API error details", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfigManager {
             _configManager: {
@@ -360,7 +355,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
     });
 
     test("provideLanguageModelChatResponse decorates temperature-related API errors", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfigManager {
             _configManager: {
@@ -415,7 +410,7 @@ suite("LiteLLM Chat Provider Unit Tests", () => {
     });
 
     test("provideLanguageModelChatResponse surfaces non-API errors as response text", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfigManager {
             _configManager: { getConfig: () => Promise<{ url: string }> };

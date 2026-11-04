@@ -7,7 +7,7 @@ import { LiteLLMClient, LiteLLMDiscoveryError } from "../../adapters/litellmClie
 import type { BackendSession } from "../backendSession";
 import type { LiteLLMConfig, LiteLLMModelInfo } from "../../types";
 import { sharedDiscoveryBackoff } from "../base/discoveryBackoff";
-import { createMockChatResponseOptions, createMockSecrets, createMockUserMessage } from "../../test/utils/testMocks";
+import { createMockChatResponseOptions, createMockUserMessage } from "../../test/utils/testMocks";
 import { createMockSSEStream } from "../../test/utils/testStreamUtils";
 
 const USER_AGENT = "GitHubCopilotChat/test VSCode/test";
@@ -68,7 +68,7 @@ suite("Per-group routing", () => {
     });
 
     test("discovery hands the configured timeout and the real user agent to the session client", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const internals = access(provider);
         sandbox.stub(internals._configManager, "getConfig").resolves({
             discoveryTimeoutMs: 30_000,
@@ -91,7 +91,7 @@ suite("Per-group routing", () => {
     });
 
     test("two groups on one host route to their own credentials", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const internals = access(provider);
         sandbox.stub(internals._configManager, "getConfig").resolves({
             inactivityTimeout: 60,
@@ -139,7 +139,7 @@ suite("Per-group routing", () => {
     });
 
     test("lookupInfo resolves a discovered model object to its own entry", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const internals = access(provider);
         sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
         const config = { baseUrl: SHARED_HOST, apiKey: "key-a" };
@@ -158,7 +158,7 @@ suite("Per-group routing", () => {
     });
 
     test("a model reload keeps routing so an in-flight request still resolves", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const internals = access(provider);
         sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 60_000 });
         sandbox
@@ -176,7 +176,7 @@ suite("Per-group routing", () => {
     });
 
     test("a reload during a discovery keeps the superseded result out of the cache", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const internals = access(provider);
         sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 60_000 });
 
@@ -224,8 +224,8 @@ suite("Per-group routing", () => {
         assert.strictEqual(getModelInfo.callCount, getModelInfoCallsBefore + 1);
     });
 
-    test("a superseded discovery does not overwrite the capability caches the newer one wrote", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+    test("a superseded discovery does not overwrite the capability cache the newer one wrote", async () => {
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const internals = access(provider);
         sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
         const configuration = { baseUrl: SHARED_HOST, apiKey: "key-a" };
@@ -276,7 +276,7 @@ suite("Per-group routing", () => {
     });
 
     test("two keys on one host keep separate lists, and the failing one serves its own last-known models", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const internals = access(provider);
         sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
         const sharedConfig = { baseUrl: SHARED_HOST, apiKey: "shared-key" };
@@ -332,7 +332,7 @@ suite("Stale discovery results", () => {
     });
 
     test("refreshing one of two same-host groups does not fire the picker refresh", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const internals = access(provider);
         sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
         const configA = { baseUrl: SHARED_HOST, apiKey: "key-a" };
@@ -389,7 +389,7 @@ suite("Stale discovery results", () => {
     }
 
     test("serves the last known models with a visible warning when a refresh fails", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const { getModelInfo } = configureSession(sandbox, provider);
         const configuration = { baseUrl: SHARED_HOST, apiKey: "key-a" };
         const token = new vscode.CancellationTokenSource().token;
@@ -413,7 +413,7 @@ suite("Stale discovery results", () => {
     });
 
     test("returns an empty list when the group is misconfigured, so the error stays visible", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const { getModelInfo } = configureSession(sandbox, provider);
         const configuration = { baseUrl: SHARED_HOST, apiKey: "key-a" };
         const token = new vscode.CancellationTokenSource().token;
@@ -426,7 +426,7 @@ suite("Stale discovery results", () => {
     });
 
     test("returns an empty list when the first refresh for a group fails", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const { getModelInfo } = configureSession(sandbox, provider);
         getModelInfo.rejects(new TypeError("fetch failed"));
 
@@ -439,7 +439,7 @@ suite("Stale discovery results", () => {
     });
 
     test("a cancelled refresh serves the last known models unmarked", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const internals = access(provider);
         sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
         const configuration = { baseUrl: SHARED_HOST, apiKey: "key-a" };
@@ -465,7 +465,7 @@ suite("Stale discovery results", () => {
     });
 
     test("a cancelled discovery never records a failure", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const internals = access(provider);
         sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
         const configuration = { baseUrl: SHARED_HOST, apiKey: "key-a" };

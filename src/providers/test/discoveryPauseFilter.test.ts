@@ -3,7 +3,6 @@ import * as vscode from "vscode";
 import * as sinon from "sinon";
 import { LiteLLMChatProvider } from "../";
 import type { LiteLLMModelInfoResponse } from "../../types";
-import { createMockSecrets } from "../../test/utils/testMocks";
 import type { ConfigManager } from "../../config/configManager";
 import type { BackendSession } from "../backendSession";
 
@@ -44,7 +43,7 @@ suite("Paused Deployment Discovery Filter", () => {
         });
 
         const makeProvider = (session: BackendSession): LiteLLMChatProvider => {
-            const provider = new LiteLLMChatProvider(createMockSecrets({}), userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const configManager = (provider as unknown as ChatProviderTestAccess)._configManager;
             sandbox.stub(configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
             sandbox.stub(configManager, "convertProviderConfiguration").returns(session);

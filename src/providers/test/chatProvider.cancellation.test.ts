@@ -8,7 +8,7 @@ import type { OpenAIChatCompletionRequest } from "../../types";
 import { ActiveRequestRegistry, type ActiveRequestPhase } from "../activeRequests";
 import { CopilotMdManager, type CopilotMdEntry } from "../../observability";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
-import { collectResponseText, createMockSecrets, TEST_USER_AGENT } from "../../test/utils/testMocks";
+import { collectResponseText, TEST_USER_AGENT } from "../../test/utils/testMocks";
 import {
     runChatRequest,
     seedDiscoveredBackend,
@@ -24,11 +24,6 @@ const BACKOFF_MS = 5_000;
 
 suite("LiteLLM Chat Provider Cancellation", () => {
     let sandbox: sinon.SinonSandbox;
-
-    const mockSecrets = createMockSecrets({
-        "litellm-connector.baseUrl": "http://localhost:4000",
-        "litellm-connector.apiKey": "test-api-key",
-    });
 
     const userAgent = TEST_USER_AGENT;
 
@@ -54,7 +49,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
         chatCalls: number;
     }> {
         const registry = new ActiveRequestRegistry();
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent, undefined, registry);
+        const provider = new LiteLLMChatProvider(userAgent, undefined, registry);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -165,7 +160,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
                 };
             },
         };
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         stubConfigAndDiscovery(sandbox, provider);
         stubCleanChatStream(sandbox, []);
         const reported: vscode.LanguageModelResponsePart[] = [];
@@ -191,7 +186,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
         attemptBehaviour: () => ReadableStream<Uint8Array>
     ): Promise<{ reported: vscode.LanguageModelResponsePart[]; chatCalls: number }> {
         const registry = new ActiveRequestRegistry();
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent, undefined, registry);
+        const provider = new LiteLLMChatProvider(userAgent, undefined, registry);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -267,7 +262,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
 
     test("cancels a request that is still waiting for response headers", async () => {
         const registry = new ActiveRequestRegistry();
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent, undefined, registry);
+        const provider = new LiteLLMChatProvider(userAgent, undefined, registry);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -319,7 +314,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
 
     test("reports the sending phase again when a retry starts a new header wait", async () => {
         const registry = new ActiveRequestRegistry();
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent, undefined, registry);
+        const provider = new LiteLLMChatProvider(userAgent, undefined, registry);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -363,7 +358,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
 
     test("leaves the registry empty after a failed request", async () => {
         const registry = new ActiveRequestRegistry();
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent, undefined, registry);
+        const provider = new LiteLLMChatProvider(userAgent, undefined, registry);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -384,7 +379,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
 
     test("cancellation during a reasoning-only stream surfaces cancellation, not retry exhaustion", async () => {
         const encoder = new TextEncoder();
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -423,7 +418,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
 
     test("cancellation between attempts aborts instead of sending another request", async () => {
         const encoder = new TextEncoder();
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -461,7 +456,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
     });
 
     test("provideLanguageModelChatResponse throws on cancellation during request", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfigManager {
             _configManager: {

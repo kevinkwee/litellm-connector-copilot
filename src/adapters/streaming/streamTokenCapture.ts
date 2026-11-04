@@ -61,9 +61,9 @@ export interface TokenSnapshot {
  */
 export class StreamTokenCapture {
     private readonly _inner: vscode.Progress<vscode.LanguageModelResponsePart>;
-    private _modelId: string;
-    private _modelInfo?: LiteLLMModelInfo;
-    private _pricing: ReturnType<typeof extractPricing>;
+    private readonly _modelId: string;
+    private readonly _modelInfo?: LiteLLMModelInfo;
+    private readonly _pricing: ReturnType<typeof extractPricing>;
 
     // Accumulated internal counts (populated during streaming)
     private _textBuffer = "";
@@ -91,12 +91,6 @@ export class StreamTokenCapture {
         this._inner = inner;
         this._modelInfo = modelInfo;
         this._pricing = extractPricing(modelInfo);
-    }
-
-    public setModelInfo(modelId: string, modelInfo?: LiteLLMModelInfo): void {
-        this._modelInfo = modelInfo;
-        this._pricing = extractPricing(modelInfo);
-        this._modelId = modelId;
     }
 
     setEstimatedPromptTokens(count: number): void {

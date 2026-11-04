@@ -377,9 +377,7 @@
 		"chatProvider",
 		"languageModelCapabilities",
 		"languageModelPricing",
-		"languageModelProxy",
 		"languageModelSystem",
-		"languageModelThinkingPart",
-		"languageModelToolSupportsModel"
+		"languageModelThinkingPart"
 	]
 }

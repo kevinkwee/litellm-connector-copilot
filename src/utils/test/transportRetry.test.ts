@@ -158,7 +158,6 @@ suite("Transport Retry Utilities", () => {
 
     test("StreamedTextAccumulator classifies text, tool call, and thinking parts", () => {
         const accumulator = new StreamedTextAccumulator();
-        assert.ok(accumulator.isEmpty, "fresh accumulator is empty");
 
         accumulator.add(new vscode.LanguageModelTextPart("Hello "));
         accumulator.add(thinkingPart("deep "));
@@ -169,20 +168,13 @@ suite("Transport Retry Utilities", () => {
         assert.strictEqual(accumulator.text, "Hello world");
         assert.strictEqual(accumulator.thinking, "deep thought");
         assert.ok(accumulator.sawToolCall);
-        assert.strictEqual(accumulator.isEmpty, false);
-
-        accumulator.reset();
-        assert.ok(accumulator.isEmpty);
-        assert.strictEqual(accumulator.text, "");
-        assert.strictEqual(accumulator.thinking, "");
-        assert.strictEqual(accumulator.sawToolCall, false);
     });
 
     test("StreamedTextAccumulator ignores non-text, non-thinking parts", () => {
         const accumulator = new StreamedTextAccumulator();
         const usagePart = new vscode.LanguageModelDataPart(new TextEncoder().encode("{}"), "usage");
         accumulator.add(usagePart);
-        assert.ok(accumulator.isEmpty, "data parts must not affect resume content");
+        assert.strictEqual(accumulator.hasResumableOutput, false, "data parts must not affect resume content");
     });
 
     test("hasResumableOutput treats whitespace-only text and reasoning as nothing", () => {

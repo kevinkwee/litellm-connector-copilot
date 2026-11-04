@@ -47,7 +47,6 @@ export interface BaseTestAccess {
         modelInfo?: LiteLLMModelInfo,
         caller?: string
     ) => Promise<{ request: OpenAIChatCompletionRequest; toolNames: ToolNameMapping }>;
-    buildCapabilities: (modelInfo: LiteLLMModelInfo | undefined) => vscode.LanguageModelChatCapabilities;
     stripUnsupportedParametersFromRequest: (
         requestBody: Record<string, unknown>,
         modelInfo: LiteLLMModelInfo | undefined,

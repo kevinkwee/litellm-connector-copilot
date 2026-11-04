@@ -303,7 +303,7 @@ When wrapping a caught error in a new one, pass the original through `cause` so 
 
 - Sanitize and validate all user and external input at the boundary. Model lists, configuration values, and streamed SSE payloads are external input. Never trust data from outside the system boundary.
 - Use allowlists, not denylists. Reject by default, accept only known-good patterns.
-- Store API keys only via `ConfigManager` / `SecretStorage`. Provider secrets are declared with `"secret": true` in the `languageModelChatProviders` contribution in `package.json` and encrypted by VS Code. **Never** store secrets in `globalState`.
+- Store API keys only as provider configuration: declare the group with `"secret": true` in the `languageModelChatProviders` contribution in `package.json`, and let VS Code encrypt it. **Never** store secrets in `globalState`.
 - No hardcoded API keys, tokens, or passwords.
 - Do not expose internal details in error messages to end users.
 - Use fake or anonymized data in tests, never real user data. Tests use mocked fetch and must never hit a real LiteLLM proxy.
@@ -474,7 +474,7 @@ When fixing bugs, add a regression test that captures the bug so it cannot silen
 
 ### Priority (blockers first)
 
-1. **Security and PII**: no PII in logs, no hardcoded secrets, secrets only via `ConfigManager` / `SecretStorage`
+1. **Security and PII**: no PII in logs, no hardcoded secrets, secrets only as provider configuration (`"secret": true` in `package.json`)
 2. **DRY**: no duplicate types, classes, functions, or logic
 3. **File Structure**: single responsibility per file, naming respected
 4. **Architecture**: layer separation, base and derived provider split respected
@@ -534,7 +534,7 @@ Any code you edit must be brought up to these standards:
 - [ ] Tests added/updated; intent is clear from test names.
 - [ ] Coverage meets minimums and does not regress more than 1% in any category.
 - [ ] Changed files were re-read or otherwise verified to confirm the requested code exists in the repository state.
-- [ ] No secrets stored outside `ConfigManager` / `SecretStorage`.
+- [ ] No secret persisted outside VS Code's provider configuration.
 
 ### Provider-Specific Requirements (if working on `src/providers/`)
 
@@ -576,7 +576,7 @@ This repository is a **VS Code extension**. Agents must follow these rules when 
   - At **response time**, `options.configuration` is the per-model picker configuration (`reasoningEffort`, `temperature`), not the group's credentials. Resolve credentials by the model object VS Code passes back (`registry.lookupInfo(model)`), falling back to the id only when the object was not produced by this registry.
   - Configuration properties marked with `"secret": true` are encrypted by VS Code.
   - Use `ConfigManager.convertProviderConfiguration()` to convert VS Code's per-group config object into a `BackendSession` (backend label, base URL, API key, and its HTTP client).
-  - For non-provider secrets: use `vscode.SecretStorage` via `ConfigManager`. **Never** use `globalState`.
+  - Provider secrets are the only secrets: VS Code encrypts them and passes them in `options.configuration`, so the connector never reads `vscode.SecretStorage` itself. **Never** store a secret in `globalState`.
 - **Model picker visibility**: every `LanguageModelChatInformation` returned from `provideLanguageModelChatInformation` must set `isUserSelectable: true` so the model appears in VS Code's model picker dropdown. Models that omit this flag (or set it to `false`) are hidden from the picker even when discovery succeeds.
 - **Backend grouping**: per-backend sectioning in the picker is driven by VS Code's `(vendor, groupName)` lookup, not by anything this provider returns. `category` must be a string, one of `lightweight`, `versatile`, `powerful`, or `undefined`: the picker calls `getCategoryLabel(category)` and crashes with `TypeError: a.charAt is not a function` on an object or `null`. `toVSCodeInfo` passes `derivePickerCategory`, a capability tier.
 - **Reasoning effort picker (`group: "navigation"`)**: when a model supports reasoning, its `configurationSchema.properties.reasoningEffort` must include `group: "navigation"`. Only navigation-grouped properties are surfaced as inline picker actions. Without it the effort selector is hidden behind the secondary settings UI and users cannot change effort from the chat picker.
@@ -589,7 +589,7 @@ This repository is a **VS Code extension**. Agents must follow these rules when 
 ### Reload and refresh
 
 - **Settings that trigger a refresh**: `src/extension.ts` watches only the settings that shape discovery output (`modelOverrides`, `enableModelOverrides`, `modelCapabilitiesOverrides`, `displayPricingInPicker`, `forceResponsesEndpoint`) and calls `reloadModelDiscovery()`. Adding a setting that changes what discovery returns means adding it to that list.
-- **Reload semantics**: `reloadModelDiscovery()` clears the discovery response cache and every backend's backoff history through `registry.clearDiscoveryCaches()`, then fires the change event. The routing table and the per-model capability caches survive, so a request from a running session keeps resolving while VS Code re-queries each group. A discovery that was already awaiting the proxy when the reload happened carries the older epoch and skips both its cache write and its per-backend write, so it cannot undo those clears with a pre-change list.
+- **Reload semantics**: `reloadModelDiscovery()` clears the discovery response cache and every backend's backoff history through `registry.clearDiscoveryCaches()`, then fires the change event. The routing table and the per-model capability cache survive, so a request from a running session keeps resolving while VS Code re-queries each group. A discovery that was already awaiting the proxy when the reload happened carries the older epoch and skips both its cache write and its per-backend write, so it cannot undo those clears with a pre-change list.
 - **Reload Models**: the command calls `reloadModels()`, which forgets every learned limit through `clearLearnedLimits()` (the effort fallback ladder, the `include_usage` opt-out, and the registry's learned parameters) and then runs the reload above. A settings-triggered refresh calls `reloadModelDiscovery()` alone, because learned limits describe the proxy rather than the settings.
 - **Show Available Models**: the command asks VS Code for the models it currently holds for this vendor (`vscode.lm.selectChatModels`). VS Code may also include models the user hid from the picker.
 - **Cancelled discovery**: a discovery VS Code cancels returns the backend's last known models unchanged. It does not advance the backoff, sleep, or mark the list stale, because a cancellation says nothing about the backend's health.
@@ -625,7 +625,7 @@ This extension integrates LiteLLM proxies into VS Code's Language Model APIs. It
   - Activates the extension and instantiates exactly one `LiteLLMChatProvider`.
   - Registers `LiteLLMChatProvider` with `vscode.lm.registerLanguageModelChatProvider("litellm-connector", provider)`.
   - The extension does NOT register a `LanguageModelTextCompletionProvider`.
-  - Holds `context.secrets` for `SecretStorage` (if needed for non-provider secrets).
+  - Creates what the provider takes (the User-Agent string, and two optional arguments, an `EffortFallbackCache` and the `ActiveRequestRegistry` shared with the cancel command) and registers the commands. The provider builds its own model registry, and nothing here reads a secret, because provider secrets arrive per group in `options.configuration`.
   - Receives per-group configuration from VS Code via `options.configuration` in `provideLanguageModelChatInformation`; response-time routing follows the model object VS Code passes back.
   - The configuration schema is defined in the `package.json` `languageModelChatProviders` contribution point (VS Code per-group format).
 
@@ -802,7 +802,7 @@ The authoritative counts are the upstream usage numbers reported with each reply
 ### Cost Tracking Pipeline
 
 - **Pricing extraction**: `src/utils/pricingCalculator.ts` provides pure helpers to extract pricing from `LiteLLMModelInfo` (including nested `pricing` fallback), format display strings, derive price categories, and calculate request costs from token snapshots.
-- **Model picker pricing surfaces**: `src/providers/litellmProviderRegistry.ts` maps per-token LiteLLM pricing to VS Code per-1M fields (`inputCost`, `outputCost`, `cacheCost`, `cacheWriteCost`, `priceCategory`) and sets `pricing` for compact labels.
+- **Model picker pricing surfaces**: `src/providers/liteLLMProviderRegistry.ts` maps per-token LiteLLM pricing to VS Code per-1M fields (`inputCost`, `outputCost`, `cacheCost`, `cacheWriteCost`, `priceCategory`) and sets `pricing` for compact labels.
 - **Fallback picker detail/tooltip**: when enabled by `displayPricingInPicker`, `toVSCodeInfo()` appends compact pricing to `detail` and appends a pricing breakdown to `tooltip` for environments where hover pricing tables are unavailable.
 - **Price category strategy**: `derivePriceCategory()` categorizes by `maxCost` (highest per-1M input/output cost) using thresholds `<=10` low, `<20` medium, `<=100` high, otherwise very_high.
 - **Token snapshot cost fields**: `src/adapters/streaming/streamTokenCapture.ts` stores flat estimated fields (`estimatedInputCost`, `estimatedOutputCost`, `estimatedTotalCost`) on `TokenSnapshot`. `completionTokens` is the upstream `completion_tokens` when the gateway reported one, otherwise the local text estimate with thinking included. `outputTokens` is what the request produced: that upstream count, or the local text plus tool-call estimate when there is none. The usage payload, the estimated cost, and the telemetry metric all read `outputTokens`.
@@ -815,17 +815,17 @@ The authoritative counts are the upstream usage numbers reported with each reply
 
 ### BackendRegistry Contract
 
-The `BackendRegistry` (class `LiteLLMProviderRegistry` in `src/providers/litellmProviderRegistry.ts`) is the **single source of truth for backends and their associated models**. It owns the discovery HTTP fetch, the per-group namespacing, the change detection, and the per-model capability caches.
+The `BackendRegistry` (class `LiteLLMProviderRegistry` in `src/providers/liteLLMProviderRegistry.ts`) is the **single source of truth for backends and their associated models**. It owns the discovery HTTP fetch, the per-group namespacing, the change detection, and the per-model capability cache.
 
 The contract is **public read, internal write**:
 
 - **Public surface (read + ingress)**:
   - `discoverModels(options, token)`: the only way for VS Code (or any consumer) to fetch a model list and populate the registry. The registry owns the HTTP fetch, the namespacing (`<routing>/<rawModel>` ids), and the change detection. Consumers see a single ingress that returns the model list, updates the registry, and fires the change event as a unit. Discovery applies LiteLLM's paused-model listing rule (see `toListableDeployments` in `src/providers/base/pausedModelListing.ts`): deployments with `model_info.blocked === true` are dropped, each public `model_name` is listed once from its first live deployment, and a name whose every deployment is paused is hidden. The registry builds its cache keys with `toBackendIdentityKey` (`src/providers/base/backendIdentity.ts`) and classifies refresh failures with `isTransientDiscoveryFailure` (`src/providers/base/discoveryFailure.ts`).
   - `lookup(id)`: resolve a namespaced id to its routing entry (`{baseUrl, apiKey, rawModelName, routingIdentity}`). This is the fallback for a model object the registry did not produce.
-  - `lookupInfo(info)`: resolve the exact model object VS Code passes back at request time. This is the primary response-time path, because two groups on the same host produce the same namespaced ids but different credentials. The registry records each object in a `WeakMap` as it returns it from discovery.
+  - `lookupInfo(info)`: resolve the exact model object VS Code passes back at request time. This is the primary response-time path, because two groups on the same host produce the same namespaced ids but different credentials. The registry records each object in a `WeakMap` as it returns it from discovery. Known limitation: a discovery that a reload superseded still hands VS Code the model objects it built, and those were not recorded, so their `lookupInfo` misses and falls back to the id, which resolves to whichever group wrote that id last. Two provider groups on one host are therefore only safe once each has completed a discovery that no reload superseded.
   - `extractRawName(id)`: strip the routing prefix from a namespaced id.
-  - `getModelInfo(id)` / `getDerivedCapabilities(id)`: read the per-model capability caches. Discovery writes them under the same epoch guard as the response cache, so a superseded discovery never overwrites what the newer one derived. These are NOT a model-list cache. They cache the capability info for known models and feed the request hot path. Ids are per host, so two groups on one host share these entries.
-  - `size()`, `clearCaches()`, `clearDiscoveryCaches()`: registration-state reads and reset. `clearCaches()` wipes the per-model caches (model info, derived capabilities, unsupported parameters), the discovery response cache, and every backend's backoff history. `clearDiscoveryCaches()` wipes only the discovery response cache and the backoff histories, and bumps the discovery epoch, which is what a model reload uses.
+  - `getModelInfo(id)`: reads the per-model capability cache. Discovery writes it under the same epoch guard as the response cache, so a superseded discovery never overwrites what the newer one derived. This is NOT a model-list cache. It caches the capability info for known models and feeds the request hot path. Ids are per host, so two groups on one host share these entries.
+  - `size()`, `clearCaches()`, `clearDiscoveryCaches()`: registration-state reads and reset. `clearCaches()` wipes the per-model caches (model info, unsupported parameters), the discovery response cache, and every backend's backoff history. `clearDiscoveryCaches()` wipes only the discovery response cache and the backoff histories, and bumps the discovery epoch, which is what a model reload uses.
   - `recordUnsupportedParameter(modelId, param)` / `getUnsupportedParameters(modelId)`: the in-session store of parameters a live rejection taught the client to strip. Keyed by the namespaced picker id, because a learned limit describes one proxy's model config. The transport wires the client's strip-and-retry callback into `recordUnsupportedParameter`; the request builder reads `getUnsupportedParameters` to skip re-sending what a model already rejected. Only connector-added parameters (the `cache_control` marker and the `cache` directive) are recorded: a model parameter the proxy's `/model/info` claimed to support is surfaced to the user instead of being stripped. `clearUnsupportedParameters()` forgets them on a user-initiated reload.
   - `onDidChange`: fires when a backend's model set has actually changed. The base provider subscribes once and forwards to VS Code's `onDidChangeLanguageModelChatInformation`.
 
@@ -836,7 +836,7 @@ The contract is **public read, internal write**:
 
 **Short-lived discovery cache**: the registry keeps a TTL-bound response cache keyed by backend identity (the server URL with trailing slashes trimmed, plus a hash suffix of the API key) rather than by host alone. Cache entries are invalidated by `clearCaches()`, `clearDiscoveryCaches()`, and manual reloads. Set `discoveryCacheTtlMs=0` to disable caching entirely.
 
-**Stale-while-error**: a refresh that fails for a transient reason (network, timeout, 5xx, anything except a 400/401/403/404 response) returns the models this backend delivered last time, copied with a warning `statusIcon` and `warningText` so the failure stays visible in the picker. The stale list wins even after the failure threshold, because blocking a group that still has models would drop the model choice of a running chat session. A misconfigured group (400/401/403/404) returns an empty list so the real error is not hidden. A group with no prior successful discovery does the same. Those failures also log a `discovery.failed_without_last_known` warning naming the reason and the server URL, until the failure threshold blocks the group. A cancelled discovery is not a failure: it returns the last known models unmarked and leaves the backoff untouched.
+**Stale-while-error**: a refresh that fails for a transient reason (network, timeout, 5xx, anything except a 400/401/403/404 response) returns the models this backend delivered last time, copied with a warning `statusIcon` and `warningText` so the failure stays visible in the picker. The stale list wins even after the failure threshold, because blocking a group that still has models would drop the model choice of a running chat session. A misconfigured group (400/401/403/404) returns an empty list so the real error is not hidden. A group with no prior successful discovery does the same. Those failures also log a `discovery.failed_without_last_known` warning naming the reason and the server URL, and once the failure threshold blocks the group it logs `discovery.blocked` with the same reason, because the `Blocked` error is thrown by the layer that also has to record it. A cancelled discovery is not a failure: it returns the last known models unmarked and leaves the backoff untouched.
 
 **Backoff is per backend**: `sharedDiscoveryBackoff` keeps one `DiscoveryBackoffController` per backend identity, so a dead group's failures cannot delay or block another group's discovery, and a successful discovery clears that backend's history. Once a backend is blocked, only the group with nothing to serve receives the `Blocked` error. The backoff wait stops when VS Code cancels the discovery call.
 

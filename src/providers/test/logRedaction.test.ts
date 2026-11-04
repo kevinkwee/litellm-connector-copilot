@@ -10,7 +10,6 @@ import {
     collectResponseText,
     createMockChatResponseOptions,
     createMockModel,
-    createMockSecrets,
     createMockUserMessage,
     TEST_USER_AGENT,
 } from "../../test/utils/testMocks";
@@ -52,7 +51,7 @@ function spyOnEveryLogMethod(sandbox: sinon.SinonSandbox): string[] {
 }
 
 function createProvider(sandbox: sinon.SinonSandbox): { provider: LiteLLMChatProvider; seams: ProviderSeams } {
-    const provider = new LiteLLMChatProvider(createMockSecrets(), TEST_USER_AGENT);
+    const provider = new LiteLLMChatProvider(TEST_USER_AGENT);
     const seams = provider as unknown as ProviderSeams;
     sandbox.stub(seams._configManager, "getConfig").resolves({
         url: "http://localhost:4000",

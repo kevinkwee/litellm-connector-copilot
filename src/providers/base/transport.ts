@@ -73,25 +73,17 @@ export class Transport {
         const baseUrl = typeof configuration?.baseUrl === "string" ? configuration.baseUrl.trim() : "";
         const apiKey = typeof configuration?.apiKey === "string" ? configuration.apiKey.trim() : "";
 
+        // The provider terminates a rejected configuration and logs it with the request
+        // id, so the transport only throws.
         if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) {
-            const errMsg = `No baseUrl provided in call-time configuration for model "${request.model}". Configure the LiteLLM provider group in VS Code's Language Models view.`;
-            this.logger.error(`[transport.sendRequestToLiteLLM] Configuration validation failed: ${errMsg}`);
-            StructuredLogger.error("transport.config_validation_failed", {
-                model: request.model,
-                reason: "missing_or_invalid_baseUrl",
-                caller,
-            });
-            throw new Error(errMsg);
+            throw new Error(
+                `No baseUrl provided in call-time configuration for model "${request.model}". Configure the LiteLLM provider group in VS Code's Language Models view.`
+            );
         }
         if (!apiKey) {
-            const errMsg = `No apiKey provided in call-time configuration for model "${request.model}". Configure the LiteLLM provider group in VS Code's Language Models view.`;
-            this.logger.error(`[transport.sendRequestToLiteLLM] Configuration validation failed: ${errMsg}`);
-            StructuredLogger.error("transport.config_validation_failed", {
-                model: request.model,
-                reason: "missing_apiKey",
-                caller,
-            });
-            throw new Error(errMsg);
+            throw new Error(
+                `No apiKey provided in call-time configuration for model "${request.model}". Configure the LiteLLM provider group in VS Code's Language Models view.`
+            );
         }
 
         // Thread disableCaching from the per-call configuration through to the

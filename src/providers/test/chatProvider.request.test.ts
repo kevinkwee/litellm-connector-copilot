@@ -4,7 +4,7 @@ import * as vscode from "vscode";
 
 import { LiteLLMChatProvider } from "../";
 import type { OpenAIChatCompletionRequest } from "../../types";
-import { createMockSecrets, TEST_USER_AGENT } from "../../test/utils/testMocks";
+import { TEST_USER_AGENT } from "../../test/utils/testMocks";
 import {
     runChatRequest,
     stubCleanChatStream,
@@ -14,11 +14,6 @@ import {
 
 suite("LiteLLM Chat Provider Request", () => {
     let sandbox: sinon.SinonSandbox;
-
-    const mockSecrets = createMockSecrets({
-        "litellm-connector.baseUrl": "http://localhost:4000",
-        "litellm-connector.apiKey": "test-api-key",
-    });
 
     const userAgent = TEST_USER_AGENT;
 
@@ -31,7 +26,7 @@ suite("LiteLLM Chat Provider Request", () => {
     });
 
     test("provideTokenCount handles string and message inputs", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         const tokenSource = new vscode.CancellationTokenSource();
 
         const stringCount = await provider.provideTokenCount(
@@ -84,7 +79,7 @@ suite("LiteLLM Chat Provider Request", () => {
     });
 
     test("sends the host conversation id as metadata.session_id", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         stubConfigAndDiscovery(sandbox, provider);
         const sent: OpenAIChatCompletionRequest[] = [];
         stubCleanChatStream(sandbox, sent);
@@ -97,7 +92,7 @@ suite("LiteLLM Chat Provider Request", () => {
     });
 
     test("sends a stable fingerprint as metadata.session_id when the host sends no conversation id", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
         stubConfigAndDiscovery(sandbox, provider);
         const sent: OpenAIChatCompletionRequest[] = [];
         stubCleanChatStream(sandbox, sent);

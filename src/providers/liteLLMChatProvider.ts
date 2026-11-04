@@ -34,12 +34,10 @@ import {
     getTotalTokenLimit,
 } from "../adapters/tokenUtils";
 
-import type { EffortFallbackCache } from "../utils/reasoningEffortFallback";
 import { StreamTokenCapture } from "../adapters/streaming/streamTokenCapture";
 import type { OpenAIChatCompletionRequest } from "../types";
 import { RequestCancellation } from "../utils/requestCancellation";
 import type { RequestOutcomeContext } from "./base/requestOutcome";
-import type { ActiveRequestRegistry } from "./activeRequests";
 import { DEFAULT_RETRY_BUDGET_MS, RetryBudget, retryBudgetError } from "../utils/retryBudget";
 import {
     StreamedTextAccumulator,
@@ -62,15 +60,6 @@ import {
  * buffers live for one upstream attempt, and the token capture lives for one request.
  */
 export class LiteLLMChatProvider extends LiteLLMProviderBase implements LanguageModelChatProvider {
-    constructor(
-        secrets: vscode.SecretStorage,
-        userAgent: string,
-        effortFallbackCache?: EffortFallbackCache,
-        activeRequests?: ActiveRequestRegistry
-    ) {
-        super(secrets, userAgent, effortFallbackCache, activeRequests);
-    }
-
     async provideLanguageModelChatInformation(
         options: vscode.PrepareLanguageModelChatModelOptions,
         token: CancellationToken
@@ -100,7 +89,9 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
     ): Promise<void> {
         const startTime = LiteLLMTelemetry.startTimer();
         const requestStartDate = new Date();
-        const requestId = Math.random().toString(36).substring(7);
+        // Twelve hex characters from a UUID, enough to correlate the log, the transcript and
+        // the live-request registry without carrying a full UUID everywhere.
+        const requestId = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
 
         // Hoisted to the outer scope so the failure/cancel paths in the catch
         // block can still emit a `.copilotmd` entry when the request got far

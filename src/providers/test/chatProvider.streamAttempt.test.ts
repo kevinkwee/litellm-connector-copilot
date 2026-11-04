@@ -16,7 +16,6 @@ import {
     collectToolCalls,
     createMockChatResponseOptions,
     createMockModel,
-    createMockSecrets,
     createMockUserMessage,
     TEST_USER_AGENT,
 } from "../../test/utils/testMocks";
@@ -41,7 +40,7 @@ interface ProviderSeams {
 }
 
 function createProvider(sandbox: sinon.SinonSandbox): { provider: LiteLLMChatProvider; seams: ProviderSeams } {
-    const provider = new LiteLLMChatProvider(createMockSecrets(), TEST_USER_AGENT);
+    const provider = new LiteLLMChatProvider(TEST_USER_AGENT);
     const seams = provider as unknown as ProviderSeams;
     sandbox.stub(seams._configManager, "getConfig").resolves({
         url: "http://localhost:4000",
@@ -55,7 +54,6 @@ function createProvider(sandbox: sinon.SinonSandbox): { provider: LiteLLMChatPro
 suite("LiteLLMChatProvider stream attempt", () => {
     let sandbox: sinon.SinonSandbox;
 
-    const mockSecrets = createMockSecrets();
     const userAgent = TEST_USER_AGENT;
 
     setup(() => {
@@ -507,7 +505,7 @@ suite("LiteLLMChatProvider stream attempt", () => {
     });
 
     test("reports a truncated stream as an error instead of a blank reply", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfigManager {
             _configManager: {
@@ -570,7 +568,7 @@ suite("LiteLLMChatProvider stream attempt", () => {
     });
 
     test("delivers a complete buffered tool call when the stream closes without [DONE]", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfigManager {
             _configManager: {

@@ -2,18 +2,13 @@ import * as assert from "assert";
 import * as vscode from "vscode";
 import * as sinon from "sinon";
 import { LiteLLMChatProvider } from "../";
-import { createMockSecrets, TEST_USER_AGENT } from "../../test/utils/testMocks";
+import { TEST_USER_AGENT } from "../../test/utils/testMocks";
 import { access, apiError, seedBackendForCall } from "../../test/utils/providerBaseTestUtils";
 import { EffortFallbackCache } from "../../utils/reasoningEffortFallback";
 import type { BackendSession } from "../backendSession";
 
 suite("LiteLLMProviderBase discovery", () => {
     let sandbox: sinon.SinonSandbox;
-
-    const mockSecrets = createMockSecrets({
-        "litellm-connector.baseUrl": "http://localhost:4000",
-        "litellm-connector.apiKey": "test-api-key",
-    });
 
     const userAgent = TEST_USER_AGENT;
 
@@ -44,7 +39,7 @@ suite("LiteLLMProviderBase discovery", () => {
             }) as unknown as BackendSession;
 
         const makeProvider = (session: ReturnType<typeof makeSession>, sandbox: sinon.SinonSandbox) => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             sandbox.stub(access(provider)._configManager, "convertProviderConfiguration").returns(session);
             return provider;
         };
@@ -108,7 +103,7 @@ suite("LiteLLMProviderBase discovery", () => {
                     apiKey: "test-key",
                     client: { getModelInfo: getModelInfoStub },
                 } as unknown as BackendSession;
-                const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+                const provider = new LiteLLMChatProvider(userAgent);
                 const configManager = access(provider)._configManager;
                 localSandbox.stub(configManager, "convertProviderConfiguration").returns(session);
                 // Disable discovery caching so subsequent calls actually call the client
@@ -145,7 +140,7 @@ suite("LiteLLMProviderBase discovery", () => {
             try {
                 const sessionA = makeSession([{ model_name: "gpt-4", litellm_provider: "openai" }]);
                 const sessionB = makeSession([{ model_name: "claude-3", litellm_provider: "anthropic" }]);
-                const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+                const provider = new LiteLLMChatProvider(userAgent);
                 const configManager = access(provider)._configManager;
                 const stub = localSandbox.stub(configManager, "convertProviderConfiguration");
                 stub.callsFake((config: Record<string, unknown>) => {
@@ -226,7 +221,7 @@ suite("LiteLLMProviderBase discovery", () => {
         });
 
         test("returns the same model id on every call", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             // The model id is stable across calls because the routing identity, derived
             // from the URL hostname, does not change.
             const configManager = access(provider)._configManager;
@@ -248,7 +243,7 @@ suite("LiteLLMProviderBase discovery", () => {
         });
 
         test("returns model objects without tags", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const configManager = access(provider)._configManager;
             const mockSession = makeMockSession();
             sandbox.stub(configManager, "convertProviderConfiguration").returns(mockSession);
@@ -265,7 +260,7 @@ suite("LiteLLMProviderBase discovery", () => {
         });
 
         test("attaches reasoning configuration schema when supported", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const configManager = access(provider)._configManager;
             const mockSession = makeMockSession();
             sandbox.stub(configManager, "convertProviderConfiguration").returns(mockSession);
@@ -300,7 +295,7 @@ suite("LiteLLMProviderBase discovery", () => {
                     }),
                 } as unknown as BackendSession["client"],
             };
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const configManager = access(provider)._configManager;
             sandbox.stub(configManager, "convertProviderConfiguration").returns(sessionWithTemperature);
 
@@ -337,7 +332,7 @@ suite("LiteLLMProviderBase discovery", () => {
                     }),
                 } as unknown as BackendSession["client"],
             };
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const configManager = access(provider)._configManager;
             sandbox.stub(configManager, "convertProviderConfiguration").returns(sessionWithoutTemperature);
 
@@ -354,14 +349,14 @@ suite("LiteLLMProviderBase discovery", () => {
         });
 
         test("returns [] when no configuration is provided (vendor-level call)", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const token = new vscode.CancellationTokenSource().token;
             const models = await provider.discoverModels({ silent: true }, token);
             assert.deepStrictEqual(models, []);
         });
 
         test("throws a LanguageModelError when configuration is invalid", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const token = new vscode.CancellationTokenSource().token;
             const configManager = access(provider)._configManager;
             sandbox.stub(configManager, "convertProviderConfiguration").returns(undefined);
@@ -376,7 +371,7 @@ suite("LiteLLMProviderBase discovery", () => {
         });
 
         test("per-group model lists are isolated: one group refresh does not trample another", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const configManager = access(provider)._configManager;
             const wolframConfig: Record<string, unknown> = {
                 baseUrl: "https://wolfram.example",
@@ -433,7 +428,7 @@ suite("LiteLLMProviderBase discovery", () => {
         });
 
         test("serves the live result instead of the prior delivery when the backend returns none", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const mockSession = makeMockSession();
             // An empty result is surfaced, so the picker reflects the live state of the
             // backend rather than the previous list.
@@ -464,7 +459,7 @@ suite("LiteLLMProviderBase discovery", () => {
             // `apiKey` that was passed in on the originating call. The
             // model object on the wire does not need to carry
             // `configuration` because the registry is the source of truth.
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const configManager = access(provider)._configManager;
             const mockSession = makeMockSession();
             sandbox.stub(configManager, "convertProviderConfiguration").returns(mockSession);
@@ -496,7 +491,7 @@ suite("LiteLLMProviderBase discovery", () => {
         };
 
         test("base forwards transport strip callbacks into the registry", () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+            const provider = new LiteLLMChatProvider(userAgent);
             const record = sandbox.stub(access(provider)._registry, "recordUnsupportedParameter");
             const transport = access(provider)._transport as unknown as {
                 onUnsupportedParameter?: (model: string, param: string) => void;
@@ -508,7 +503,7 @@ suite("LiteLLMProviderBase discovery", () => {
         });
 
         test("reloadModels forgets every learned limit", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent, new EffortFallbackCache());
+            const provider = new LiteLLMChatProvider(userAgent, new EffortFallbackCache());
             const internals = access(provider);
             internals._effortFallbackCache.recordFailure("host-a.example/model", "high");
             internals._usageOptOutModels.add("host-a.example/model");
@@ -526,7 +521,7 @@ suite("LiteLLMProviderBase discovery", () => {
         });
 
         test("a settings-triggered reload keeps every learned limit", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent, new EffortFallbackCache());
+            const provider = new LiteLLMChatProvider(userAgent, new EffortFallbackCache());
             const internals = access(provider);
             internals._effortFallbackCache.recordFailure("host-a.example/model", "high");
             internals._usageOptOutModels.add("host-a.example/model");
@@ -549,7 +544,7 @@ suite("LiteLLMProviderBase discovery", () => {
         });
 
         test("the effort ladder learns under the namespaced id, not the wire model name", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent, new EffortFallbackCache());
+            const provider = new LiteLLMChatProvider(userAgent, new EffortFallbackCache());
             const internals = access(provider);
             const namespacedModel = { ...model, id: "host-a.example/model-reasoning", name: "model-reasoning" };
             const baseConfig = { baseUrl: "https://host-a.example", apiKey: "k", reasoningEffort: "high" };
@@ -587,7 +582,7 @@ suite("LiteLLMProviderBase discovery", () => {
         });
 
         test("the usage opt-out learns under the namespaced id, not the wire model name", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent, new EffortFallbackCache());
+            const provider = new LiteLLMChatProvider(userAgent, new EffortFallbackCache());
             const internals = access(provider);
             const namespacedModel = { ...model, id: "host-a.example/model-usage", name: "model-usage" };
             const baseConfig = { baseUrl: "https://host-a.example", apiKey: "k" };
@@ -621,7 +616,7 @@ suite("LiteLLMProviderBase discovery", () => {
         });
 
         test("sendRequestWithRetry hands the transport the namespaced id as the learned-limits key", async () => {
-            const provider = new LiteLLMChatProvider(mockSecrets, userAgent, new EffortFallbackCache());
+            const provider = new LiteLLMChatProvider(userAgent, new EffortFallbackCache());
             const internals = access(provider);
             const namespacedModel = { ...model, id: "host-a.example/model-key", name: "model-key" };
             const baseConfig = { baseUrl: "https://host-a.example", apiKey: "k" };

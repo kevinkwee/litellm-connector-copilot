@@ -1,23 +1,12 @@
 import * as assert from "assert";
-import type * as vscode from "vscode";
 
 import { ConfigManager } from "../config/configManager";
 
 const CLIENT_OPTIONS = { discoveryTimeoutMs: 5_000, userAgent: "test-ua" };
 
-function createSecrets(overrides?: { get?: (key: string) => Promise<string | undefined> }): vscode.SecretStorage {
-    return {
-        get: overrides?.get ?? (async () => undefined),
-        store: async () => {},
-        delete: async () => {},
-        keys: async () => [],
-        onDidChange: () => ({ dispose() {} }),
-    } as unknown as vscode.SecretStorage;
-}
-
 suite("ConfigManager", () => {
     test("convertProviderConfiguration returns a backend session when provider config is complete", () => {
-        const manager = new ConfigManager(createSecrets());
+        const manager = new ConfigManager();
 
         const session = manager.convertProviderConfiguration(
             { providerName: "group-a", baseUrl: "http://localhost:4000", apiKey: "secret" },
@@ -30,7 +19,7 @@ suite("ConfigManager", () => {
     });
 
     test("derives backendName from the URL hostname", () => {
-        const manager = new ConfigManager(createSecrets());
+        const manager = new ConfigManager();
 
         const session = manager.convertProviderConfiguration(
             { baseUrl: "https://llmapi.wolfram.com/v1", apiKey: "sk-test" },
@@ -42,7 +31,7 @@ suite("ConfigManager", () => {
     });
 
     test("passes the supplied discovery timeout and user agent to the session client", () => {
-        const manager = new ConfigManager(createSecrets());
+        const manager = new ConfigManager();
 
         const session = manager.convertProviderConfiguration(
             { baseUrl: "http://localhost:4000", apiKey: "secret" },
@@ -63,7 +52,7 @@ suite("ConfigManager", () => {
     });
 
     test("getConfig returns only supported keys", async () => {
-        const manager = new ConfigManager(createSecrets());
+        const manager = new ConfigManager();
 
         const config = await manager.getConfig();
 
@@ -74,7 +63,7 @@ suite("ConfigManager", () => {
     });
 
     test("ignores a stale providerName in the configuration payload", () => {
-        const manager = new ConfigManager(createSecrets());
+        const manager = new ConfigManager();
 
         const session = manager.convertProviderConfiguration(
             { baseUrl: "http://localhost:4000", apiKey: "secret", providerName: "stale-payload-value" },
@@ -86,7 +75,7 @@ suite("ConfigManager", () => {
     });
 
     test("returns undefined without a baseUrl", () => {
-        const manager = new ConfigManager(createSecrets());
+        const manager = new ConfigManager();
 
         assert.strictEqual(
             manager.convertProviderConfiguration({ providerName: "group-a", apiKey: "secret" }, CLIENT_OPTIONS),
@@ -95,7 +84,7 @@ suite("ConfigManager", () => {
     });
 
     test("returns undefined when baseUrl is not http(s)", () => {
-        const manager = new ConfigManager(createSecrets());
+        const manager = new ConfigManager();
 
         assert.strictEqual(
             manager.convertProviderConfiguration(
@@ -107,7 +96,7 @@ suite("ConfigManager", () => {
     });
 
     test("returns undefined without apiKey", () => {
-        const manager = new ConfigManager(createSecrets());
+        const manager = new ConfigManager();
 
         assert.strictEqual(
             manager.convertProviderConfiguration(
@@ -116,15 +105,5 @@ suite("ConfigManager", () => {
             ),
             undefined
         );
-    });
-
-    test("getSecret exposes stored values", async () => {
-        const manager = new ConfigManager(
-            createSecrets({
-                get: async (key: string) => (key === "litellm-connector.apiKey.default" ? "abc" : undefined),
-            })
-        );
-
-        assert.strictEqual(await manager.getSecret("litellm-connector.apiKey.default"), "abc");
     });
 });

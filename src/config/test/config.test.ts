@@ -4,8 +4,6 @@ import * as sinon from "sinon";
 import { ConfigManager } from "../configManager";
 
 suite("ConfigManager Unit Tests", () => {
-    let mockSecrets: vscode.SecretStorage;
-    let secretsMap: Map<string, string>;
     let configManager: ConfigManager;
     let getConfigurationStub: sinon.SinonStub;
     let configGetStub: sinon.SinonStub;
@@ -13,20 +11,8 @@ suite("ConfigManager Unit Tests", () => {
 
     setup(() => {
         settingsMap = new Map<string, unknown>();
-        secretsMap = new Map<string, string>();
-        mockSecrets = {
-            get: async (key: string) => secretsMap.get(key),
-            store: async (key: string, value: string) => {
-                secretsMap.set(key, value);
-            },
-            delete: async (key: string) => {
-                secretsMap.delete(key);
-            },
-            onDidChange: new vscode.EventEmitter<vscode.SecretStorageChangeEvent>().event,
-        } as unknown as vscode.SecretStorage;
 
         // Stub workspace configuration reads so tests are deterministic and don't depend on VS Code defaults.
-        // We return explicit values for the keys ConfigManager reads.
         configGetStub = sinon.stub();
         // `litellm-connector.baseUrl`, `.apiKeySecretRef`, and `.emitUsageData`
         // are not read under VS Code's per-group provider configuration.
@@ -59,7 +45,7 @@ suite("ConfigManager Unit Tests", () => {
             },
             has: () => false,
         } as unknown as vscode.WorkspaceConfiguration);
-        configManager = new ConfigManager(mockSecrets);
+        configManager = new ConfigManager();
     });
 
     teardown(() => {
@@ -67,7 +53,7 @@ suite("ConfigManager Unit Tests", () => {
     });
 
     test("getConfig returns empty values when nothing is stored", async () => {
-        const manager = new ConfigManager(mockSecrets);
+        const manager = new ConfigManager();
         const config = await manager.getConfig();
         // url and key are not part of LiteLLMConfig; backends are configured
         // per provider group in VS Code's Language Models settings.
@@ -77,7 +63,7 @@ suite("ConfigManager Unit Tests", () => {
     test("getConfig clamps an inactivityTimeout below the minimum", async () => {
         settingsMap.set("litellm-connector.inactivityTimeout", 0);
 
-        const manager = new ConfigManager(mockSecrets);
+        const manager = new ConfigManager();
         const cfg = await manager.getConfig();
 
         assert.strictEqual(cfg.inactivityTimeout, 1);
@@ -86,7 +72,7 @@ suite("ConfigManager Unit Tests", () => {
     test("getConfig clamps an inactivityTimeout above the maximum", async () => {
         settingsMap.set("litellm-connector.inactivityTimeout", 1_000_000);
 
-        const manager = new ConfigManager(mockSecrets);
+        const manager = new ConfigManager();
         const cfg = await manager.getConfig();
 
         assert.strictEqual(cfg.inactivityTimeout, 3600);
@@ -95,7 +81,7 @@ suite("ConfigManager Unit Tests", () => {
     test("getConfig falls back to the default for a non-numeric inactivityTimeout", async () => {
         settingsMap.set("litellm-connector.inactivityTimeout", "soon");
 
-        const manager = new ConfigManager(mockSecrets);
+        const manager = new ConfigManager();
         const cfg = await manager.getConfig();
 
         assert.strictEqual(cfg.inactivityTimeout, 60);
@@ -104,7 +90,7 @@ suite("ConfigManager Unit Tests", () => {
     test("getConfig keeps an in-range inactivityTimeout", async () => {
         settingsMap.set("litellm-connector.inactivityTimeout", 90);
 
-        const manager = new ConfigManager(mockSecrets);
+        const manager = new ConfigManager();
         const cfg = await manager.getConfig();
 
         assert.strictEqual(cfg.inactivityTimeout, 90);
@@ -117,7 +103,7 @@ suite("ConfigManager Unit Tests", () => {
             "another-model": ["vision"],
         });
 
-        const manager = new ConfigManager(mockSecrets);
+        const manager = new ConfigManager();
         const cfg = await manager.getConfig();
 
         assert.deepStrictEqual(cfg.modelCapabilitiesOverrides, {
@@ -128,14 +114,14 @@ suite("ConfigManager Unit Tests", () => {
     });
 
     test("getConfig returns empty object for modelCapabilitiesOverrides when not set", async () => {
-        const manager = new ConfigManager(mockSecrets);
+        const manager = new ConfigManager();
         const cfg = await manager.getConfig();
 
         assert.deepStrictEqual(cfg.modelCapabilitiesOverrides, {});
     });
 
     test("getConfig reports no discovery change-notification timing fields", async () => {
-        const manager = new ConfigManager(mockSecrets);
+        const manager = new ConfigManager();
         const cfg = await manager.getConfig();
 
         // The registry fires the change event as soon as a model set changes, so
@@ -336,10 +322,10 @@ suite("ConfigManager Unit Tests", () => {
     });
 
     test("every LiteLLMConfig field is populated by getConfig() (anti-dead-config guard)", async () => {
-        // This test exists because settings were previously declared, read into
-        // LiteLLMConfig, and reported to telemetry WITHOUT any runtime behavior.
+        // A setting that is declared, read into LiteLLMConfig, and reported to
+        // telemetry without driving behavior is dead configuration.
         // If you add a new LiteLLMConfig field, you MUST also wire it to behavior
-        // or this guard will fail. Do NOT weaken this guard — codify the contract.
+        // or this guard will fail. Do NOT weaken this guard: it codifies the contract.
         //
         // The strong guard is the per-feature wiring tests (transport.fallback,
         // disableCaching.wiring). This test pins the expected live field set so
@@ -370,7 +356,7 @@ suite("ConfigManager Unit Tests", () => {
         for (const field of liveFields) {
             assert.ok(
                 field in config,
-                `LiteLLMConfig.${field} must be populated by getConfig() — if removed, update this guard`
+                `LiteLLMConfig.${field} must be populated by getConfig(). If removed, update this guard`
             );
         }
     });
