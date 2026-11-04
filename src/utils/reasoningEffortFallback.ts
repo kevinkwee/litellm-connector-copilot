@@ -122,6 +122,24 @@ export class EffortFallbackCache {
     }
 }
 
+/**
+ * Spellings that name the reasoning effort input in a rejection body.
+ *
+ * Each spelling comes from a rejection wording LiteLLM or a provider produces: flat
+ * (`reasoning_effort`) on chat completions, `reasoning.effort` on `/responses`,
+ * `reasoningEffort` on the providers that take camelCase (lowercased before
+ * matching), `effort='x'` in the Anthropic transformation's own message
+ * (`effort='xhigh' is not supported by this model`), and "reasoning effort" in
+ * LiteLLM's Anthropic map when it cannot map a level.
+ */
+const REASONING_EFFORT_NAMES: readonly string[] = [
+    "reasoning_effort",
+    "reasoning effort",
+    "reasoning.effort",
+    "effort='",
+    "reasoningeffort",
+];
+
 export function isReasoningError(error: unknown): boolean {
     const status = getStatusCode(error);
     if (status === undefined || status < 400 || status >= 500) {
@@ -134,7 +152,12 @@ export function isReasoningError(error: unknown): boolean {
     }
 
     Logger.debug(`[isReasoningError] status: ${status}, textLength: ${text.length}`);
-    return text.includes("reasoning") && (text.includes("effort") || text.includes("parameter"));
+    // The ladder steps down only when the body names the effort input. A body naming
+    // another reasoning input, such as `reasoning_content` or reasoning items, does
+    // not qualify, because stepping down would downgrade the model for an unrelated
+    // failure. A 4xx that cites the effort while refusing something else also
+    // qualifies, so the name alone is not proof of a refusal.
+    return REASONING_EFFORT_NAMES.some((name) => text.includes(name));
 }
 
 function buildNotificationKey(modelId: string, originalEffort: SupportedReasoningEffort): string {

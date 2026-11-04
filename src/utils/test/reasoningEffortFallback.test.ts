@@ -95,6 +95,82 @@ suite("reasoningEffortFallback", () => {
 
             assert.strictEqual(isReasoningError(error), true);
         });
+
+        test("returns false for a 400 about reasoning_content without naming the effort", () => {
+            // The ladder steps the effort down, so a failure about a different
+            // reasoning input must not move it.
+            const error = buildError({
+                status: 400,
+                message: "Invalid parameter: reasoning_content must be passed back to the API",
+            });
+
+            assert.strictEqual(isReasoningError(error), false);
+        });
+
+        test("returns false when the body mentions reasoning items and a parameter", () => {
+            const error = buildError({
+                status: 400,
+                message: "Unsupported parameter: reasoning items",
+            });
+
+            assert.strictEqual(isReasoningError(error), false);
+        });
+
+        test("returns true for LiteLLM's Anthropic map rejecting an unmappable level", () => {
+            // "Unmapped reasoning effort: 'x'. Must be one of: ..." from the fork's
+            // Anthropic transformation.
+            const error = buildError({
+                status: 400,
+                message: "Unmapped reasoning effort: 'ultra'. Must be one of: 'minimal', 'low', 'medium', 'high'.",
+            });
+
+            assert.strictEqual(isReasoningError(error), true);
+        });
+
+        test("returns true when the refusal names the effort as reasoning.effort", () => {
+            // A /responses request moves the flat parameter into `reasoning`, so the
+            // upstream error names the nested path.
+            const error = buildError({
+                status: 400,
+                body: { error: { message: "Unsupported value: 'xhigh' for 'reasoning.effort'" } },
+            });
+
+            assert.strictEqual(isReasoningError(error), true);
+        });
+
+        test("returns true for the Anthropic effort='level' refusal", () => {
+            // "effort='xhigh' is not supported by this model" from the fork's Anthropic
+            // transformation.
+            const error = buildError({
+                status: 400,
+                message: "effort='xhigh' is not supported by this model. Got model: claude-opus-5",
+            });
+
+            assert.strictEqual(isReasoningError(error), true);
+        });
+
+        test("returns true when the body names the effort in camelCase", () => {
+            // The fork's OCI transform hands the field over in camelCase and does not
+            // validate the level, so a refusal can name it that way. No captured message
+            // exists, so this body is representative.
+            const error = buildError({
+                status: 400,
+                message: "Unsupported value: 'xhigh' for parameter reasoningEffort",
+            });
+
+            assert.strictEqual(isReasoningError(error), true);
+        });
+
+        test("returns false when the body assigns the effort with double quotes", () => {
+            // Only the single-quoted Anthropic form is in the spelling list, so a
+            // double-quoted assignment does not qualify.
+            const error = buildError({
+                status: 400,
+                message: "Unsupported value: 'effort=\"high\"' for this model",
+            });
+
+            assert.strictEqual(isReasoningError(error), false);
+        });
     });
 
     test("clear resets cached failures", () => {

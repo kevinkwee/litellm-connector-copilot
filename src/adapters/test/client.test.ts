@@ -271,6 +271,7 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.strictEqual(findRejectedParameter("Unsupported parameter: 'temperature'"), "temperature");
         assert.strictEqual(findRejectedParameter('unknown parameter "top_p"'), "top_p");
         assert.strictEqual(findRejectedParameter("unexpected keyword argument 'stop'"), "stop");
+        assert.strictEqual(findRejectedParameter("extraneous key [cache_control] is not permitted"), "cache_control");
         assert.strictEqual(
             findRejectedParameter('{"error":{"message":"Unsupported parameter: temperature","param":"temperature"}}'),
             "temperature"
@@ -291,6 +292,7 @@ suite("LiteLLM Client Unit Tests", () => {
     test("isUnsupportedParameterError only matches parameter-rejection bodies", () => {
         assert.strictEqual(isUnsupportedParameterError("Unsupported parameter: temperature"), true);
         assert.strictEqual(isUnsupportedParameterError("Extra inputs are not permitted"), true);
+        assert.strictEqual(isUnsupportedParameterError("extraneous key [cache_control] is not permitted"), true);
         assert.strictEqual(isUnsupportedParameterError("Maximum context length exceeded"), false);
     });
 

@@ -80,6 +80,7 @@ const UNSUPPORTED_PARAMETER_PHRASES = [
     "unrecognized request argument",
     "unexpected keyword argument",
     "extra inputs are not permitted",
+    "extraneous key",
     "does not support parameter",
 ];
 
@@ -98,19 +99,33 @@ export function isUnsupportedParameterError(bodyText: string): boolean {
  */
 export function findRejectedParameter(bodyText: string): string | undefined {
     const phrase =
-        /(?:unsupported|unknown|unrecognized|unexpected|invalid|extra|does\s+not\s+support)\s+(?:keyword\s+)?(?:parameter|argument|request argument|inputs?|keys?)s?(?:\s+supplied)?\s*/i;
+        /(?:unsupported|unknown|unrecognized|unexpected|invalid|extraneous|extra|does\s+not\s+support)\s+(?:keyword\s+)?(?:parameter|argument|request argument|inputs?|keys?)s?(?:\s+supplied)?\s*/i;
     const rest = bodyText.match(phrase);
     if (!rest || rest.index === undefined) {
         return undefined;
     }
     const afterPhrase = bodyText.slice(rest.index + rest[0].length);
     // Accepted shapes: `: temperature`, `: ['temperature']`, `: {'temperature': ...}`,
-    // `'temperature'`. Anything else (for example "Unsupported parameter for this
-    // model") names no parameter, and guessing one would mislead the user.
+    // `'temperature'`, and Bedrock's `[temperature]`. Anything else (for example
+    // "Unsupported parameter for this model") names no parameter, and guessing one
+    // would mislead the user.
     const named = afterPhrase.match(
-        /^(?:[:=]\s*['"`]?([A-Za-z0-9_.-]+)|[:=]\s*\[\s*['"`]([A-Za-z0-9_.-]+)|[:=]\s*\{\s*['"`]([A-Za-z0-9_.-]+)|['"`]([A-Za-z0-9_.-]+))/
+        /^(?:[:=]\s*['"`]?([A-Za-z0-9_.-]+)|[:=]\s*\[\s*['"`]([A-Za-z0-9_.-]+)|[:=]\s*\{\s*['"`]([A-Za-z0-9_.-]+)|['"`]([A-Za-z0-9_.-]+)|\[([A-Za-z0-9_.-]+)\])/
     );
-    return named?.[1] ?? named?.[2] ?? named?.[3] ?? named?.[4];
+    return named?.[1] ?? named?.[2] ?? named?.[3] ?? named?.[4] ?? named?.[5];
+}
+
+/**
+ * True when a rejection body says it refused an input, which is what separates a
+ * rejection of a connector-added parameter from a body that merely echoes the prompt.
+ *
+ * `isUnsupportedParameterError` covers the parameter wordings, including Bedrock's
+ * "extraneous key [<name>] is not permitted". The cache-bypass directive has a refusal
+ * that names no parameter at all: the proxy's cache-control check answers 403 with
+ * "Not allowed to set no-cache as a cache control" (`litellm/proxy/hooks/cache_control_check.py`).
+ */
+function saysItRefusedAnInput(errorText: string): boolean {
+    return isUnsupportedParameterError(errorText) || errorText.toLowerCase().includes("not allowed to set");
 }
 
 /**
@@ -315,9 +330,9 @@ export class LiteLLMClient {
 
     /**
      * Builds the retry body for a 400 or 403 that rejects a parameter this
-     * connector adds itself. Returns undefined when the rejection names no such
-     * parameter or the body does not carry it, in which case the caller must
-     * surface the error instead.
+     * connector adds itself. Returns undefined when the body does not read as a
+     * refusal, names no such parameter, or does not carry it, in which case the
+     * caller must surface the error instead.
      *
      * Two families qualify:
      * - `cache_control`, the Anthropic prompt-caching marker added by the
@@ -326,6 +341,11 @@ export class LiteLLMClient {
      * - the cache-bypass directive added for `litellm-connector.disableCaching`
      *   (`cache["no-cache"]`). A key the proxy does not allow to set it answers
      *   403, so the same strip-and-retry covers both statuses.
+     *
+     * The refusal requirement applies to both families. The rejection body can echo
+     * the prompt, and stripping and learning on a parameter name alone would let an
+     * unrelated 400 that quotes `cache_control` or `no-cache` disable prompt caching
+     * or the cache bypass for the session.
      *
      * Nothing else in the body is touched: any other parameter is either the
      * user's own configuration or was accepted by the proxy's capability data,
@@ -336,15 +356,16 @@ export class LiteLLMClient {
         body: OpenAIChatCompletionRequest | LiteLLMResponsesRequest,
         modelId: string
     ): OpenAIChatCompletionRequest | LiteLLMResponsesRequest | undefined {
+        if (!saysItRefusedAnInput(errorText)) {
+            return undefined;
+        }
         const errorLower = errorText.toLowerCase();
         const promptCachingRejected = errorLower.includes("cache_control");
-        const cacheBypassRejected =
-            errorLower.includes("no-cache") ||
-            errorLower.includes("no_cache") ||
-            (errorLower.includes("cache") &&
-                (errorLower.includes("unknown parameter") ||
-                    errorLower.includes("unsupported parameter") ||
-                    errorLower.includes("extra inputs are not permitted")));
+        // The directive's own name is the standalone word `cache`, which the proxy's
+        // permission refusal reports as `no-cache`. A word boundary does not match
+        // across the underscore in `cache_control`, so the marker name alone leaves
+        // this family unmatched.
+        const cacheBypassRejected = /\bcache\b/.test(errorLower);
         if (!promptCachingRejected && !cacheBypassRejected) {
             return undefined;
         }
