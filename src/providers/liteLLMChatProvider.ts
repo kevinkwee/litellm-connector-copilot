@@ -274,8 +274,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // and repeating it only multiplies a guaranteed failure.
             let headersTimeoutAttempts = 0;
             let resumed = false;
-            // Output already streamed when an attempt starts. An attempt that adds to
-            // it proved the upstream is working, so the retry clock starts over.
+            // Output already streamed when an attempt starts. An attempt that adds to it
+            // proves the upstream is working, so the retry clock starts over.
             let outputAtAttemptStart = 0;
             while (true) {
                 try {
@@ -441,12 +441,17 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         // that empty would misdescribe it.
                         const isEmptyReply =
                             err.reasoningChars === 0 && err.normalFinish && accumulator.thinking.length === 0;
+                        const afterAttempts =
+                            emptyAttempt > 0 ? `after ${emptyAttempt} resume attempt(s)` : "on the first attempt";
                         const reason = isEmptyReply
                             ? `LiteLLM: model returned an empty reply (no text, reasoning or tool call) ` +
-                              `after ${emptyAttempt} resend(s); try resending.`
-                            : `LiteLLM: model returned reasoning-only response (no text or tool calls) ` +
-                              `after ${emptyAttempt} resume attempt(s). The upstream provider is ` +
-                              `truncating generation mid-reasoning; try resending.`;
+                              `${afterAttempts}; try resending.`
+                            : err.reasoningChars > 0
+                              ? `LiteLLM: model returned a reasoning-only response (no text or tool calls) ` +
+                                `${afterAttempts}. The upstream provider is truncating generation ` +
+                                `mid-reasoning; try resending.`
+                              : `LiteLLM: model returned no text or tool call ${afterAttempts}, and the ` +
+                                `response was cut short; try resending.`;
                         throw new Error(reason, { cause: err });
                     }
 

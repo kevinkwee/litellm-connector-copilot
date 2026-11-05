@@ -66,9 +66,9 @@ suite("LiteLLM Chat Provider retry budget accounting", () => {
 
     /**
      * Runs one chat request against a client stub that answers with the given
-     * replies in order. The clock advances by a fixed step per attempt, so the
-     * five-millisecond budget is spent deterministically rather than by elapsed
-     * wall-clock time.
+     * replies in order. The clock advances by a fixed step per attempt, so the budget
+     * passed in `config` is spent deterministically rather than by elapsed wall-clock
+     * time.
      */
     async function runTurn(
         replies: (() => ReadableStream<Uint8Array> | Promise<ReadableStream<Uint8Array>>)[],
@@ -201,7 +201,7 @@ suite("LiteLLM Chat Provider retry budget accounting", () => {
         assert.strictEqual(ledgers[1], ledgers[0], "a resend of the same body must not get a fresh budget");
     });
 
-    test("a length cut with no output keeps the truncation wording", async () => {
+    test("a length cut with no output reports a reply cut short, not an empty one", async () => {
         // A length finish ended the attempt before the model could answer, so the
         // reply is cut short rather than empty, and the notice must say so.
         const { reported } = await runTurn(
@@ -210,11 +210,12 @@ suite("LiteLLM Chat Provider retry budget accounting", () => {
         );
 
         const notice = findErrorTextPart(reported) ?? "";
-        assert.match(notice, /truncating generation mid-reasoning/);
+        assert.match(notice, /response was cut short/);
         assert.doesNotMatch(notice, /empty reply/);
+        assert.doesNotMatch(notice, /reasoning-only/);
     });
 
-    test("a final stop after earlier reasoning keeps the truncation wording", async () => {
+    test("a final stop after earlier reasoning reports a reply cut short, not an empty one", async () => {
         // The user already saw reasoning from the first attempt, so a second attempt
         // that stops with nothing new was cut short, not empty.
         const { attempts, reported } = await runTurn(
@@ -228,8 +229,9 @@ suite("LiteLLM Chat Provider retry budget accounting", () => {
 
         assert.strictEqual(attempts, 2, "the empty stop must be the attempt the notice describes");
         const notice = findErrorTextPart(reported) ?? "";
-        assert.match(notice, /truncating generation mid-reasoning/);
+        assert.match(notice, /response was cut short/);
         assert.doesNotMatch(notice, /empty reply/);
+        assert.doesNotMatch(notice, /reasoning-only/);
     });
 
     test("a resumed attempt starts with its own rate-limit ledger", async () => {

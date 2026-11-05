@@ -68,8 +68,8 @@ suite("Transport", () => {
     });
 
     test("the /responses fallback shares the attempt's rate-limit ledger", async () => {
-        // The fallback resends the same body, so it must spend what the first call
-        // already waited rather than starting a fresh allowance.
+        // The fallback resends the same body, so it must keep the allowance the first
+        // call was given rather than starting a fresh one.
         const token = new vscode.CancellationTokenSource().token;
         const progress = { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>;
         const ledgers: unknown[] = [];

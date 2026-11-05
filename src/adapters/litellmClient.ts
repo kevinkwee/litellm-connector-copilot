@@ -508,8 +508,9 @@ export class LiteLLMClient {
     }
 
     /**
-     * Fetches with retries on 429 rate limiting, within the wait budget of the
-     * provider attempt in `options.ledger`. A budget of 0 disables the retries.
+     * Fetches with retries on 429 rate limiting, within the budget configured on the
+     * client and shared with every other call that sends the same provider attempt
+     * (`options.ledger`). A budget of 0 disables the retries.
      * {@link planRateLimitRetry} picks each wait. A 5xx response is retried by
      * {@link fetchWithRetry}; a connection failure is not, because the provider
      * owns network retries.

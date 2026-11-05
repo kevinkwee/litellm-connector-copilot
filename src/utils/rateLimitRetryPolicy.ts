@@ -29,7 +29,7 @@ export interface RateLimitRetryState {
 export class RateLimitWaitLedger {
     private _waitedMs = 0;
 
-    /** Sum of the waits this attempt has already taken, in milliseconds. */
+    /** The waits this attempt has already taken, added together, in milliseconds. */
     public get waitedMs(): number {
         return this._waitedMs;
     }
