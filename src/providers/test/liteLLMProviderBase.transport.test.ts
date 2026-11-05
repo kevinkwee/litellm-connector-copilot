@@ -3,6 +3,8 @@ import * as vscode from "vscode";
 import * as sinon from "sinon";
 import { Transport } from "../base/transport";
 import { ConfigManager } from "../../config/configManager";
+import { LiteLLMApiError } from "../../adapters/litellmClient";
+import { RateLimitWaitLedger } from "../../utils/rateLimitRetryPolicy";
 
 suite("Transport", () => {
     let sandbox: sinon.SinonSandbox;
@@ -63,6 +65,51 @@ suite("Transport", () => {
                 ),
             /No apiKey/
         );
+    });
+
+    test("the /responses fallback shares the attempt's rate-limit ledger", async () => {
+        // The fallback resends the same body, so it must spend what the first call
+        // already waited rather than starting a fresh allowance.
+        const token = new vscode.CancellationTokenSource().token;
+        const progress = { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>;
+        const ledgers: unknown[] = [];
+        const localTransport = new Transport({
+            configManager,
+            userAgent: "ua",
+            logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, trace: () => {} },
+            liteLLMClientFactory: (() => ({
+                chat: (_request: unknown, mode: string, _token: unknown, _id: unknown, ledger: unknown) => {
+                    ledgers.push(ledger);
+                    if (mode === "responses") {
+                        return Promise.reject(
+                            new LiteLLMApiError(
+                                502,
+                                "upstream schema mismatch",
+                                "LiteLLM API error: 502 Bad Gateway\nupstream schema mismatch"
+                            )
+                        );
+                    }
+                    return Promise.resolve(new ReadableStream());
+                },
+            })) as never,
+        });
+        const ledger = new RateLimitWaitLedger();
+
+        await localTransport.sendRequestToLiteLLM(
+            { model: "m", messages: [], stream: true, max_tokens: 100 },
+            progress,
+            token,
+            "test",
+            { mode: "responses" } as never,
+            { baseUrl: "https://example.com", apiKey: "sk-test", allowChatCompletionsFallback: true },
+            "request-1",
+            "model-1",
+            ledger
+        );
+
+        assert.strictEqual(ledgers.length, 2, "the 5xx must trigger one fallback");
+        assert.strictEqual(ledgers[0], ledger);
+        assert.strictEqual(ledgers[1], ledger, "the fallback must not get a fresh budget");
     });
 
     test("sendRequestToLiteLLM constructs a client with the call-time configuration", async () => {

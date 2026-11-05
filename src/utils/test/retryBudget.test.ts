@@ -76,6 +76,28 @@ suite("RetryBudget", () => {
         assert.strictEqual(budget.clipDelay(500), 0);
     });
 
+    test("restart gives the next retry the whole budget again", () => {
+        const clock = createClock();
+        const budget = new RetryBudget(1_000, clock.now);
+        budget.markFailure();
+        clock.advance(1_500);
+
+        budget.restart();
+
+        assert.strictEqual(budget.remainingMs(), 1_000, "a productive attempt starts the clock over");
+    });
+
+    test("a productive attempt is allowed past the budget it would otherwise have spent", () => {
+        const clock = createClock();
+        const budget = new RetryBudget(1_000, clock.now);
+        budget.markFailure();
+        clock.advance(1_500);
+
+        budget.restart();
+
+        assert.strictEqual(budget.markFailure(), true, "an attempt that delivered output earns another retry");
+    });
+
     test("a zero budget disables the bound", () => {
         const clock = createClock();
         const budget = new RetryBudget(0, clock.now);

@@ -4,23 +4,47 @@ export type RateLimitGiveUpReason = "retries_disabled" | "budget_exhausted" | "r
 /** Where a 429 wait came from: the proxy's Retry-After header, or the client's own backoff. */
 export type RateLimitWaitSource = "retry_after" | "backoff";
 
-/** Retry progress of one call to the proxy at the moment it receives a 429. */
+/** Retry progress of one provider attempt at the moment it receives a 429. */
 export interface RateLimitRetryState {
-    /** Waits already taken in this call. */
+    /** Waits already taken by the HTTP call the decision is for. */
     readonly attempt: number;
     /** Sum of the waits already taken, in milliseconds. */
     readonly waitedMs: number;
-    /** Most this call may wait in total, in milliseconds. */
+    /** Most this attempt may wait in total, in milliseconds. */
     readonly budgetMs: number;
     /** Wait the proxy asked for through Retry-After, when the header is usable. */
     readonly retryAfterMs?: number;
+}
+
+/**
+ * Waits one provider attempt has taken on 429 responses, shared by every HTTP call
+ * that sends that attempt.
+ *
+ * One attempt can send its body more than once (a connector-parameter strip and
+ * retry, the `/responses` fallback, the `include_usage` retry), and each resend
+ * meets the same rate limit. Counting the waits per HTTP call would hand every
+ * resend a fresh budget and multiply the time a rate-limited turn spends waiting,
+ * so the ledger is created per provider attempt and threaded down.
+ */
+export class RateLimitWaitLedger {
+    private _waitedMs = 0;
+
+    /** Sum of the waits this attempt has already taken, in milliseconds. */
+    public get waitedMs(): number {
+        return this._waitedMs;
+    }
+
+    /** Adds one wait to the attempt's total. */
+    public recordWait(delayMs: number): void {
+        this._waitedMs += delayMs;
+    }
 }
 
 export type RateLimitRetryDecision =
     | { readonly kind: "wait"; readonly delayMs: number; readonly source: RateLimitWaitSource }
     | { readonly kind: "give_up"; readonly reason: RateLimitGiveUpReason };
 
-/** Facts about a rate-limited call the client stopped retrying. */
+/** Facts about a rate-limited attempt the client stopped retrying. */
 export interface RateLimitFailure {
     readonly reason: RateLimitGiveUpReason;
     readonly waitedMs: number;

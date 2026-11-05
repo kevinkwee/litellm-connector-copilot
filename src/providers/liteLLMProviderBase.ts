@@ -10,6 +10,7 @@ import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../types";
 import { countTokens } from "../adapters/tokenUtils";
 import { ConfigManager } from "../config/configManager";
 import { Logger } from "../utils/logger";
+import { RateLimitWaitLedger } from "../utils/rateLimitRetryPolicy";
 import { isOpenAIParamSupported } from "../utils/modelCapabilities";
 import { RequestBuilder } from "./base/requestBuilder";
 import { describeFailureForLog } from "./base/errorLogFields";
@@ -306,7 +307,8 @@ export abstract class LiteLLMProviderBase {
         modelInfo?: LiteLLMModelInfo,
         configuration?: Record<string, unknown>,
         requestId?: string,
-        learnedLimitsKey?: string
+        learnedLimitsKey?: string,
+        rateLimitLedger?: RateLimitWaitLedger
     ): Promise<ReadableStream<Uint8Array>> {
         return this._transport.sendRequestToLiteLLM(
             request,
@@ -316,7 +318,8 @@ export abstract class LiteLLMProviderBase {
             modelInfo,
             configuration,
             requestId,
-            learnedLimitsKey
+            learnedLimitsKey,
+            rateLimitLedger
         );
     }
 
@@ -344,6 +347,10 @@ export abstract class LiteLLMProviderBase {
         // keyed by the namespaced picker id rather than the wire model name.
         const modelId = model.id;
         let usageRetryAttempted = false;
+        // One attempt, one 429 budget: a resend of the same body (the include_usage
+        // retry) meets the same rate limit, so it spends what is left rather than a
+        // fresh budget.
+        const rateLimitLedger = new RateLimitWaitLedger();
 
         const clearUsageFlag = () => {
             delete (request as { stream_options?: { include_usage?: boolean } }).stream_options;
@@ -359,7 +366,8 @@ export abstract class LiteLLMProviderBase {
                     modelInfo,
                     await this.getCallTimeConfiguration(options, model),
                     requestId,
-                    modelId
+                    modelId,
+                    rateLimitLedger
                 );
             } catch (err) {
                 // Payload shape only. The turn boundary logs the failure.

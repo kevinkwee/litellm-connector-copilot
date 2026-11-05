@@ -544,8 +544,7 @@ suite("LiteLLM Chat Provider Retry", () => {
         );
     });
 
-    test("reports the retry budget, not the reasoning-only count, when the budget stops that retry", async () => {
-        const encoder = new TextEncoder();
+    test("an exhausted turn with no reasoning at all reports an empty reply", async () => {
         const provider = new LiteLLMChatProvider(userAgent);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
@@ -554,35 +553,32 @@ suite("LiteLLM Chat Provider Retry", () => {
             url: "http://localhost:4000",
             networkRetries: 3,
             networkRetryDelayMs: 1,
-            emptyResponseRetries: 5,
+            emptyResponseRetries: 1,
             emptyResponseRetryDelayMs: 1,
-            retryBudgetMs: 5,
             inactivityTimeout: 60,
         });
         seedDiscoveredBackend(sandbox, provider, "model-1");
         const reported: vscode.LanguageModelResponsePart[] = [];
-        // The clock advances per attempt, so the budget is spent deterministically.
-        let now = 1_000;
-        sandbox.stub(Date, "now").callsFake(() => now);
-        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async () => {
-            now += 10;
-            return new ReadableStream<Uint8Array>({
-                start(controller) {
-                    controller.enqueue(
-                        encoder.encode('data: {"choices":[{"delta":{"reasoning_content":"more thought"}}]}\n\n')
-                    );
-                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                    controller.close();
-                },
-            });
-        });
+        // The attempt ends on a proven stop with no content of any kind, so nothing
+        // was cut short and the truncation wording would be wrong.
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(
+            async () =>
+                new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.enqueue(
+                            new TextEncoder().encode('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n')
+                        );
+                        controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+                        controller.close();
+                    },
+                })
+        );
 
         await runChatRequest(provider, reported);
 
         const text = findErrorTextPart(reported);
-        assert.ok(text, "the failure must surface as an error text part");
-        assert.match(text, /retryBudgetSeconds/, "the user must learn which setting ended the turn");
-        assert.doesNotMatch(text, /reasoning-only response persisted/);
+        assert.match(text ?? "", /empty reply \(no text, reasoning or tool call\)/);
+        assert.doesNotMatch(text ?? "", /truncating generation mid-reasoning/);
     });
 
     test("resends an unchanged request when the attempt streamed only whitespace", async () => {

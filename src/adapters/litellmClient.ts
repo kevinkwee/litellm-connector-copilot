@@ -8,7 +8,12 @@ import type {
 import { transformToResponsesFormat } from "./responsesAdapter";
 import { StructuredLogger } from "../observability/structuredLogger";
 import { Logger } from "../utils/logger";
-import { planRateLimitRetry, type RateLimitFailure, type RateLimitWaitSource } from "../utils/rateLimitRetryPolicy";
+import {
+    planRateLimitRetry,
+    RateLimitWaitLedger,
+    type RateLimitFailure,
+    type RateLimitWaitSource,
+} from "../utils/rateLimitRetryPolicy";
 import { normalizeProxyBaseUrl } from "../utils/proxyBaseUrl";
 import { HeadersTimeoutError } from "../utils/transportRetry";
 
@@ -79,6 +84,8 @@ interface RateLimitFetchOptions {
     /** Ties the retry logs to the provider's request logs. */
     readonly requestId?: string;
     readonly token?: vscode.CancellationToken;
+    /** Waits already taken by this provider attempt, shared by every resend. */
+    readonly ledger: RateLimitWaitLedger;
 }
 
 interface RateLimitRetryLogEntry {
@@ -261,7 +268,8 @@ export class LiteLLMClient {
         request: OpenAIChatCompletionRequest,
         mode?: string,
         token?: vscode.CancellationToken,
-        requestId?: string
+        requestId?: string,
+        rateLimitLedger: RateLimitWaitLedger = new RateLimitWaitLedger()
     ): Promise<ReadableStream<Uint8Array>> {
         const endpoint = this.getEndpoint(mode);
         let body: OpenAIChatCompletionRequest | LiteLLMResponsesRequest = request;
@@ -278,7 +286,13 @@ export class LiteLLMClient {
 
         Logger.trace(`Sending chat request to ${endpoint}`, { model: request.model });
         const url = `${this.config.url}${endpoint}`;
-        const rateLimitOptions: RateLimitFetchOptions = { model: request.model, endpoint, requestId, token };
+        const rateLimitOptions: RateLimitFetchOptions = {
+            model: request.model,
+            endpoint,
+            requestId,
+            token,
+            ledger: rateLimitLedger,
+        };
         let response = await this.fetchWithRateLimit(
             url,
             {
@@ -494,8 +508,8 @@ export class LiteLLMClient {
     }
 
     /**
-     * Fetches with retries on 429 rate limiting, within a total wait budget
-     * for this call. A budget of 0 disables the retries.
+     * Fetches with retries on 429 rate limiting, within the wait budget of the
+     * provider attempt in `options.ledger`. A budget of 0 disables the retries.
      * {@link planRateLimitRetry} picks each wait. A 5xx response is retried by
      * {@link fetchWithRetry}; a connection failure is not, because the provider
      * owns network retries.
@@ -508,7 +522,6 @@ export class LiteLLMClient {
         options: RateLimitFetchOptions
     ): Promise<Response> {
         const budgetMs = this.config.rateLimitMaxDelayMs ?? LiteLLMClient.DEFAULT_RATE_LIMIT_MAX_DELAY_MS;
-        let waitedMs = 0;
         let attempt = 0;
 
         while (true) {
@@ -521,6 +534,7 @@ export class LiteLLMClient {
                 return response;
             }
 
+            const waitedMs = options.ledger.waitedMs;
             const retryAfterMs = this.parseRetryAfterDelayMs(response);
             const decision = planRateLimitRetry({ attempt, waitedMs, budgetMs, retryAfterMs });
             if (decision.kind === "give_up") {
@@ -540,7 +554,7 @@ export class LiteLLMClient {
                 budgetMs,
                 source: decision.source,
             });
-            waitedMs += decision.delayMs;
+            options.ledger.recordWait(decision.delayMs);
             await this.sleep(decision.delayMs, options.token);
         }
     }

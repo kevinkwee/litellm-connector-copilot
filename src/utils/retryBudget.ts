@@ -11,7 +11,8 @@ export const DEFAULT_RETRY_BUDGET_MS = 300_000;
  * failed retry attempt and each backoff sleep counts. The budget gates only
  * *starting* another attempt, so an attempt already in flight runs to its own
  * bound, and the backoff sleep is clipped to the time left. A budget of 0 or less
- * disables the bound.
+ * disables the bound. An attempt that delivered new output restarts the clock, because
+ * it proves the upstream was working.
  */
 export class RetryBudget {
     private startedAt: number | undefined;
@@ -53,6 +54,17 @@ export class RetryBudget {
             return true;
         }
         return !this.isExhausted();
+    }
+
+    /**
+     * Clears the clock, so the next retry starts with the whole budget again.
+     *
+     * An attempt that delivered new output proves the upstream was working, and the
+     * budget bounds a stalled proxy rather than the total time a productive turn
+     * spends.
+     */
+    public restart(): void {
+        this.startedAt = undefined;
     }
 
     /** A backoff delay clipped to the budget's remaining time, never negative. */

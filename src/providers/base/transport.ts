@@ -4,6 +4,7 @@ import { StructuredLogger } from "../../observability/structuredLogger";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types";
 import type { TransportDeps } from "./types";
 import { describeFailureForLog, toErrorLogFields } from "./errorLogFields";
+import type { RateLimitWaitLedger } from "../../utils/rateLimitRetryPolicy";
 
 /**
  * Sends a LiteLLM request to the configured endpoint.
@@ -56,7 +57,8 @@ export class Transport {
         modelInfo?: LiteLLMModelInfo,
         configuration?: Record<string, unknown>,
         requestId?: string,
-        learnedLimitsKey?: string
+        learnedLimitsKey?: string,
+        rateLimitLedger?: RateLimitWaitLedger
     ): Promise<ReadableStream<Uint8Array>> {
         this.logger.debug(
             `[transport.sendRequestToLiteLLM] Preparing LiteLLM request for model: ${request.model} (caller: ${caller})`
@@ -151,7 +153,7 @@ export class Transport {
             configuration.allowChatCompletionsFallback === true;
 
         try {
-            const stream = await client.chat(request, modelInfo?.mode, token, requestId);
+            const stream = await client.chat(request, modelInfo?.mode, token, requestId, rateLimitLedger);
             this.logger.debug(`[transport.sendRequestToLiteLLM] HTTP stream established for model: ${request.model}`);
             StructuredLogger.debug("transport.http_response_stream_open", {
                 model: request.model,
@@ -179,7 +181,7 @@ export class Transport {
                     caller,
                     ...toErrorLogFields(err),
                 });
-                return client.chat(request, "chat", token, requestId);
+                return client.chat(request, "chat", token, requestId, rateLimitLedger);
             }
 
             // The provider owns the single log for a request failure, so this

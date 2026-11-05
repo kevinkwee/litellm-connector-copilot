@@ -260,6 +260,12 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 },
             };
 
+            const restartBudgetAfterProgress = (): void => {
+                if (accumulator.text.length + accumulator.thinking.length > outputAtAttemptStart) {
+                    retryBudget.restart();
+                }
+            };
+
             let stream: ReadableStream<Uint8Array>;
             let attempt = 0;
             let emptyAttempt = 0;
@@ -268,6 +274,9 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // and repeating it only multiplies a guaranteed failure.
             let headersTimeoutAttempts = 0;
             let resumed = false;
+            // Output already streamed when an attempt starts. An attempt that adds to
+            // it proved the upstream is working, so the retry clock starts over.
+            let outputAtAttemptStart = 0;
             while (true) {
                 try {
                     // A cancel that landed before this attempt stops here, so a
@@ -278,6 +287,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         );
                         throw Object.assign(new Error("Operation cancelled by user"), { name: "CancellationError" });
                     }
+                    outputAtAttemptStart = accumulator.text.length + accumulator.thinking.length;
                     // A retry starts a fresh header wait, so the request is back in the
                     // phase the picker labels "waiting for headers".
                     activeRequest.setPhase("sending");
@@ -378,9 +388,9 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     if (err instanceof ReasoningOnlyError) {
                         // The previous attempt already delivered the answer, so an
                         // attempt that streams nothing but its finish frame completed the
-                        // turn. New reasoning means the model was still thinking, so that
-                        // spends the retry budget, and only a `stop` finish proves the
-                        // model chose to end its turn.
+                        // turn. New reasoning means the model was still working, so that
+                        // attempt restarts the retry clock, and only a `stop` finish proves
+                        // the model chose to end its turn.
                         if (
                             resumed &&
                             accumulator.text.trim().length > 0 &&
@@ -395,6 +405,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                             break;
                         }
                         if (emptyAttempt < maxEmptyRetries && !requestCancellation.isCancellationRequested) {
+                            restartBudgetAfterProgress();
                             if (!retryBudget.markFailure()) {
                                 // The budget, not the reasoning-only count, ends the
                                 // turn, so the user must be told which setting bounded it.
@@ -420,22 +431,23 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                             // budget; treat the next iteration as a fresh resume.
                             continue;
                         }
-                        // Exhausted: throw a distinct error so the chip explains
-                        // the failure instead of "no response was returned".
-                        Logger.error(
-                            `[transportRetry] request=${requestId} reasoning-only response persisted after ${emptyAttempt} resume attempt(s); failing request`
-                        );
-                        StructuredLogger.error("request.reasoning_only_exhausted", {
-                            requestId,
-                            attempts: emptyAttempt,
-                            config: maxEmptyRetries,
-                        });
-                        throw new Error(
-                            `LiteLLM: model returned reasoning-only response (no text or tool calls) ` +
-                                `after ${emptyAttempt} resume attempt(s). The upstream provider is ` +
-                                `truncating generation mid-reasoning; try resending.`,
-                            { cause: err }
-                        );
+                        // Exhausted: throw a distinct error so the chip explains the
+                        // failure instead of "no response was returned". The boundary
+                        // handler records this turn's failure once, so nothing is logged
+                        // here.
+                        // An empty reply is one that ended on a proven stop having produced
+                        // nothing at all. A length cut, or a resend that adds nothing to
+                        // reasoning the user already saw, was cut short instead, and calling
+                        // that empty would misdescribe it.
+                        const isEmptyReply =
+                            err.reasoningChars === 0 && err.normalFinish && accumulator.thinking.length === 0;
+                        const reason = isEmptyReply
+                            ? `LiteLLM: model returned an empty reply (no text, reasoning or tool call) ` +
+                              `after ${emptyAttempt} resend(s); try resending.`
+                            : `LiteLLM: model returned reasoning-only response (no text or tool calls) ` +
+                              `after ${emptyAttempt} resume attempt(s). The upstream provider is ` +
+                              `truncating generation mid-reasoning; try resending.`;
+                        throw new Error(reason, { cause: err });
                     }
 
                     if (err instanceof HeadersTimeoutError) {
@@ -490,6 +502,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         throw err;
                     }
 
+                    restartBudgetAfterProgress();
                     if (!retryBudget.markFailure()) {
                         // The budget, not the attempt count, ends the turn here. The
                         // boundary handler logs the failure, so this throw does not.
