@@ -13,6 +13,21 @@ import { normalizeProxyBaseUrl } from "../utils/proxyBaseUrl";
 import { HeadersTimeoutError } from "../utils/transportRetry";
 
 /**
+ * Reads the `code` an error's cause carries. undici reports its own timeouts this
+ * way, and the property is not part of any error type.
+ */
+function readCauseCode(err: unknown): unknown {
+    if (!(err instanceof Error)) {
+        return undefined;
+    }
+    const cause: unknown = err.cause;
+    if (typeof cause !== "object" || cause === null || !("code" in cause)) {
+        return undefined;
+    }
+    return cause.code;
+}
+
+/**
  * Error thrown when a /model/info discovery request times out.
  */
 class DiscoveryTimeoutError extends Error {
@@ -149,7 +164,13 @@ export class LiteLLMClient {
     private static readonly DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
     private static readonly DEFAULT_RATE_LIMIT_MAX_DELAY_MS = 120_000;
     /** Wait for response headers when the setting is absent. */
-    private static readonly DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
+    private static readonly DEFAULT_HEADERS_TIMEOUT_MS = 300_000;
+    /**
+     * The header limit the runtime's own fetch applies, reported when that limit rather
+     * than the setting ends a request. `ConfigManager.MAX_HEADERS_TIMEOUT_SECONDS` holds
+     * the same runtime fact, because the setting cannot exceed it.
+     */
+    private static readonly RUNTIME_HEADERS_TIMEOUT_MS = 300_000;
     /** 5xx retries per call. The client is the only layer that retries a 5xx. */
     private static readonly MAX_SERVER_ERROR_RETRIES = 2;
     private static readonly SERVER_ERROR_RETRY_DELAY_MS = 1_000;
@@ -272,11 +293,13 @@ export class LiteLLMClient {
         // and retried. A parameter the proxy itself claimed to support is
         // reported instead: hiding it would send the same rejected body on
         // every later request.
+        let rejectionText: string | undefined;
         if (response.status === 400 || response.status === 403) {
-            const retryBody = this.planConnectorParameterRetry(await response.clone().text(), body, request.model);
+            rejectionText = await this.readBodyText(response, token);
+            const retryBody = this.planConnectorParameterRetry(rejectionText, body, request.model);
             if (retryBody) {
                 Logger.warn(`Retrying ${request.model} without a connector-added parameter the proxy rejected`);
-                this.discardBody(response);
+                rejectionText = undefined;
                 response = await this.fetchWithRateLimit(
                     url,
                     {
@@ -290,7 +313,7 @@ export class LiteLLMClient {
         }
 
         if (!response.ok) {
-            const errorText = await response.text();
+            const errorText = rejectionText ?? (await this.readBodyText(response, token));
             // The body can echo the prompt, so it stays on the error for the
             // user-facing notice; the provider logs identifiers only.
             throw new LiteLLMApiError(
@@ -413,13 +436,13 @@ export class LiteLLMClient {
      * output and therefore whether the request should resume or be resent
      * unchanged. Retrying in both layers would multiply the attempts.
      *
-     * The wait for response headers is bounded here, because undici's own
-     * header timeout is not reachable through `fetch` options, and because the
-     * proxy buffers the first streamed chunk before it writes headers, which
-     * leaves the body watchdog nothing to watch.
+     * The wait for response headers is bounded here, because the proxy buffers the
+     * first streamed chunk before it writes headers, which leaves the body watchdog
+     * nothing to watch. The runtime's fetch ignores a custom `dispatcher`, so the
+     * runtime's own 300 s header limit still applies to every request.
      */
     private async fetchWithRetry(url: string, init: RequestInit, token?: vscode.CancellationToken): Promise<Response> {
-        const headersTimeoutMs = this.config.headersTimeoutMs ?? LiteLLMClient.DEFAULT_HEADERS_TIMEOUT_MS;
+        const headersTimeoutMs = this.headersTimeoutMs;
         let serverErrorAttempt = 0;
         while (true) {
             if (token?.isCancellationRequested) {
@@ -450,6 +473,12 @@ export class LiteLLMClient {
             } catch (err: unknown) {
                 if (headersTimedOut) {
                     throw new HeadersTimeoutError(headersTimeoutMs);
+                }
+                if (readCauseCode(err) === "UND_ERR_HEADERS_TIMEOUT") {
+                    // The runtime's fetch keeps its own 300 s header limit whatever
+                    // the setting says, so a request can fail here without the
+                    // setting having fired.
+                    throw new HeadersTimeoutError(LiteLLMClient.RUNTIME_HEADERS_TIMEOUT_MS, "runtime", { cause: err });
                 }
                 if (err instanceof Error && err.name === "AbortError") {
                     throw new Error("Operation cancelled by user", { cause: err });
@@ -498,7 +527,7 @@ export class LiteLLMClient {
                 throw new LiteLLMRateLimitError(
                     { reason: decision.reason, waitedMs, budgetMs, retryAfterMs },
                     response.statusText,
-                    await response.text()
+                    await this.readBodyText(response, options.token)
                 );
             }
 
@@ -533,6 +562,82 @@ export class LiteLLMClient {
         // An unread body holds the connection open, so a retried request would
         // keep both responses' sockets alive until the garbage collector runs.
         void response.body?.cancel().catch(() => undefined);
+    }
+
+    /**
+     * Reads an error response body within the headers-timeout bound.
+     *
+     * The body watchdog starts only once the stream reaches the provider, so a
+     * proxy that stalls partway through an error body would otherwise hold the
+     * turn open for as long as it likes. The body is read through its own reader
+     * because `response.text()` locks the stream, and a locked stream cannot be
+     * cancelled, which would leave the connection open until the proxy finished.
+     *
+     * The status is what the caller acts on, so a body that times out resolves with
+     * the text decoded so far instead of failing the request, and a body the user
+     * cancelled stops the read and rejects.
+     */
+    private async readBodyText(response: Response, token?: vscode.CancellationToken): Promise<string> {
+        if (token?.isCancellationRequested) {
+            this.discardBody(response);
+            throw new Error("Operation cancelled by user");
+        }
+
+        const reader: ReadableStreamDefaultReader<Uint8Array> | undefined = response.body?.getReader();
+        if (!reader) {
+            // A response without a stream has nothing that can stall.
+            return await response.text();
+        }
+
+        const decoder = new TextDecoder();
+        let text = "";
+        const readAll = (async (): Promise<string> => {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    return text + decoder.decode();
+                }
+                text += decoder.decode(value, { stream: true });
+            }
+        })();
+
+        const cancelled = Symbol("cancelled");
+        const timedOut = Symbol("timedOut");
+        // Cancelling the reader resolves the pending read, so the reason is recorded
+        // before the cancel to keep the outcome unambiguous.
+        let stopReason: typeof cancelled | typeof timedOut | undefined;
+        const stopReading = async (): Promise<void> => {
+            await reader.cancel().catch(() => undefined);
+        };
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let registration: vscode.Disposable | undefined;
+        const cancellation = new Promise<typeof cancelled>((resolve) => {
+            registration = token?.onCancellationRequested(() => {
+                stopReason = cancelled;
+                void stopReading().then(() => resolve(cancelled));
+            });
+        });
+        const timeout = new Promise<typeof timedOut>((resolve) => {
+            timer = setTimeout(() => {
+                stopReason = timedOut;
+                void stopReading().then(() => resolve(timedOut));
+            }, this.headersTimeoutMs);
+        });
+
+        try {
+            await Promise.race([readAll, cancellation, timeout]);
+            if (stopReason === cancelled) {
+                throw new Error("Operation cancelled by user");
+            }
+            return stopReason === timedOut ? text : await readAll;
+        } finally {
+            clearTimeout(timer);
+            registration?.dispose();
+        }
+    }
+
+    private get headersTimeoutMs(): number {
+        return this.config.headersTimeoutMs ?? LiteLLMClient.DEFAULT_HEADERS_TIMEOUT_MS;
     }
 
     private sleep(ms: number, token?: vscode.CancellationToken): Promise<void> {

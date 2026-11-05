@@ -99,9 +99,17 @@ suite("retryBudgetError", () => {
         assert.strictEqual(error.cause instanceof Error, true);
     });
     test("names the headers setting when that is what the last attempt hit", () => {
-        const error = retryBudgetError(300_000, new HeadersTimeoutError(120_000));
+        const error = retryBudgetError(300_000, new HeadersTimeoutError(300_000));
 
-        assert.match(error.message, /litellm-connector\.headersTimeout/);
+        assert.match(error.message, /produced no response headers within litellm-connector\.headersTimeout/);
+        assert.doesNotMatch(error.message, /HTTP runtime's own header limit/);
+    });
+
+    test("names the runtime's own limit when that is what the last attempt hit", () => {
+        const error = retryBudgetError(300_000, new HeadersTimeoutError(300_000, "runtime"));
+
+        assert.doesNotMatch(error.message, /produced no response headers within litellm-connector/);
+        assert.match(error.message, /HTTP runtime's own header limit/);
     });
 
     test("names the inactivity setting when that is what the last attempt hit", () => {

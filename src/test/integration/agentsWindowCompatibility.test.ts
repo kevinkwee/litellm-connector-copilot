@@ -166,7 +166,7 @@ suite("Agents Window Compatibility Manifest", () => {
         // A settings entry nested inside another entry is valid JSON and is still
         // invisible to VS Code, so the shape is asserted, not just the key.
         const expected: Record<string, { default: number; minimum: number; maximum: number }> = {
-            "litellm-connector.headersTimeout": { default: 120, minimum: 1, maximum: 300 },
+            "litellm-connector.headersTimeout": { default: 300, minimum: 1, maximum: 300 },
             "litellm-connector.retryBudgetSeconds": { default: 300, minimum: 0, maximum: 3_600 },
         };
         for (const [key, bounds] of Object.entries(expected)) {

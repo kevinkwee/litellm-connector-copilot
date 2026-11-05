@@ -58,8 +58,10 @@ export class ConfigManager {
     // retrying a request the host never cancels.
     //
     // The headers ceiling matches the 300 s header limit of the runtime's fetch,
-    // which would clamp a larger value anyway, so the setting does not accept one.
-    private static readonly DEFAULT_HEADERS_TIMEOUT_SECONDS = 120;
+    // which does not consult a custom dispatcher, so a value above 300 s would still
+    // be cut off there. `LiteLLMClient` holds the same limit as
+    // `RUNTIME_HEADERS_TIMEOUT_MS`, to report a request that hits it.
+    private static readonly DEFAULT_HEADERS_TIMEOUT_SECONDS = 300;
     private static readonly MIN_HEADERS_TIMEOUT_SECONDS = 1;
     private static readonly MAX_HEADERS_TIMEOUT_SECONDS = 300;
     private static readonly DEFAULT_RETRY_BUDGET_SECONDS = DEFAULT_RETRY_BUDGET_MS / 1_000;

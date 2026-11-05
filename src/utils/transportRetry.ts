@@ -30,12 +30,33 @@ export class InactivityTimeoutError extends Error {
  * upstream spends the whole time to first token in this phase. The body watchdog
  * starts only after headers and cannot see it. A fresh request is worth trying
  * because nothing was generated from the connector's point of view.
+ *
+ * `source` says which timer expired: the connector's setting or the HTTP runtime's
+ * own header limit.
  */
 export class HeadersTimeoutError extends Error {
-    public constructor(public readonly timeoutMs: number) {
-        super(`No response headers after ${timeoutMs}ms (litellm-connector.headersTimeout)`);
+    public constructor(
+        public readonly timeoutMs: number,
+        public readonly source: "connector" | "runtime" = "connector",
+        options?: ErrorOptions
+    ) {
+        super(
+            source === "runtime"
+                ? `The HTTP runtime's own header limit expired after ${formatDuration(timeoutMs)}`
+                : `No response headers after ${formatDuration(timeoutMs)} (litellm-connector.headersTimeout)`,
+            options
+        );
         this.name = "HeadersTimeoutError";
     }
+}
+
+/** Renders a duration as a compact value, keeping a sub-second one readable. */
+export function formatDuration(durationMs: number): string {
+    if (durationMs < 1_000) {
+        return `${durationMs}ms`;
+    }
+    const seconds = durationMs / 1_000;
+    return Number.isInteger(seconds) ? `${seconds}s` : `${seconds.toFixed(1)}s`;
 }
 
 /** HTTP statuses whose mid-stream failure a fresh request can plausibly survive. */
@@ -139,8 +160,8 @@ export class ReasoningOnlyError extends Error {
  * upstream failure this function consults directly: it returns its `retriable`
  * flag, so a transient mid-stream death resumes like a dropped socket while a
  * rejected request surfaces its message. `InactivityTimeoutError` and
- * `HeadersTimeoutError` are the connector's own timeouts for this class of
- * failure, and both are worth a fresh attempt. `ReasoningOnlyError` is NOT
+ * `HeadersTimeoutError` both end an attempt without a completed response, whichever
+ * timer fired, and both are worth a fresh attempt. `ReasoningOnlyError` is NOT
  * classified here because it has its own, separate retry budget
  * (`emptyResponseRetries`).
  */

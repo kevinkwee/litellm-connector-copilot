@@ -41,13 +41,18 @@ import type { RequestOutcomeContext } from "./base/requestOutcome";
 import { DEFAULT_RETRY_BUDGET_MS, RetryBudget, retryBudgetError } from "../utils/retryBudget";
 import {
     StreamedTextAccumulator,
+    HeadersTimeoutError,
     ReasoningOnlyError,
     isTransportRetriableError,
     buildResumeMessages,
     sleepWithCancellation,
     backoffDelayMs,
     logTransportRetry,
+    formatDuration,
 } from "../utils/transportRetry";
+
+/** Headers-timeout retries one request may spend. */
+const MAX_HEADERS_TIMEOUT_RETRIES = 1;
 
 /**
  * Chat provider implementation for VS Code's LanguageModelChatProvider.
@@ -258,6 +263,10 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             let stream: ReadableStream<Uint8Array>;
             let attempt = 0;
             let emptyAttempt = 0;
+            // A headers timeout means the proxy never started answering, so one retry
+            // covers a transient stall. A second means the wait itself is the problem,
+            // and repeating it only multiplies a guaranteed failure.
+            let headersTimeoutAttempts = 0;
             let resumed = false;
             while (true) {
                 try {
@@ -427,6 +436,23 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                                 `truncating generation mid-reasoning; try resending.`,
                             { cause: err }
                         );
+                    }
+
+                    if (err instanceof HeadersTimeoutError) {
+                        headersTimeoutAttempts += 1;
+                        if (headersTimeoutAttempts > MAX_HEADERS_TIMEOUT_RETRIES) {
+                            // The connector's timer uses the setting's value. The runtime's
+                            // limit fires at 300 s whatever the setting says.
+                            const detail =
+                                err.source === "runtime"
+                                    ? `The HTTP runtime's own header limit fired, which litellm-connector.headersTimeout cannot move.`
+                                    : `The last attempt waited ${formatDuration(err.timeoutMs)} (litellm-connector.headersTimeout).`;
+                            throw new Error(
+                                `LiteLLM: the proxy sent no response headers on ${headersTimeoutAttempts} attempts, ` +
+                                    `so the request is no longer retried. ${detail}`,
+                                { cause: err }
+                            );
+                        }
                     }
 
                     const isLastAttempt = attempt >= maxTransportRetries;

@@ -1,4 +1,4 @@
-import { HeadersTimeoutError, InactivityTimeoutError } from "./transportRetry";
+import { HeadersTimeoutError, InactivityTimeoutError, formatDuration } from "./transportRetry";
 
 /** Default retry budget, in milliseconds, for a request that declares no budget. */
 export const DEFAULT_RETRY_BUDGET_MS = 300_000;
@@ -61,32 +61,27 @@ export class RetryBudget {
     }
 }
 
-/** Renders a budget as a compact duration, keeping a sub-second value readable. */
-function formatBudget(budgetMs: number): string {
-    if (budgetMs < 1_000) {
-        return `${budgetMs}ms`;
-    }
-    const seconds = budgetMs / 1_000;
-    return Number.isInteger(seconds) ? `${seconds}s` : `${seconds.toFixed(1)}s`;
-}
-
 /**
  * The error a request ends with when its retry budget stops it.
  *
  * Connector-authored, so the text is safe to log. It names the setting that
  * bounded the turn and never quotes the upstream failure, which may echo the
- * prompt. When the last failure was one of the connector's own time budgets, the
- * setting that would actually help is named too.
+ * prompt. When the last attempt ended on a timeout, its setting is named too, except
+ * for the runtime's own header limit, where the hint says the setting cannot move the
+ * limit.
  */
 export function retryBudgetError(budgetMs: number, lastError: unknown): Error {
     let hint = "";
     if (lastError instanceof HeadersTimeoutError) {
-        hint = " The last attempt produced no response headers within litellm-connector.headersTimeout.";
+        hint =
+            lastError.source === "runtime"
+                ? " The last attempt hit the HTTP runtime's own header limit, which litellm-connector.headersTimeout cannot move."
+                : " The last attempt produced no response headers within litellm-connector.headersTimeout.";
     } else if (lastError instanceof InactivityTimeoutError) {
         hint = " The last attempt streamed nothing within litellm-connector.inactivityTimeout.";
     }
     return new Error(
-        `LiteLLM: stopped retrying after ${formatBudget(budgetMs)} of retries ` +
+        `LiteLLM: stopped retrying after ${formatDuration(budgetMs)} of retries ` +
             `(litellm-connector.retryBudgetSeconds). The response is incomplete.${hint}`,
         { cause: lastError }
     );

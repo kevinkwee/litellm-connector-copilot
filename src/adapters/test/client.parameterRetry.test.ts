@@ -4,19 +4,11 @@ import * as sinon from "sinon";
 import { LiteLLMClient } from "../litellmClient";
 
 /**
- * Builds a failing response shaped the way the client reads one: `text()` for the
- * message, and `clone()` for the retry decision.
+ * Builds a real failing response, so the client reads it through the same stream a
+ * proxy would send.
  */
 function rejectionResponse(status: number, bodyText: string): Response {
-    return {
-        ok: false,
-        status,
-        statusText: status === 403 ? "Forbidden" : "Bad Request",
-        text: async () => bodyText,
-        clone: function (this: unknown) {
-            return this;
-        },
-    } as unknown as Response;
+    return new Response(bodyText, { status, statusText: status === 403 ? "Forbidden" : "Bad Request" });
 }
 
 suite("LiteLLM Client connector parameter retry", () => {

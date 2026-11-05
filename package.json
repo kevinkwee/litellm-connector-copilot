@@ -189,10 +189,10 @@
 				},
 				"litellm-connector.headersTimeout": {
 					"type": "number",
-					"default": 120,
+					"default": 300,
 					"minimum": 1,
 					"maximum": 300,
-					"description": "Most time in seconds to wait for the proxy's response headers before aborting the attempt. The proxy buffers the first streamed chunk before it writes headers, so this bounds the wait the stream inactivity timeout cannot see. Capped at 300s because the runtime's fetch has its own 300s header limit. Default: 120 (2 minutes)."
+					"description": "Most time in seconds to wait for the proxy's response headers before aborting the attempt. The proxy buffers the first streamed chunk before it writes headers, so this bounds the wait the stream inactivity timeout cannot see. A headers timeout is retried at most once per request. Capped at 300s because the runtime's fetch keeps its own 300s header limit. Default: 300 (5 minutes)."
 				},
 				"litellm-connector.retryBudgetSeconds": {
 					"type": "number",

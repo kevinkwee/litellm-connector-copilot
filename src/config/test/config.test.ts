@@ -197,10 +197,10 @@ suite("ConfigManager Unit Tests", () => {
         assert.strictEqual((await configManager.getConfig()).headersTimeoutMs, 45_000);
     });
 
-    test("should default headersTimeout to 120 seconds", async () => {
+    test("should default headersTimeout to 300 seconds", async () => {
         settingsMap.delete("litellm-connector.headersTimeout");
 
-        assert.strictEqual((await configManager.getConfig()).headersTimeoutMs, 120_000);
+        assert.strictEqual((await configManager.getConfig()).headersTimeoutMs, 300_000);
     });
 
     test("should raise a headersTimeout below one second to one second", async () => {
@@ -210,7 +210,7 @@ suite("ConfigManager Unit Tests", () => {
         assert.strictEqual((await configManager.getConfig()).headersTimeoutMs, 1_000);
     });
 
-    test("should cap headersTimeout at the HTTP stack's own 300 second header limit", async () => {
+    test("should cap headersTimeout at the runtime's own 300 second header limit", async () => {
         settingsMap.set("litellm-connector.headersTimeout", 100_000);
 
         assert.strictEqual((await configManager.getConfig()).headersTimeoutMs, 300_000);
@@ -219,7 +219,7 @@ suite("ConfigManager Unit Tests", () => {
     test("should fall back to the default for a non-numeric headersTimeout", async () => {
         settingsMap.set("litellm-connector.headersTimeout", Number.NaN);
 
-        assert.strictEqual((await configManager.getConfig()).headersTimeoutMs, 120_000);
+        assert.strictEqual((await configManager.getConfig()).headersTimeoutMs, 300_000);
     });
 
     test("should read retryBudgetSeconds from workspace settings", async () => {

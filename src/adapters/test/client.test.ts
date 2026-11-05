@@ -558,25 +558,19 @@ suite("LiteLLM Client Unit Tests", () => {
         sinon.assert.calledOnce(cancel);
     });
 
-    test("chat cancels the rejected body before the strip-and-retry", async () => {
+    test("chat consumes the rejected body before the strip-and-retry", async () => {
         const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
-        const cancel = sandbox.stub().resolves();
-        const fetchStub = sandbox.stub(global, "fetch");
-        fetchStub.onCall(0).resolves({
-            ok: false,
+        const rejection = new Response("Not allowed to set no-cache as a cache control", {
             status: 403,
             statusText: "Forbidden",
-            body: { cancel },
-            text: async () => "Not allowed to set no-cache as a cache control",
-            clone() {
-                return this;
-            },
-        } as unknown as Response);
+        });
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.onCall(0).resolves(rejection);
         fetchStub.onCall(1).resolves(createStreamResponse());
 
         await client.chat({ model: "gpt-4", messages: [] });
 
-        sinon.assert.calledOnce(cancel);
+        assert.strictEqual(rejection.bodyUsed, true, "the rejection body must be read, not left open");
     });
 
     test("getModelInfo throws with status details when response is not ok", async () => {
@@ -842,7 +836,7 @@ suite("LiteLLM Client Unit Tests", () => {
     test("does not abort a response whose headers already arrived", async () => {
         // The timer is armed on the controller that also governs the body, so a
         // timer left running would abort a healthy stream once the header bound
-        // passed. The 120 s default hides that, which is why this test sets 5 ms.
+        // passed. The 300 s default hides that, which is why this test sets 5 ms.
         const client = new LiteLLMClient({ ...config, headersTimeoutMs: 5 }, userAgent);
         let capturedSignal: AbortSignal | undefined;
         sandbox.stub(global, "fetch").callsFake((_input: string | URL | Request, init?: RequestInit) => {

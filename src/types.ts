@@ -283,7 +283,7 @@ export interface LiteLLMConfig {
 
     /**
      * Most time in milliseconds a chat request may wait for response headers.
-     * Default: 120000.
+     * Default: 300000.
      */
     headersTimeoutMs?: number;
 
@@ -315,7 +315,7 @@ export interface LiteLLMClientConfig {
      */
     rateLimitMaxDelayMs?: number;
     /**
-     * Most time in milliseconds to wait for response headers. Default: 120000.
+     * Most time in milliseconds to wait for response headers. Default: 300000.
      */
     headersTimeoutMs?: number;
     /**
