@@ -3,6 +3,7 @@ import { convertMessages, convertTools, validateRequest } from "../../utils";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest, OpenAIFunctionToolDef } from "../../types";
 import { DEFAULT_ANTHROPIC_PROMPT_CACHING, resolveAnthropicCacheControl } from "../../utils/promptCaching";
 import { isDeepSeekModel, resolveToolResultImageMode, resolveToolResultTextMode } from "../../utils/modelUtils";
+import { getSupportedReasoningEfforts } from "../../utils/modelCapabilities";
 import type { ToolNameMapping } from "../../utils/toolNameUtils";
 import type { RequestBuilderDeps } from "./types";
 
@@ -72,7 +73,8 @@ export class RequestBuilder {
                 typeof mo.max_tokens === "number"
                     ? Math.min(mo.max_tokens, model.maxOutputTokens)
                     : model.maxOutputTokens,
-            ...(this.isParameterSupported("reasoning_effort", modelInfo, rawModelId) && reasoningEffort
+            ...(this.isParameterSupported("reasoning_effort", modelInfo, rawModelId) &&
+            this.modelAcceptsReasoningEffort(model.id, modelInfo, reasoningEffort)
                 ? { reasoning_effort: reasoningEffort }
                 : {}),
         };
@@ -147,5 +149,31 @@ export class RequestBuilder {
             rawModelId
         );
         return { request: requestBody, toolNames };
+    }
+
+    /**
+     * True when the level is one the model is known to offer, or nothing is known about
+     * the model.
+     *
+     * The list is the one the picker builds its control from, resolved under the
+     * namespaced id the picker uses, so a `modelOverrides` entry that matches it affects
+     * both the picker and the request. VS Code stores a level the user picked and merges
+     * it into every later request without re-checking the current schema, and it hides
+     * the control once the list is empty, so a stored value can outlive the declaration
+     * that allowed it. Sending it would fail on a model that refuses the parameter.
+     */
+    private modelAcceptsReasoningEffort(
+        modelId: string,
+        modelInfo: LiteLLMModelInfo | undefined,
+        effort: string | undefined
+    ): boolean {
+        if (!effort) {
+            return false;
+        }
+        if (!modelInfo) {
+            return true;
+        }
+        const offered: readonly string[] = getSupportedReasoningEfforts(modelInfo, modelId);
+        return offered.includes(effort);
     }
 }

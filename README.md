@@ -9,11 +9,10 @@ All credit for the original extension belongs to the upstream authors. Licensed 
 Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 
 ### Reasoning control
-- Expanded reasoning effort levels with corrected fallback behavior.
 - `reasoning_effort: "none"` is always sent explicitly instead of the parameter being silently dropped.
 - The effort used when the user has not picked one is the highest level the model lists, so a model that never offers `medium` is not sent a level it rejects. A `modelOverrides` `defaultEffort` wins when the model's list contains it.
 - The output-token reservation is capped at half the context window, so a model whose declared output limit covers its whole window still leaves a usable input limit.
-- The effort fallback steps one level down and retries only when the rejection names the effort input (`reasoning_effort`, "reasoning effort", `reasoning.effort`, `effort='`, or `reasoningEffort`), so a failure about `reasoning_content` or "reasoning items" surfaces as an error instead of silently downgrading the model.
+- A rejected reasoning effort fails the turn with a notice naming the fix: declare exactly the levels the model accepts with `supports_<level>_reasoning_effort: true` in the LiteLLM model config (a reasoning model with none of those keys and no override is offered every level, `none` to `max`), or list them in a `modelOverrides` `forceMandatory` entry, then run Reload Models. A model that refuses the parameter itself is pointed at `supports_reasoning: false` with its `supports_<level>_reasoning_effort` entries set to `false`, because LiteLLM's model map refills a key that is only deleted. There is no automatic step-down, because the picker already offers exactly the levels the proxy declares.
 
 ### Claude reasoning continuity across tool calls
 - Claude's encrypted thinking is preserved across tool call rounds: signed thinking blocks are sealed into VS Code replayable thinking parts (signature plus the exact block text in part metadata, matching the keys the built-in Copilot providers persist), and redacted thinking blocks carry the redacted data. On later rounds the connector rebuilds Anthropic `thinking_blocks` from those parts, so the model keeps its reasoning context instead of re-deriving it.

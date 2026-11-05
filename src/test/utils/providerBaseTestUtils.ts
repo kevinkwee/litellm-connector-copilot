@@ -4,7 +4,6 @@ import type * as vscode from "vscode";
 import type { ConfigManager } from "../../config/configManager";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types";
 import type { ToolNameMapping } from "../../utils/toolNameUtils";
-import type { EffortFallbackCache } from "../../utils/reasoningEffortFallback";
 import type { LiteLLMChatProvider } from "../../providers";
 import type { BackendSession } from "../../providers/backendSession";
 
@@ -37,7 +36,6 @@ export interface BaseTestAccess {
             learnedLimitsKey?: string
         ) => Promise<ReadableStream<Uint8Array>>;
     };
-    _effortFallbackCache: EffortFallbackCache;
     _usageOptOutModels: Set<string>;
     refreshModelInformation: () => void;
     buildOpenAIChatRequest: (
@@ -74,15 +72,11 @@ export interface BaseTestAccess {
         options: vscode.ProvideLanguageModelChatResponseOptions,
         model: vscode.LanguageModelChatInformation
     ) => Promise<Record<string, unknown> | undefined>;
-    applyReasoningEffort: (
-        request: OpenAIChatCompletionRequest,
-        effort: OpenAIChatCompletionRequest["reasoning_effort"] | undefined
-    ) => void;
 }
 
 /**
- * Builds the 4xx-shaped error the reasoning-effort fallback treats as worth
- * retrying.
+ * Builds an error carrying an HTTP status, for the rejection paths that classify by
+ * status and body text.
  */
 export function apiError(message: string, status: number): Error & { status: number } {
     const err = new Error(message) as Error & { status: number };

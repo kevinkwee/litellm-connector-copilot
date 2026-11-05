@@ -4,7 +4,6 @@ import * as sinon from "sinon";
 import { LiteLLMChatProvider } from "../";
 import { TEST_USER_AGENT } from "../../test/utils/testMocks";
 import { access, apiError, seedBackendForCall } from "../../test/utils/providerBaseTestUtils";
-import { EffortFallbackCache } from "../../utils/reasoningEffortFallback";
 import type { BackendSession } from "../backendSession";
 
 suite("LiteLLMProviderBase discovery", () => {
@@ -503,38 +502,27 @@ suite("LiteLLMProviderBase discovery", () => {
         });
 
         test("reloadModels forgets every learned limit", async () => {
-            const provider = new LiteLLMChatProvider(userAgent, new EffortFallbackCache());
+            const provider = new LiteLLMChatProvider(userAgent);
             const internals = access(provider);
-            internals._effortFallbackCache.recordFailure("host-a.example/model", "high");
             internals._usageOptOutModels.add("host-a.example/model");
             internals._registry.recordUnsupportedParameter("host-a.example/model", "cache_control");
             sandbox.stub(internals, "refreshModelInformation");
 
             provider.reloadModels();
 
-            assert.strictEqual(
-                internals._effortFallbackCache.getEffectiveEffort("host-a.example/model", "high"),
-                "high"
-            );
             assert.strictEqual(internals._usageOptOutModels.size, 0);
             assert.strictEqual(internals._registry.getUnsupportedParameters("host-a.example/model").size, 0);
         });
 
         test("a settings-triggered reload keeps every learned limit", async () => {
-            const provider = new LiteLLMChatProvider(userAgent, new EffortFallbackCache());
+            const provider = new LiteLLMChatProvider(userAgent);
             const internals = access(provider);
-            internals._effortFallbackCache.recordFailure("host-a.example/model", "high");
             internals._usageOptOutModels.add("host-a.example/model");
             internals._registry.recordUnsupportedParameter("host-a.example/model", "cache_control");
             sandbox.stub(internals, "refreshModelInformation");
 
             provider.reloadModelDiscovery();
 
-            assert.notStrictEqual(
-                internals._effortFallbackCache.getEffectiveEffort("host-a.example/model", "high"),
-                "high",
-                "the effort ladder learns nothing from the settings"
-            );
             assert.strictEqual(internals._usageOptOutModels.has("host-a.example/model"), true);
             assert.strictEqual(
                 internals._registry.getUnsupportedParameters("host-a.example/model").has("cache_control"),
@@ -543,46 +531,8 @@ suite("LiteLLMProviderBase discovery", () => {
             );
         });
 
-        test("the effort ladder learns under the namespaced id, not the wire model name", async () => {
-            const provider = new LiteLLMChatProvider(userAgent, new EffortFallbackCache());
-            const internals = access(provider);
-            const namespacedModel = { ...model, id: "host-a.example/model-reasoning", name: "model-reasoning" };
-            const baseConfig = { baseUrl: "https://host-a.example", apiKey: "k", reasoningEffort: "high" };
-            seedBackendForCall(sandbox, provider, baseConfig, {
-                backendName: "host-a.example",
-                baseUrl: "https://host-a.example",
-                apiKey: "k",
-                client: {} as never,
-            });
-            sandbox
-                .stub(internals._transport, "sendRequestToLiteLLM")
-                .onCall(0)
-                .rejects(apiError("LiteLLM API error 400: reasoning_effort not supported", 400))
-                .onCall(1)
-                .resolves(new ReadableStream());
-
-            await internals.sendRequestWithRetry(
-                { model: "model-reasoning", messages: [], stream: true, max_tokens: 100, reasoning_effort: "high" },
-                namespacedModel,
-                { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
-                new vscode.CancellationTokenSource().token
-            );
-
-            assert.notStrictEqual(
-                internals._effortFallbackCache.getEffectiveEffort("host-a.example/model-reasoning", "high"),
-                "high",
-                "the namespaced id is where the ladder records the failure"
-            );
-            assert.strictEqual(
-                internals._effortFallbackCache.getEffectiveEffort("model-reasoning", "high"),
-                "high",
-                "the wire name must not become a second key"
-            );
-        });
-
         test("the usage opt-out learns under the namespaced id, not the wire model name", async () => {
-            const provider = new LiteLLMChatProvider(userAgent, new EffortFallbackCache());
+            const provider = new LiteLLMChatProvider(userAgent);
             const internals = access(provider);
             const namespacedModel = { ...model, id: "host-a.example/model-usage", name: "model-usage" };
             const baseConfig = { baseUrl: "https://host-a.example", apiKey: "k" };
@@ -616,7 +566,7 @@ suite("LiteLLMProviderBase discovery", () => {
         });
 
         test("sendRequestWithRetry hands the transport the namespaced id as the learned-limits key", async () => {
-            const provider = new LiteLLMChatProvider(userAgent, new EffortFallbackCache());
+            const provider = new LiteLLMChatProvider(userAgent);
             const internals = access(provider);
             const namespacedModel = { ...model, id: "host-a.example/model-key", name: "model-key" };
             const baseConfig = { baseUrl: "https://host-a.example", apiKey: "k" };

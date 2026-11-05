@@ -48,7 +48,11 @@ suite("RequestBuilder", () => {
 
     test("buildOpenAIChatRequest caps max_tokens to model maxOutputTokens", async () => {
         configManager.getConfig.resolves({});
-        const model = { id: "gpt-x", maxInputTokens: 100, maxOutputTokens: 50 } as vscode.LanguageModelChatInformation;
+        const model = {
+            id: "group-a/gpt-x",
+            maxInputTokens: 100,
+            maxOutputTokens: 50,
+        } as vscode.LanguageModelChatInformation;
         const messages: vscode.LanguageModelChatRequestMessage[] = [
             {
                 role: vscode.LanguageModelChatMessageRole.User,
@@ -69,8 +73,129 @@ suite("RequestBuilder", () => {
         sinon.assert.match(req.stream, true);
     });
 
+    suite("reasoning effort gate", () => {
+        const model = {
+            id: "group-a/gpt-x",
+            maxInputTokens: 100,
+            maxOutputTokens: 50,
+        } as vscode.LanguageModelChatInformation;
+        const messages: vscode.LanguageModelChatRequestMessage[] = [
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelTextPart("hi")],
+                name: undefined,
+            },
+        ];
+        const options = (effort: string) =>
+            ({
+                modelOptions: {},
+                modelConfiguration: { reasoningEffort: effort },
+            }) as unknown as vscode.ProvideLanguageModelChatResponseOptions;
+
+        /** Builder whose effort source is the picker selection, as the provider wires it. */
+        const buildWithEffort = async (modelInfo: LiteLLMModelInfo, effort: string) =>
+            buildRequest(
+                new RequestBuilder({
+                    configManager,
+                    getReasoningEffort: (callOptions) =>
+                        (callOptions as unknown as { modelConfiguration?: { reasoningEffort?: string } })
+                            .modelConfiguration?.reasoningEffort,
+                    stripUnsupportedParametersFromRequest: () => {},
+                    isParameterSupported: () => true,
+                    getUnsupportedParameters: () => new Set<string>(),
+                    getTelemetryOptions: () => ({ caller: "test", modelConfiguration: {} }),
+                    usageOptOutModels: new Set(),
+                    extractRawModelName: (id: string) => id.slice(id.indexOf("/") + 1),
+                }),
+                messages,
+                model,
+                options(effort),
+                modelInfo,
+                "caller"
+            );
+
+        /** Points `modelOverrides` at one entry, so the id the gate uses decides the list. */
+        const buildWithOverride = async (pattern: string) => {
+            sandbox.stub(vscode.workspace, "getConfiguration").returns({
+                get: (key: string, defaultValue?: unknown) => {
+                    if (key === "litellm-connector.modelOverrides") {
+                        return [
+                            {
+                                match: pattern,
+                                supportsReasoning: true,
+                                reasoningEfforts: ["low", "high"],
+                                forceMandatory: true,
+                            },
+                        ];
+                    }
+                    if (key === "litellm-connector.enableModelOverrides") {
+                        return true;
+                    }
+                    return defaultValue;
+                },
+            } as unknown as vscode.WorkspaceConfiguration);
+            return buildWithEffort({} as LiteLLMModelInfo, "high");
+        };
+
+        test("keeps the effort when an override matches the namespaced id, as the picker does", async () => {
+            // The picker resolves the list under the namespaced id, so an override
+            // anchored to that id must also reach the request path.
+            configManager.getConfig.resolves({});
+
+            const request = await buildWithOverride("^group-a/gpt-x$");
+
+            assert.strictEqual(request.reasoning_effort, "high");
+        });
+
+        test("drops the effort when an override matches only the raw name", async () => {
+            // The picker never sees this override, so it offers no level and the request
+            // must not carry one.
+            configManager.getConfig.resolves({});
+
+            const request = await buildWithOverride("^gpt-x$");
+
+            assert.strictEqual(request.reasoning_effort, undefined);
+        });
+
+        test("sends the picker effort when the model offers that level", async () => {
+            configManager.getConfig.resolves({});
+            const modelInfo = { supports_reasoning: true, supports_high_reasoning_effort: true } as LiteLLMModelInfo;
+
+            const request = await buildWithEffort(modelInfo, "high");
+
+            assert.strictEqual(request.reasoning_effort, "high");
+        });
+
+        test("drops a saved effort the model no longer offers", async () => {
+            // VS Code merges a previously picked level into every request without
+            // re-checking the schema, and hides the control once the model offers
+            // nothing, so the connector must not send it.
+            configManager.getConfig.resolves({});
+            const modelInfo = { supports_reasoning: false } as LiteLLMModelInfo;
+
+            const request = await buildWithEffort(modelInfo, "high");
+
+            assert.strictEqual(request.reasoning_effort, undefined);
+        });
+
+        test("drops a saved effort the model no longer offers, though it offers others", async () => {
+            // The control stays visible while the list is non-empty, so the user can recover;
+            // the stale level does not reach a model whose declaration dropped it.
+            configManager.getConfig.resolves({});
+            const modelInfo = { supports_reasoning: true, supports_low_reasoning_effort: true } as LiteLLMModelInfo;
+
+            const request = await buildWithEffort(modelInfo, "high");
+
+            assert.strictEqual(request.reasoning_effort, undefined);
+        });
+    });
+
     suite("temperature from modelConfiguration", () => {
-        const model = { id: "gpt-x", maxInputTokens: 100, maxOutputTokens: 50 } as vscode.LanguageModelChatInformation;
+        const model = {
+            id: "group-a/gpt-x",
+            maxInputTokens: 100,
+            maxOutputTokens: 50,
+        } as vscode.LanguageModelChatInformation;
         const messages: vscode.LanguageModelChatRequestMessage[] = [
             {
                 role: vscode.LanguageModelChatMessageRole.User,
@@ -169,7 +294,11 @@ suite("RequestBuilder", () => {
 
     test("buildOpenAIChatRequest preserves tool_choice when ToolMode is Required", async () => {
         configManager.getConfig.resolves({});
-        const model = { id: "gpt-x", maxInputTokens: 100, maxOutputTokens: 50 } as vscode.LanguageModelChatInformation;
+        const model = {
+            id: "group-a/gpt-x",
+            maxInputTokens: 100,
+            maxOutputTokens: 50,
+        } as vscode.LanguageModelChatInformation;
         const messages: vscode.LanguageModelChatRequestMessage[] = [
             {
                 role: vscode.LanguageModelChatMessageRole.User,

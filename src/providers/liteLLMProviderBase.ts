@@ -11,14 +11,6 @@ import { countTokens } from "../adapters/tokenUtils";
 import { ConfigManager } from "../config/configManager";
 import { Logger } from "../utils/logger";
 import { isOpenAIParamSupported } from "../utils/modelCapabilities";
-import type { SupportedReasoningEffort } from "../types";
-import {
-    EFFORT_LADDER_LENGTH,
-    EffortFallbackCache,
-    hasShownReasoningFallbackNotification,
-    isReasoningError,
-    markReasoningFallbackNotified,
-} from "../utils/reasoningEffortFallback";
 import { RequestBuilder } from "./base/requestBuilder";
 import { describeFailureForLog } from "./base/errorLogFields";
 import { Transport } from "./base/transport";
@@ -66,7 +58,6 @@ export abstract class LiteLLMProviderBase {
 
     private readonly _requestBuilder: RequestBuilder;
     private readonly _transport: Transport;
-    protected readonly _effortFallbackCache: EffortFallbackCache;
     // Per-session memo of models that have rejected `stream_options.include_usage`
     // on a live upstream call. NOT a model-info cache: it cannot be corrupted by
     // stale capability data. Keyed by the namespaced picker id, because a learned
@@ -78,11 +69,9 @@ export abstract class LiteLLMProviderBase {
 
     constructor(
         protected readonly userAgent: string,
-        effortFallbackCache?: EffortFallbackCache,
         protected readonly activeRequests: ActiveRequestRegistry = new ActiveRequestRegistry()
     ) {
         this._configManager = new ConfigManager();
-        this._effortFallbackCache = effortFallbackCache ?? new EffortFallbackCache();
         this._registry = new LiteLLMProviderRegistry({
             configManager: this._configManager,
             userAgent: this.userAgent,
@@ -158,22 +147,12 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Forgets every per-proxy limit learned from a live request: the effort
-     * fallback ladder, the `include_usage` opt-out, and the unsupported parameters.
+     * Forgets every per-proxy limit learned from a live request: the `include_usage`
+     * opt-out and the unsupported parameters.
      */
     private clearLearnedLimits(): void {
-        this._effortFallbackCache.clear();
         this._usageOptOutModels.clear();
         this._registry.clearUnsupportedParameters();
-    }
-
-    /**
-     * Clears the reasoning-effort fallback cache on extension deactivation.
-     */
-    public clearSessionCaches(): void {
-        Logger.info("Clearing reasoning-effort fallback cache");
-        this._effortFallbackCache.clear();
-        Logger.info("Reasoning-effort fallback cache cleared");
     }
 
     /**
@@ -342,9 +321,14 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Sends a LiteLLM request, walking the reasoning-effort ladder when the
-     * upstream rejects the effort the request carries, and retrying once without
-     * `stream_options.include_usage` when the upstream rejects that flag.
+     * Sends a LiteLLM request, retrying once without `stream_options.include_usage`
+     * when the upstream rejects that flag.
+     *
+     * A rejected reasoning effort is not retried. The picker offers exactly the levels
+     * its declaration offers, so a rejection means that declaration is wrong, and a
+     * turn that quietly ran at a lower effort would hide that.
+     * `describeTurnFailure` builds the notice from the classification in
+     * `base/proxyParameterRejection.ts`.
      */
     protected async sendRequestWithRetry(
         request: OpenAIChatCompletionRequest,
@@ -359,24 +343,13 @@ export abstract class LiteLLMProviderBase {
         // A learned limit describes one proxy's model config, so every store is
         // keyed by the namespaced picker id rather than the wire model name.
         const modelId = model.id;
-        Logger.debug(`[sendRequestWithRetry] modelId: ${modelId}, reasoning_effort: ${request.reasoning_effort}`);
-        const originalEffort = (request as { reasoning_effort?: SupportedReasoningEffort }).reasoning_effort;
-        let effectiveEffort = this._effortFallbackCache.getEffectiveEffort(modelId, originalEffort);
-        Logger.debug(`[sendRequestWithRetry] originalEffort: ${originalEffort}, effectiveEffort: ${effectiveEffort}`);
-        this.applyReasoningEffort(request, effectiveEffort);
-
-        const notificationKeyEffort = originalEffort ?? effectiveEffort;
-        let attempts = 0;
-        let lastError: unknown;
         let usageRetryAttempted = false;
 
         const clearUsageFlag = () => {
             delete (request as { stream_options?: { include_usage?: boolean } }).stream_options;
         };
 
-        // One attempt per ladder step plus the final omitted-parameter attempt.
-        // The give-up check below ends the walk on the last of those.
-        while (attempts <= EFFORT_LADDER_LENGTH) {
+        while (true) {
             try {
                 return await this.sendRequestToLiteLLM(
                     request,
@@ -389,6 +362,7 @@ export abstract class LiteLLMProviderBase {
                     modelId
                 );
             } catch (err) {
+                // Payload shape only. The turn boundary logs the failure.
                 this.logRequestPayloadOnFailure(request, err, {
                     stage: "sendRequestWithRetry",
                     modelId: model.id,
@@ -397,54 +371,19 @@ export abstract class LiteLLMProviderBase {
                 });
 
                 const errorMessage = err instanceof Error ? err.message : String(err);
-                if (this.isUsageIncludeUsageParameterError(errorMessage)) {
+                if (!usageRetryAttempted && this.isUsageIncludeUsageParameterError(errorMessage)) {
                     this._usageOptOutModels.add(modelId);
                     clearUsageFlag();
-
-                    if (!usageRetryAttempted) {
-                        usageRetryAttempted = true;
-                        Logger.warn(
-                            `[sendRequestWithRetry] Retrying once without stream_options.include_usage after upstream rejection for model ${model.id}`
-                        );
-                        continue;
-                    }
+                    usageRetryAttempted = true;
+                    Logger.warn(
+                        `[sendRequestWithRetry] Retrying once without stream_options.include_usage after upstream rejection for model ${model.id}`
+                    );
+                    continue;
                 }
 
-                Logger.debug(`[sendRequestWithRetry] Caught error, checking isReasoningError...`);
-                const isReasoning = isReasoningError(err);
-                Logger.debug(`[sendRequestWithRetry] isReasoningError result: ${isReasoning}`);
-                if (!isReasoning) {
-                    Logger.debug("[sendRequestWithRetry] Not a reasoning error, throwing immediately");
-                    throw err;
-                }
-
-                lastError = err;
-                const nextEffort = this._effortFallbackCache.recordFailure(modelId, effectiveEffort);
-                attempts += 1;
-                Logger.debug(
-                    `[sendRequestWithRetry] After recordFailure: nextEffort: ${nextEffort}, attempts: ${attempts}`
-                );
-
-                if (nextEffort === effectiveEffort || attempts > EFFORT_LADDER_LENGTH) {
-                    Logger.debug("[sendRequestWithRetry] Condition met - throwing toMeaningfulError");
-                    throw this.toMeaningfulError(err, "Reasoning effort fallback exhausted");
-                }
-
-                const previous = effectiveEffort;
-                effectiveEffort = nextEffort;
-                this.applyReasoningEffort(request, effectiveEffort);
-
-                if (notificationKeyEffort && previous && previous !== effectiveEffort) {
-                    this.notifyReasoningFallback(modelId, model.name, notificationKeyEffort, effectiveEffort);
-                }
-
-                Logger.info(
-                    `[reasoning] ${modelId}: retrying with downgraded effort ${effectiveEffort ?? "(omitted)"} after failure`
-                );
+                throw err;
             }
         }
-
-        throw this.toMeaningfulError(lastError, "Reasoning effort fallback exhausted");
     }
 
     private isUsageIncludeUsageParameterError(errorMessage: string): boolean {
@@ -456,59 +395,6 @@ export abstract class LiteLLMProviderBase {
                 lower.includes("unknown parameter") ||
                 lower.includes("unexpected keyword argument"))
         );
-    }
-
-    private toMeaningfulError(error: unknown, fallbackMessage: string): Error {
-        if (error instanceof Error) {
-            return error;
-        }
-
-        if (typeof error === "string") {
-            return new Error(error);
-        }
-
-        if (typeof error === "object" && error !== null && "message" in error) {
-            const message = (error as { message?: unknown }).message;
-            if (typeof message === "string" && message.trim().length > 0) {
-                return new Error(message);
-            }
-        }
-
-        return new Error(fallbackMessage);
-    }
-
-    private applyReasoningEffort(
-        request: OpenAIChatCompletionRequest,
-        effort: SupportedReasoningEffort | undefined,
-        summary?: "auto" | "concise" | "detailed"
-    ): void {
-        if (!effort) {
-            const requestRecord = request as unknown as Record<string, unknown>;
-            delete requestRecord.reasoning_effort;
-            return;
-        }
-        // Object form is used by `gpt-5.4+` callers (and the OpenAI Responses API
-        // in general) to control whether summary text is returned alongside the
-        // reasoning text. The OpenAI Chat Completions spec still accepts the
-        // legacy string form; both are forwarded to LiteLLM unchanged.
-        request.reasoning_effort = summary ? { effort, summary } : effort;
-    }
-
-    private notifyReasoningFallback(
-        modelId: string,
-        modelDisplayName: string,
-        originalEffort: SupportedReasoningEffort,
-        fallbackEffort: SupportedReasoningEffort | undefined
-    ): void {
-        if (hasShownReasoningFallbackNotification(modelId, originalEffort)) {
-            return;
-        }
-
-        const fallbackLabel = fallbackEffort ?? "omitted";
-        void vscode.window.showInformationMessage(
-            `Effort '${originalEffort}' is not supported by ${modelDisplayName}; using '${fallbackLabel}' for this session.`
-        );
-        markReasoningFallbackNotified(modelId, originalEffort);
     }
 
     /**

@@ -2,10 +2,9 @@ import * as assert from "assert";
 import * as vscode from "vscode";
 import * as sinon from "sinon";
 import { LiteLLMChatProvider } from "../";
-import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types";
+import type { LiteLLMModelInfo } from "../../types";
 import { TEST_USER_AGENT } from "../../test/utils/testMocks";
 import { access, apiError, seedBackendForCall } from "../../test/utils/providerBaseTestUtils";
-import { EffortFallbackCache } from "../../utils/reasoningEffortFallback";
 
 suite("LiteLLMProviderBase", () => {
     let sandbox: sinon.SinonSandbox;
@@ -32,28 +31,6 @@ suite("LiteLLMProviderBase", () => {
             capabilities: { toolCalling: true, imageInput: false },
         };
 
-        suite("applyReasoningEffort", () => {
-            test("sends reasoning_effort='none' as a real value", () => {
-                const provider = new LiteLLMChatProvider(userAgent);
-                const request = { model: "test-model", messages: [] } as OpenAIChatCompletionRequest;
-
-                access(provider).applyReasoningEffort(request, "none");
-
-                const recordRequest = request as unknown as Record<string, unknown>;
-                assert.strictEqual(recordRequest.reasoning_effort, "none");
-            });
-
-            test("sets reasoning_effort field for non-none values", () => {
-                const provider = new LiteLLMChatProvider(userAgent);
-                const request = { model: "test-model", messages: [] } as OpenAIChatCompletionRequest;
-
-                access(provider).applyReasoningEffort(request, "high");
-
-                const recordRequest = request as unknown as Record<string, unknown>;
-                assert.strictEqual(recordRequest.reasoning_effort, "high");
-            });
-        });
-
         test("applies reasoning effort from modelConfiguration", async () => {
             const provider = new LiteLLMChatProvider(userAgent);
             const request = (
@@ -77,7 +54,7 @@ suite("LiteLLMProviderBase", () => {
             assert.strictEqual(request.reasoning_effort, "medium");
         });
 
-        test("applies picker xhigh when fallback cache is empty", async () => {
+        test("sends the picker's xhigh as reasoning_effort", async () => {
             const provider = new LiteLLMChatProvider(userAgent);
             const modelInfo: LiteLLMModelInfo = {
                 mode: "chat",
@@ -150,7 +127,7 @@ suite("LiteLLMProviderBase", () => {
         });
     });
 
-    suite("sendRequestWithRetry: reasoning fallback", () => {
+    suite("sendRequestWithRetry", () => {
         const model: vscode.LanguageModelChatInformation = {
             id: "model-reasoning",
             name: "model-reasoning",
@@ -163,10 +140,10 @@ suite("LiteLLMProviderBase", () => {
         };
 
         function setupProvider(): LiteLLMChatProvider {
-            return new LiteLLMChatProvider(userAgent, new EffortFallbackCache());
+            return new LiteLLMChatProvider(userAgent);
         }
 
-        test("retries once on reasoning 4xx and succeeds", async () => {
+        test("a rejected reasoning effort is sent once and fails the turn", async () => {
             const provider = setupProvider();
             const baseConfig = { baseUrl: "https://wolfram.example", apiKey: "k", reasoningEffort: "high" };
             seedBackendForCall(sandbox, provider, baseConfig, {
@@ -175,24 +152,30 @@ suite("LiteLLMProviderBase", () => {
                 apiKey: "k",
                 client: {} as never,
             });
-            const sendStub = sandbox
-                .stub(access(provider)._transport, "sendRequestToLiteLLM")
-                .onCall(0)
-                .rejects(apiError("LiteLLM API error 400: reasoning_effort not supported", 400))
-                .onCall(1)
-                .resolves(new ReadableStream());
+            const rejection = apiError("LiteLLM API error 400: reasoning_effort not supported", 400);
+            const sendStub = sandbox.stub(access(provider)._transport, "sendRequestToLiteLLM").rejects(rejection);
+            const showInfo = sandbox.stub(vscode.window, "showInformationMessage").resolves(undefined);
 
-            const stream = await access(provider).sendRequestWithRetry(
-                { model: "model-reasoning", messages: [], stream: true, max_tokens: 100, reasoning_effort: "high" },
-                model,
-                { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
-                new vscode.CancellationTokenSource().token,
-                "test"
+            await assert.rejects(
+                () =>
+                    access(provider).sendRequestWithRetry(
+                        {
+                            model: "model-reasoning",
+                            messages: [],
+                            stream: true,
+                            max_tokens: 100,
+                            reasoning_effort: "high",
+                        },
+                        model,
+                        { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+                        { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
+                        new vscode.CancellationTokenSource().token,
+                        "test"
+                    ),
+                (err: unknown) => err === rejection
             );
-
-            assert.ok(stream);
-            assert.ok(sendStub.calledTwice);
+            sinon.assert.calledOnce(sendStub);
+            sinon.assert.notCalled(showInfo);
         });
 
         test("a context overflow surfaces the proxy error once, with no silent retry", async () => {
@@ -222,40 +205,7 @@ suite("LiteLLMProviderBase", () => {
             sinon.assert.calledOnce(sendStub);
         });
 
-        test("notifies once per model and original effort", async () => {
-            const provider = setupProvider();
-            const baseConfig = { baseUrl: "https://wolfram.example", apiKey: "k", reasoningEffort: "high" };
-            seedBackendForCall(sandbox, provider, baseConfig, {
-                backendName: "wolfram",
-                baseUrl: "https://wolfram.example",
-                apiKey: "k",
-                client: {} as never,
-            });
-            const showInfo = sandbox.stub(vscode.window, "showInformationMessage").resolves(undefined);
-
-            sandbox
-                .stub(access(provider)._transport, "sendRequestToLiteLLM")
-                .onCall(0)
-                .rejects(apiError("LiteLLM API error 400: reasoning_effort not supported", 400))
-                .onCall(1)
-                .resolves(new ReadableStream());
-
-            await access(provider).sendRequestWithRetry(
-                // The learned-limit key is the namespaced model id, so this test
-                // uses its own model object to avoid sharing the notification key
-                // with the "retries once on reasoning 4xx" test.
-                { model: "notify-once-model", messages: [], stream: true, max_tokens: 100, reasoning_effort: "high" },
-                { ...model, id: "notify-once-model" },
-                { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
-                new vscode.CancellationTokenSource().token,
-                "test"
-            );
-
-            assert.ok(showInfo.called);
-        });
-
-        test("does not retry on non-reasoning 5xx errors", async () => {
+        test("does not retry a 5xx error", async () => {
             const provider = setupProvider();
             const baseConfig = { baseUrl: "https://wolfram.example", apiKey: "k" };
             seedBackendForCall(sandbox, provider, baseConfig, {
@@ -279,10 +229,10 @@ suite("LiteLLMProviderBase", () => {
                 )
             );
 
-            assert.ok(sendStub.calledOnce, "should not retry on non-reasoning 5xx");
+            assert.ok(sendStub.calledOnce, "a 5xx is not retried by this loop");
         });
 
-        test("does not retry on 4xx errors that are unrelated to reasoning", async () => {
+        test("does not retry an unrelated 4xx error", async () => {
             const provider = setupProvider();
             const baseConfig = { baseUrl: "https://wolfram.example", apiKey: "k" };
             seedBackendForCall(sandbox, provider, baseConfig, {
@@ -307,70 +257,6 @@ suite("LiteLLMProviderBase", () => {
             );
 
             assert.ok(sendStub.calledOnce);
-        });
-
-        test("reaches the omitted-parameter step when the model rejects every effort", async () => {
-            const provider = setupProvider();
-            const baseConfig = { baseUrl: "https://wolfram.example", apiKey: "k" };
-            seedBackendForCall(sandbox, provider, baseConfig, {
-                backendName: "wolfram",
-                baseUrl: "https://wolfram.example",
-                apiKey: "k",
-                client: {} as never,
-            });
-
-            const attemptedEfforts: unknown[] = [];
-            const sendStub = sandbox.stub(access(provider)._transport, "sendRequestToLiteLLM").callsFake((request) => {
-                attemptedEfforts.push(request.reasoning_effort);
-                // A model that does not accept the parameter at all: every
-                // effort value is rejected, and only its absence works.
-                if (request.reasoning_effort !== undefined) {
-                    return Promise.reject(apiError("LiteLLM API error 400: reasoning_effort not supported", 400));
-                }
-                return Promise.resolve(new ReadableStream());
-            });
-
-            const stream = await access(provider).sendRequestWithRetry(
-                { model: "model-reasoning", messages: [], stream: true, max_tokens: 100, reasoning_effort: "high" },
-                model,
-                { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
-                new vscode.CancellationTokenSource().token,
-                "test"
-            );
-
-            assert.ok(stream);
-            assert.strictEqual(attemptedEfforts.at(-1), undefined);
-            // high, medium, low, minimal, none, omitted.
-            assert.strictEqual(sendStub.callCount, 6);
-        });
-
-        test("attempts no more than the ladder plus the omitted step", async () => {
-            const provider = setupProvider();
-            const baseConfig = { baseUrl: "https://wolfram.example", apiKey: "k" };
-            seedBackendForCall(sandbox, provider, baseConfig, {
-                backendName: "wolfram",
-                baseUrl: "https://wolfram.example",
-                apiKey: "k",
-                client: {} as never,
-            });
-            const sendStub = sandbox
-                .stub(access(provider)._transport, "sendRequestToLiteLLM")
-                .rejects(apiError("LiteLLM API error 400: reasoning_effort not supported", 400));
-
-            await assert.rejects(() =>
-                access(provider).sendRequestWithRetry(
-                    { model: "model-reasoning", messages: [], stream: true, max_tokens: 100, reasoning_effort: "max" },
-                    model,
-                    { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                    { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
-                    new vscode.CancellationTokenSource().token,
-                    "test"
-                )
-            );
-
-            // max, xhigh, high, medium, low, minimal, none, omitted.
-            assert.strictEqual(sendStub.callCount, 8);
         });
 
         test("retries once without stream_options include_usage on unknown parameter rejection", async () => {
@@ -407,34 +293,42 @@ suite("LiteLLMProviderBase", () => {
             assert.ok(sendStub.calledTwice);
         });
 
-        test("applies cached lower effort when prior failure recorded", async () => {
+        test("resends at most once when the include_usage rejection persists", async () => {
+            // Only the usageRetryAttempted flag bounds this loop. The third call resolves, so
+            // a loop that retries more than twice returns instead of spinning, which
+            // would starve the mocha timer and hang the run.
             const provider = setupProvider();
-            const baseConfig = { baseUrl: "https://wolfram.example", apiKey: "k", reasoningEffort: "high" };
+            const baseConfig = { baseUrl: "https://wolfram.example", apiKey: "k" };
             seedBackendForCall(sandbox, provider, baseConfig, {
                 backendName: "wolfram",
                 baseUrl: "https://wolfram.example",
                 apiKey: "k",
                 client: {} as never,
             });
-            // Pre-seed fallback cache: prior "high" failure → next "low"
-            access(provider)._effortFallbackCache.recordFailure("model-reasoning", "high");
+            const rejection = apiError("LiteLLM API error 400: Unsupported parameter: stream_options", 400);
+            const sendStub = sandbox.stub(access(provider)._transport, "sendRequestToLiteLLM").rejects(rejection);
+            sendStub.onThirdCall().resolves(new ReadableStream());
 
-            const capturedRequests: OpenAIChatCompletionRequest[] = [];
-            sandbox.stub(access(provider)._transport, "sendRequestToLiteLLM").callsFake(async (req) => {
-                capturedRequests.push(req);
-                return new ReadableStream();
-            });
-
-            await access(provider).sendRequestWithRetry(
-                { model: "model-reasoning", messages: [], stream: true, max_tokens: 100, reasoning_effort: "high" },
-                model,
-                { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-                { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
-                new vscode.CancellationTokenSource().token,
-                "test"
+            await assert.rejects(
+                () =>
+                    access(provider).sendRequestWithRetry(
+                        {
+                            model: "model-reasoning",
+                            messages: [],
+                            stream: true,
+                            max_tokens: 100,
+                            stream_options: { include_usage: true },
+                        },
+                        model,
+                        { configuration: baseConfig } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+                        { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>,
+                        new vscode.CancellationTokenSource().token,
+                        "test"
+                    ),
+                (err: unknown) => err === rejection
             );
 
-            assert.ok(capturedRequests[0].reasoning_effort !== "high", "should have downgraded before first send");
+            sinon.assert.calledTwice(sendStub);
         });
     });
 

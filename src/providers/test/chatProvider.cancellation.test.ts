@@ -49,7 +49,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
         chatCalls: number;
     }> {
         const registry = new ActiveRequestRegistry();
-        const provider = new LiteLLMChatProvider(userAgent, undefined, registry);
+        const provider = new LiteLLMChatProvider(userAgent, registry);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -186,7 +186,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
         attemptBehaviour: () => ReadableStream<Uint8Array>
     ): Promise<{ reported: vscode.LanguageModelResponsePart[]; chatCalls: number }> {
         const registry = new ActiveRequestRegistry();
-        const provider = new LiteLLMChatProvider(userAgent, undefined, registry);
+        const provider = new LiteLLMChatProvider(userAgent, registry);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -262,7 +262,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
 
     test("cancels a request that is still waiting for response headers", async () => {
         const registry = new ActiveRequestRegistry();
-        const provider = new LiteLLMChatProvider(userAgent, undefined, registry);
+        const provider = new LiteLLMChatProvider(userAgent, registry);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -314,7 +314,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
 
     test("reports the sending phase again when a retry starts a new header wait", async () => {
         const registry = new ActiveRequestRegistry();
-        const provider = new LiteLLMChatProvider(userAgent, undefined, registry);
+        const provider = new LiteLLMChatProvider(userAgent, registry);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };
@@ -358,7 +358,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
 
     test("leaves the registry empty after a failed request", async () => {
         const registry = new ActiveRequestRegistry();
-        const provider = new LiteLLMChatProvider(userAgent, undefined, registry);
+        const provider = new LiteLLMChatProvider(userAgent, registry);
         const providerWithConfig = provider as unknown as {
             _configManager: { getConfig: () => Promise<Record<string, unknown>> };
         };

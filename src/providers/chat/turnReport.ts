@@ -17,6 +17,7 @@ import type { TokenSnapshot } from "../../adapters/streaming/streamTokenCapture"
 import { describeFailureForLog, toErrorLogFields } from "../base/errorLogFields";
 import { parseApiError } from "../base/apiErrorMessage";
 import { exportRequestOutcome, recordCancelledTurn, type RequestOutcomeContext } from "../base/requestOutcome";
+import { isReasoningEffortRejection, rejectsReasoningEffortParameter } from "../base/proxyParameterRejection";
 
 /** What every outcome of one chat turn reports. */
 interface TurnReportBase {
@@ -158,6 +159,17 @@ export function reportHostCancellation(report: HostCancelledTurnReport): void {
 }
 
 /**
+ * True when the body names a rejected parameter that is not the reasoning effort.
+ *
+ * `isReasoningEffortRejection` matches its two halves independently, so a body that
+ * echoes the effort name beside a genuine rejection of another parameter satisfies
+ * it. The specific parameter is the better explanation, so it wins.
+ */
+function namesAnotherParameter(rejectionBody: string): boolean {
+    return findRejectedParameter(rejectionBody) !== undefined && !rejectsReasoningEffortParameter(rejectionBody);
+}
+
+/**
  * Turns a failure into the text the user reads in the turn.
  *
  * An upstream rejection is parsed and, where the rejection names a fix the user can
@@ -181,7 +193,19 @@ export function describeTurnFailure(error: unknown, modelId: string): string {
     if (error instanceof LiteLLMRateLimitError) {
         return appendRateLimitHint(message, error.failure);
     }
-    if (isUnsupportedParameterError(rejectionBody)) {
+    if (isReasoningEffortRejection(rejectionBody) && !namesAnotherParameter(rejectionBody)) {
+        // Dropping the effort at the proxy would leave the picker offering levels that
+        // are silently discarded, so the notice points at the declaration the picker
+        // reads instead.
+        message += rejectsReasoningEffortParameter(rejectionBody)
+            ? `. This model rejected the reasoning-effort parameter itself, so no level will be accepted. ` +
+              `Set supports_reasoning: false and its supports_<level>_reasoning_effort entries to false in the ` +
+              `LiteLLM model config, then run Reload Models.`
+            : `. This model rejected its reasoning effort. Declare exactly the levels it accepts with ` +
+              `supports_<level>_reasoning_effort: true in the LiteLLM model config (a reasoning model ` +
+              `with no level flags and no override is offered every level, none to max), or list them ` +
+              `in a modelOverrides forceMandatory entry, then run Reload Models.`;
+    } else if (isUnsupportedParameterError(rejectionBody)) {
         // Resending the identical body would fail the same way, so the rejection is
         // reported once with the proxy-side fix. Only parameters the connector adds
         // itself are ever stripped.
