@@ -18,7 +18,6 @@ import {
     sanitizeToolName,
     type ToolNameMapping,
 } from "./utils/toolNameUtils";
-import { decodeUtf8, encodeBase64 } from "./utils/byteEncoding";
 import {
     buildThinkingBlocks,
     readRedactedData,
@@ -38,7 +37,7 @@ import {
  * Strategy:
  * - Always ensure IDs start with 'fc_' to satisfy strict models
  * - Generate IDs in the safe range of 42-63 characters
- * - Use deterministic hashing for stability (same input → same output)
+ * - Use deterministic hashing
  * - Use varied filler when padding
  * - Preserve a readable middle fragment for debugging
  *
@@ -94,7 +93,9 @@ export function normalizeToolCallId(id: string, maxLen = 56): string {
     // Strip common prefixes we want to replace to keep the middle part readable
     const cleanRaw = raw.replace(/^call_|^tc_/, "");
     const safeMiddle = cleanRaw.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 10);
-    const hash = stableHash(raw); // Hash the FULL original ID for stability
+    // Hash the raw id rather than the stripped middle, so two ids that differ only in
+    // their prefix keep distinct hashes.
+    const hash = stableHash(raw);
 
     // fc_ + safeMiddle(<=10) + _ + hash(16) tops out at 30 chars; varied filler
     // grows it to exactly the 42-char minimum.
@@ -106,16 +107,16 @@ export function normalizeToolCallId(id: string, maxLen = 56): string {
 }
 
 function stableHash(input: string): string {
-    // Must work in BOTH extension host (node) and web bundle.
-    // Use a small, deterministic, non-crypto hash (FNV-1a 64-bit) and encode as hex.
-    // Collision risk is low for our use (shrinking IDs) and avoids bundling Node builtins.
+    // FNV-1a 64-bit encoded as hex, with a fixed 16-char width so the length
+    // arithmetic in normalizeToolCallId stays exact. Determinism is what the callers
+    // need, not any particular algorithm: a tool call and its result are normalized
+    // separately and have to land on the same id.
     let hash = 0xcbf29ce484222325n; // offset basis
     const prime = 0x100000001b3n;
     for (const ch of input) {
         hash ^= BigInt(ch.codePointAt(0) ?? 0);
         hash = (hash * prime) & 0xffffffffffffffffn;
     }
-    // Fixed 16-char width keeps downstream length arithmetic exact.
     return hash.toString(16).padStart(16, "0");
 }
 
@@ -252,12 +253,8 @@ export function convertMessages(
             } else if (part instanceof vscode.LanguageModelDataPart) {
                 if (part.mimeType.startsWith("image/")) {
                     contentItems.push(toImageContentItem(part.mimeType, part.data));
-                } else if (part.mimeType.startsWith("application/json")) {
-                    // Handle JSON data parts by decoding and appending as text
-                    textParts.push(decodeUtf8(part.data));
-                } else if (part.mimeType.startsWith("text/")) {
-                    // Handle explicit text data parts
-                    textParts.push(decodeUtf8(part.data));
+                } else if (part.mimeType.startsWith("text/") || part.mimeType.startsWith("application/json")) {
+                    textParts.push(new TextDecoder().decode(part.data));
                 } else {
                     Logger.trace(`[convertMessages] Skipping data part with unsupported mime type: ${part.mimeType}`);
                 }
@@ -730,7 +727,7 @@ function collectToolResultContent(pr: { content?: readonly unknown[] }): {
             if (TOOL_RESULT_IMAGE_MIME_TYPES.has(part.mimeType.toLowerCase())) {
                 images.push(toImageContentItem(part.mimeType, part.data));
             } else if (part.mimeType.startsWith("text/") || part.mimeType.includes("json")) {
-                textParts.push(decodeUtf8(part.data));
+                textParts.push(new TextDecoder().decode(part.data));
             } else {
                 Logger.trace(
                     `[collectToolResultContent] Skipping data part with unsupported mime type: ${part.mimeType}`
@@ -761,7 +758,7 @@ function toImageContentItem(mimeType: string, data: Uint8Array): OpenAIChatMessa
     return {
         type: "image_url",
         image_url: {
-            url: `data:${normalizedMimeType};base64,${encodeBase64(data)}`,
+            url: `data:${normalizedMimeType};base64,${Buffer.from(data).toString("base64")}`,
         },
     };
 }

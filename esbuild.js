@@ -1,35 +1,36 @@
 /**
+ * Prints a start and a finish marker around each build, listing the errors
+ * esbuild reported and each error's source location when it has one. A build
+ * with no errors or warnings prints nothing at this log level, so the markers
+ * are the completion signal a `--watch` session otherwise lacks.
+ *
  * @type {import('esbuild').Plugin}
  */
-function createProblemMatcherPlugin(label) {
-    /** @type {import('esbuild').Plugin} */
-    return {
-        name: `esbuild-problem-matcher-${label}`,
-        setup(build) {
-            build.onStart(() => {
-                console.log(`[${label}] build started`);
+const buildLogPlugin = {
+    name: "build-log",
+    setup(build) {
+        build.onStart(() => {
+            console.log("build started");
+        });
+        build.onEnd((result) => {
+            result.errors.forEach(({ text, location }) => {
+                console.error(`✘ ${text}`);
+                if (!location) return;
+                console.error(`    ${location.file}:${location.line}:${location.column}:`);
             });
-            build.onEnd((result) => {
-                result.errors.forEach(({ text, location }) => {
-                    console.error(`✘ [${label}] ${text}`);
-                    if (!location) return;
-                    console.error(`    ${location.file}:${location.line}:${location.column}:`);
-                });
-                console.log(`[${label}] build finished`);
-            });
-        },
-    };
-}
+            console.log("build finished");
+        });
+    },
+};
 
 const esbuild = require("esbuild");
-const path = require("path");
 
 const production = (process.argv.includes("--production") || process.env.NODE_ENV === "production") ? true : false;
 const watch = process.argv.includes("--watch");
 const generateSourceMaps = !production;
 
 /** @type {esbuild.BuildOptions} */
-const shared = {
+const bundleOptions = {
     entryPoints: ["src/extension.ts"],
     bundle: true,
     minify: production,
@@ -42,62 +43,24 @@ const shared = {
     },
     external: ["vscode"],
     metafile: true,
+    platform: "node",
+    format: "cjs",
+    target: "node20",
+    outfile: "dist/extension.js",
+    plugins: [buildLogPlugin],
 };
 
-/** @type {esbuild.BuildOptions[]} */
-const buildTargets = [
-    {
-        ...shared,
-        platform: "node",
-        format: "cjs",
-        target: "node20",
-        outfile: "dist/extension.js",
-        plugins: [createProblemMatcherPlugin("node")],
-    },
-    {
-        ...shared,
-        platform: "browser",
-        format: "esm",
-        target: ["chrome120", "firefox120", "safari17"],
-        outfile: "dist/web/extension.js",
-        plugins: [
-            createProblemMatcherPlugin("web"),
-            {
-                name: "web-module-swap",
-                setup(build) {
-                    build.onResolve({ filter: /\/(structuredLogFileSink)$/ }, (args) => {
-                        // Node-only modules swap to their .web.ts no-op/browser
-                        // variants in the web target. Bare specifier safety:
-                        // only relative "./name" imports are rewritten.
-                        const base = args.path.replace(/^\.\//, "");
-                        if (base !== args.path) {
-                            return {
-                                path: path.join(args.resolveDir, `${base}.web.ts`),
-                                external: false
-                            };
-                        }
-                    });
-                },
-            },
-        ],
-        conditions: ["browser"],
-    },
-];
-
 async function main() {
-    console.log("Starting build targets...");
-    const contexts = await Promise.all(buildTargets.map((opts) => esbuild.context(opts)));
-
+    const context = await esbuild.context(bundleOptions);
     if (watch) {
         console.log("Watching for changes...");
-        await Promise.all(contexts.map((ctx) => ctx.watch()));
-    } else {
-        console.log("Running rebuild...");
-        await Promise.all(contexts.map((ctx) => ctx.rebuild()));
-        console.log("Rebuild complete, disposing contexts...");
-        await Promise.all(contexts.map((ctx) => ctx.dispose()));
-        console.log("Done.");
+        await context.watch();
+        return;
     }
+    console.log("Building the extension bundle...");
+    await context.rebuild();
+    await context.dispose();
+    console.log("Done.");
 }
 
 main().catch((e) => {

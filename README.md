@@ -109,6 +109,7 @@ Forked from upstream `v2.1.9`. Everything below is on top of that baseline.
 - Removed the git commit-message feature (its command, SCM title button, `litellm-connector.commitModelIdOverride` setting, and provider), the unused `AuditTrail`, the "LiteLLM: Reset All Configuration" command, and the server-side token-counter request. Token counts now come from the local estimator only.
 - Removed legacy and deprecated code paths, the unused v2 message pipeline, the legacy config migration, and the old Set Log Level command; inlined language model provider registration.
 - Removed upstream's PostHog telemetry pipeline, marketplace packaging, CI/CD, and community scaffolding. Local metric logging and structured logging remain.
+- Dropped VS Code for the Web support. The extension runs in a Node extension host only, so local, remote, and Agents windows are unaffected and the build emits a single `dist/extension.js` bundle.
 - `npm run bump-version dev` now emits semver-correct dotted prerelease tags (e.g. `2.1.10-dev.11`).
 
 ### Agents window (Copilot SDK harness) compatibility

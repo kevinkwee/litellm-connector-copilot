@@ -1,7 +1,5 @@
 /**
- * Web-compatible SHA-256 hash using SubtleCrypto. Works in Node.js (19+) and in
- * browser and web extension environments, where the Node `crypto` module does not
- * exist.
+ * Returns the SHA-256 digest of `input` as lowercase hex.
  */
 export async function sha256HexAsync(input: string): Promise<string> {
     const encoder = new TextEncoder();
@@ -12,12 +10,12 @@ export async function sha256HexAsync(input: string): Promise<string> {
 }
 
 /**
- * Web-compatible SHA-1 hash returning raw bytes, using SubtleCrypto.
+ * SHA-1 hash returning raw bytes, using SubtleCrypto.
  *
  * Accepts a string (hashed as UTF-8) or raw bytes. UUID v5 must feed raw
  * bytes: RFC 4122 hashes `namespace bytes || utf8(name)`, and round-tripping
  * those bytes through a string would re-encode every byte >= 0x80. The byte
- * parameter is pinned to `ArrayBuffer` because Web Crypto rejects
+ * parameter is pinned to `ArrayBuffer` because SubtleCrypto rejects
  * `SharedArrayBuffer`-backed views.
  *
  * The raw bytes (not hex) are returned because UUID v5 manipulates individual

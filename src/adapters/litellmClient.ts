@@ -414,9 +414,9 @@ export class LiteLLMClient {
      * unchanged. Retrying in both layers would multiply the attempts.
      *
      * The wait for response headers is bounded here, because undici's own
-     * header timeout is neither reachable through `fetch` options nor present in
-     * the web build, and because the proxy buffers the first streamed chunk
-     * before it writes headers, which leaves the body watchdog nothing to watch.
+     * header timeout is not reachable through `fetch` options, and because the
+     * proxy buffers the first streamed chunk before it writes headers, which
+     * leaves the body watchdog nothing to watch.
      */
     private async fetchWithRetry(url: string, init: RequestInit, token?: vscode.CancellationToken): Promise<Response> {
         const headersTimeoutMs = this.config.headersTimeoutMs ?? LiteLLMClient.DEFAULT_HEADERS_TIMEOUT_MS;

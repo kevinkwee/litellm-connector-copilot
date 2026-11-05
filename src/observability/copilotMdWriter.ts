@@ -3,7 +3,6 @@ import { Logger } from "../utils/logger";
 import { StructuredLogger } from "./structuredLogger";
 import { buildCopilotMdFilename, renderCopilotMd, type CopilotMdEntry } from "./copilotMdRenderer";
 import { selectFilesForDeletion, type CapsConfig, type FileMeta } from "./copilotMdCaps";
-import { encodeUtf8 } from "../utils/byteEncoding";
 
 /**
  * # `.copilotmd` writer + caps enforcer
@@ -56,7 +55,7 @@ export class CopilotMdWriter {
             const fileUri = vscode.Uri.joinPath(sessionFolder, filename);
 
             const content = renderCopilotMd(entry);
-            const contentBytes = encodeUtf8(content);
+            const contentBytes = Buffer.from(content, "utf8");
 
             // Ensure the session folder exists. `createDirectory` is recursive
             // in vscode.workspace.fs and a no-op if the directory already exists.

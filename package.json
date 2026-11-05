@@ -33,7 +33,6 @@
 	"license": "Apache-2.0",
 	"publisher": "GethNet",
 	"main": "./dist/extension.js",
-	"browser": "./dist/web/extension.js",
 	"scripts": {
 		"bump-version": "node scripts/bump-version.js",
 		"clean": "node scripts/clean.mjs dist out coverage test-results",
