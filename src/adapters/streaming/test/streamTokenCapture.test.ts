@@ -284,7 +284,12 @@ suite("StreamTokenCapture", () => {
         });
 
         assert.strictEqual(reportedParts.length, 1);
-        const forwardedUsage = JSON.parse(Buffer.from(reportedParts[0].data).toString("utf-8"));
+        const parsedForwarded: unknown = JSON.parse(Buffer.from(reportedParts[0].data).toString("utf-8"));
+        const forwardedUsage = parsedForwarded as {
+            estimated_input_cost?: number;
+            estimated_output_cost?: number;
+            estimated_total_cost?: number;
+        };
         assert.strictEqual(forwardedUsage.estimated_input_cost, expectedCost.inputCost);
         assert.strictEqual(forwardedUsage.estimated_output_cost, expectedCost.outputCost);
         assert.strictEqual(forwardedUsage.estimated_total_cost, expectedCost.totalCost);

@@ -291,9 +291,11 @@ suite("Tool Call Args Corruption Logging", () => {
         assert.ok(String(fields.normalizedId).startsWith("fc_"));
     });
 
-    test("still emits the buffered call when finish_reason is tool_calls, and logs the error-level event", () => {
+    test("still emits the buffered call when finish_reason is tool_calls, and leaves the drop to the emitter", () => {
         const state = createInitialStreamingState();
         const errorStub = sandbox.stub(StructuredLogger, "error");
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        const debugStub = sandbox.stub(StructuredLogger, "debug");
         const invalidArgs = '{"incomplete":';
 
         interpretStreamEvent(
@@ -322,7 +324,17 @@ suite("Tool Call Args Corruption Logging", () => {
             assert.strictEqual(toolCall.name, "bad_tool");
             assert.strictEqual(toolCall.args, invalidArgs);
         }
-        const corruptionCalls = errorStub
+        // The emitter drops this call and owns its single record, so the interpreter
+        // logs it at debug only.
+        assert.strictEqual(
+            errorStub.getCalls().filter((call) => call.args[0] === "stream.tool_call_args_invalid_json").length,
+            0
+        );
+        assert.strictEqual(
+            warnStub.getCalls().filter((call) => call.args[0] === "stream.tool_call_args_invalid_json").length,
+            0
+        );
+        const corruptionCalls = debugStub
             .getCalls()
             .filter((call) => call.args[0] === "stream.tool_call_args_invalid_json");
         assert.strictEqual(corruptionCalls.length, 1);
@@ -354,6 +366,26 @@ suite("Tool Call Args Corruption Logging", () => {
         assert.strictEqual(fields.argsPreview, "{invalid");
     });
 
+    test("a duplicate id at a tool_calls finish logs the corrupt arguments here", () => {
+        // The call reaches neither the emitter nor a resend, so this layer is the one
+        // that has to record the corrupt arguments.
+        const state = createInitialStreamingState();
+        state.emittedToolCallIds.add("fc_call_dup");
+        state.toolCallBuffers.set(0, { id: "fc_call_dup", name: "read_file", args: '{"p":' });
+        const errorStub = sandbox.stub(StructuredLogger, "error");
+        const debugStub = sandbox.stub(StructuredLogger, "debug");
+
+        interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
+
+        assert.strictEqual(
+            errorStub.getCalls().filter((call) => call.args[0] === "stream.tool_call_args_invalid_json").length,
+            1
+        );
+        assert.strictEqual(
+            debugStub.getCalls().filter((call) => call.args[0] === "stream.tool_call_args_invalid_json").length,
+            0
+        );
+    });
     test("still reports the corrupt arguments of a call whose id was already emitted", () => {
         const state = createInitialStreamingState();
         const errorStub = sandbox.stub(StructuredLogger, "error");

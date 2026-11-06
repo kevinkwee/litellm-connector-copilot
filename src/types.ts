@@ -176,24 +176,6 @@ export interface ModelOverride {
 }
 
 /**
- * LiteLLM model configuration parameters.
- */
-export interface LiteLLMParams {
-    custom_llm_provider?: string;
-    litellm_credential_name?: string;
-    use_in_pass_through?: boolean;
-    use_litellm_proxy?: boolean;
-    /**
-     * When true, merge OpenAI chat `delta.reasoning_content` into `delta.content` so the
-     * reasoning text is surfaced inline with the assistant response instead of as a
-     * separate thinking part. Defaults to `false` (emit as thinking).
-     */
-    merge_reasoning_content_in_choices?: boolean;
-    model?: string;
-    tags?: string[];
-}
-
-/**
  * LiteLLM workspace-level configuration. Backend connection details
  * (baseUrl, apiKey) are delivered by VS Code 1.120 per-group
  * `options.configuration` payloads on every provider call; they are NOT
@@ -210,13 +192,7 @@ export interface LiteLLMConfig {
      * Default: "5m".
      */
     anthropicPromptCaching?: AnthropicPromptCachingMode;
-    /**
-     * Enable/disable the model override system.
-     * When enabled, merged user and bundled model override rules are applied.
-     * When disabled, only LiteLLM /model/info derived capabilities are used.
-     * Default: true (backwards compatible).
-     */
-    enableModelOverrides?: boolean;
+
     /**
      * Per-model capability overrides exposed to VS Code.
      * Key is the Model ID (e.g. 'gpt-4o').
@@ -386,15 +362,6 @@ export interface LiteLLMModelInfo {
     modalities?: string[];
     tags?: string[];
     [key: string]: unknown; // Allow additional fields for extensibility
-}
-
-/**
- * Single model entry from /model/info endpoint.
- */
-export interface LiteLLMModelEntry {
-    model_name: string;
-    litellm_params?: LiteLLMParams;
-    model_info?: LiteLLMModelInfo;
 }
 
 /**
@@ -569,32 +536,10 @@ export interface LiteLLMResponseTool {
     strict: boolean;
 }
 
-/**
- * Transformed model item for internal use.
- */
-export interface TransformedModelItem {
-    id: string;
-    object: string;
-    created: number;
-    owned_by: string;
-    model_name: string;
-    litellm_params?: LiteLLMParams;
-    model_info?: LiteLLMModelInfo;
-}
-
 /** A tool call the connector dropped because its arguments could not be parsed. */
 export interface DroppedToolCall {
     readonly id: string;
     readonly name: string;
-}
-
-/**
- * Buffer used to accumulate streamed tool call parts until arguments are valid JSON.
- */
-export interface ToolCallBuffer {
-    id?: string;
-    name?: string;
-    args: string;
 }
 
 /** OpenAI-style chat roles. */

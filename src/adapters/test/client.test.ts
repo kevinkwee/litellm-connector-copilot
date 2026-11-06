@@ -194,6 +194,15 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.strictEqual(cancelled, true, "the waited-on response must not keep its body open");
     });
 
+    test("a response with no body throws without logging an error", async () => {
+        // The throw reaches the turn boundary, which records the failure once.
+        const client = new LiteLLMClient(config, userAgent);
+        const errorStub = sandbox.stub(Logger, "error");
+        sandbox.stub(global, "fetch").resolves(new Response(null, { status: 200 }));
+
+        await assert.rejects(() => client.chat({ model: "m", messages: [] }), /No response body/);
+        sinon.assert.notCalled(errorStub);
+    });
     test("getEndpoint resolves correctly", () => {
         const client = new LiteLLMClient(config, userAgent);
         // @ts-expect-error - accessing private method for testing

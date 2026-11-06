@@ -158,13 +158,6 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Public access to model info from the registry's capability cache.
-     */
-    public getModelInfo(modelId: string): LiteLLMModelInfo | undefined {
-        return this._registry.getModelInfo(modelId);
-    }
-
-    /**
      * Releases everything this provider holds, so nothing outlives deactivation.
      * Safe to call more than once.
      */
@@ -544,7 +537,7 @@ export abstract class LiteLLMProviderBase {
         request: OpenAIChatCompletionRequest,
         error: unknown,
         context: {
-            stage: "sendRequestWithRetry" | "provideLanguageModelChatResponse";
+            stage: "sendRequestWithRetry";
             modelId: string;
             caller?: string;
             modelInfoMode?: string;

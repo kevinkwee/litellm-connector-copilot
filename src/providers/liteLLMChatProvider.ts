@@ -479,31 +479,20 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         !isTransportRetriableError(err) ||
                         isLastAttempt
                     ) {
-                        // A tool call already reached VS Code before the stream
-                        // died: the agent loop may have executed it, so resending
-                        // this request could double-execute the tool. Not
-                        // recoverable here; log it loudly and rethrow.
+                        // A tool call already reached VS Code before the stream died: the
+                        // agent loop may have executed it, so resending this request could
+                        // double-execute the tool. That is a decision, recorded at info
+                        // level, and `request.failed` records the turn's outcome.
                         if (accumulator.sawToolCall && isTransportRetriableError(err) && !isLastAttempt) {
-                            Logger.error(
-                                `[transportRetry] request=${requestId} unrecoverable: tool call was already emitted before the transport error; not retrying to avoid double tool execution`,
-                                toErrorLogFields(err)
-                            );
-                            StructuredLogger.error("request.transport_retry_blocked_tool_call", {
+                            StructuredLogger.info("request.transport_retry_skipped", {
                                 requestId,
                                 attempt,
+                                reason: "tool_call_delivered",
                                 ...toErrorLogFields(err),
                             });
                         }
                         // Rethrow so non-transport errors flow through the
-                        // shared catch handling below.
-                        if (attempt === 0) {
-                            this.logRequestPayloadOnFailure(requestBodyBuilt, err, {
-                                stage: "provideLanguageModelChatResponse",
-                                modelId: model.id,
-                                caller,
-                                modelInfoMode: modelInfo?.mode,
-                            });
-                        }
+                        // shared catch handling below, which records the turn's failure.
                         throw err;
                     }
 

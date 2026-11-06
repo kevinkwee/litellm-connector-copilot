@@ -44,8 +44,6 @@ export function estimateMediaTokenCost(mimeType: string, dataLength: number): nu
     return 0;
 }
 
-export const DEFAULT_MAX_OUTPUT_TOKENS = 16000;
-export const DEFAULT_CONTEXT_LENGTH = 128000;
 const SMART_OUTPUT_RESERVATION_MIN = 16000;
 const SMART_OUTPUT_RESERVATION_MAX = 64000;
 

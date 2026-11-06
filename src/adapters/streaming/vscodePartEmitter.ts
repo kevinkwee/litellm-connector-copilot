@@ -136,7 +136,7 @@ export function emitPartsToVSCode(
                                 typeof part.args === "string"
                                     ? part.args.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS)
                                     : "<non-string>",
-                            error: parseErr instanceof Error ? parseErr.message : String(parseErr),
+                            error: parseErr instanceof Error ? parseErr.name : typeof parseErr,
                         });
                         droppedToolCalls.push({ id: part.id, name: part.name });
                         StructuredLogger.error("vscode.tool_call_parse_failed", {
@@ -148,7 +148,7 @@ export function emitPartsToVSCode(
                                 typeof part.args === "string"
                                     ? part.args.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS)
                                     : "<non-string>",
-                            error: parseErr instanceof Error ? parseErr.message : String(parseErr),
+                            error: parseErr instanceof Error ? parseErr.name : typeof parseErr,
                         });
                     }
                 } else {

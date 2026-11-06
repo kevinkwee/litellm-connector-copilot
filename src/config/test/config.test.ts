@@ -335,7 +335,6 @@ suite("ConfigManager Unit Tests", () => {
             "inactivityTimeout",
             "disableCaching",
             "anthropicPromptCaching",
-            "enableModelOverrides",
             "modelCapabilitiesOverrides",
             "forceResponsesEndpoint",
             "allowChatCompletionsFallback",

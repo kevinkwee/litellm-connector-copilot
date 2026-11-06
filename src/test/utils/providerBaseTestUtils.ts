@@ -19,8 +19,7 @@ export interface BaseTestAccess {
             id: string
         ) => { baseUrl: string; apiKey: string; rawModelName: string; routingIdentity: string } | undefined;
         getModelInfo: (id: string) => LiteLLMModelInfo | undefined;
-        clearCaches: () => void;
-        size: () => number;
+        clearDiscoveryCaches: () => void;
         recordUnsupportedParameter: (modelId: string, param: string) => void;
         getUnsupportedParameters: (modelId: string) => ReadonlySet<string>;
     };

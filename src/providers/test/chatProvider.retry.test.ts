@@ -297,6 +297,47 @@ suite("LiteLLM Chat Provider Retry", () => {
         assert.strictEqual(second[2].content, "Continue");
     });
 
+    test("a blocked retry is recorded as a decision, not as a second failure", async () => {
+        const errorStub = sandbox.stub(StructuredLogger, "error");
+        const infoStub = sandbox.stub(StructuredLogger, "info");
+        const provider = new LiteLLMChatProvider(userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(
+            async () =>
+                new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.enqueue(
+                            new TextEncoder().encode(
+                                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_time","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n'
+                            )
+                        );
+                    },
+                    pull(controller) {
+                        controller.error(new TypeError("terminated"));
+                    },
+                })
+        );
+
+        await runChatRequest(provider, []);
+
+        const skipped = infoStub.getCalls().filter((call) => call.args[0] === "request.transport_retry_skipped");
+        assert.strictEqual(skipped.length, 1, "the decision is recorded once");
+        assert.strictEqual((skipped[0].args[1] as { reason: string }).reason, "tool_call_delivered");
+        assert.deepStrictEqual(
+            errorStub.getCalls().map((call) => call.args[0]),
+            ["request.failed"],
+            "the turn's failure is the only error-level record"
+        );
+    });
     test("tool call already emitted before a transport error blocks the retry", async () => {
         const encoder = new TextEncoder();
         const provider = new LiteLLMChatProvider(userAgent);

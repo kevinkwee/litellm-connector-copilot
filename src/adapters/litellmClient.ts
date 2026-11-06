@@ -343,7 +343,6 @@ export class LiteLLMClient {
         }
 
         if (!response.body) {
-            Logger.error("No response body from LiteLLM API");
             throw new Error("No response body from LiteLLM API");
         }
 

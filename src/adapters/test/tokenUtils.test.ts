@@ -1,6 +1,5 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
-import { isAnthropicModel } from "../../utils/modelUtils";
 import { estimateToolTokens, countTokens, countOpenAIChatMessagesTokens, getReservedOutputTokens } from "../tokenUtils";
 import type { LiteLLMModelInfo } from "../../types";
 
@@ -67,17 +66,6 @@ suite("TokenUtils Unit Tests", () => {
 
         // total 32000 - input 31900 - structural headroom 256 => clamped to minimum 1
         assert.strictEqual(reserved, 1);
-    });
-
-    test("isAnthropicModel identifies models correctly", () => {
-        assert.strictEqual(isAnthropicModel("claude-3-opus"), true);
-        assert.strictEqual(isAnthropicModel("gpt-4o"), false);
-        assert.strictEqual(
-            isAnthropicModel("some-model", {
-                litellm_provider: "anthropic",
-            } as unknown as LiteLLMModelInfo),
-            true
-        );
     });
 
     test("countOpenAIChatMessagesTokens counts transport tool calls and tool results", () => {

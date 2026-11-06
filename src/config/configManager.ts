@@ -17,7 +17,6 @@ export class ConfigManager {
     private static lastInactivityTimeoutWarning: string | undefined;
     private static readonly DISABLE_CACHING_KEY = "litellm-connector.disableCaching";
     private static readonly ANTHROPIC_PROMPT_CACHING_KEY = "litellm-connector.anthropicPromptCaching";
-    private static readonly KEY_MODEL_OVERRIDES_ENABLE = "litellm-connector.enableModelOverrides";
     private static readonly MODEL_CAPABILITIES_OVERRIDES_KEY = "litellm-connector.modelCapabilitiesOverrides";
     private static readonly FORCE_RESPONSES_ENDPOINT_KEY = "litellm-connector.forceResponsesEndpoint";
     private static readonly ALLOW_CHAT_COMPLETIONS_FALLBACK_KEY = "litellm-connector.allowChatCompletionsFallback";
@@ -160,8 +159,6 @@ export class ConfigManager {
         const anthropicPromptCaching = normalizeAnthropicPromptCachingMode(
             workspaceConfig.get<unknown>(ConfigManager.ANTHROPIC_PROMPT_CACHING_KEY)
         );
-        const enableModelOverrides = workspaceConfig.get<boolean>(ConfigManager.KEY_MODEL_OVERRIDES_ENABLE, true);
-
         const modelCapabilitiesOverridesRaw = workspaceConfig.get<Record<string, string | string[]>>(
             ConfigManager.MODEL_CAPABILITIES_OVERRIDES_KEY,
             {}
@@ -267,7 +264,6 @@ export class ConfigManager {
             inactivityTimeout,
             disableCaching,
             anthropicPromptCaching,
-            enableModelOverrides,
             modelCapabilitiesOverrides,
             forceResponsesEndpoint,
             allowChatCompletionsFallback,

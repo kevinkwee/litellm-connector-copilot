@@ -26,10 +26,6 @@
  *    which is what distinguishes two groups on the same host.
  *  - `extractRawName(id)`: strip the routing prefix from a namespaced id.
  *  - `getModelInfo(id)`: read the model info cache populated during discovery.
- *  - `size()`: number of distinct backends currently registered.
- *  - `clearCaches()`: wipe the per-model caches (model info, unsupported
- *    parameters), the discovery response cache, and every backend's backoff
- *    history.
  *  - `clearDiscoveryCaches()`: wipes the discovery response cache and every
  *    backend's backoff history. Routing and the per-model caches survive.
  *  - `recordUnsupportedParameter(modelId, param)` /
@@ -76,7 +72,6 @@ import {
 } from "../utils/modelCapabilities";
 import { deriveGroupNameFromUrl } from "../utils";
 import { sleepWithCancellation } from "../utils/transportRetry";
-import { sha256HexAsync } from "../utils/discoveryHash";
 import type { LiteLLMConfig, LiteLLMModelInfo } from "../types";
 import type { ConfigManager } from "../config/configManager";
 import type { BackendSession } from "./backendSession";
@@ -95,10 +90,8 @@ import {
  * Cached result from a /model/info discovery call.
  */
 interface CachedDiscoveryResult {
-    readonly bodyHash: string;
     readonly models: readonly vscode.LanguageModelChatInformation[];
     readonly fetchedAtMs: number;
-    readonly ttlMs: number;
 }
 
 /**
@@ -316,24 +309,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
      */
     public getModelInfo(id: string): LiteLLMModelInfo | undefined {
         return this.modelInfoCache.get(id);
-    }
-
-    /**
-     * Number of distinct backends currently registered. Not a routing primitive.
-     */
-    public size(): number {
-        return this.modelsByBackend.size;
-    }
-
-    /**
-     * Wipes the per-model caches (model info, unsupported parameters), the discovery
-     * response cache, and every backend's backoff history. Does NOT touch the routing
-     * table.
-     */
-    public clearCaches(): void {
-        this.modelInfoCache.clear();
-        this.unsupportedParamsByModel.clear();
-        this.clearDiscoveryCaches();
     }
 
     /**
@@ -662,7 +637,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
                     ageMs: Date.now() - cached.fetchedAtMs,
                     ttlMs,
                     modelCount: cached.models.length,
-                    bodyHash: cached.bodyHash.slice(0, 8),
                 });
                 return [...cached.models];
             }
@@ -706,25 +680,19 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         const infos = selectable.map((item) => item.info);
 
         // A reload during the fetch invalidates everything this call derived, so
-        // both the response cache and the per-model capability cache are
-        // skipped. Writing them would let a pre-reload answer overwrite the
-        // newer one. The hash is computed before the guard so no await sits
-        // between the epoch check and the writes it protects.
-        const bodyHash = ttlMs > 0 ? await sha256HexAsync(JSON.stringify(models.data ?? [])) : undefined;
+        // both the response cache and the per-model capability cache are skipped:
+        // writing them would let a pre-reload answer overwrite the newer one.
         if (this.discoveryEpoch === epochAtFetchStart) {
             for (const item of selectable) {
                 this.modelInfoCache.set(item.info.id, item.modelInfo);
             }
-            if (ttlMs > 0 && bodyHash !== undefined) {
+            if (ttlMs > 0) {
                 this.discoveryResponseCache.set(cacheKey, {
-                    bodyHash,
                     models: infos,
                     fetchedAtMs: Date.now(),
-                    ttlMs,
                 });
                 StructuredLogger.debug("discovery.cached", {
                     baseUrl: session.baseUrl,
-                    bodyHash: bodyHash.slice(0, 8),
                     modelCount: infos.length,
                     ttlMs,
                 });

@@ -16,8 +16,7 @@ import { LiteLLMProviderRegistry } from "../../liteLLMProviderRegistry";
  * `vscode.LanguageModelError.Blocked` is thrown.
  *
  * `clearDiscoveryCaches()` clears every backend's history so a model reload
- * starts from a clean slate. `clearCaches()` resets the same histories alongside
- * the per-model caches.
+ * starts from a clean slate.
  */
 suite("Discovery backoff", () => {
     let sandbox: sinon.SinonSandbox;
@@ -156,7 +155,7 @@ suite("Discovery backoff", () => {
         assert.match(String((blockedCall.args[1] as { reason: string }).reason), /HTTP request failed/);
     });
 
-    test("clearCaches resets the shared backoff state", () => {
+    test("clearDiscoveryCaches resets the shared backoff state", () => {
         const registry = new LiteLLMProviderRegistry({
             configManager: configManager as unknown as ConfigManager,
             userAgent: "test",
@@ -165,7 +164,7 @@ suite("Discovery backoff", () => {
         sharedDiscoveryBackoff.recordFailure("backend", 0);
         sharedDiscoveryBackoff.recordFailure("backend", 1_000);
 
-        registry.clearCaches();
+        registry.clearDiscoveryCaches();
 
         const decision = sharedDiscoveryBackoff.recordFailure("backend", 0);
         assert.strictEqual(decision.attempt, 1);

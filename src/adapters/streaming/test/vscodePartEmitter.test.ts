@@ -77,6 +77,26 @@ suite("vscodePartEmitter", () => {
         assert.strictEqual(fields.argsPreview, "{invalid json");
     });
 
+    test("logs the error name rather than a message that quotes the arguments", () => {
+        // V8 quotes the text around the failure position, which for a large payload
+        // sits far past the 160-character preview the log is allowed to keep.
+        const warnStub = sandbox.stub(Logger, "warn");
+        const errorStub = sandbox.stub(StructuredLogger, "error");
+        const progress = { report: () => undefined } as vscode.Progress<vscode.LanguageModelResponsePart>;
+        // The unquoted value sits past the preview window, and V8 quotes it in the
+        // error message, so a logged message would carry it.
+        const args = `{"a":"${"x".repeat(400)}", "k": SECRETVALUE}`;
+        const tail = "SECRETVALU";
+
+        emitPartsToVSCode([{ type: "tool_call", index: 0, id: "call_1", name: "t1", args }], progress);
+
+        const warnFields = warnStub.firstCall.args[1] as Record<string, unknown>;
+        const errorFields = errorStub.firstCall.args[1] as Record<string, unknown>;
+        assert.strictEqual(warnFields.error, "SyntaxError");
+        assert.strictEqual(errorFields.error, "SyntaxError");
+        assert.ok(!JSON.stringify(warnFields).includes(tail), "the log must not carry the argument text");
+        assert.ok(!JSON.stringify(errorFields).includes(tail), "the log must not carry the argument text");
+    });
     test("reports every data part without dropping any", () => {
         const reported: unknown[] = [];
         const progress = {

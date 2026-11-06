@@ -172,7 +172,7 @@ suite("SSE Decoder Unit Tests", () => {
             for await (const payload of decodeSSE(stream)) {
                 results.push(payload);
             }
-        } catch (_err) {
+        } catch {
             threwError = true;
         }
 

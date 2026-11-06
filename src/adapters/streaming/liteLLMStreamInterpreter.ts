@@ -175,14 +175,15 @@ function logDroppedToolCallBuffer(
 }
 
 /**
- * Returns a tool call part for each deliverable chat-completions buffer, logs the
- * undeliverable ones, skips ids already emitted, and clears the buffers.
+ * Returns a part for each chat-completions buffer this layer can deliver, records the
+ * ones it cannot, skips ids already emitted, and clears the buffers.
  *
- * A call with invalid JSON arguments is returned only at a `tool_calls` finish, where
- * the model declares its calls complete, and the emitter drops it there because its
- * arguments still do not parse. At any other finish it is dropped here and recorded on
- * the state, and the stream reader judges from the finish whether the drop answered the
- * turn.
+ * A buffer with invalid JSON arguments is still returned at a `tool_calls` finish,
+ * where the model declares its calls complete, because the emitter is the layer that
+ * drops it there: this layer records the parse failure at debug level and leaves the
+ * single record of the drop to the emitter. At any other finish this layer drops the
+ * call, records it on the state, and logs the drop itself, and the stream reader judges
+ * from the finish whether the drop answered the turn.
  */
 function settleChatToolCallBuffers(state: StreamingState, finishReason: string): EmittedPart[] {
     const parts: EmittedPart[] = [];
@@ -196,7 +197,10 @@ function settleChatToolCallBuffers(state: StreamingState, finishReason: string):
             JSON.parse(buffer.args);
         } catch {
             isJsonValid = false;
-            StructuredLogger.error("stream.tool_call_args_invalid_json", {
+        }
+        const isDuplicate = state.emittedToolCallIds.has(buffer.id);
+        if (!isJsonValid) {
+            const fields = {
                 requestId: state.requestId,
                 toolName: buffer.name,
                 normalizedId: buffer.id,
@@ -204,9 +208,16 @@ function settleChatToolCallBuffers(state: StreamingState, finishReason: string):
                 finishReason,
                 argsLength: buffer.args.length,
                 argsPreview: buffer.args.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS),
-            });
+            };
+            if (finishReason === "tool_calls" && !isDuplicate) {
+                // The call reaches the emitter, which drops it there and owns the single
+                // record for the drop.
+                StructuredLogger.debug("stream.tool_call_args_invalid_json", fields);
+            } else {
+                StructuredLogger.error("stream.tool_call_args_invalid_json", fields);
+            }
         }
-        if (state.emittedToolCallIds.has(buffer.id)) {
+        if (isDuplicate) {
             continue;
         }
         if (!isJsonValid && finishReason !== "tool_calls") {
