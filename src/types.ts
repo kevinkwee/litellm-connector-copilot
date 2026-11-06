@@ -328,6 +328,9 @@ export interface LiteLLMClientConfig {
     onUnsupportedParameter?: (model: string, param: string) => void;
 }
 
+/** A per-token rate as the proxy reports it: a number, or a decimal string. */
+export type PricedRate = number | string | null | undefined;
+
 /**
  * Detailed model information from LiteLLM proxy including capabilities and token constraints.
  */
@@ -365,10 +368,10 @@ export interface LiteLLMModelInfo {
     supports_reasoning?: boolean | null;
     supports_computer_use?: boolean | null;
     // Pricing fields (per-token costs, USD). Optional; absent when backend does not return pricing.
-    input_cost_per_token?: number | null;
-    output_cost_per_token?: number | null;
-    cache_read_input_token_cost?: number | null;
-    cache_creation_input_token_cost?: number | null;
+    input_cost_per_token?: PricedRate;
+    output_cost_per_token?: PricedRate;
+    cache_read_input_token_cost?: PricedRate;
+    cache_creation_input_token_cost?: PricedRate;
     // Extended reasoning effort support fields from LiteLLM
     supports_none_reasoning_effort?: boolean | null;
     supports_minimal_reasoning_effort?: boolean | null;

@@ -131,8 +131,13 @@ export function findRejectedParameter(bodyText: string): string | undefined {
     // `'temperature'`, and Bedrock's `[temperature]`. Anything else (for example
     // "Unsupported parameter for this model") names no parameter, and guessing one
     // would mislead the user.
+    // A name may carry dots (`stream_options.include_usage`) but cannot end with one:
+    // the proxy appends ". Received Model Group=..." to relayed provider errors.
+    const name = String.raw`[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*`;
     const named = afterPhrase.match(
-        /^(?:[:=]\s*['"`]?([A-Za-z0-9_.-]+)|[:=]\s*\[\s*['"`]([A-Za-z0-9_.-]+)|[:=]\s*\{\s*['"`]([A-Za-z0-9_.-]+)|['"`]([A-Za-z0-9_.-]+)|\[([A-Za-z0-9_.-]+)\])/
+        new RegExp(
+            String.raw`^(?:[:=]\s*['"\`]?(${name})|[:=]\s*\[\s*['"\`](${name})|[:=]\s*\{\s*['"\`](${name})|['"\`](${name})|\[(${name})\])`
+        )
     );
     return named?.[1] ?? named?.[2] ?? named?.[3] ?? named?.[4] ?? named?.[5];
 }

@@ -11,6 +11,7 @@ import { countTokens } from "../adapters/tokenUtils";
 import { ConfigManager } from "../config/configManager";
 import { Logger } from "../utils/logger";
 import { RateLimitWaitLedger } from "../utils/rateLimitRetryPolicy";
+import { rejectsUsageOptOut } from "./base/usageOptOutRejection";
 import { isOpenAIParamSupported } from "../utils/modelCapabilities";
 import { RequestBuilder } from "./base/requestBuilder";
 import { describeFailureForLog } from "./base/errorLogFields";
@@ -378,8 +379,7 @@ export abstract class LiteLLMProviderBase {
                     modelInfoMode: modelInfo?.mode,
                 });
 
-                const errorMessage = err instanceof Error ? err.message : String(err);
-                if (!usageRetryAttempted && this.isUsageIncludeUsageParameterError(errorMessage)) {
+                if (!usageRetryAttempted && rejectsUsageOptOut(err)) {
                     this._usageOptOutModels.add(modelId);
                     clearUsageFlag();
                     usageRetryAttempted = true;
@@ -392,17 +392,6 @@ export abstract class LiteLLMProviderBase {
                 throw err;
             }
         }
-    }
-
-    private isUsageIncludeUsageParameterError(errorMessage: string): boolean {
-        const lower = errorMessage.toLowerCase();
-        return (
-            (lower.includes("stream_options") || lower.includes("include_usage")) &&
-            (lower.includes("unsupported parameter") ||
-                lower.includes("not supported") ||
-                lower.includes("unknown parameter") ||
-                lower.includes("unexpected keyword argument"))
-        );
     }
 
     /**

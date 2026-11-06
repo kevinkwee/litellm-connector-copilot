@@ -34,6 +34,78 @@ suite("pricingCalculator", () => {
             ]);
         });
 
+        test("reads a rate the proxy reports as a string", () => {
+            // A quoted rate is what a config file produces, and the parser accepts it.
+            const modelInfo = {
+                input_cost_per_token: "0.000001",
+                output_cost_per_token: "2e-6",
+            } as unknown as LiteLLMModelInfo;
+
+            const pricing = extractPricing(modelInfo);
+
+            assert.strictEqual(pricing?.inputCostPerToken, 0.000001);
+            assert.strictEqual(pricing?.outputCostPerToken, 0.000002);
+            const cost = calculateRequestCost({
+                promptTokens: 1_000,
+                completionTokens: 1_000,
+                cachedTokens: 0,
+                cacheCreationInputTokens: 0,
+                pricing,
+            });
+            assert.ok(cost.totalCost > 0, "a string rate must still price a request");
+        });
+
+        test("reads a string rate from the nested pricing object", () => {
+            const modelInfo = {
+                pricing: { inputCostPerToken: "0.000003", outputCostPerToken: "0.000004" },
+            } as unknown as LiteLLMModelInfo;
+
+            const pricing = extractPricing(modelInfo);
+
+            assert.strictEqual(pricing?.inputCostPerToken, 0.000003);
+            assert.strictEqual(pricing?.outputCostPerToken, 0.000004);
+        });
+
+        test("reads a tier whose rates the proxy reports as strings", () => {
+            const modelInfo = {
+                input_cost_per_token: 0.000001,
+                input_cost_per_token_above_200k_tokens: "0.000002",
+                output_cost_per_token_above_200k_tokens: "0.0000075",
+            } as unknown as LiteLLMModelInfo;
+
+            const pricing = extractPricing(modelInfo);
+
+            assert.deepStrictEqual(pricing?.tiers, [
+                {
+                    thresholdTokens: 200_000,
+                    inputCostPerToken: 0.000002,
+                    outputCostPerToken: 0.0000075,
+                },
+            ]);
+        });
+
+        for (const refused of ["", "  ", "abc", "0x10", "Infinity", "NaN", "1e400"]) {
+            test(`ignores the rate string ${JSON.stringify(refused)}`, () => {
+                const modelInfo = {
+                    input_cost_per_token: refused,
+                    output_cost_per_token: refused,
+                } as unknown as LiteLLMModelInfo;
+
+                assert.strictEqual(extractPricing(modelInfo), undefined);
+            });
+        }
+
+        test("still reads a numeric rate beside a refused string", () => {
+            const modelInfo = {
+                input_cost_per_token: "NaN",
+                output_cost_per_token: 0.000002,
+            } as unknown as LiteLLMModelInfo;
+
+            const pricing = extractPricing(modelInfo);
+
+            assert.strictEqual(pricing?.inputCostPerToken, undefined);
+            assert.strictEqual(pricing?.outputCostPerToken, 0.000002);
+        });
         test("reads a tier key written with a bare token count", () => {
             const modelInfo: LiteLLMModelInfo = {
                 input_cost_per_token_above_1000_tokens: 0.000002,

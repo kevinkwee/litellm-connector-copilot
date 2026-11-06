@@ -124,18 +124,16 @@ function tierFieldName(fieldName: string, label: string): string {
  * Reads every category's rate at one threshold.
  *
  * A tier exists only when the input-token key at that threshold carries a
- * numeric rate, which is the key LiteLLM selects the tier with. A category whose
+ * rate, which is the key LiteLLM selects the tier with. A category whose
  * tiered key is absent keeps its base rate.
  */
 function readTierRates(modelInfo: LiteLLMModelInfo, threshold: TierThreshold): PricingRates | undefined {
-    if (
-        extractNumericField(modelInfo, tierFieldName(PRICING_FIELDS.inputCostPerToken, threshold.label)) === undefined
-    ) {
+    if (readPricingField(modelInfo, tierFieldName(PRICING_FIELDS.inputCostPerToken, threshold.label)) === undefined) {
         return undefined;
     }
     const rates: Partial<Record<keyof PricingRates, number>> = {};
     for (const rateField of PRICING_RATE_FIELDS) {
-        const rate = extractNumericField(modelInfo, tierFieldName(PRICING_FIELDS[rateField], threshold.label));
+        const rate = readPricingField(modelInfo, tierFieldName(PRICING_FIELDS[rateField], threshold.label));
         if (rate !== undefined) {
             rates[rateField] = rate;
         }
@@ -159,12 +157,39 @@ function extractPricingTiers(modelInfo: LiteLLMModelInfo): readonly PricingTier[
     return tiers.sort((left, right) => left.thresholdTokens - right.thresholdTokens);
 }
 
-function extractNumericField(modelInfo: LiteLLMModelInfo, field: string): number | undefined {
-    const value = modelInfo[field as keyof LiteLLMModelInfo];
-    if (value === null || value === undefined) {
+/**
+ * A decimal or exponent literal, which is the only shape a numeric string may take.
+ * Hex, `Infinity`, `NaN`, and an empty string fail it. A value that overflows to
+ * infinity matches it and is refused after parsing, because no rate the proxy meant
+ * can be infinite.
+ */
+const DECIMAL_LITERAL = /^[+-]?(\d+(\.\d*)?|\.\d+)(e[+-]?\d+)?$/i;
+
+/**
+ * Reads a numeric pricing value.
+ *
+ * A rate may arrive as a string rather than a number, so both spellings are read. A
+ * finite number is used as-is; a string is accepted only when it is a plain decimal
+ * literal.
+ */
+function toFiniteNumber(value: unknown): number | undefined {
+    if (typeof value === "number") {
+        return Number.isFinite(value) ? value : undefined;
+    }
+    if (typeof value !== "string") {
         return undefined;
     }
-    return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+    const trimmed = value.trim();
+    if (!DECIMAL_LITERAL.test(trimmed)) {
+        return undefined;
+    }
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/** Reads one pricing field from the model info, tolerating a string rate. */
+function readPricingField(modelInfo: LiteLLMModelInfo, field: string): number | undefined {
+    return toFiniteNumber(modelInfo[field as keyof LiteLLMModelInfo]);
 }
 
 export function extractPricing(modelInfo: LiteLLMModelInfo | undefined): ModelPricing | undefined {
@@ -176,26 +201,20 @@ export function extractPricing(modelInfo: LiteLLMModelInfo | undefined): ModelPr
 
     const basePricing: ModelPricing = {
         inputCostPerToken:
-            extractNumericField(modelInfo, PRICING_FIELDS.inputCostPerToken) ??
-            (typeof nestedPricing?.inputCostPerToken === "number" ? nestedPricing.inputCostPerToken : undefined),
+            readPricingField(modelInfo, PRICING_FIELDS.inputCostPerToken) ??
+            toFiniteNumber(nestedPricing?.inputCostPerToken),
         outputCostPerToken:
-            extractNumericField(modelInfo, PRICING_FIELDS.outputCostPerToken) ??
-            (typeof nestedPricing?.outputCostPerToken === "number" ? nestedPricing.outputCostPerToken : undefined),
+            readPricingField(modelInfo, PRICING_FIELDS.outputCostPerToken) ??
+            toFiniteNumber(nestedPricing?.outputCostPerToken),
         cacheReadCostPerToken:
-            extractNumericField(modelInfo, PRICING_FIELDS.cacheReadCostPerToken) ??
-            (typeof nestedPricing?.cacheReadCostPerToken === "number"
-                ? nestedPricing.cacheReadCostPerToken
-                : undefined),
+            readPricingField(modelInfo, PRICING_FIELDS.cacheReadCostPerToken) ??
+            toFiniteNumber(nestedPricing?.cacheReadCostPerToken),
         cacheCreationCostPerToken:
-            extractNumericField(modelInfo, PRICING_FIELDS.cacheCreationCostPerToken) ??
-            (typeof nestedPricing?.cacheCreationCostPerToken === "number"
-                ? nestedPricing.cacheCreationCostPerToken
-                : undefined),
+            readPricingField(modelInfo, PRICING_FIELDS.cacheCreationCostPerToken) ??
+            toFiniteNumber(nestedPricing?.cacheCreationCostPerToken),
         cacheCreation1hCostPerToken:
-            extractNumericField(modelInfo, PRICING_FIELDS.cacheCreation1hCostPerToken) ??
-            (typeof nestedPricing?.cacheCreation1hCostPerToken === "number"
-                ? nestedPricing.cacheCreation1hCostPerToken
-                : undefined),
+            readPricingField(modelInfo, PRICING_FIELDS.cacheCreation1hCostPerToken) ??
+            toFiniteNumber(nestedPricing?.cacheCreation1hCostPerToken),
     };
 
     const tiers = extractPricingTiers(modelInfo);
