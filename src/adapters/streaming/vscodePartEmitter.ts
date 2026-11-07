@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { Logger } from "../../utils/logger";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import { TOOL_ARGS_PREVIEW_MAX_CHARS } from "./liteLLMStreamInterpreter";
-import type { EmittedPart } from "./liteLLMStreamInterpreter";
+import type { EmittedPart } from "./streamingState";
 import type { DroppedToolCall } from "../../types";
 
 /**

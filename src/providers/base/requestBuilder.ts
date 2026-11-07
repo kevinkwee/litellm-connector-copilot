@@ -73,8 +73,11 @@ export class RequestBuilder {
                 typeof mo.max_tokens === "number"
                     ? Math.min(mo.max_tokens, model.maxOutputTokens)
                     : model.maxOutputTokens,
-            ...(this.isParameterSupported("reasoning_effort", modelInfo, rawModelId) &&
-            this.modelAcceptsReasoningEffort(model.id, modelInfo, reasoningEffort)
+            // The picker offers exactly `getSupportedReasoningEfforts`, so that list is
+            // the gate. `supported_openai_params` is not consulted: it reports the
+            // provider's own knobs, while a model config that declares effort flags is
+            // stating the levels this deployment accepts.
+            ...(this.modelAcceptsReasoningEffort(model.id, modelInfo, reasoningEffort)
                 ? { reasoning_effort: reasoningEffort }
                 : {}),
         };

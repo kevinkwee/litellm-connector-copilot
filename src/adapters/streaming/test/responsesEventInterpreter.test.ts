@@ -1,5 +1,6 @@
 import * as assert from "assert";
-import { interpretStreamEvent, createInitialStreamingState, hasBufferedToolCalls } from "../liteLLMStreamInterpreter";
+import { interpretStreamEvent, hasBufferedToolCalls } from "../liteLLMStreamInterpreter";
+import { createInitialStreamingState } from "../streamingState";
 
 declare const suite: (name: string, fn: () => void) => void;
 declare const test: (name: string, fn: () => void) => void;
@@ -30,6 +31,44 @@ suite("Anthropic prompt-cache usage parsing", () => {
         };
         assert.strictEqual(usage.prompt_tokens_details?.cached_tokens, 60);
         assert.strictEqual(usage.prompt_tokens_details?.cache_creation_input_tokens, 40);
+    });
+});
+
+suite("/responses reasoning", () => {
+    test("emits a thinking part for a reasoning summary delta", () => {
+        const state = createInitialStreamingState();
+
+        const parts = interpretStreamEvent(
+            { type: "response.reasoning_summary_text.delta", delta: "weighing options" },
+            state
+        );
+
+        const thinking = parts.find((part) => part.type === "thinking");
+        assert.ok(thinking, "reasoning must reach VS Code as a thinking part");
+        if (thinking?.type === "thinking") {
+            assert.strictEqual(thinking.value, "weighing options");
+            assert.strictEqual(thinking.id, "litellm-thinking-1");
+        }
+    });
+
+    test("keeps consecutive reasoning deltas in one block", () => {
+        const state = createInitialStreamingState();
+
+        const first = interpretStreamEvent({ type: "response.reasoning_summary_text.delta", delta: "one " }, state);
+        const second = interpretStreamEvent({ type: "response.reasoning_text.delta", delta: "two" }, state);
+
+        const firstPart = first.find((part) => part.type === "thinking");
+        const secondPart = second.find((part) => part.type === "thinking");
+        assert.ok(firstPart?.type === "thinking" && secondPart?.type === "thinking");
+        assert.strictEqual(secondPart.id, firstPart.id, "one reply's reasoning stays in one part");
+    });
+
+    test("ignores a reasoning delta with no text", () => {
+        const state = createInitialStreamingState();
+
+        const parts = interpretStreamEvent({ type: "response.reasoning_summary_text.delta", delta: "" }, state);
+
+        assert.strictEqual(parts.length, 0);
     });
 });
 

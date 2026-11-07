@@ -7,6 +7,7 @@ import { LiteLLMApiError, LiteLLMClient } from "../../adapters/litellmClient";
 import type { OpenAIChatCompletionRequest } from "../../types";
 import { ActiveRequestRegistry, type ActiveRequestPhase } from "../activeRequests";
 import { CopilotMdManager, type CopilotMdEntry } from "../../observability";
+import { StructuredLogger } from "../../observability/structuredLogger";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
 import { collectResponseText, TEST_USER_AGENT } from "../../test/utils/testMocks";
 import {
@@ -182,9 +183,12 @@ suite("LiteLLM Chat Provider Cancellation", () => {
      * cancels it from the connector while the provider sits in its backoff. Only a
      * cancellation that reaches that sleep can end the turn inside 500 ms.
      */
-    async function runBackoffCancelledRequest(
-        attemptBehaviour: () => ReadableStream<Uint8Array>
-    ): Promise<{ reported: vscode.LanguageModelResponsePart[]; chatCalls: number }> {
+    async function runBackoffCancelledRequest(attemptBehaviour: () => ReadableStream<Uint8Array>): Promise<{
+        reported: vscode.LanguageModelResponsePart[];
+        chatCalls: number;
+        exportStub: sinon.SinonStub;
+        metricStub: sinon.SinonStub;
+    }> {
         const registry = new ActiveRequestRegistry();
         const provider = new LiteLLMChatProvider(userAgent, registry);
         const providerWithConfig = provider as unknown as {
@@ -200,7 +204,17 @@ suite("LiteLLM Chat Provider Cancellation", () => {
         });
         seedDiscoveredBackend(sandbox, provider, "model-1");
         const reported: vscode.LanguageModelResponsePart[] = [];
+        const exportStub = sandbox.stub(CopilotMdManager.instance, "exportEntry").resolves(undefined);
+        const metricStub = sandbox.stub(LiteLLMTelemetry, "reportMetric");
         let chatCalls = 0;
+        // The retry decision is logged immediately before the sleep, so waiting for it
+        // arms the cancel without depending on a fixed delay.
+        let retryDecided = false;
+        sandbox.stub(StructuredLogger, "warn").callsFake((event: string) => {
+            if (event === "request.transport_retry" || event === "request.reasoning_only_retry") {
+                retryDecided = true;
+            }
+        });
         sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async () => {
             chatCalls += 1;
             return attemptBehaviour();
@@ -209,10 +223,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
         const host = new vscode.CancellationTokenSource();
         const request = runChatRequest(provider, reported, host.token).catch(() => undefined);
         try {
-            await waitFor(() => chatCalls === 1, "the first attempt was never sent");
-            // The cancel has to land once the backoff is armed. Cancelling before it
-            // starts would end the turn without ever exercising the sleep.
-            await new Promise((resolve) => setTimeout(resolve, 50));
+            await waitFor(() => retryDecided, "the retry decision was never logged");
             const [entry] = registry.list();
             assert.ok(entry, "a request waiting to retry must still be listed");
             entry.cancel();
@@ -223,7 +234,7 @@ suite("LiteLLM Chat Provider Cancellation", () => {
             host.dispose();
         }
 
-        return { reported, chatCalls };
+        return { reported, chatCalls, exportStub, metricStub };
     }
 
     test("ends the transport backoff at once when the connector cancels", async () => {
@@ -258,6 +269,62 @@ suite("LiteLLM Chat Provider Cancellation", () => {
         );
 
         assert.match(collectResponseText(reported), /cancelled from the LiteLLM connector/i);
+    });
+
+    test("writes the attempt a backoff cancel replaced to the transcript", async () => {
+        // The reset that folds a replaced attempt into the request totals runs at the
+        // top of the next attempt, so a cancel during the sleep leaves that attempt as
+        // the last one instead of clearing it into an estimate for a retry never made.
+        const encoder = new TextEncoder();
+        const { exportStub } = await runBackoffCancelledRequest(
+            () =>
+                new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+                        controller.enqueue(
+                            encoder.encode(
+                                'data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":100,"completion_tokens":10}}\n\n'
+                            )
+                        );
+                    },
+                    pull(controller) {
+                        controller.error(new TypeError("terminated"));
+                    },
+                })
+        );
+
+        const transcript = transcriptOf(exportStub);
+        assert.deepStrictEqual(
+            { prompt: transcript.usage.promptTokens, output: transcript.usage.outputTokens },
+            { prompt: 100, output: 10 }
+        );
+    });
+
+    test("the cancelled metric reports the prompt of the attempt that ran", async () => {
+        // The metric reads the same snapshot the transcript does, so a cancel during
+        // the sleep cannot report an attempt that never ran.
+        const encoder = new TextEncoder();
+        const { metricStub } = await runBackoffCancelledRequest(
+            () =>
+                new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.enqueue(
+                            encoder.encode(
+                                'data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":100,"completion_tokens":10}}\n\n'
+                            )
+                        );
+                    },
+                    pull(controller) {
+                        controller.error(new TypeError("terminated"));
+                    },
+                })
+        );
+
+        const cancelledMetric = metricStub
+            .getCalls()
+            .map((call) => call.args[0] as { status?: string; tokensIn?: number })
+            .find((metric) => metric.status === "cancelled");
+        assert.strictEqual(cancelledMetric?.tokensIn, 100);
     });
 
     test("cancels a request that is still waiting for response headers", async () => {

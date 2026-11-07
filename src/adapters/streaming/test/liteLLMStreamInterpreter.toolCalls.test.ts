@@ -1,11 +1,7 @@
 import * as assert from "assert";
 import * as sinon from "sinon";
-import {
-    interpretStreamEvent,
-    createInitialStreamingState,
-    flushPendingBuffers,
-    hasBufferedToolCalls,
-} from "../liteLLMStreamInterpreter";
+import { interpretStreamEvent, flushPendingBuffers, hasBufferedToolCalls } from "../liteLLMStreamInterpreter";
+import { createInitialStreamingState } from "../streamingState";
 import { StructuredLogger } from "../../../observability/structuredLogger";
 import { Logger } from "../../../utils/logger";
 
@@ -402,16 +398,16 @@ suite("Tool Call Args Corruption Logging", () => {
 
     test("tags a malformed /responses call skipped by recovery with its request id", () => {
         const state = createInitialStreamingState("req-responses");
-        const errorStub = sandbox.stub(StructuredLogger, "error");
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
         state.responseToolCallBuffers.set("call-bad", { id: "call-bad", name: "search", args: "{invalid" });
         state.responseToolCallOrder = ["call-bad"];
 
         flushPendingBuffers(state);
 
         assert.deepStrictEqual(
-            errorStub
+            warnStub
                 .getCalls()
-                .filter((call) => call.args[0] === "stream.tool_call_args_invalid_json")
+                .filter((call) => call.args[0] === "stream.responses_tool_call_buffer_dropped")
                 .map((call) => (call.args[1] as Record<string, unknown>).requestId),
             ["req-responses"]
         );
@@ -685,7 +681,11 @@ suite("Tool call drops", () => {
             state
         );
 
-        assert.deepStrictEqual(state.droppedToolCalls, [{ id: "anonymous", name: "search_files" }]);
+        assert.deepStrictEqual(
+            state.droppedToolCalls,
+            [{ id: "anonymous_req-anon-done", name: "search_files" }],
+            "the record carries the request-scoped id"
+        );
     });
 
     test("records every /responses call dropped while flushing buffers", () => {
@@ -699,7 +699,10 @@ suite("Tool call drops", () => {
         const parts = flushPendingBuffers(state);
 
         assert.strictEqual(parts.filter((part) => part.type === "tool_call").length, 0);
-        assert.deepStrictEqual(state.droppedToolCalls.map((call) => call.name).sort(), ["read_file", "search_files"]);
+        assert.deepStrictEqual(state.droppedToolCalls, [
+            { id: "call-keyed", name: "read_file" },
+            { id: "anonymous_req-flush", name: "search_files" },
+        ]);
     });
 
     test("records a chat call dropped for unparseable arguments", () => {
@@ -734,6 +737,126 @@ suite("Tool call drops", () => {
             state.droppedToolCalls.map((call) => call.name),
             ["read_file"],
             "the dropped call is recorded so the turn can explain it"
+        );
+    });
+});
+
+suite("/responses incomplete tool calls", () => {
+    const DROPPED_EVENT = "stream.responses_tool_call_buffer_dropped";
+    const REQUEST_ID = "req-incomplete";
+    let sandbox: sinon.SinonSandbox;
+
+    setup(() => {
+        sandbox = sinon.createSandbox();
+    });
+
+    teardown(() => {
+        sandbox.restore();
+    });
+
+    function droppedEventFields(warnStub: sinon.SinonStub): Record<string, unknown>[] {
+        return warnStub
+            .getCalls()
+            .filter((call) => call.args[0] === DROPPED_EVENT)
+            .map((call) => call.args[1] as Record<string, unknown>);
+    }
+
+    test("logs a keyed /responses call with no name without recording a drop", () => {
+        // The model never named the call, so no notice may claim a tool did not run.
+        const state = createInitialStreamingState(REQUEST_ID);
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+
+        interpretStreamEvent(
+            {
+                type: "response.output_item.done",
+                item: { type: "function_call", call_id: "call-noname", arguments: '{"q":1}' },
+            },
+            state
+        );
+
+        assert.deepStrictEqual(
+            droppedEventFields(warnStub).map((fields) => fields.reason),
+            ["incomplete"]
+        );
+        assert.deepStrictEqual(state.droppedToolCalls, []);
+    });
+
+    test("logs a keyed /responses call with no arguments without recording a drop", () => {
+        // A call whose arguments never arrived was cut off, which the stream reader
+        // judges from the finish, so it is not reported as a tool that failed to run.
+        const state = createInitialStreamingState(REQUEST_ID);
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        interpretStreamEvent(
+            {
+                type: "response.output_item.delta",
+                item: { type: "function_call", call_id: "call-noargs", name: "search_files" },
+            },
+            state
+        );
+
+        interpretStreamEvent({ type: "response.completed", response: {} }, state);
+
+        assert.deepStrictEqual(
+            droppedEventFields(warnStub).map((fields) => fields.reason),
+            ["incomplete"]
+        );
+        assert.deepStrictEqual(state.droppedToolCalls, []);
+    });
+
+    test("logs an incomplete anonymous /responses call at stream end without recording it", () => {
+        const state = createInitialStreamingState(REQUEST_ID);
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        state.anonymousResponseToolName = "search_files";
+
+        flushPendingBuffers(state);
+
+        assert.deepStrictEqual(
+            droppedEventFields(warnStub).map((fields) => fields.reason),
+            ["incomplete"]
+        );
+        assert.deepStrictEqual(state.droppedToolCalls, []);
+    });
+
+    test("logs an incomplete anonymous /responses call on output_item.done without recording it", () => {
+        const state = createInitialStreamingState(REQUEST_ID);
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+
+        interpretStreamEvent(
+            { type: "response.output_item.done", item: { type: "function_call", name: "search_files" } },
+            state
+        );
+
+        assert.deepStrictEqual(
+            droppedEventFields(warnStub).map((fields) => fields.reason),
+            ["incomplete"]
+        );
+        assert.deepStrictEqual(state.droppedToolCalls, []);
+    });
+
+    test("logs nothing for an empty anonymous buffer at stream end", () => {
+        // A recovery with no anonymous call buffered must not report a drop for a call
+        // that never existed.
+        const state = createInitialStreamingState(REQUEST_ID);
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+
+        flushPendingBuffers(state);
+
+        assert.deepStrictEqual(droppedEventFields(warnStub), []);
+    });
+
+    test("logs a malformed anonymous /responses call under the shared drop event", () => {
+        // One event name covers the keyed and anonymous shapes, so a support reader
+        // finds every dropped call under the same key.
+        const state = createInitialStreamingState(REQUEST_ID);
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+        state.anonymousResponseToolName = "search_files";
+        state.anonymousResponseToolArgs = "{not json";
+
+        flushPendingBuffers(state);
+
+        assert.deepStrictEqual(
+            droppedEventFields(warnStub).map((fields) => fields.reason),
+            ["invalid_json_args"]
         );
     });
 });

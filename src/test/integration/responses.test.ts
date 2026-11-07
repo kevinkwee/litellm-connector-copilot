@@ -1,5 +1,6 @@
 import * as assert from "assert";
-import { interpretStreamEvent, createInitialStreamingState } from "../../adapters/streaming/liteLLMStreamInterpreter";
+import { interpretStreamEvent } from "../../adapters/streaming/liteLLMStreamInterpreter";
+import { createInitialStreamingState } from "../../adapters/streaming/streamingState";
 
 suite("Responses /responses stream interpreter integration", () => {
     test("should handle output_item.delta → output_item.done tool call sequence", () => {

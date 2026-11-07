@@ -185,8 +185,8 @@ export async function* decodeSSE(
             const isEmptyStream = payloadCount === 0;
 
             if (bufferHasIncompletData) {
-                Logger.error("[decodeSSE] Stream ended with incomplete data in buffer");
-                StructuredLogger.error("stream.ended_without_done_incomplete_buffer", {
+                Logger.debug("[decodeSSE] Stream ended with incomplete data in buffer");
+                StructuredLogger.debug("stream.ended_without_done_incomplete_buffer", {
                     chunkCount,
                     payloadCount,
                     bufferLength: buffer.length,
@@ -199,8 +199,8 @@ export async function* decodeSSE(
                     );
                 }
             } else if (isEmptyStream) {
-                Logger.error("[decodeSSE] Stream ended without any payloads or [DONE] marker");
-                StructuredLogger.error("stream.ended_without_done_empty_stream", {
+                Logger.debug("[decodeSSE] Stream ended without any payloads or [DONE] marker");
+                StructuredLogger.debug("stream.ended_without_done_empty_stream", {
                     chunkCount,
                     payloadCount: 0,
                     note: "Stream ended without receiving any data",

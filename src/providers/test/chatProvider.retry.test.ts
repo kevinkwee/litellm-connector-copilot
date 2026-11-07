@@ -6,6 +6,7 @@ import { LiteLLMChatProvider } from "../";
 import { LiteLLMClient } from "../../adapters/litellmClient";
 import type { OpenAIChatCompletionRequest } from "../../types";
 import { StructuredLogger } from "../../observability/structuredLogger";
+import { LiteLLMTelemetry } from "../../utils/telemetry";
 import { TEST_USER_AGENT } from "../../test/utils/testMocks";
 import {
     findErrorTextPart,
@@ -13,6 +14,38 @@ import {
     seedDiscoveredBackend,
     UUID_PATTERN,
 } from "../../test/utils/chatProviderTestUtils";
+
+/** A body that emits text and a usage frame, then dies of a dropped socket. */
+function dyingStreamAfterUsage(promptTokens: number, completionTokens: number): ReadableStream<Uint8Array> {
+    const encoder = new TextEncoder();
+    return new ReadableStream<Uint8Array>({
+        start(controller) {
+            controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"par"}}]}\n\n'));
+            controller.enqueue(
+                encoder.encode(
+                    `data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":${promptTokens},"completion_tokens":${completionTokens}}}\n\n`
+                )
+            );
+        },
+        pull(controller) {
+            controller.error(new TypeError("terminated"));
+        },
+    });
+}
+
+/** One SSE body carrying `events` as `data:` frames, then the terminator. */
+function sseStream(events: readonly object[]): ReadableStream<Uint8Array> {
+    const encoder = new TextEncoder();
+    return new ReadableStream<Uint8Array>({
+        start(controller) {
+            for (const event of events) {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            }
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+        },
+    });
+}
 
 suite("LiteLLM Chat Provider Retry", () => {
     let sandbox: sinon.SinonSandbox;
@@ -297,6 +330,52 @@ suite("LiteLLM Chat Provider Retry", () => {
         assert.strictEqual(second[2].content, "Continue");
     });
 
+    test("a /responses reasoning-only retry resends the request unchanged", async () => {
+        // That endpoint has no field for `reasoning_content`, so a resume would append
+        // a "Continue" with nothing before it. The attempt is resent as it was.
+        const provider = new LiteLLMChatProvider(userAgent);
+        const providerConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+            _registry: { getModelInfo: (id: string) => unknown };
+        };
+        sandbox.stub(providerConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            emptyResponseRetries: 2,
+            emptyResponseRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        sandbox.stub(providerConfig._registry, "getModelInfo").returns({ mode: "responses" });
+
+        const sentRequests: OpenAIChatCompletionRequest[] = [];
+        const chatStub = sandbox.stub(LiteLLMClient.prototype, "chat");
+        chatStub.onFirstCall().callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sentRequests.push(request);
+            return sseStream([
+                { type: "response.reasoning_summary_text.delta", delta: "thinking hard" },
+                { type: "response.incomplete", response: { incomplete_details: { reason: "max_output_tokens" } } },
+            ]);
+        });
+        chatStub.onSecondCall().callsFake(async (request: OpenAIChatCompletionRequest) => {
+            sentRequests.push(request);
+            return sseStream([
+                { type: "response.output_text.delta", delta: "Answer." },
+                { type: "response.completed", response: { status: "completed" } },
+            ]);
+        });
+
+        await runChatRequest(provider, []);
+
+        assert.strictEqual(sentRequests.length, 2, "Expected two HTTP attempts");
+        assert.deepStrictEqual(
+            sentRequests[1].messages,
+            sentRequests[0].messages,
+            "the retry carries no assistant turn and no Continue nudge"
+        );
+    });
+
     test("a blocked retry is recorded as a decision, not as a second failure", async () => {
         const errorStub = sandbox.stub(StructuredLogger, "error");
         const infoStub = sandbox.stub(StructuredLogger, "info");
@@ -415,6 +494,34 @@ suite("LiteLLM Chat Provider Retry", () => {
         const exhaustedErrorText = findErrorTextPart(reported);
         assert.ok(exhaustedErrorText, "exhausted transport retries must surface as an error text part");
         assert.match(exhaustedErrorText, /terminated/);
+    });
+
+    test("a failed retried turn reports the prompt of every attempt in its metric", async () => {
+        // The proxy billed both attempts, so the failure metric reports their sum
+        // rather than the last attempt's prompt.
+        const metricStub = sandbox.stub(LiteLLMTelemetry, "reportMetric");
+        const provider = new LiteLLMChatProvider(userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 1,
+            networkRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const chatStub = sandbox.stub(LiteLLMClient.prototype, "chat");
+        chatStub.onFirstCall().callsFake(async () => dyingStreamAfterUsage(100, 10));
+        chatStub.onSecondCall().callsFake(async () => dyingStreamAfterUsage(120, 20));
+
+        await runChatRequest(provider, []);
+
+        const failedMetric = metricStub
+            .getCalls()
+            .map((call) => call.args[0] as { status?: string; tokensIn?: number })
+            .find((metric) => metric.status === "failure");
+        assert.strictEqual(failedMetric?.tokensIn, 220);
     });
 
     test("transport retry resends the unchanged request when the attempt produced nothing", async () => {

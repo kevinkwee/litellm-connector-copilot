@@ -166,6 +166,23 @@ suite("RequestBuilder", () => {
             assert.strictEqual(request.reasoning_effort, "high");
         });
 
+        test("sends the effort when the model declares the level, though its parameter list omits it", async () => {
+            // The picker offers the level from the declaration alone, so the request
+            // must carry it even when `supported_openai_params` does not list it. A
+            // deployment whose proxy still refuses it answers with guidance, which is
+            // the documented outcome of a wrong declaration.
+            configManager.getConfig.resolves({});
+            const modelInfo = {
+                supports_reasoning: true,
+                supports_high_reasoning_effort: true,
+                supported_openai_params: ["stream", "tools"],
+            } as unknown as LiteLLMModelInfo;
+
+            const request = await buildWithEffort(modelInfo, "high");
+
+            assert.strictEqual(request.reasoning_effort, "high");
+        });
+
         test("drops a saved effort the model no longer offers", async () => {
             // VS Code merges a previously picked level into every request without
             // re-checking the schema, and hides the control once the model offers

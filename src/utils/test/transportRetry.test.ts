@@ -11,6 +11,7 @@ import {
     isTransportRetriableError,
     backoffDelayMs,
     buildResumeMessages,
+    selectResumableContent,
     sleepWithCancellation,
 } from "../transportRetry";
 
@@ -174,21 +175,53 @@ suite("Transport Retry Utilities", () => {
         const accumulator = new StreamedTextAccumulator();
         const usagePart = new vscode.LanguageModelDataPart(new TextEncoder().encode("{}"), "usage");
         accumulator.add(usagePart);
-        assert.strictEqual(accumulator.hasResumableOutput, false, "data parts must not affect resume content");
+        assert.strictEqual(
+            selectResumableContent(accumulator, { canReplayReasoning: true }),
+            undefined,
+            "data parts must not affect resume content"
+        );
     });
 
-    test("hasResumableOutput treats whitespace-only text and reasoning as nothing", () => {
+    test("selectResumableContent treats whitespace-only text and reasoning as nothing", () => {
         // Leading and trailing whitespace is trimmed, so blank output counts as
         // nothing to continue.
         const accumulator = new StreamedTextAccumulator();
         accumulator.add(new vscode.LanguageModelTextPart("\n\n"));
-        assert.strictEqual(accumulator.hasResumableOutput, false);
+        assert.strictEqual(selectResumableContent(accumulator, { canReplayReasoning: true }), undefined);
 
         accumulator.add(thinkingPart("   "));
-        assert.strictEqual(accumulator.hasResumableOutput, false);
+        assert.strictEqual(selectResumableContent(accumulator, { canReplayReasoning: true }), undefined);
 
         accumulator.add(new vscode.LanguageModelTextPart("answer"));
-        assert.strictEqual(accumulator.hasResumableOutput, true);
+        assert.deepStrictEqual(selectResumableContent(accumulator, { canReplayReasoning: true }), {
+            text: "\n\nanswer",
+            thinking: "   ",
+        });
+    });
+
+    test("selectResumableContent drops reasoning an endpoint cannot replay", () => {
+        // `/responses` has no field for `reasoning_content`, so a reasoning-only
+        // attempt has nothing a resume could carry and is resent unchanged rather
+        // than answered with a bare "Continue" nudge.
+        const accumulator = new StreamedTextAccumulator();
+        accumulator.add(thinkingPart("partial reasoning"));
+
+        assert.strictEqual(selectResumableContent(accumulator, { canReplayReasoning: false }), undefined);
+        assert.deepStrictEqual(selectResumableContent(accumulator, { canReplayReasoning: true }), {
+            text: "",
+            thinking: "partial reasoning",
+        });
+    });
+
+    test("selectResumableContent keeps text on an endpoint that cannot replay reasoning", () => {
+        const accumulator = new StreamedTextAccumulator();
+        accumulator.add(new vscode.LanguageModelTextPart("partial answer"));
+        accumulator.add(thinkingPart("partial reasoning"));
+
+        assert.deepStrictEqual(selectResumableContent(accumulator, { canReplayReasoning: false }), {
+            text: "partial answer",
+            thinking: "",
+        });
     });
 
     test("buildResumeMessages appends one assistant turn with text and reasoning", () => {

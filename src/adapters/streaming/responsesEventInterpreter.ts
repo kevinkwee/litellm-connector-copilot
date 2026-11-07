@@ -2,39 +2,21 @@
  * The `/responses` half of the stream interpreter: its event shapes, its tool-call
  * flush, and the dispatch the interpreter hands a `/responses` frame to.
  *
- * The chat-completions handling and the buffered state live in
- * `liteLLMStreamInterpreter.ts`. The two state types come from there as type-only
- * imports, erased at compile time, so the runtime dependency runs one way.
+ * The chat-completions handling lives in `liteLLMStreamInterpreter.ts`. The state types
+ * and the helpers both halves use come from `streamingState.ts`.
  */
 
 import { StructuredLogger } from "../../observability/structuredLogger";
 import { Logger } from "../../utils/logger";
-import { sanitizeToolName } from "../../utils/toolNameUtils";
-import type { EmittedPart, StreamingState } from "./liteLLMStreamInterpreter";
 import { normalizeUsagePayload, type RawUsagePayload } from "./usagePayload";
-
-/**
- * Translates a tool name the model sent into the name VS Code declared for it.
- *
- * The request advertised sanitized, deduplicated names, so the model's call
- * carries a wire name. A model-invented or mangled name is normalized again so
- * it stays wire-safe, and the per-request map then recovers the declared
- * spelling.
- */
-export function resolveToolCallName(state: StreamingState, modelName: string): string {
-    if (modelName.length === 0) {
-        // A call that never carried a name cannot be executed, and
-        // `sanitizeToolName("")` would invent the placeholder "tool", which the
-        // agent loop would then try to run. Settlement drops an unnamed buffer.
-        return "";
-    }
-    const wireName = sanitizeToolName(modelName);
-    return state.wireToDeclaredNames?.get(wireName) ?? wireName;
-}
-
-export function requestTag(state: StreamingState): string {
-    return `request=${state.requestId ?? "unknown"}`;
-}
+import {
+    formatAnonymousToolCallRecordId,
+    ensureCurrentThinkingBlockId,
+    requestTag,
+    resolveToolCallName,
+    type EmittedPart,
+    type StreamingState,
+} from "./streamingState";
 
 /**
  * `/responses` usage object. LiteLLM reports the counters as `input_tokens` and
@@ -88,42 +70,81 @@ function toRawUsage(usage: ResponsesStreamUsage): RawUsagePayload {
 }
 
 /**
- * Delivers each keyed `/responses` tool call that has a name and valid JSON
- * arguments, and drops the rest. Settles the buffers so a later frame cannot
- * emit the same call twice.
+ * Logs a `/responses` tool call the interpreter cannot deliver. The caller owns the
+ * record on `droppedToolCalls`.
  */
-function flushResponsesToolCalls(state: StreamingState, toolCallParts: EmittedPart[]): number {
+function logDroppedResponsesToolCall(
+    state: StreamingState,
+    reason: "incomplete" | "invalid_json_args",
+    call: { readonly id: string | undefined; readonly toolName: string | undefined; readonly argsLength: number }
+): void {
+    Logger.warn(`[responsesStream] ${requestTag(state)} Dropped /responses tool call (${reason})`);
+    StructuredLogger.warn("stream.responses_tool_call_buffer_dropped", {
+        requestId: state.requestId,
+        reason,
+        toolName: call.toolName,
+        id: call.id,
+        argsLength: call.argsLength,
+    });
+}
+
+/**
+ * The call a `/responses` buffer can deliver, or `undefined` when it cannot.
+ *
+ * A call missing its name or its arguments was never fully declared, so it is only
+ * logged and no notice names it. One whose arguments do not parse cannot run, so it is
+ * logged and recorded as a tool that did not run.
+ */
+export function acceptResponsesToolCall(
+    state: StreamingState,
+    call: { readonly id: string; readonly name?: string; readonly args?: string }
+): { readonly id: string; readonly name: string; readonly args: string } | undefined {
+    if (!call.name || !call.args) {
+        logDroppedResponsesToolCall(state, "incomplete", {
+            id: call.id,
+            toolName: call.name,
+            argsLength: call.args?.length ?? 0,
+        });
+        return undefined;
+    }
+    try {
+        JSON.parse(call.args);
+    } catch {
+        logDroppedResponsesToolCall(state, "invalid_json_args", {
+            id: call.id,
+            toolName: call.name,
+            argsLength: call.args.length,
+        });
+        state.droppedToolCalls.push({ id: call.id, name: call.name });
+        return undefined;
+    }
+    return { id: call.id, name: call.name, args: call.args };
+}
+
+/**
+ * Delivers each keyed `/responses` tool call {@link acceptResponsesToolCall} accepts,
+ * and settles the buffers so a later frame cannot emit the same call twice.
+ */
+export function flushResponsesToolCalls(state: StreamingState, toolCallParts: EmittedPart[]): number {
     let flushedToolCallCount = 0;
     for (const id of state.responseToolCallOrder) {
         const buffer = state.responseToolCallBuffers.get(id);
         if (!buffer) {
             continue;
         }
-        if (buffer.name && buffer.args) {
-            try {
-                JSON.parse(buffer.args);
-                Logger.trace(`[interpretStreamEvent] Flushing /responses tool call: ${buffer.name} (id: ${buffer.id})`);
-                toolCallParts.push({
-                    type: "tool_call",
-                    index: toolCallParts.length,
-                    id: buffer.id,
-                    name: buffer.name,
-                    args: buffer.args,
-                });
-                flushedToolCallCount++;
-            } catch {
-                Logger.warn(
-                    `[interpretStreamEvent] ${requestTag(state)} Dropped malformed tool call args for ${buffer.name}`
-                );
-                StructuredLogger.warn("stream.responses_tool_call_buffer_dropped", {
-                    requestId: state.requestId,
-                    toolName: buffer.name,
-                    id: buffer.id,
-                    argsLength: buffer.args.length,
-                });
-                state.droppedToolCalls.push({ id: buffer.id, name: buffer.name });
-            }
+        const accepted = acceptResponsesToolCall(state, buffer);
+        if (!accepted) {
+            continue;
         }
+        Logger.trace(`[interpretStreamEvent] Flushing /responses tool call: ${accepted.name} (id: ${accepted.id})`);
+        toolCallParts.push({
+            type: "tool_call",
+            index: toolCallParts.length,
+            id: accepted.id,
+            name: accepted.name,
+            args: accepted.args,
+        });
+        flushedToolCallCount++;
     }
     state.responseToolCallBuffers.clear();
     state.responseToolCallOrder = [];
@@ -170,6 +191,7 @@ export function interpretResponsesEvent(
     data: Record<string, unknown>,
     state: StreamingState,
     parts: {
+        readonly thinking: EmittedPart[];
         readonly text: EmittedPart[];
         readonly toolCalls: EmittedPart[];
         readonly data: EmittedPart[];
@@ -177,6 +199,16 @@ export function interpretResponsesEvent(
         readonly finish: EmittedPart[];
     }
 ): void {
+    // The chat-to-Responses bridge reports reasoning as a summary delta, and the
+    // provider's own text form can arrive too. Both are the model thinking, so they
+    // share one block id per reply, which keeps that reply's reasoning in one part.
+    if (
+        (data.type === "response.reasoning_summary_text.delta" || data.type === "response.reasoning_text.delta") &&
+        typeof data.delta === "string" &&
+        data.delta.length > 0
+    ) {
+        parts.thinking.push({ type: "thinking", value: data.delta, id: ensureCurrentThinkingBlockId(state) });
+    }
     if (data.type === "response.output_text.delta" && typeof data.delta === "string") {
         Logger.trace(`[interpretStreamEvent] Emitting /responses text delta: ${data.delta.length} chars`);
         parts.text.push({ type: "text", value: data.delta });
@@ -314,25 +346,20 @@ export function interpretResponsesEvent(
                 Logger.trace(
                     `[interpretStreamEvent] Flushing keyed tool call on output_item.done: ${name} (id: ${callId})`
                 );
-                if (name && args) {
-                    try {
-                        JSON.parse(args);
-                        parts.toolCalls.push({
-                            type: "tool_call",
-                            index: parts.toolCalls.length,
-                            id: callId,
-                            name,
-                            args,
-                        });
-                        StructuredLogger.trace("stream.responses_tool_call_done", {
-                            callId,
-                            name,
-                            argsLength: args.length,
-                        });
-                    } catch {
-                        Logger.warn(`[interpretStreamEvent] Dropped malformed tool call ${name} on output_item.done`);
-                        state.droppedToolCalls.push({ id: callId, name });
-                    }
+                const accepted = acceptResponsesToolCall(state, { id: callId, name, args });
+                if (accepted) {
+                    parts.toolCalls.push({
+                        type: "tool_call",
+                        index: parts.toolCalls.length,
+                        id: accepted.id,
+                        name: accepted.name,
+                        args: accepted.args,
+                    });
+                    StructuredLogger.trace("stream.responses_tool_call_done", {
+                        callId,
+                        name: accepted.name,
+                        argsLength: accepted.args.length,
+                    });
                 }
                 state.responseToolCallBuffers.delete(callId);
                 state.responseToolCallOrder = state.responseToolCallOrder.filter((id) => id !== callId);
@@ -342,24 +369,26 @@ export function interpretResponsesEvent(
                 const name = nameFromDone ? resolveToolCallName(state, nameFromDone) : state.anonymousResponseToolName;
                 const args = argsFromDone ?? state.anonymousResponseToolArgs;
                 Logger.trace(`[interpretStreamEvent] Flushing anonymous tool call on output_item.done: ${name}`);
-                if (name && args) {
-                    try {
-                        JSON.parse(args);
-                        parts.toolCalls.push({
-                            type: "tool_call",
-                            index: parts.toolCalls.length,
-                            id: "anonymous",
-                            name,
-                            args,
-                        });
-                        StructuredLogger.trace("stream.responses_anonymous_tool_done", {
-                            name,
-                            argsLength: args.length,
-                        });
-                    } catch {
-                        state.droppedToolCalls.push({ id: "anonymous", name });
-                        Logger.warn(`[interpretStreamEvent] Dropped malformed anonymous tool call ${name}`);
-                    }
+                const accepted = acceptResponsesToolCall(state, {
+                    id: formatAnonymousToolCallRecordId(state),
+                    name,
+                    args,
+                });
+                if (accepted) {
+                    // The call declared no id of its own, so the part keeps the synthetic
+                    // "anonymous" id while the log and the record carry the request-scoped
+                    // one.
+                    parts.toolCalls.push({
+                        type: "tool_call",
+                        index: parts.toolCalls.length,
+                        id: "anonymous",
+                        name: accepted.name,
+                        args: accepted.args,
+                    });
+                    StructuredLogger.trace("stream.responses_anonymous_tool_done", {
+                        name: accepted.name,
+                        argsLength: accepted.args.length,
+                    });
                 }
             }
 

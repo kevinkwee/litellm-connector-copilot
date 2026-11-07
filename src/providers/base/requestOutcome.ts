@@ -5,7 +5,7 @@ import type { ChatSessionIdSource } from "../../utils/chatSessionId";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
 import { exportCopilotMdEntry, type CopilotMdEntry } from "../../observability";
 
-/** Fields every `.copilotmd` entry of one request shares, whatever its outcome. */
+/** The request facts shared by every outcome report. */
 export interface RequestOutcomeContext {
     readonly requestId: string;
     readonly model: { readonly id: string; readonly maxInputTokens: number };
@@ -16,6 +16,7 @@ export interface RequestOutcomeContext {
     readonly requestBodyBuilt: OpenAIChatCompletionRequest | undefined;
     readonly activeMessages: readonly vscode.LanguageModelChatRequestMessage[];
     readonly requestStartDate: Date;
+    /** The request totals, summing every attempt a retry replaced. */
     readonly usage: TokenSnapshot;
     readonly responseParts: readonly vscode.LanguageModelResponsePart[];
     readonly sessionId: string;
@@ -73,13 +74,13 @@ export function exportRequestOutcome(context: RequestOutcomeContext, outcome: Re
  */
 export function recordCancelledTurn(
     context: RequestOutcomeContext,
-    options: { tokensIn: number | undefined; durationMs: number; statusReason: string }
+    options: { durationMs: number; statusReason: string }
 ): void {
     LiteLLMTelemetry.reportMetric({
         requestId: context.requestId,
         model: context.model.id,
         durationMs: options.durationMs,
-        tokensIn: options.tokensIn,
+        tokensIn: context.usage.promptTokens,
         status: "cancelled",
         caller: context.caller,
     });

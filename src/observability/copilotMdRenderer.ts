@@ -95,7 +95,7 @@ export interface CopilotMdEntry {
     timeToFirstTokenMs: number | undefined;
     /** The model id actually used (post-override). Usually equals `model`; emitted as `resolved model`. */
     resolvedModel: string;
-    /** Token snapshot from `StreamTokenCapture.getSnapshot()`. Drives the `usage` line. */
+    /** Request token totals from `StreamTokenCapture.getSpendSnapshot()`. Drives the `usage` line. */
     usage: TokenSnapshot;
     /** Response parts emitted to VS Code through `progress.report(...)`, namely text, tool calls, and thinking. */
     responseParts: readonly vscode.LanguageModelResponsePart[];

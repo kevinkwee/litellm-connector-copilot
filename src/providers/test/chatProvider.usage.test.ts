@@ -9,7 +9,7 @@ import type { OpenAIChatCompletionRequest } from "../../types";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
 import { TEST_USER_AGENT } from "../../test/utils/testMocks";
 import { createMockSSEStream } from "../../test/utils/testStreamUtils";
-import { seedDiscoveredBackend } from "../../test/utils/chatProviderTestUtils";
+import { seedDiscoveredBackend, runChatRequest } from "../../test/utils/chatProviderTestUtils";
 
 suite("LiteLLM Chat Provider Usage", () => {
     let sandbox: sinon.SinonSandbox;
@@ -386,6 +386,61 @@ suite("LiteLLM Chat Provider Usage", () => {
 
         sinon.assert.calledOnce(exportStub);
         assert.strictEqual(exportStub.firstCall.args[0].debugName, "background-summarizer");
+    });
+
+    test("a retried turn exports the spend of every attempt it made", async () => {
+        // The transcript is the record of what the proxy billed, so it sums the
+        // attempts a resume replaced instead of describing only the last one.
+        const provider = new LiteLLMChatProvider(userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 3,
+            networkRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+
+        const encoder = new TextEncoder();
+        const usageFrame = (promptTokens: number, completionTokens: number): string =>
+            `data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":${promptTokens},"completion_tokens":${completionTokens}}}\n\n`;
+        const chatStub = sandbox.stub(LiteLLMClient.prototype, "chat");
+        chatStub.onFirstCall().callsFake(
+            async () =>
+                new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n'));
+                        controller.enqueue(encoder.encode(usageFrame(100, 10)));
+                    },
+                    pull(controller) {
+                        controller.error(new TypeError("terminated"));
+                    },
+                })
+        );
+        chatStub.onSecondCall().callsFake(
+            async () =>
+                new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'));
+                        controller.enqueue(encoder.encode(usageFrame(120, 20)));
+                        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                        controller.close();
+                    },
+                })
+        );
+        const exportStub = sandbox.stub(CopilotMdManager.instance, "exportEntry").resolves(undefined);
+
+        await runChatRequest(provider, []);
+
+        sinon.assert.calledOnce(exportStub);
+        const exportedUsage = exportStub.firstCall.args[0].usage;
+        assert.deepStrictEqual(
+            { prompt: exportedUsage.promptTokens, output: exportedUsage.outputTokens },
+            { prompt: 220, output: 30 },
+            "the transcript sums both attempts"
+        );
     });
 
     test("merges partial usage frames to avoid dropping previously reported token details", async () => {

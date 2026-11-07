@@ -520,12 +520,7 @@ export abstract class LiteLLMProviderBase {
         modelInfo: LiteLLMModelInfo | undefined,
         modelId?: string
     ): void {
-        const paramsToCheck = [
-            "temperature",
-            "top_p",
-            "cache_control",
-            "tool_choice", // Added for GPT-5.6 Azure and similar models that don't support tool_choice
-        ];
+        const paramsToCheck = ["temperature", "top_p", "cache_control", "tool_choice"];
         for (const p of paramsToCheck) {
             if (!this.isParameterSupported(p, modelInfo, modelId) && p in requestBody) {
                 delete requestBody[p];

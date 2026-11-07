@@ -13,7 +13,6 @@ import {
     LiteLLMApiError,
     LiteLLMRateLimitError,
 } from "../../adapters/litellmClient";
-import type { TokenSnapshot } from "../../adapters/streaming/streamTokenCapture";
 import { describeFailureForLog, toErrorLogFields } from "../base/errorLogFields";
 import { parseApiError } from "../base/apiErrorMessage";
 import { exportRequestOutcome, recordCancelledTurn, type RequestOutcomeContext } from "../base/requestOutcome";
@@ -25,13 +24,11 @@ interface TurnReportBase {
     readonly modelId: string;
     readonly caller: string;
     readonly durationMs: number;
-    readonly tokensIn: number | undefined;
     readonly outcomeContext: () => RequestOutcomeContext;
 }
 
 /** A turn the model finished. */
 export interface SuccessfulTurnReport extends TurnReportBase {
-    readonly snapshot: TokenSnapshot;
     readonly reservedOutputTokens: number;
     readonly totalTokenMax: number;
 }
@@ -55,9 +52,11 @@ export interface FailedTurnReport extends TurnReportBase {
  * line, and the transcript entry.
  */
 export function reportTurnSuccess(report: SuccessfulTurnReport): void {
-    const { snapshot } = report;
+    // One read of the request totals backs the metric, the final usage line and the transcript.
+    const outcomeContext = report.outcomeContext();
+    const { usage: snapshot } = outcomeContext;
     const tokensOut = snapshot.outputTokens;
-    const tokensIn = snapshot.promptTokens ?? report.tokensIn;
+    const tokensIn = snapshot.promptTokens;
     const reasoningTokens = snapshot.reasoningTokens || undefined;
     const cachedTokens = snapshot.cachedTokens || undefined;
     const systemPromptTokens = snapshot.systemPromptTokens || undefined;
@@ -108,7 +107,7 @@ export function reportTurnSuccess(report: SuccessfulTurnReport): void {
         estimatedTotalCost,
     });
 
-    exportRequestOutcome(report.outcomeContext(), { status: "success", durationMs: report.durationMs });
+    exportRequestOutcome(outcomeContext, { status: "success", durationMs: report.durationMs });
 }
 
 /**
@@ -129,7 +128,6 @@ export function reportConnectorCancellation(report: ConnectorCancelledTurnReport
         `Chat request cancelled from the connector | RequestID: ${report.requestId} | Model: ${report.modelId} | Caller: ${report.caller}`
     );
     recordCancelledTurn(report.outcomeContext(), {
-        tokensIn: report.tokensIn,
         durationMs: report.durationMs,
         statusReason: "Cancelled from the LiteLLM connector",
     });
@@ -152,7 +150,6 @@ export function reportHostCancellation(report: HostCancelledTurnReport): void {
         stage: "provideLanguageModelChatResponse",
     });
     recordCancelledTurn(report.outcomeContext(), {
-        tokensIn: report.tokensIn,
         durationMs: report.durationMs,
         statusReason: "Cancelled by the user",
     });
@@ -245,11 +242,12 @@ export function reportTurnFailure(report: FailedTurnReport): void {
         ...errorLogFields,
     });
 
+    const outcomeContext = report.outcomeContext();
     LiteLLMTelemetry.reportMetric({
         requestId: report.requestId,
         model: report.modelId,
         durationMs: report.durationMs,
-        tokensIn: report.tokensIn,
+        tokensIn: outcomeContext.usage.promptTokens,
         status: "failure",
         error: describeFailureForLog(report.error),
         caller: report.caller,
@@ -258,7 +256,7 @@ export function reportTurnFailure(report: FailedTurnReport): void {
     const message = describeTurnFailure(report.error, report.modelId);
     // A failure before the body exists has nothing to render, which the context
     // reports by leaving the body undefined.
-    exportRequestOutcome(report.outcomeContext(), {
+    exportRequestOutcome(outcomeContext, {
         status: "failure",
         durationMs: report.durationMs,
         statusReason: message,

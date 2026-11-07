@@ -171,7 +171,7 @@
 					"default": 2,
 					"minimum": 0,
 					"maximum": 10,
-					"description": "Maximum retries for a cleanly-completed stream that produced only reasoning (no text, no tool calls). The retry appends the partial reasoning to the request so the model continues its thought. Separate budget from networkRetries because reasoning-only responses cluster in upstream bursts. Set to 0 to disable."
+					"description": "Maximum retries for a cleanly-completed stream that produced only reasoning (no text, no tool calls). The retry appends the partial reasoning to the request so the model continues its thought; a /responses model cannot carry that reasoning back, so its request is resent unchanged. A model that declares it has nothing to say is resent at most once whatever this setting allows. Separate budget from networkRetries because reasoning-only responses cluster in upstream bursts. Set to 0 to disable."
 				},
 				"litellm-connector.emptyResponseRetryDelayMs": {
 					"type": "number",

@@ -1,8 +1,8 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
-import type { OpenAIUsagePayload } from "../../../types";
+import type { LiteLLMModelInfo, OpenAIUsagePayload } from "../../../types";
 import { StreamTokenCapture } from "../streamTokenCapture";
-import { calculateRequestCost } from "../../../utils/pricingCalculator";
+import { calculateRequestCost, extractPricing } from "../../../utils/pricingCalculator";
 import { normalizeUsagePayload, type RawUsagePayload } from "../usagePayload";
 
 suite("StreamTokenCapture", () => {
@@ -293,6 +293,144 @@ suite("StreamTokenCapture", () => {
         assert.strictEqual(forwardedUsage.estimated_input_cost, expectedCost.inputCost);
         assert.strictEqual(forwardedUsage.estimated_output_cost, expectedCost.outputCost);
         assert.strictEqual(forwardedUsage.estimated_total_cost, expectedCost.totalCost);
+    });
+
+    test("a retried request reports every attempt it replaced in its totals", () => {
+        // Each attempt the proxy ran is billed, and the resumed request pays for the
+        // replayed text again, so the request totals are the sum.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress, {
+            input_cost_per_token: 0.000001,
+            output_cost_per_token: 0.000002,
+        } as unknown as LiteLLMModelInfo);
+
+        capture.progress.report(asUsagePart({ prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 }));
+        capture.resetAccumulation();
+        capture.progress.report(asUsagePart({ prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 }));
+
+        const lastAttemptCost = capture.getSnapshot().estimatedTotalCost ?? 0;
+        const requestTotals = capture.getSpendSnapshot();
+
+        assert.deepStrictEqual(
+            {
+                prompt: requestTotals.promptTokens,
+                output: requestTotals.outputTokens,
+                cost: requestTotals.estimatedTotalCost,
+            },
+            {
+                prompt: 220,
+                output: 30,
+                cost: lastAttemptCost + 100 * 0.000001 + 10 * 0.000002,
+            },
+            "the totals add the replaced attempt"
+        );
+    });
+
+    test("a retried request keeps the forwarded usage part describing one attempt", () => {
+        // The host reads the usage part for context size, so it must not grow with
+        // the retries the request made.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress);
+
+        capture.progress.report(asUsagePart({ prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 }));
+        capture.resetAccumulation();
+        capture.progress.report(asUsagePart({ prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 }));
+
+        const forwarded = inner.parts
+            .filter((part) => part instanceof vscode.LanguageModelDataPart && part.mimeType === "usage")
+            .at(-1) as vscode.LanguageModelDataPart;
+        const payload = JSON.parse(Buffer.from(forwarded.data).toString("utf-8")) as { prompt_tokens: number };
+        assert.strictEqual(payload.prompt_tokens, 120, "the forwarded usage part stays one attempt");
+    });
+
+    test("a retried request sums every usage detail, not just the prompt and output", () => {
+        // Cache, reasoning, tool and prediction counts also reach the final usage line
+        // and the transcript, so a lost fold would under-report them on a retried turn.
+        const inner = createInnerProgress();
+        const modelInfo = { input_cost_per_token: 0.000001, output_cost_per_token: 0.000002 };
+        const capture = new StreamTokenCapture("gpt-4", inner.progress, modelInfo as unknown as LiteLLMModelInfo);
+        const usageFrame = (offset: number): Record<string, unknown> => ({
+            prompt_tokens: 100 + offset,
+            completion_tokens: 10 + offset,
+            prompt_tokens_details: { cached_tokens: 3 + offset, cache_creation_input_tokens: 5 + offset },
+            completion_tokens_details: {
+                reasoning_tokens: 7 + offset,
+                tool_tokens: 11 + offset,
+                accepted_prediction_tokens: 13 + offset,
+                rejected_prediction_tokens: 17 + offset,
+            },
+        });
+        const attemptCost = (offset: number) =>
+            calculateRequestCost({
+                promptTokens: 100 + offset,
+                completionTokens: 10 + offset,
+                cachedTokens: 3 + offset,
+                cacheCreationInputTokens: 5 + offset,
+                pricing: extractPricing(modelInfo as unknown as LiteLLMModelInfo),
+            });
+
+        capture.progress.report(asUsagePart(usageFrame(0)));
+        capture.resetAccumulation();
+        capture.progress.report(asUsagePart(usageFrame(10)));
+
+        const requestTotals = capture.getSpendSnapshot();
+        const first = attemptCost(0);
+        const second = attemptCost(10);
+
+        assert.deepStrictEqual(
+            {
+                completion: requestTotals.completionTokens,
+                cached: requestTotals.cachedTokens,
+                cacheWrite: requestTotals.cacheCreationInputTokens,
+                reasoning: requestTotals.reasoningTokens,
+                tool: requestTotals.toolTokens,
+                accepted: requestTotals.acceptedPredictionTokens,
+                rejected: requestTotals.rejectedPredictionTokens,
+                inputCost: requestTotals.estimatedInputCost,
+                outputCost: requestTotals.estimatedOutputCost,
+            },
+            {
+                completion: 30,
+                cached: 16,
+                cacheWrite: 20,
+                reasoning: 24,
+                tool: 32,
+                accepted: 36,
+                rejected: 44,
+                inputCost: first.inputCost + second.inputCost,
+                outputCost: first.outputCost + second.outputCost,
+            }
+        );
+    });
+
+    test("a retried request reports upstream usage when an earlier attempt streamed it", () => {
+        // The fold is what keeps the flag true once a reset clears the estimator, so a
+        // turn whose earlier attempt reported usage is never relabelled as an estimate.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress);
+
+        capture.progress.report(asUsagePart({ prompt_tokens: 10, completion_tokens: 2 }));
+        capture.resetAccumulation();
+        capture.progress.report(asTextPart("second attempt"));
+
+        assert.strictEqual(capture.getSpendSnapshot().sawUpstreamUsage, true);
+    });
+
+    test("a retried request without a usage frame reports an estimate", () => {
+        // The prompt is then a local estimate, which must not be read as evidence
+        // that the gateway streamed its own counts.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress);
+        capture.setEstimatedPromptTokens(500);
+
+        capture.progress.report(asTextPart("first attempt"));
+        capture.resetAccumulation();
+        capture.progress.report(asTextPart("second attempt"));
+
+        const requestTotals = capture.getSpendSnapshot();
+
+        assert.strictEqual(requestTotals.sawUpstreamUsage, false);
+        assert.strictEqual(requestTotals.promptTokens, 1000, "both estimates are counted");
     });
 
     test("captures LiteLLM Anthropic cache counters and bills writes at the cache-write price", () => {

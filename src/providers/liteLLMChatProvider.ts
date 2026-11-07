@@ -45,6 +45,7 @@ import {
     ReasoningOnlyError,
     isTransportRetriableError,
     buildResumeMessages,
+    selectResumableContent,
     sleepWithCancellation,
     backoffDelayMs,
     logTransportRetry,
@@ -115,8 +116,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
 
         const caller = this.getTelemetryOptions(options).caller;
 
-        let tokensIn: number | undefined;
-
         Logger.info(`Chat request started | RequestID: ${requestId} | Model: ${model.id} | Caller: ${caller}`);
         Logger.trace(
             `Chat request: received model id="${model.id}" name="${model.name}" hasOptionsConfig=${(options as { configuration?: unknown }).configuration !== undefined}`
@@ -164,7 +163,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         });
 
         // The fields every outcome of this request shares. Built on demand so the
-        // usage snapshot and the response parts are read when the turn ends, not
+        // request totals and the response parts are read when the turn ends, not
         // when it starts.
         const outcomeContext = (): RequestOutcomeContext => ({
             requestId,
@@ -174,7 +173,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             requestBodyBuilt,
             activeMessages,
             requestStartDate,
-            usage: tokenCapture.getSnapshot(),
+            usage: tokenCapture.getSpendSnapshot(),
             responseParts: responsePartCollector.parts,
             sessionId,
             sessionIdSource: resolvedSession.source,
@@ -228,10 +227,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             tokenCapture.setReservedOutputTokens(reservedOutputTokens);
             tokenCapture.setTotalTokenMax(totalTokenMax);
 
-            // Input estimate for the telemetry report. A resume replaces it with the
-            // resumed estimate.
-            tokensIn = estimatedTransportInputTokens;
-
             // A socket death (`terminated` / `fetch failed`) or inactivity abort
             // kills the upstream request but does NOT undo parts already emitted
             // to VS Code. Instead of surfacing the transport error (which shows
@@ -269,6 +264,8 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             let stream: ReadableStream<Uint8Array>;
             let attempt = 0;
             let emptyAttempt = 0;
+            // Resends spent on an attempt that proved an empty `stop`.
+            let emptyStopResends = 0;
             // A headers timeout means the proxy never started answering, so one retry
             // covers a transient stall. A second means the wait itself is the problem,
             // and repeating it only multiplies a guaranteed failure.
@@ -287,6 +284,15 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         );
                         throw Object.assign(new Error("Operation cancelled by user"), { name: "CancellationError" });
                     }
+                    if (resumed) {
+                        // The attempt being replaced keeps its accounting until the next
+                        // request actually starts, so a turn cancelled during the backoff
+                        // sleep reports the attempt that ran, not an estimate for one
+                        // that never started. Its spend is folded into the request totals
+                        // here, and the estimator then starts clean so the usage part
+                        // describes only the attempt that follows.
+                        tokenCapture.resetAccumulation();
+                    }
                     outputAtAttemptStart = accumulator.text.length + accumulator.thinking.length;
                     // A retry starts a fresh header wait, so the request is back in the
                     // phase the picker labels "waiting for headers".
@@ -297,16 +303,15 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         // the previous attempt stopped. With nothing to continue, a
                         // "Continue" nudge would ask the model to carry on with output
                         // no attempt produced, so the request is resent unchanged.
-                        if (!accumulator.hasResumableOutput) {
+                        const resume = selectResumableContent(accumulator, {
+                            canReplayReasoning: modelInfo?.mode !== "responses",
+                        });
+                        if (!resume) {
                             Logger.debug(
-                                `[transportRetry] request=${requestId} resending the unchanged request (no attempt produced output)`
+                                `[transportRetry] request=${requestId} resending the unchanged request (no replayable output)`
                             );
                         } else {
-                            const resumedMessages = buildResumeMessages(
-                                messages,
-                                accumulator.text,
-                                accumulator.thinking
-                            );
+                            const resumedMessages = buildResumeMessages(messages, resume.text, resume.thinking);
                             const resumedRequestBody = await this.buildOpenAIChatRequest(
                                 resumedMessages,
                                 model,
@@ -334,12 +339,11 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                                     modelInfo,
                                 })
                             );
-                            tokensIn = resumedInputTokens;
                         }
                     }
-                    // Read before the body exists: a config failure here cannot strand
-                    // an open upstream response. A setting changed mid-turn still
-                    // applies to the next attempt.
+                    // Read before the response stream opens, so a config failure here
+                    // cannot strand an upstream response. A setting changed mid-turn
+                    // still applies to the next attempt.
                     const streamCfg = await this._configManager.getConfig();
                     stream = await this.sendRequestWithRetry(
                         requestBodyBuilt,
@@ -404,7 +408,19 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                             tokenCapture.flushUsage();
                             break;
                         }
-                        if (emptyAttempt < maxEmptyRetries && !requestCancellation.isCancellationRequested) {
+                        // A proven empty stop is resent once, not up to the whole empty
+                        // budget: the model declared it had nothing to say, so a second
+                        // resend mostly buys the same answer at full prompt cost.
+                        const emptyStopExhausted =
+                            err.normalFinish && err.reasoningChars === 0 && emptyStopResends >= 1;
+                        if (
+                            emptyAttempt < maxEmptyRetries &&
+                            !emptyStopExhausted &&
+                            !requestCancellation.isCancellationRequested
+                        ) {
+                            if (err.normalFinish && err.reasoningChars === 0) {
+                                emptyStopResends += 1;
+                            }
                             restartBudgetAfterProgress();
                             if (!retryBudget.markFailure()) {
                                 // The budget, not the reasoning-only count, ends the
@@ -425,7 +441,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                                 delayMs: delay,
                                 resumedReasoningChars: accumulator.thinking.length,
                             });
-                            tokenCapture.resetAccumulation();
                             await sleepWithCancellation(delay, requestCancellation);
                             // Do NOT count this against the transport attempt
                             // budget; treat the next iteration as a fresh resume.
@@ -521,9 +536,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         resumedTextChars: accumulator.text.length,
                         ...toErrorLogFields(err),
                     });
-                    // Fresh attempt: drop partial-response token accounting so
-                    // the next usage snapshot reflects only the resumed stream.
-                    tokenCapture.resetAccumulation();
                     await sleepWithCancellation(delay, requestCancellation);
                 }
             }
@@ -538,8 +550,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 modelId: model.id,
                 caller,
                 durationMs: LiteLLMTelemetry.endTimer(startTime),
-                tokensIn,
-                snapshot: tokenCapture.getSnapshot(),
                 reservedOutputTokens,
                 totalTokenMax,
                 outcomeContext,
@@ -557,7 +567,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     modelId: model.id,
                     caller,
                     durationMs,
-                    tokensIn,
                     responsePartCount: responsePartCollector.parts.length,
                     outcomeContext,
                 });
@@ -575,7 +584,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     modelId: model.id,
                     caller,
                     durationMs,
-                    tokensIn,
                     outcomeContext,
                 });
                 throw Object.assign(new Error("Operation cancelled by user"), {
@@ -589,7 +597,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 modelId: model.id,
                 caller,
                 durationMs,
-                tokensIn,
                 error: err,
                 progress: trackingProgress,
                 outcomeContext,

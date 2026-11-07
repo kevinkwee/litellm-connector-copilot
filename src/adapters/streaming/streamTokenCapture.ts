@@ -9,8 +9,12 @@ import type {
 import { calculateRequestCost, extractPricing, type RequestCost } from "../../utils/pricingCalculator";
 
 /**
- * Snapshot of all tracked token counts for a single request.
- * Values prefer upstream usage when available; fall back to internal counting.
+ * Snapshot of the tracked token counts. Values prefer upstream usage when available
+ * and fall back to internal counting.
+ *
+ * {@link StreamTokenCapture.getSnapshot} describes one attempt, which is what a usage
+ * part forwarded to the host carries because the host reads it for context size.
+ * {@link StreamTokenCapture.getSpendSnapshot} describes the whole request.
  */
 export interface TokenSnapshot {
     // Input side
@@ -40,7 +44,7 @@ export interface TokenSnapshot {
     // Metadata
     sawUpstreamUsage: boolean;
 
-    // Pricing-aware cost estimation (USD). Zero when pricing unavailable.
+    // Pricing-aware cost estimation in USD. The fields are absent when the model declares no rates.
     estimatedInputCost?: number;
     estimatedOutputCost?: number;
     estimatedTotalCost?: number;
@@ -56,7 +60,7 @@ export interface TokenSnapshot {
  *   const capture = new StreamTokenCapture(modelId, innerProgress, modelInfo);
  *   // pass capture.progress wherever you'd pass progress
  *   await sendRequest(..., capture.progress, ...);
- *   const snapshot = capture.getSnapshot();
+ *   const spend = capture.getSpendSnapshot();
  */
 export class StreamTokenCapture {
     private readonly _inner: vscode.Progress<vscode.LanguageModelResponsePart>;
@@ -71,6 +75,23 @@ export class StreamTokenCapture {
 
     // Upstream usage (from a DataPart, `response.completed`, or `response.incomplete`)
     private _sawUpstreamUsage = false;
+    /** Spend of the attempts this request replaced, folded in before each reset. */
+    private readonly _spent = {
+        promptTokens: 0,
+        completionTokens: 0,
+        outputTokens: 0,
+        toolTokens: 0,
+        cachedTokens: 0,
+        cacheCreationInputTokens: 0,
+        reasoningTokens: 0,
+        acceptedPredictionTokens: 0,
+        rejectedPredictionTokens: 0,
+        inputCost: 0,
+        outputCost: 0,
+        totalCost: 0,
+    };
+    /** Whether any attempt this request replaced reported upstream usage. */
+    private _spentSawUpstreamUsage = false;
     private _upstream?: OpenAIUsagePayload;
 
     // Pre-computed input token estimates (set by caller before request)
@@ -113,12 +134,29 @@ export class StreamTokenCapture {
     }
 
     /**
-     * Drops the token accounting accumulated for a partial response so a
-     * resumed attempt starts from a clean estimator state. The already-emitted
-     * parts stay counted in the request's input-token baseline on the next
-     * round (VS Code rebuilds history), so keeping them here would double-count.
+     * Ends the accounting for an attempt a retry replaces, so the next attempt starts
+     * from a clean estimator state.
+     *
+     * The proxy bills the replaced attempt too, so its spend is folded into the request
+     * totals that {@link getSpendSnapshot} reports. Keeping that accounting here would
+     * count it again, and a resume would also carry the streamed text in its own prompt.
      */
     resetAccumulation(): void {
+        const replaced = this.getSnapshot();
+        this._spent.promptTokens += replaced.promptTokens;
+        this._spent.completionTokens += replaced.completionTokens;
+        this._spent.outputTokens += replaced.outputTokens;
+        this._spent.cachedTokens += replaced.cachedTokens;
+        this._spent.cacheCreationInputTokens += replaced.cacheCreationInputTokens;
+        this._spent.reasoningTokens += replaced.reasoningTokens;
+        this._spentSawUpstreamUsage ||= replaced.sawUpstreamUsage;
+        this._spent.toolTokens += replaced.toolTokens;
+        this._spent.acceptedPredictionTokens += replaced.acceptedPredictionTokens;
+        this._spent.rejectedPredictionTokens += replaced.rejectedPredictionTokens;
+        this._spent.inputCost += replaced.estimatedInputCost ?? 0;
+        this._spent.outputCost += replaced.estimatedOutputCost ?? 0;
+        this._spent.totalCost += replaced.estimatedTotalCost ?? 0;
+
         this._textBuffer = "";
         this._reasoningBuffer = "";
         this._toolCallTokens = 0;
@@ -126,6 +164,39 @@ export class StreamTokenCapture {
         this._upstream = undefined;
     }
 
+    /**
+     * The request's totals: the last attempt plus every attempt it replaced.
+     *
+     * A retried turn is billed for each attempt the proxy ran, so this is what the
+     * metrics, the final usage line and the transcript record. `systemPromptTokens`
+     * stays a context value, because it measures the prompt rather than spend.
+     *
+     * An attempt that failed before the proxy received it still contributes its
+     * prompt estimate, so a turn whose attempts all failed to connect over-estimates
+     * its spend rather than under-reporting it.
+     */
+    getSpendSnapshot(): TokenSnapshot {
+        const last = this.getSnapshot();
+        const hasCost = last.estimatedInputCost !== undefined || last.estimatedOutputCost !== undefined;
+        return {
+            ...last,
+            promptTokens: last.promptTokens + this._spent.promptTokens,
+            completionTokens: last.completionTokens + this._spent.completionTokens,
+            outputTokens: last.outputTokens + this._spent.outputTokens,
+            toolTokens: last.toolTokens + this._spent.toolTokens,
+            reasoningTokens: last.reasoningTokens + this._spent.reasoningTokens,
+            acceptedPredictionTokens: last.acceptedPredictionTokens + this._spent.acceptedPredictionTokens,
+            rejectedPredictionTokens: last.rejectedPredictionTokens + this._spent.rejectedPredictionTokens,
+            cachedTokens: last.cachedTokens + this._spent.cachedTokens,
+            cacheCreationInputTokens: last.cacheCreationInputTokens + this._spent.cacheCreationInputTokens,
+            sawUpstreamUsage: last.sawUpstreamUsage || this._spentSawUpstreamUsage,
+            estimatedInputCost: hasCost ? (last.estimatedInputCost ?? 0) + this._spent.inputCost : undefined,
+            estimatedOutputCost: hasCost ? (last.estimatedOutputCost ?? 0) + this._spent.outputCost : undefined,
+            estimatedTotalCost: hasCost ? (last.estimatedTotalCost ?? 0) + this._spent.totalCost : undefined,
+        };
+    }
+
+    /** This attempt's counts, before the replaced attempts are folded in. */
     getSnapshot(): TokenSnapshot {
         const hasUpstream = this._sawUpstreamUsage && this._upstream !== undefined;
         const promptDetails: OpenAIUsagePromptTokenDetails | undefined = this._upstream?.prompt_tokens_details;
@@ -188,7 +259,7 @@ export class StreamTokenCapture {
      * This ensures usage data is always reported, even for providers that don't send
      * usage in their streaming response.
      *
-     * Should be called after the stream completes and before getSnapshot().
+     * Should be called after the stream completes and before the snapshot is read.
      */
     flushUsage(): void {
         if (this._sawUpstreamUsage) {

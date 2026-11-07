@@ -1,5 +1,6 @@
 import * as assert from "assert";
-import { interpretStreamEvent, createInitialStreamingState } from "../liteLLMStreamInterpreter";
+import { interpretStreamEvent } from "../liteLLMStreamInterpreter";
+import { createInitialStreamingState } from "../streamingState";
 
 declare const suite: (name: string, fn: () => void) => void;
 declare const test: (name: string, fn: () => void) => void;

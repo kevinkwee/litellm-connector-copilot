@@ -162,6 +162,18 @@ suite("LiteLLM Chat Provider retry budget accounting", () => {
         assert.match(findErrorTextPart(reported) ?? "", /litellm-connector\.retryBudgetSeconds/);
     });
 
+    test("a proven empty stop is resent once, not for the whole empty budget", async () => {
+        const emptyStop = () => endingStream(['data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n']);
+
+        const { attempts, reported } = await runTurn([emptyStop, emptyStop, emptyStop], {
+            emptyResponseRetries: 3,
+            retryBudgetMs: 60_000,
+        });
+
+        assert.strictEqual(attempts, 2, "one resend is enough for a model that declared it had nothing to say");
+        assert.match(findErrorTextPart(reported) ?? "", /empty reply/);
+    });
+
     test("a reasoning-only resend that adds reasoning restarts the retry clock", async () => {
         const { attempts, reported } = await runTurn([
             () => endingStream([reasoningDelta("first thought")]),

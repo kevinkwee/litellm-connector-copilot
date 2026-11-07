@@ -8,12 +8,11 @@ import { StructuredLogger } from "../../observability/structuredLogger";
 import { toErrorLogFields } from "../base/errorLogFields";
 import { decodeSSE } from "../../adapters/sse/sseDecoder";
 import {
-    createInitialStreamingState,
     flushPendingBuffers,
     hasBufferedToolCalls,
     interpretStreamEvent,
 } from "../../adapters/streaming/liteLLMStreamInterpreter";
-import type { EmittedPart } from "../../adapters/streaming/liteLLMStreamInterpreter";
+import { createInitialStreamingState, type EmittedPart } from "../../adapters/streaming/streamingState";
 import { emitPartsToVSCode } from "../../adapters/streaming/vscodePartEmitter";
 import { InactivityTimeoutError, ReasoningOnlyError, UpstreamStreamError } from "../../utils/transportRetry";
 

@@ -3,99 +3,18 @@ import { Logger } from "../../utils/logger";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import { redactedThinkingMetadata, signedThinkingMetadata } from "../../utils/thinkingBlocks";
 import { normalizeUsagePayload, type RawUsagePayload } from "./usagePayload";
-import { interpretResponsesEvent, requestTag, resolveToolCallName } from "./responsesEventInterpreter";
+import { acceptResponsesToolCall, flushResponsesToolCalls, interpretResponsesEvent } from "./responsesEventInterpreter";
+import {
+    formatAnonymousToolCallRecordId,
+    ensureCurrentThinkingBlockId,
+    nextThinkingBlockId,
+    requestTag,
+    resolveToolCallName,
+    type ChatToolCallBuffer,
+    type EmittedPart,
+    type StreamingState,
+} from "./streamingState";
 import { extractUpstreamStreamError } from "./upstreamStreamError";
-import type { DroppedToolCall } from "../../types";
-
-/**
- * Discriminated union of response parts the stream interpreter emits toward
- * VS Code (text, data, thinking, buffered tool calls, finish, and usage).
- */
-export type EmittedPart =
-    | { type: "text"; value: string }
-    | { type: "data"; mimeType: string; value: unknown }
-    | { type: "thinking"; value: string | string[]; id?: string; metadata?: Record<string, unknown> }
-    | { type: "tool_call"; index: number; id?: string; name?: string; args: string }
-    | { type: "finish"; reason?: string }
-    | { type: "response"; usage?: { inputTokens?: number; outputTokens?: number } };
-
-interface ChatToolCallBuffer {
-    id?: string;
-    name?: string;
-    args: string;
-}
-
-export interface StreamingState {
-    /** Ties this stream's diagnostics to its request when several sessions stream at once. */
-    readonly requestId: string | undefined;
-    /**
-     * Advertised tool name to the name VS Code declared, for every tool whose
-     * advertised name differs from its declared spelling, whether the sanitizer
-     * or the collision suffix changed it. Tool calls carry the wire name the
-     * request advertised, and VS Code resolves a call by the name it declared,
-     * so the emission path translates back through this map.
-     */
-    readonly wireToDeclaredNames: ReadonlyMap<string, string> | undefined;
-    toolCallBuffers: Map<number, ChatToolCallBuffer>;
-    /** Call ids already delivered, so a repeated id cannot execute a tool twice. */
-    emittedToolCallIds: Set<string>;
-    responseToolCallBuffers: Map<string, { id: string; name?: string; args: string }>;
-    responseToolCallOrder: string[];
-    mergeReasoningContentInChoices: boolean;
-    /**
-     * Anonymous tool buffering: used when upstream streams tool args before emitting a stable
-     * call_id. If multiple anonymous calls interleave without call_ids they cannot be disambiguated.
-     */
-    anonymousResponseToolName: string | undefined;
-    anonymousResponseToolArgs: string;
-    /**
-     * Thinking-block id allocation. Text deltas of one Anthropic
-     * thinking block share an id so VS Code and the Agents window merge them
-     * with that block's sealed part; a sealed (signature or redacted) part
-     * ends the id so the next block streams under a fresh one. Ids carry no
-     * upstream meaning; they only group the parts of one block.
-     */
-    thinkingBlockCounter: number;
-    currentThinkingBlockId: string | undefined;
-    /**
-     * Calls dropped because their arguments could not be parsed. The stream reader names
-     * them in a notice when the attempt completes; an attempt that throws, for a retry or a
-     * failure, discards them.
-     */
-    readonly droppedToolCalls: DroppedToolCall[];
-}
-
-export function createInitialStreamingState(
-    requestId?: string,
-    wireToDeclaredNames?: ReadonlyMap<string, string>
-): StreamingState {
-    return {
-        requestId,
-        wireToDeclaredNames,
-        toolCallBuffers: new Map(),
-        emittedToolCallIds: new Set(),
-        responseToolCallBuffers: new Map(),
-        responseToolCallOrder: [],
-        mergeReasoningContentInChoices: false,
-        anonymousResponseToolName: undefined,
-        anonymousResponseToolArgs: "",
-        thinkingBlockCounter: 0,
-        currentThinkingBlockId: undefined,
-        droppedToolCalls: [],
-    };
-}
-
-function nextThinkingBlockId(state: StreamingState): string {
-    state.thinkingBlockCounter += 1;
-    return `litellm-thinking-${state.thinkingBlockCounter}`;
-}
-
-function ensureCurrentThinkingBlockId(state: StreamingState): string {
-    if (state.currentThinkingBlockId === undefined) {
-        state.currentThinkingBlockId = nextThinkingBlockId(state);
-    }
-    return state.currentThinkingBlockId;
-}
 
 /**
  * Normalizes a streamed `function.arguments` delta to text. The OpenAI stream
@@ -460,6 +379,7 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
 
     // 2. Handle LiteLLM /responses format
     interpretResponsesEvent(data, state, {
+        thinking: thinkingParts,
         text: textParts,
         toolCalls: toolCallParts,
         data: dataParts,
@@ -524,89 +444,50 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
  * `response.completed`, `response.incomplete`, or other finish frame.
  *
  * Emits:
- * - Named /responses-format tool calls with valid JSON arguments
- * - The anonymous tool call, when it has a name and valid JSON arguments
+ * - The keyed and anonymous /responses calls the interpreter can deliver
  * - The chat-completions tool calls a non-`tool_calls` finish frame would emit
  * - A finish part with reason "incomplete_stream_end"
  *
- *
- * A call with unreadable arguments is logged and recorded on `droppedToolCalls`
- * instead of emitted, so the turn can explain what did not run.
- * Returns an array of emitted parts in emission order.
+ * A call the interpreter cannot deliver is logged, and one whose arguments do not
+ * parse is also recorded on `droppedToolCalls`, so the turn can explain which tool did
+ * not run.
  */
 export function flushPendingBuffers(state: StreamingState): EmittedPart[] {
     const parts: EmittedPart[] = [];
-    let toolCallIndex = 0;
 
-    // 1. Flush /responses-format tool calls. VS Code invokes a tool by its name,
-    // so a call that never received one cannot run.
-    for (const id of state.responseToolCallOrder) {
-        const buffer = state.responseToolCallBuffers.get(id);
-        if (!buffer) {
-            continue;
-        }
-        if (!buffer.name) {
-            Logger.warn(`[flushPendingBuffers] ${requestTag(state)} Skipping unnamed /responses tool call (id: ${id})`);
-            continue;
-        }
-        try {
-            JSON.parse(buffer.args);
-            parts.push({ type: "tool_call", index: toolCallIndex++, id, name: buffer.name, args: buffer.args });
-            Logger.debug(`[flushPendingBuffers] Flushed /responses tool call: ${buffer.name} (id: ${id})`);
-        } catch {
-            Logger.warn(
-                `[flushPendingBuffers] ${requestTag(state)} Skipping malformed /responses tool call args (id: ${id})`
-            );
-            StructuredLogger.error("stream.tool_call_args_invalid_json", {
-                requestId: state.requestId,
-                toolName: buffer.name,
-                callId: id,
-                argsLength: buffer.args.length,
-                argsPreview: buffer.args.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS),
-            });
-            state.droppedToolCalls.push({ id, name: buffer.name });
-        }
-    }
-    state.responseToolCallBuffers.clear();
-    state.responseToolCallOrder = [];
+    // The keyed /responses calls settle through the same helper the
+    // `response.completed` path uses, so one rule drops a call whichever frame ends the
+    // stream.
+    const toolCallIndex = flushResponsesToolCalls(state, parts);
 
-    // 2. Flush anonymous tool call
-    if (state.anonymousResponseToolName && state.anonymousResponseToolArgs) {
-        try {
-            JSON.parse(state.anonymousResponseToolArgs);
+    // The anonymous /responses buffer is not part of the keyed map, so it settles here
+    // through the same rule. The guard keeps an empty buffer from logging a drop for a
+    // call that never existed.
+    if (state.anonymousResponseToolName || state.anonymousResponseToolArgs) {
+        const anonymousCall = acceptResponsesToolCall(state, {
+            id: formatAnonymousToolCallRecordId(state),
+            name: state.anonymousResponseToolName,
+            args: state.anonymousResponseToolArgs,
+        });
+        if (anonymousCall) {
             parts.push({
                 type: "tool_call",
-                index: toolCallIndex++,
+                index: toolCallIndex,
                 id: `anonymous_${Date.now()}`,
-                name: state.anonymousResponseToolName,
-                args: state.anonymousResponseToolArgs,
+                name: anonymousCall.name,
+                args: anonymousCall.args,
             });
-            Logger.debug(`[flushPendingBuffers] Flushed anonymous tool call: ${state.anonymousResponseToolName}`);
-        } catch {
-            Logger.warn(
-                `[flushPendingBuffers] ${requestTag(state)} Skipping malformed anonymous tool call args (${state.anonymousResponseToolArgs.length} chars)`
-            );
-            StructuredLogger.error("stream.tool_call_args_invalid_json", {
-                requestId: state.requestId,
-                toolName: state.anonymousResponseToolName,
-                argsLength: state.anonymousResponseToolArgs.length,
-                argsPreview: state.anonymousResponseToolArgs.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS),
-            });
-            state.droppedToolCalls.push({
-                id: `anonymous_${state.requestId ?? "stream"}`,
-                name: state.anonymousResponseToolName,
-            });
+            Logger.debug(`[flushPendingBuffers] Flushed anonymous tool call: ${anonymousCall.name}`);
         }
     }
     state.anonymousResponseToolName = undefined;
     state.anonymousResponseToolArgs = "";
 
-    // 3. Settle chat-completions buffers by the rules of a non-`tool_calls`
-    // finish frame, so a call is never emitted without an id or a name, or
-    // with invalid JSON arguments.
+    // Chat-completions buffers settle by the rules of a non-`tool_calls` finish
+    // frame, so a call is never emitted without an id or a name, or with invalid JSON
+    // arguments.
     parts.push(...settleChatToolCallBuffers(state, INCOMPLETE_STREAM_END));
 
-    // 4. Emit finish with "incomplete_stream_end" reason to signal partial response
     Logger.debug(`[flushPendingBuffers] Emitting ${parts.length} flushed parts with incomplete_stream_end signal`);
     StructuredLogger.debug("stream.pending_buffers_flushed", {
         toolCallsEmitted: parts.filter((p) => p.type === "tool_call").length,

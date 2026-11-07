@@ -262,17 +262,36 @@ export class StreamedTextAccumulator {
     public get sawToolCall(): boolean {
         return this._sawToolCall;
     }
+}
 
-    /**
-     * True when the attempt streamed text or reasoning a resume could continue.
-     *
-     * Whitespace alone does not count: leading and trailing whitespace is trimmed
-     * before the check, so an attempt that produced only blank lines is resent
-     * unchanged instead of being continued.
-     */
-    public get hasResumableOutput(): boolean {
-        return this._text.trim().length > 0 || this._thinking.trim().length > 0;
+/** Content a resume replays as the trailing assistant message. */
+export interface ResumeContent {
+    readonly text: string;
+    readonly thinking: string;
+}
+
+/**
+ * The content a resume can replay, or `undefined` when the attempt produced
+ * nothing to continue.
+ *
+ * Whitespace alone does not count: an attempt that produced only blank lines is
+ * resent unchanged instead of being continued.
+ *
+ * Reasoning is replayable only where the endpoint carries it. A `/responses`
+ * request has no field for `reasoning_content`, so the reasoning it streamed
+ * cannot reach the model again, and replaying nothing would turn the resume into
+ * a bare "Continue" nudge that asks the model to continue output no attempt
+ * produced.
+ */
+export function selectResumableContent(
+    accumulator: StreamedTextAccumulator,
+    options: { readonly canReplayReasoning: boolean }
+): ResumeContent | undefined {
+    const thinking = options.canReplayReasoning ? accumulator.thinking : "";
+    if (accumulator.text.trim().length === 0 && thinking.trim().length === 0) {
+        return undefined;
     }
+    return { text: accumulator.text, thinking };
 }
 
 function isThinkingPartInstance(part: vscode.LanguageModelResponsePart): boolean {

@@ -1,5 +1,6 @@
 import * as assert from "assert";
-import { interpretStreamEvent, createInitialStreamingState } from "../liteLLMStreamInterpreter";
+import { interpretStreamEvent } from "../liteLLMStreamInterpreter";
+import { createInitialStreamingState } from "../streamingState";
 import { UpstreamStreamError } from "../../../utils/transportRetry";
 
 declare const suite: (name: string, fn: () => void) => void;

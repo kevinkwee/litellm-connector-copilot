@@ -514,7 +514,6 @@ export function convertTools(options: vscode.ProvideLanguageModelChatResponseOpt
  */
 export function validateRequest(messages: readonly vscode.LanguageModelChatRequestMessage[]): void {
     if (messages.length === 0) {
-        Logger.error("No messages in request");
         throw new Error("Invalid request: no messages.");
     }
 
@@ -523,8 +522,7 @@ export function validateRequest(messages: readonly vscode.LanguageModelChatReque
             return;
         }
         if (!message.content || message.content.length === 0) {
-            Logger.error(`Validation failed: message at index ${index} has empty content`);
-            throw new Error("Invalid request: empty message content.");
+            throw new Error(`Invalid request: message ${index + 1} has empty content.`);
         }
         if (message.role !== vscode.LanguageModelChatMessageRole.Assistant) {
             return;
@@ -577,7 +575,7 @@ function assertToolResultsFollow(
     while (pendingCallIds.size > 0) {
         const nextMessage = messages[nextIndex++];
         if (!nextMessage || nextMessage.role !== vscode.LanguageModelChatMessageRole.User) {
-            failMissingToolResult(pendingCallIds);
+            throw new Error(TOOL_RESULT_PAIRING_ERROR);
         }
         let matched = 0;
         for (const part of nextMessage.content ?? []) {
@@ -586,15 +584,9 @@ function assertToolResultsFollow(
             }
         }
         if (matched === 0) {
-            failMissingToolResult(pendingCallIds);
+            throw new Error(TOOL_RESULT_PAIRING_ERROR);
         }
     }
-}
-
-/** Logs the calls still waiting for a result and reports the pairing failure. */
-function failMissingToolResult(pendingCallIds: ReadonlySet<string>): never {
-    Logger.error("Validation failed: missing tool result for call IDs:", Array.from(pendingCallIds));
-    throw new Error(TOOL_RESULT_PAIRING_ERROR);
 }
 
 /**
