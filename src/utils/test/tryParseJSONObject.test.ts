@@ -1,6 +1,6 @@
 import * as assert from "assert";
 
-import { tryParseJSONObject } from "../../utils";
+import { tryParseJSONObject } from "../../utils/messageConversion";
 
 suite("tryParseJSONObject", () => {
     test("tryParseJSONObject handles valid and invalid JSON", () => {

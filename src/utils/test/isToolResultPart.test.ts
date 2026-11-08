@@ -1,6 +1,6 @@
 import * as assert from "assert";
 
-import { isToolResultPart } from "../../utils";
+import { isToolResultPart } from "../../utils/messageConversion";
 
 suite("isToolResultPart", () => {
     test("accepts a part that carries a callId and content", () => {

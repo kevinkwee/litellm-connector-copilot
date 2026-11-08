@@ -140,22 +140,33 @@ export class StreamTokenCapture {
      * The proxy bills the replaced attempt too, so its spend is folded into the request
      * totals that {@link getSpendSnapshot} reports. Keeping that accounting here would
      * count it again, and a resume would also carry the streamed text in its own prompt.
+     *
+     * The prompt side is folded only when the attempt reached the proxy. A connect-phase
+     * failure never reached it, so that attempt's prompt count is the connector's own
+     * estimate and folding it would price a request that never happened. The folded total
+     * cost is derived from the folded sides, so the estimate cannot reappear inside it.
      */
-    resetAccumulation(): void {
+    resetAccumulation(options: { readonly reachedProxy: boolean }): void {
         const replaced = this.getSnapshot();
-        this._spent.promptTokens += replaced.promptTokens;
+        const inputCost = options.reachedProxy ? (replaced.estimatedInputCost ?? 0) : 0;
+        const outputCost = replaced.estimatedOutputCost ?? 0;
+        if (options.reachedProxy) {
+            this._spent.promptTokens += replaced.promptTokens;
+            this._spent.cachedTokens += replaced.cachedTokens;
+            this._spent.cacheCreationInputTokens += replaced.cacheCreationInputTokens;
+            this._spent.inputCost += inputCost;
+        }
         this._spent.completionTokens += replaced.completionTokens;
         this._spent.outputTokens += replaced.outputTokens;
-        this._spent.cachedTokens += replaced.cachedTokens;
-        this._spent.cacheCreationInputTokens += replaced.cacheCreationInputTokens;
         this._spent.reasoningTokens += replaced.reasoningTokens;
         this._spentSawUpstreamUsage ||= replaced.sawUpstreamUsage;
         this._spent.toolTokens += replaced.toolTokens;
         this._spent.acceptedPredictionTokens += replaced.acceptedPredictionTokens;
         this._spent.rejectedPredictionTokens += replaced.rejectedPredictionTokens;
-        this._spent.inputCost += replaced.estimatedInputCost ?? 0;
-        this._spent.outputCost += replaced.estimatedOutputCost ?? 0;
-        this._spent.totalCost += replaced.estimatedTotalCost ?? 0;
+        this._spent.outputCost += outputCost;
+        // Derived from the folded sides, so a refused attempt cannot leave a priced
+        // prompt inside the total.
+        this._spent.totalCost += inputCost + outputCost;
 
         this._textBuffer = "";
         this._reasoningBuffer = "";
@@ -171,9 +182,10 @@ export class StreamTokenCapture {
      * metrics, the final usage line and the transcript record. `systemPromptTokens`
      * stays a context value, because it measures the prompt rather than spend.
      *
-     * An attempt that failed before the proxy received it still contributes its
-     * prompt estimate, so a turn whose attempts all failed to connect over-estimates
-     * its spend rather than under-reporting it.
+     * An attempt a retry replaced contributes its prompt only when it reached the proxy.
+     * The attempt the turn ended on is always counted, because it is the last reading the
+     * connector has: a turn whose final attempt never connected therefore reports that
+     * attempt's estimate rather than under-reporting its spend.
      */
     getSpendSnapshot(): TokenSnapshot {
         const last = this.getSnapshot();

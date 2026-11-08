@@ -1,7 +1,7 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
 
-import { convertTools } from "../../utils";
+import { convertTools } from "../../utils/messageConversion";
 
 suite("convertTools", () => {
     test("convertTools asks for any tool when ToolMode.Required covers several tools", () => {

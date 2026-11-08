@@ -3,23 +3,8 @@ import { interpretStreamEvent } from "../../adapters/streaming/liteLLMStreamInte
 import { createInitialStreamingState } from "../../adapters/streaming/streamingState";
 
 suite("Responses /responses stream interpreter integration", () => {
-    test("should handle output_item.delta → output_item.done tool call sequence", () => {
+    test("should handle an output_item.done tool call", () => {
         const state = createInitialStreamingState();
-
-        interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", call_id: "c1", name: "search", arguments: '{"q":' },
-            },
-            state
-        );
-        interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", call_id: "c1", arguments: '"test"}' },
-            },
-            state
-        );
 
         const parts = interpretStreamEvent(
             {

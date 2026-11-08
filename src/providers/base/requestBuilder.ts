@@ -1,5 +1,5 @@
 import type * as vscode from "vscode";
-import { convertMessages, convertTools, validateRequest } from "../../utils";
+import { convertMessages, convertTools, validateRequest } from "../../utils/messageConversion";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest, OpenAIFunctionToolDef } from "../../types";
 import { DEFAULT_ANTHROPIC_PROMPT_CACHING, resolveAnthropicCacheControl } from "../../utils/promptCaching";
 import { isDeepSeekModel, resolveToolResultImageMode, resolveToolResultTextMode } from "../../utils/modelUtils";

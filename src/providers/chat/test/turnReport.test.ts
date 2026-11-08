@@ -41,15 +41,30 @@ suite("describeTurnFailure", () => {
         assert.doesNotMatch(message, /drop_params/, "the notice never suggests drop_params for the effort");
     });
 
-    test("points a whole-parameter rejection at supports_reasoning", () => {
-        const body = '{"error":{"message":"Unsupported parameter: reasoning_effort"}}';
+    test("points a whole-parameter rejection at allowed_openai_params first", () => {
+        // Shaped like LiteLLM's own UnsupportedParamsError, whose text recommends this fix:
+        // the deployment only fails because its provider config omits the parameter.
+        const body =
+            '{"error":{"message":"litellm.UnsupportedParamsError: openai does not support parameters: [\'reasoning_effort\'], for model=gpt-x. To drop these, set drop_params=true. Otherwise, send allowed_openai_params=[\'reasoning_effort\']"}}';
+        const error = new LiteLLMApiError(400, body, `LiteLLM API error: 400 Bad Request\n${body}`);
+
+        const message = describeTurnFailure(error, "model-1");
+
+        assert.match(message, /allowed_openai_params: \["reasoning_effort"\]/);
+        assert.match(message, /supports_reasoning: false/, "an upstream that really refuses it keeps that alternative");
+        assert.doesNotMatch(message, /Declare exactly the levels/, "a parameter refusal is not a level refusal");
+    });
+
+    test("points an upstream refusal at supports_reasoning, not allowed_openai_params", () => {
+        // LiteLLM forwarded this one, so listing the parameter would change nothing.
+        const body =
+            '{"error":{"message":"Unsupported parameter: \'reasoning_effort\' is not supported with this model."}}';
         const error = new LiteLLMApiError(400, body, `LiteLLM API error: 400 Bad Request\n${body}`);
 
         const message = describeTurnFailure(error, "model-1");
 
         assert.match(message, /supports_reasoning: false/);
-        assert.match(message, /and its supports_<level>_reasoning_effort entries to false/);
-        assert.doesNotMatch(message, /Declare exactly the levels/, "a parameter refusal is not a level refusal");
+        assert.doesNotMatch(message, /allowed_openai_params/, "the proxy did forward the parameter");
     });
 
     test("prefers the specific parameter when the body also echoes the effort name", () => {

@@ -46,8 +46,8 @@ suite("Telemetry Unit Tests", () => {
         assert.ok(loggerInfoStub.calledOnce);
         const infoMessage = firstArg<string>(loggerInfoStub);
         assert.ok(infoMessage.includes("[TokenUsage]"));
-        assert.ok(infoMessage.includes("tokens_in=0"));
-        assert.ok(infoMessage.includes("tokens_out=0"));
+        assert.ok(infoMessage.includes("tokens_in=n/a"), "an unreported count is missing, not zero");
+        assert.ok(infoMessage.includes("tokens_out=n/a"));
         assert.ok(infoMessage.includes("token_count_max=n/a"));
         assert.ok(infoMessage.includes("total_token_max=n/a"));
     });

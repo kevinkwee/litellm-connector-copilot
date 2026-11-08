@@ -9,6 +9,7 @@ import {
     InactivityTimeoutError,
     UpstreamStreamError,
     isTransportRetriableError,
+    failedBeforeReachingProxy,
     backoffDelayMs,
     buildResumeMessages,
     selectResumableContent,
@@ -155,6 +156,29 @@ suite("Transport Retry Utilities", () => {
         // reasoning-only streams have their own retry budget, never the transport budget
         assert.strictEqual(isTransportRetriableError(new ReasoningOnlyError(5, 400)), false);
         assert.strictEqual(isTransportRetriableError(new Error("some unrelated failure")), false);
+    });
+
+    test("failedBeforeReachingProxy reads the connect-phase code from the cause", () => {
+        // Node's fetch puts the socket code on the cause, not on the error itself.
+        const refused = new TypeError("fetch failed", { cause: { code: "ECONNREFUSED" } });
+
+        assert.strictEqual(failedBeforeReachingProxy(refused), true);
+    });
+
+    test("failedBeforeReachingProxy keeps a socket that opened, whatever its code", () => {
+        const reset = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+
+        assert.deepStrictEqual(
+            {
+                reset: failedBeforeReachingProxy(reset),
+                timeout: failedBeforeReachingProxy(new HeadersTimeoutError(1_000)),
+                upstream: failedBeforeReachingProxy(
+                    new UpstreamStreamError(undefined, "ECONNREFUSED", undefined, "boom")
+                ),
+                plain: failedBeforeReachingProxy("nope"),
+            },
+            { reset: false, timeout: false, upstream: false, plain: false }
+        );
     });
 
     test("StreamedTextAccumulator classifies text, tool call, and thinking parts", () => {

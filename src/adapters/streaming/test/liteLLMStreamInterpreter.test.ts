@@ -90,23 +90,20 @@ suite("LiteLLMStreamInterpreter: Tool Call Regressions", () => {
         assert.deepStrictEqual(order, ["thinking", "text"]);
     });
 
-    test("should parse LiteLLM /responses tool calls and flush on completed", () => {
+    test("reports the usage of a completed /responses turn after its tool call was flushed", () => {
         const state = createInitialStreamingState();
 
-        // Tool call arrives in fragments
-        interpretStreamEvent(
+        // The bridge sends its function calls complete on `output_item.done`.
+        const doneParts = interpretStreamEvent(
             {
-                type: "response.output_tool_call.delta",
-                delta: { id: "call-resp", name: "tc_responses", arguments: "{" },
+                type: "response.output_item.done",
+                item: { type: "function_call", call_id: "call-resp", name: "tc_responses", arguments: '{"x":1}' },
             },
             state
         );
-        interpretStreamEvent(
-            {
-                type: "response.output_tool_call.delta",
-                delta: { id: "call-resp", arguments: '"x":1}' },
-            },
-            state
+        assert.deepStrictEqual(
+            doneParts.flatMap((part) => (part.type === "tool_call" ? [part.args] : [])),
+            ['{"x":1}']
         );
 
         const parts = interpretStreamEvent(
@@ -116,13 +113,6 @@ suite("LiteLLMStreamInterpreter: Tool Call Regressions", () => {
             },
             state
         );
-
-        const toolCall = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCall && toolCall.type === "tool_call");
-        if (toolCall && toolCall.type === "tool_call") {
-            assert.strictEqual(toolCall.name, "tc_responses");
-            assert.strictEqual(toolCall.args, '{"x":1}');
-        }
 
         const usage = parts.find((p) => p.type === "data");
         assert.ok(usage, "expected usage data part to be emitted");
@@ -194,144 +184,6 @@ suite("LiteLLMStreamInterpreter: Tool Call Regressions", () => {
         }
     });
 
-    test("should flush /responses tool calls on output_item.done when no completed frame", () => {
-        const state = createInitialStreamingState();
-
-        interpretStreamEvent(
-            {
-                type: "response.output_tool_call.delta",
-                delta: { id: "call-resp-2", name: "tc2", arguments: "{" },
-            },
-            state
-        );
-        interpretStreamEvent(
-            {
-                type: "response.output_tool_call.delta",
-                delta: { id: "call-resp-2", arguments: '"y":true}' },
-            },
-            state
-        );
-
-        const parts = interpretStreamEvent({ type: "response.output_item.done" }, state);
-        const toolCall = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCall && toolCall.type === "tool_call");
-        if (toolCall && toolCall.type === "tool_call") {
-            assert.strictEqual(toolCall.name, "tc2");
-            assert.strictEqual(toolCall.args, '{"y":true}');
-        }
-    });
-
-    test("should buffer response.output_item.delta with call_id and emit on output_item.done", () => {
-        const state = createInitialStreamingState();
-
-        // Delta 1: name and partial args, with call_id
-        let parts = interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", call_id: "call_abc123", name: "search_tool", arguments: '{"query":' },
-            },
-            state
-        );
-        assert.strictEqual(parts.length, 0, "should buffer, not emit yet");
-
-        // Delta 2: remaining args, same call_id
-        parts = interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", call_id: "call_abc123", arguments: '"hello"}' },
-            },
-            state
-        );
-        assert.strictEqual(parts.length, 0, "still buffered");
-
-        // Done: should emit the specific call
-        parts = interpretStreamEvent(
-            {
-                type: "response.output_item.done",
-                item: {
-                    type: "function_call",
-                    call_id: "call_abc123",
-                    name: "search_tool",
-                    arguments: '{"query":"hello"}',
-                },
-            },
-            state
-        );
-
-        const toolCallPart = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCallPart, "should emit tool_call part on output_item.done");
-        assert.ok(toolCallPart.type === "tool_call");
-        assert.strictEqual(toolCallPart.id, "call_abc123");
-        assert.strictEqual(toolCallPart.name, "search_tool");
-        assert.strictEqual(toolCallPart.args, '{"query":"hello"}');
-
-        // Buffer should be cleared for this callId
-        assert.strictEqual(state.responseToolCallBuffers.size, 0);
-    });
-
-    test("should buffer anonymous output_item.delta (no call_id) and emit on done", () => {
-        const state = createInitialStreamingState();
-
-        // Delta without call_id, so buffer anonymously
-        let parts = interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", name: "anon_tool", arguments: '{"x":' },
-            },
-            state
-        );
-        assert.strictEqual(parts.length, 0, "buffered anonymously");
-
-        // Done without call_id: emit from the anonymous buffer
-        parts = interpretStreamEvent(
-            {
-                type: "response.output_item.done",
-                item: { type: "function_call", arguments: '{"x":1}' },
-            },
-            state
-        );
-
-        const toolCallPart = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCallPart, "should emit anonymous tool_call part");
-        assert.ok(toolCallPart.type === "tool_call");
-        assert.strictEqual(toolCallPart.id, "anonymous");
-        assert.strictEqual(toolCallPart.name, "anon_tool");
-
-        // Anonymous buffer should be reset
-        assert.strictEqual(state.anonymousResponseToolArgs, "");
-        assert.strictEqual(state.anonymousResponseToolName, undefined);
-    });
-
-    test("should not re-emit on response.completed what was already flushed by output_item.done", () => {
-        const state = createInitialStreamingState();
-
-        // Buffer via output_item.delta
-        interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", call_id: "c1", name: "tool1", arguments: '{"a":1}' },
-            },
-            state
-        );
-
-        // Flush via output_item.done, which removes it from responseToolCallOrder
-        interpretStreamEvent(
-            {
-                type: "response.output_item.done",
-                item: { type: "function_call", call_id: "c1", name: "tool1", arguments: '{"a":1}' },
-            },
-            state
-        );
-
-        // response.completed should NOT re-emit already-flushed call
-        const parts = interpretStreamEvent(
-            { type: "response.completed", response: { usage: { input_tokens: 1, output_tokens: 2 } } },
-            state
-        );
-        const toolCallParts = parts.filter((p) => p.type === "tool_call");
-        assert.strictEqual(toolCallParts.length, 0, "should not double-emit flushed tool call");
-    });
-
     test("reports a completed response as a stop finish", () => {
         const state = createInitialStreamingState();
 
@@ -360,57 +212,6 @@ suite("LiteLLMStreamInterpreter: Tool Call Regressions", () => {
             [],
             "a cut-short answer is not a normal finish"
         );
-    });
-
-    test("should preserve legacy flush-all behavior when output_item.done has no item", () => {
-        const state = createInitialStreamingState();
-
-        // Legacy path: output_tool_call.delta populates buffer
-        interpretStreamEvent(
-            {
-                type: "response.output_tool_call.delta",
-                delta: { id: "legacy-id", name: "legacy_tool", arguments: '{"z":9}' },
-            },
-            state
-        );
-
-        // output_item.done with no item → flush all
-        const parts = interpretStreamEvent({ type: "response.output_item.done" }, state);
-        const toolCallPart = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCallPart, "legacy flush-all should still work");
-        assert.ok(toolCallPart.type === "tool_call");
-        assert.strictEqual(toolCallPart.name, "legacy_tool");
-        assert.strictEqual(state.responseToolCallBuffers.size, 0, "buffer cleared after flush-all");
-    });
-
-    test("should parse Gemini native tool call shape", () => {
-        const state = createInitialStreamingState();
-        const parts = interpretStreamEvent(
-            {
-                candidates: [
-                    {
-                        content: {
-                            parts: [
-                                {
-                                    functionCall: {
-                                        name: "gem_tool",
-                                        args: { city: "Paris" },
-                                    },
-                                },
-                            ],
-                        },
-                    },
-                ],
-            },
-            state
-        );
-
-        const toolCall = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCall && toolCall.type === "tool_call");
-        if (toolCall && toolCall.type === "tool_call") {
-            assert.strictEqual(toolCall.name, "gem_tool");
-            assert.strictEqual(toolCall.args, '{"city":"Paris"}');
-        }
     });
 
     test("produces no part for a marshalled VS Code object carrying usage", () => {
@@ -671,27 +472,9 @@ suite("LiteLLMStreamInterpreter: Tool Call Regressions", () => {
         assert.strictEqual(parts2[1].type, "data");
         assert.deepStrictEqual(parts2[2], { type: "finish", reason: "stop" });
 
-        // response.output_item.done
+        // An `output_item.done` for a non-call item carries nothing this layer emits.
         const parts3 = interpretStreamEvent({ type: "response.output_item.done" }, state);
-        assert.strictEqual(parts3[0].type, "finish");
-    });
-
-    test("should handle Gemini native format", () => {
-        const state = createInitialStreamingState();
-        const chunk = {
-            candidates: [
-                {
-                    content: {
-                        parts: [{ text: "hello" }],
-                    },
-                },
-            ],
-        };
-        const parts = interpretStreamEvent(chunk, state);
-        assert.strictEqual(parts[0].type, "text");
-        const textPart = parts[0];
-        assert.strictEqual(textPart.type, "text");
-        assert.strictEqual(textPart.value, "hello");
+        assert.deepStrictEqual(parts3, []);
     });
 });
 

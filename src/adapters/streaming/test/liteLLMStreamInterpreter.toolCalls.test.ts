@@ -3,7 +3,6 @@ import * as sinon from "sinon";
 import { interpretStreamEvent, flushPendingBuffers, hasBufferedToolCalls } from "../liteLLMStreamInterpreter";
 import { createInitialStreamingState } from "../streamingState";
 import { StructuredLogger } from "../../../observability/structuredLogger";
-import { Logger } from "../../../utils/logger";
 
 declare const suite: (name: string, fn: () => void) => void;
 declare const test: (name: string, fn: () => void) => void;
@@ -60,45 +59,6 @@ suite("Tool call argument deltas", () => {
 });
 
 suite("flushPendingBuffers Unit Tests", () => {
-    test("flushes /responses-format tool calls and emits with reason: incomplete_stream_end", () => {
-        const state = createInitialStreamingState();
-
-        // Simulate buffered /responses tool calls
-        state.responseToolCallBuffers.set("call-id-1", { id: "call-id-1", name: "search", args: '{"q":"test"}' });
-        state.responseToolCallOrder = ["call-id-1"];
-
-        const parts = flushPendingBuffers(state);
-
-        assert.ok(parts.length >= 2, "Should emit tool call + finish part");
-        const toolCallPart = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCallPart && toolCallPart.type === "tool_call");
-        if (toolCallPart && toolCallPart.type === "tool_call") {
-            assert.strictEqual(toolCallPart.name, "search");
-        }
-        const finishPart = parts[parts.length - 1];
-        assert.strictEqual(finishPart.type, "finish");
-        assert.strictEqual((finishPart as unknown as { reason: string; type: string }).reason, "incomplete_stream_end");
-        assert.strictEqual(state.responseToolCallBuffers.size, 0, "Buffers should be cleared");
-        assert.strictEqual(state.responseToolCallOrder.length, 0);
-    });
-
-    test("flushes anonymous tool calls when buffered", () => {
-        const state = createInitialStreamingState();
-
-        state.anonymousResponseToolName = "execute_code";
-        state.anonymousResponseToolArgs = '{"code":"print(123)"}';
-
-        const parts = flushPendingBuffers(state);
-
-        const toolCallPart = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCallPart && toolCallPart.type === "tool_call");
-        if (toolCallPart && toolCallPart.type === "tool_call") {
-            assert.strictEqual(toolCallPart.name, "execute_code");
-        }
-        assert.strictEqual(state.anonymousResponseToolName, undefined, "Anonymous state should be cleared");
-        assert.strictEqual(state.anonymousResponseToolArgs, "");
-    });
-
     test("skips malformed tool call args and still emits valid ones", () => {
         const state = createInitialStreamingState();
         state.toolCallBuffers.set(0, { id: "bad-call", name: "badtool", args: "{invalid" });
@@ -122,37 +82,6 @@ suite("flushPendingBuffers Unit Tests", () => {
         const finishPart = parts[0];
         assert.strictEqual(finishPart.type, "finish");
         assert.strictEqual((finishPart as unknown as { reason: string; type: string }).reason, "incomplete_stream_end");
-    });
-
-    test("skips an unnamed /responses call instead of inventing a tool name", () => {
-        const state = createInitialStreamingState();
-        state.responseToolCallBuffers.set("call-x", { id: "call-x", args: '{"q":1}' });
-        state.responseToolCallOrder = ["call-x"];
-
-        const parts = flushPendingBuffers(state);
-
-        assert.deepStrictEqual(
-            parts.filter((part) => part.type === "tool_call"),
-            []
-        );
-    });
-
-    test("omits malformed anonymous arguments from its warning", () => {
-        const state = createInitialStreamingState();
-        const warnStub = sinon.stub(Logger, "warn");
-        state.anonymousResponseToolName = "execute_code";
-        state.anonymousResponseToolArgs = '{"secret":"token-123"';
-
-        try {
-            flushPendingBuffers(state);
-        } finally {
-            warnStub.restore();
-        }
-
-        assert.deepStrictEqual(
-            warnStub.getCalls().map((call) => String(call.args[0]).includes("token-123")),
-            [false]
-        );
     });
 
     test("drops an id-less chat-completions buffer instead of inventing a call id", () => {
@@ -196,29 +125,6 @@ suite("hasBufferedToolCalls", () => {
         assert.strictEqual(hasBufferedToolCalls(state), true);
     });
 
-    test("is true while a /responses tool call is open", () => {
-        const state = createInitialStreamingState();
-        interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", call_id: "call_1", name: "ls", arguments: "{" },
-            },
-            state
-        );
-
-        assert.strictEqual(hasBufferedToolCalls(state), true);
-    });
-
-    test("is true while an anonymous /responses tool call is open", () => {
-        const state = createInitialStreamingState();
-        interpretStreamEvent(
-            { type: "response.output_item.delta", item: { type: "function_call", arguments: "{" } },
-            state
-        );
-
-        assert.strictEqual(hasBufferedToolCalls(state), true);
-    });
-
     test("is false once a finish frame settles the chat-completions buffers", () => {
         const state = createInitialStreamingState();
         interpretStreamEvent(
@@ -246,9 +152,9 @@ suite("Tool Call Args Corruption Logging", () => {
         sandbox.restore();
     });
 
-    test("logs an error-level event and drops the buffered call when args are invalid and finish_reason is stop", () => {
+    test("logs the argument detail at debug and drops the buffered call when args are invalid and finish_reason is stop", () => {
         const state = createInitialStreamingState();
-        const errorStub = sandbox.stub(StructuredLogger, "error");
+        const detailStub = sandbox.stub(StructuredLogger, "debug");
         const invalidArgs = '{"incomplete":';
 
         interpretStreamEvent(
@@ -275,7 +181,7 @@ suite("Tool Call Args Corruption Logging", () => {
             parts.find((p) => p.type === "tool_call"),
             undefined
         );
-        const corruptionCalls = errorStub
+        const corruptionCalls = detailStub
             .getCalls()
             .filter((call) => call.args[0] === "stream.tool_call_args_invalid_json");
         assert.strictEqual(corruptionCalls.length, 1);
@@ -289,9 +195,8 @@ suite("Tool Call Args Corruption Logging", () => {
 
     test("still emits the buffered call when finish_reason is tool_calls, and leaves the drop to the emitter", () => {
         const state = createInitialStreamingState();
-        const errorStub = sandbox.stub(StructuredLogger, "error");
+        const detailStub = sandbox.stub(StructuredLogger, "debug");
         const warnStub = sandbox.stub(StructuredLogger, "warn");
-        const debugStub = sandbox.stub(StructuredLogger, "debug");
         const invalidArgs = '{"incomplete":';
 
         interpretStreamEvent(
@@ -320,27 +225,24 @@ suite("Tool Call Args Corruption Logging", () => {
             assert.strictEqual(toolCall.name, "bad_tool");
             assert.strictEqual(toolCall.args, invalidArgs);
         }
-        // The emitter drops this call and owns its single record, so the interpreter
-        // logs it at debug only.
-        assert.strictEqual(
-            errorStub.getCalls().filter((call) => call.args[0] === "stream.tool_call_args_invalid_json").length,
-            0
-        );
-        assert.strictEqual(
-            warnStub.getCalls().filter((call) => call.args[0] === "stream.tool_call_args_invalid_json").length,
-            0
-        );
-        const corruptionCalls = debugStub
+        // The emitter drops this call and owns its single record, so this layer keeps
+        // the argument detail at debug level and writes no drop record.
+        const corruptionCalls = detailStub
             .getCalls()
             .filter((call) => call.args[0] === "stream.tool_call_args_invalid_json");
         assert.strictEqual(corruptionCalls.length, 1);
         const fields = corruptionCalls[0].args[1] as Record<string, unknown>;
         assert.strictEqual(fields.finishReason, "tool_calls");
+        assert.strictEqual(
+            warnStub.getCalls().filter((call) => call.args[0] === "stream.tool_call_buffer_dropped").length,
+            0
+        );
     });
 
-    test("flushPendingBuffers logs an error-level event when skipping malformed buffered args", () => {
+    test("flushPendingBuffers records one drop and keeps its argument detail at debug", () => {
         const state = createInitialStreamingState();
-        const errorStub = sandbox.stub(StructuredLogger, "error");
+        const detailStub = sandbox.stub(StructuredLogger, "debug");
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
 
         state.toolCallBuffers.set(0, { id: "bad-call", name: "badtool", args: "{invalid" });
         state.toolCallBuffers.set(1, { id: "good-call", name: "goodtool", args: '{"ok":true}' });
@@ -352,64 +254,41 @@ suite("Tool Call Args Corruption Logging", () => {
         if (emitted[0] && emitted[0].type === "tool_call") {
             assert.strictEqual(emitted[0].name, "goodtool");
         }
-        const corruptionCalls = errorStub
+        assert.deepStrictEqual(
+            warnStub
+                .getCalls()
+                .filter((call) => call.args[0] === "stream.tool_call_buffer_dropped")
+                .map((call) => (call.args[1] as Record<string, unknown>).reason),
+            ["invalid_json_args"],
+            "the drop leaves exactly one warn record"
+        );
+        const fields = detailStub
             .getCalls()
-            .filter((call) => call.args[0] === "stream.tool_call_args_invalid_json");
-        assert.strictEqual(corruptionCalls.length, 1);
-        const fields = corruptionCalls[0].args[1] as Record<string, unknown>;
+            .filter((call) => call.args[0] === "stream.tool_call_args_invalid_json")
+            .map((call) => call.args[1] as Record<string, unknown>)[0];
         assert.strictEqual(fields.normalizedId, "bad-call");
         assert.strictEqual(fields.toolName, "badtool");
         assert.strictEqual(fields.argsPreview, "{invalid");
     });
 
-    test("a duplicate id at a tool_calls finish logs the corrupt arguments here", () => {
-        // The call reaches neither the emitter nor a resend, so this layer is the one
-        // that has to record the corrupt arguments.
+    test("a skipped duplicate writes no record", () => {
+        // The call was already delivered, so nothing ran and nothing failed: a skipped
+        // duplicate is not a drop and has nothing to explain.
         const state = createInitialStreamingState();
         state.emittedToolCallIds.add("fc_call_dup");
         state.toolCallBuffers.set(0, { id: "fc_call_dup", name: "read_file", args: '{"p":' });
-        const errorStub = sandbox.stub(StructuredLogger, "error");
-        const debugStub = sandbox.stub(StructuredLogger, "debug");
+        const detailStub = sandbox.stub(StructuredLogger, "debug");
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
 
         interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
 
-        assert.strictEqual(
-            errorStub.getCalls().filter((call) => call.args[0] === "stream.tool_call_args_invalid_json").length,
-            1
-        );
-        assert.strictEqual(
-            debugStub.getCalls().filter((call) => call.args[0] === "stream.tool_call_args_invalid_json").length,
-            0
-        );
-    });
-    test("still reports the corrupt arguments of a call whose id was already emitted", () => {
-        const state = createInitialStreamingState();
-        const errorStub = sandbox.stub(StructuredLogger, "error");
-        state.emittedToolCallIds.add("fc_call_dup");
-        state.toolCallBuffers.set(0, { id: "fc_call_dup", name: "read_file", args: '{"p":' });
-
-        interpretStreamEvent({ choices: [{ finish_reason: "stop" }] }, state);
-
-        assert.strictEqual(
-            errorStub.getCalls().filter((call) => call.args[0] === "stream.tool_call_args_invalid_json").length,
-            1
-        );
-    });
-
-    test("tags a malformed /responses call skipped by recovery with its request id", () => {
-        const state = createInitialStreamingState("req-responses");
-        const warnStub = sandbox.stub(StructuredLogger, "warn");
-        state.responseToolCallBuffers.set("call-bad", { id: "call-bad", name: "search", args: "{invalid" });
-        state.responseToolCallOrder = ["call-bad"];
-
-        flushPendingBuffers(state);
-
         assert.deepStrictEqual(
-            warnStub
-                .getCalls()
-                .filter((call) => call.args[0] === "stream.responses_tool_call_buffer_dropped")
-                .map((call) => (call.args[1] as Record<string, unknown>).requestId),
-            ["req-responses"]
+            {
+                detail: detailStub.getCalls().filter((call) => call.args[0] === "stream.tool_call_args_invalid_json")
+                    .length,
+                drop: warnStub.getCalls().filter((call) => call.args[0] === "stream.tool_call_buffer_dropped").length,
+            },
+            { detail: 0, drop: 0 }
         );
     });
 });
@@ -651,60 +530,6 @@ suite("Tool call drops", () => {
         assert.deepStrictEqual(state.droppedToolCalls, [{ id: "call-bad", name: "search_files" }]);
     });
 
-    test("records a /responses call dropped while flushing for a completed response", () => {
-        const state = createInitialStreamingState("req-completed");
-
-        interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", call_id: "call-keyed", name: "search_files", arguments: "{not json" },
-            },
-            state
-        );
-        interpretStreamEvent({ type: "response.completed", response: {} }, state);
-
-        assert.deepStrictEqual(
-            state.droppedToolCalls.map((call) => call.name),
-            ["search_files"],
-            "the completed-response flush records what it drops"
-        );
-    });
-
-    test("records an anonymous /responses call dropped on output_item.done", () => {
-        const state = createInitialStreamingState("req-anon-done");
-
-        interpretStreamEvent(
-            {
-                type: "response.output_item.done",
-                item: { type: "function_call", name: "search_files", arguments: "{not json" },
-            },
-            state
-        );
-
-        assert.deepStrictEqual(
-            state.droppedToolCalls,
-            [{ id: "anonymous_req-anon-done", name: "search_files" }],
-            "the record carries the request-scoped id"
-        );
-    });
-
-    test("records every /responses call dropped while flushing buffers", () => {
-        const state = createInitialStreamingState("req-flush");
-
-        state.anonymousResponseToolName = "search_files";
-        state.anonymousResponseToolArgs = "{not json";
-        state.responseToolCallBuffers.set("call-keyed", { id: "call-keyed", name: "read_file", args: "[1," });
-        state.responseToolCallOrder.push("call-keyed");
-
-        const parts = flushPendingBuffers(state);
-
-        assert.strictEqual(parts.filter((part) => part.type === "tool_call").length, 0);
-        assert.deepStrictEqual(state.droppedToolCalls, [
-            { id: "call-keyed", name: "read_file" },
-            { id: "anonymous_req-flush", name: "search_files" },
-        ]);
-    });
-
     test("records a chat call dropped for unparseable arguments", () => {
         const state = createInitialStreamingState("req-dropped-chat");
 
@@ -761,7 +586,7 @@ suite("/responses incomplete tool calls", () => {
             .map((call) => call.args[1] as Record<string, unknown>);
     }
 
-    test("logs a keyed /responses call with no name without recording a drop", () => {
+    test("logs a /responses call with no name without recording a drop", () => {
         // The model never named the call, so no notice may claim a tool did not run.
         const state = createInitialStreamingState(REQUEST_ID);
         const warnStub = sandbox.stub(StructuredLogger, "warn");
@@ -781,82 +606,133 @@ suite("/responses incomplete tool calls", () => {
         assert.deepStrictEqual(state.droppedToolCalls, []);
     });
 
-    test("logs a keyed /responses call with no arguments without recording a drop", () => {
+    test("logs a /responses call with no arguments without recording a drop", () => {
         // A call whose arguments never arrived was cut off, which the stream reader
         // judges from the finish, so it is not reported as a tool that failed to run.
         const state = createInitialStreamingState(REQUEST_ID);
         const warnStub = sandbox.stub(StructuredLogger, "warn");
+
         interpretStreamEvent(
             {
-                type: "response.output_item.delta",
+                type: "response.output_item.done",
                 item: { type: "function_call", call_id: "call-noargs", name: "search_files" },
             },
             state
         );
 
-        interpretStreamEvent({ type: "response.completed", response: {} }, state);
-
         assert.deepStrictEqual(
             droppedEventFields(warnStub).map((fields) => fields.reason),
             ["incomplete"]
         );
         assert.deepStrictEqual(state.droppedToolCalls, []);
     });
+});
 
-    test("logs an incomplete anonymous /responses call at stream end without recording it", () => {
-        const state = createInitialStreamingState(REQUEST_ID);
-        const warnStub = sandbox.stub(StructuredLogger, "warn");
-        state.anonymousResponseToolName = "search_files";
+suite("Non-object tool arguments", () => {
+    let sandbox: sinon.SinonSandbox;
 
-        flushPendingBuffers(state);
-
-        assert.deepStrictEqual(
-            droppedEventFields(warnStub).map((fields) => fields.reason),
-            ["incomplete"]
-        );
-        assert.deepStrictEqual(state.droppedToolCalls, []);
+    setup(() => {
+        sandbox = sinon.createSandbox();
     });
 
-    test("logs an incomplete anonymous /responses call on output_item.done without recording it", () => {
-        const state = createInitialStreamingState(REQUEST_ID);
-        const warnStub = sandbox.stub(StructuredLogger, "warn");
+    teardown(() => {
+        sandbox.restore();
+    });
+
+    test("drops a chat call whose arguments are a JSON array", () => {
+        // The settle path is the layer that decides, so the gate is asserted here rather
+        // than only in the emitter.
+        const state = createInitialStreamingState("req-array");
 
         interpretStreamEvent(
-            { type: "response.output_item.done", item: { type: "function_call", name: "search_files" } },
+            {
+                choices: [
+                    {
+                        delta: {
+                            tool_calls: [{ index: 0, id: "call_arr", function: { name: "ls", arguments: "[]" } }],
+                        },
+                    },
+                ],
+            },
+            state
+        );
+        const parts = interpretStreamEvent({ choices: [{ finish_reason: "stop" }] }, state);
+
+        assert.deepStrictEqual(
+            {
+                calls: parts.filter((part) => part.type === "tool_call").length,
+                dropped: state.droppedToolCalls.map((call) => call.name),
+            },
+            { calls: 0, dropped: ["ls"] }
+        );
+    });
+
+    test("drops a /responses call whose arguments are null", () => {
+        // `null` parses as JSON, so only the object check keeps it from becoming a tool
+        // input no schema allows.
+        const state = createInitialStreamingState("req-null");
+
+        const parts = interpretStreamEvent(
+            {
+                type: "response.output_item.done",
+                item: { type: "function_call", call_id: "call_null", name: "ls", arguments: "null" },
+            },
             state
         );
 
         assert.deepStrictEqual(
-            droppedEventFields(warnStub).map((fields) => fields.reason),
-            ["incomplete"]
+            {
+                calls: parts.filter((part) => part.type === "tool_call").length,
+                dropped: state.droppedToolCalls.map((call) => call.name),
+            },
+            { calls: 0, dropped: ["ls"] }
         );
-        assert.deepStrictEqual(state.droppedToolCalls, []);
     });
 
-    test("logs nothing for an empty anonymous buffer at stream end", () => {
-        // A recovery with no anonymous call buffered must not report a drop for a call
-        // that never existed.
-        const state = createInitialStreamingState(REQUEST_ID);
+    test("records a /responses drop by its argument length only", () => {
+        const state = createInitialStreamingState("req-args-length");
         const warnStub = sandbox.stub(StructuredLogger, "warn");
+        const secret = "SECRETVALUE";
+        const args = `{"q":"${secret}`;
 
-        flushPendingBuffers(state);
+        interpretStreamEvent(
+            {
+                type: "response.output_item.done",
+                item: { type: "function_call", call_id: "call_bad", name: "ls", arguments: args },
+            },
+            state
+        );
 
-        assert.deepStrictEqual(droppedEventFields(warnStub), []);
+        const record = warnStub
+            .getCalls()
+            .filter((call) => call.args[0] === "stream.responses_tool_call_buffer_dropped")
+            .map((call) => call.args[1] as Record<string, unknown>)[0];
+        assert.deepStrictEqual(
+            { carriesText: JSON.stringify(record).includes(secret), argsLength: record.argsLength },
+            { carriesText: false, argsLength: args.length }
+        );
     });
 
-    test("logs a malformed anonymous /responses call under the shared drop event", () => {
-        // One event name covers the keyed and anonymous shapes, so a support reader
-        // finds every dropped call under the same key.
-        const state = createInitialStreamingState(REQUEST_ID);
+    test("logs a /responses function call that carries no call id", () => {
+        // No supported server sends this shape, and a call the connector cannot address
+        // is a drop it has to state rather than swallow.
+        const state = createInitialStreamingState("req-no-id");
         const warnStub = sandbox.stub(StructuredLogger, "warn");
-        state.anonymousResponseToolName = "search_files";
-        state.anonymousResponseToolArgs = "{not json";
 
-        flushPendingBuffers(state);
+        interpretStreamEvent(
+            {
+                type: "response.output_item.done",
+                item: { type: "function_call", name: "ls", arguments: "{}" },
+            },
+            state
+        );
 
         assert.deepStrictEqual(
-            droppedEventFields(warnStub).map((fields) => fields.reason),
-            ["invalid_json_args"]
+            warnStub
+                .getCalls()
+                .filter((call) => call.args[0] === "stream.responses_tool_call_buffer_dropped")
+                .map((call) => (call.args[1] as Record<string, unknown>).reason),
+            ["incomplete"]
         );
     });
 });
@@ -908,16 +784,8 @@ suite("Declared tool name mapping", () => {
         assert.strictEqual(toolCall.name, "read_file");
     });
 
-    test("resolves the name on a keyed /responses flush that repeats the wire name", () => {
+    test("resolves the name a /responses done frame carries as a wire name", () => {
         const state = createInitialStreamingState("req-names", new Map([["search_files", "search files"]]));
-
-        interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", call_id: "call-3", name: "search_files", arguments: "{}" },
-            },
-            state
-        );
 
         const parts = interpretStreamEvent(
             {
@@ -955,75 +823,6 @@ suite("Declared tool name mapping", () => {
                             tool_calls: [{ index: 0, function: { name: "search_files", arguments: "{}" } }],
                         },
                         finish_reason: "tool_calls",
-                    },
-                ],
-            },
-            state
-        );
-
-        const toolCall = parts.find((part) => part.type === "tool_call");
-        assert.ok(toolCall && toolCall.type === "tool_call");
-        assert.strictEqual(toolCall.name, "search files");
-    });
-
-    test("resolves the name on an anonymous /responses flush that repeats the wire name", () => {
-        const state = createInitialStreamingState("req-names", new Map([["search_files", "search files"]]));
-
-        interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", name: "search_files", arguments: "{}" },
-            },
-            state
-        );
-
-        const parts = interpretStreamEvent(
-            {
-                type: "response.output_item.done",
-                item: { type: "function_call", name: "search_files", arguments: "{}" },
-            },
-            state
-        );
-
-        const toolCall = parts.find((part) => part.type === "tool_call");
-        assert.ok(toolCall && toolCall.type === "tool_call");
-        assert.strictEqual(toolCall.name, "search files");
-    });
-
-    test("keeps the buffered name when a done frame carries an empty name", () => {
-        const state = createInitialStreamingState("req-names", new Map([["search_files", "search files"]]));
-
-        interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", call_id: "call-5", name: "search_files", arguments: "{}" },
-            },
-            state
-        );
-
-        const parts = interpretStreamEvent(
-            {
-                type: "response.output_item.done",
-                item: { type: "function_call", call_id: "call-5", name: "", arguments: "{}" },
-            },
-            state
-        );
-
-        const toolCall = parts.find((part) => part.type === "tool_call");
-        assert.ok(toolCall && toolCall.type === "tool_call");
-        assert.strictEqual(toolCall.name, "search files");
-    });
-
-    test("resolves the name of a Gemini function call", () => {
-        const state = createInitialStreamingState("req-names", new Map([["search_files", "search files"]]));
-
-        const parts = interpretStreamEvent(
-            {
-                candidates: [
-                    {
-                        content: {
-                            parts: [{ functionCall: { name: "search_files", args: { q: "x" } } }],
-                        },
                     },
                 ],
             },

@@ -1,5 +1,5 @@
 import * as assert from "assert";
-import { interpretStreamEvent, hasBufferedToolCalls } from "../liteLLMStreamInterpreter";
+import { interpretStreamEvent } from "../liteLLMStreamInterpreter";
 import { createInitialStreamingState } from "../streamingState";
 
 declare const suite: (name: string, fn: () => void) => void;
@@ -141,24 +141,6 @@ suite("response.incomplete", () => {
             false
         );
         assert.ok(parts.some((p) => p.type === "data" && p.mimeType === "usage"));
-    });
-
-    test("flushes a buffered tool call before ending the turn", () => {
-        const state = createInitialStreamingState();
-        interpretStreamEvent(
-            { type: "response.output_tool_call.delta", delta: { id: "call-inc", name: "read_file", arguments: "{}" } },
-            state
-        );
-
-        const parts = interpretStreamEvent(
-            { type: "response.incomplete", response: { incomplete_details: { reason: "max_output_tokens" } } },
-            state
-        );
-
-        const toolCall = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCall && toolCall.type === "tool_call");
-        assert.strictEqual(toolCall.name, "read_file");
-        assert.strictEqual(hasBufferedToolCalls(state), false);
     });
 
     test("reads the plural usage detail objects on a completed turn", () => {

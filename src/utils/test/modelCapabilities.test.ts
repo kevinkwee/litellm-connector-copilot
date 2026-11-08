@@ -358,7 +358,7 @@ suite("modelCapabilities", () => {
             const schema = buildReasoningEffortConfigurationSchema(["none", "low", "medium", "high"]);
             assert.ok(schema, "Expected schema for non-empty efforts");
             const prop = schema?.properties.reasoningEffort;
-            // Without `group: "navigation"` VS Code 1.120 hides the configuration property behind
+            // Without `group: "navigation"` VS Code hides the configuration property behind
             // the secondary settings UI and the reasoning effort picker is not visible from the
             // chat model selector. This guards against regressions where the field is dropped.
             assert.strictEqual(prop?.group, "navigation");
@@ -389,7 +389,7 @@ suite("modelCapabilities", () => {
             // enumDescriptions is the field VS Code uses to render the per-item description text
             // that appears alongside each option in the model picker hover popup (e.g.
             // "Balanced reasoning and speed" for "medium"). Without this, the picker shows only
-            // labels with no guidance — exactly what Copilot's own models provide.
+            // labels with no guidance, exactly what Copilot's own models provide.
             const schema = buildReasoningEffortConfigurationSchema(["none", "low", "medium", "high"]);
             const descs = schema?.properties.reasoningEffort.enumDescriptions;
             assert.ok(Array.isArray(descs), "Expected enumDescriptions to be an array");
@@ -603,7 +603,7 @@ suite("modelCapabilities", () => {
             assert.strictEqual(derivePickerCategory({ ...baseDerived, rawContextWindow: 64000 }), undefined);
         });
 
-        test("returns a string literal — never null or an object (regression guard for VS Code picker crash)", () => {
+        test("returns a string literal, never null or an object (regression guard for VS Code picker crash)", () => {
             const result = derivePickerCategory(baseDerived);
             // Guard against the exact bug class: a non-string value reaching the
             // picker's getCategoryLabel switch default branch.

@@ -144,10 +144,10 @@ export class Transport {
         });
 
         // Read the per-call fallback flag from the per-group configuration.
-        // VS Code 1.120 delivers workspace settings via options.configuration on
-        // every call; the chat provider merges LiteLLMConfig into this object
-        // before invoking the transport, so allowChatCompletionsFallback lives
-        // here rather than on a globally-cached config.
+        // The base provider merges the per-group configuration with the workspace
+        // settings it reads itself, then passes the result here, so
+        // allowChatCompletionsFallback lives on that object rather than on a
+        // globally-cached config.
         const allowFallback =
             typeof configuration?.allowChatCompletionsFallback === "boolean" &&
             configuration.allowChatCompletionsFallback === true;

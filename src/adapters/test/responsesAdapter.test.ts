@@ -1,6 +1,6 @@
 import * as assert from "assert";
 import { transformToResponsesFormat } from "../responsesAdapter";
-import { normalizeToolCallId } from "../../utils";
+import { normalizeToolCallId } from "../../utils/messageConversion";
 import type { OpenAIFunctionToolDef, OpenAIChatMessage, LiteLLMResponseInputItem } from "../../types";
 
 suite("Responses Adapter Unit Tests", () => {
@@ -702,9 +702,9 @@ suite("Responses Adapter Unit Tests", () => {
     //   "Invalid type for 'input[N].content': expected one of an array of objects or string,
     //    but got an object instead."
     //
-    // This test builds a representative inline-edit session — system prompt, several
+    // This test builds a representative inline-edit session, system prompt, several
     // user/assistant turns, one turn carrying an image, a tool invocation, and a final
-    // edit request — and asserts that every message-type input item produced by the
+    // edit request, and asserts that every message-type input item produced by the
     // adapter carries content that is either a string or an array, never a bare object.
     test("transformToResponsesFormat inline-edit session with image content never produces bare-object content (bug #98)", () => {
         const imageUrl =
@@ -720,7 +720,7 @@ suite("Responses Adapter Unit Tests", () => {
                 { role: "user", content: "Please refactor this function to be more readable." },
                 // Turn 2: assistant responds with text
                 { role: "assistant", content: "Sure, here is the refactored version:" },
-                // Turn 3: user sends a follow-up with an image (editor screenshot) alongside text — the
+                // Turn 3: user sends a follow-up with an image (editor screenshot) alongside text, the
                 // combination that triggers the inline-edit image path and previously produced a bare dict
                 {
                     role: "user",
@@ -772,7 +772,7 @@ suite("Responses Adapter Unit Tests", () => {
         assert.strictEqual(
             invalidItems.length,
             0,
-            `Found ${invalidItems.length} message item(s) with bare-object content — Azure will reject these. ` +
+            `Found ${invalidItems.length} message item(s) with bare-object content, Azure will reject these. ` +
                 `Offending items: ${JSON.stringify(invalidItems, null, 2)}`
         );
 

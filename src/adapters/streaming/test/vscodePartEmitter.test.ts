@@ -24,7 +24,7 @@ suite("vscodePartEmitter", () => {
 
         sinon.assert.calledOnce(warnStub);
         const callArgs = warnStub.firstCall.args;
-        assert.ok((callArgs[0] as string).includes("Failed to parse tool call arguments"));
+        assert.ok((callArgs[0] as string).includes("arguments are not a JSON object"));
         const fields = callArgs[1] as Record<string, unknown>;
         assert.strictEqual(fields.toolName, "t1");
         assert.strictEqual(fields.id, "call_1");
@@ -63,13 +63,13 @@ suite("vscodePartEmitter", () => {
         );
     });
 
-    test("logs an error-level structured event on tool-call argument parse failure", () => {
-        const errorStub = sandbox.stub(StructuredLogger, "error");
+    test("logs one warn record on tool-call argument parse failure", () => {
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
         const progress = { report: () => undefined } as vscode.Progress<vscode.LanguageModelResponsePart>;
 
         emitPartsToVSCode([{ type: "tool_call", index: 0, id: "call_1", name: "t1", args: "{invalid json" }], progress);
 
-        const failureCalls = errorStub.getCalls().filter((call) => call.args[0] === "vscode.tool_call_parse_failed");
+        const failureCalls = warnStub.getCalls().filter((call) => call.args[0] === "vscode.tool_call_parse_failed");
         assert.strictEqual(failureCalls.length, 1);
         const fields = failureCalls[0].args[1] as Record<string, unknown>;
         assert.strictEqual(fields.toolName, "t1");
@@ -77,26 +77,52 @@ suite("vscodePartEmitter", () => {
         assert.strictEqual(fields.argsPreview, "{invalid json");
     });
 
-    test("logs the error name rather than a message that quotes the arguments", () => {
-        // V8 quotes the text around the failure position, which for a large payload
-        // sits far past the 160-character preview the log is allowed to keep.
+    test("keeps the argument text of a large payload out of both records", () => {
+        // The unreadable value sits past the 160-character preview, so a record that
+        // carried the text or a parse message would leak it.
         const warnStub = sandbox.stub(Logger, "warn");
-        const errorStub = sandbox.stub(StructuredLogger, "error");
+        const structuredStub = sandbox.stub(StructuredLogger, "warn");
         const progress = { report: () => undefined } as vscode.Progress<vscode.LanguageModelResponsePart>;
-        // The unquoted value sits past the preview window, and V8 quotes it in the
-        // error message, so a logged message would carry it.
         const args = `{"a":"${"x".repeat(400)}", "k": SECRETVALUE}`;
         const tail = "SECRETVALU";
 
         emitPartsToVSCode([{ type: "tool_call", index: 0, id: "call_1", name: "t1", args }], progress);
 
         const warnFields = warnStub.firstCall.args[1] as Record<string, unknown>;
-        const errorFields = errorStub.firstCall.args[1] as Record<string, unknown>;
-        assert.strictEqual(warnFields.error, "SyntaxError");
-        assert.strictEqual(errorFields.error, "SyntaxError");
+        const structuredFields = structuredStub.firstCall.args[1] as Record<string, unknown>;
         assert.ok(!JSON.stringify(warnFields).includes(tail), "the log must not carry the argument text");
-        assert.ok(!JSON.stringify(errorFields).includes(tail), "the log must not carry the argument text");
+        assert.ok(!JSON.stringify(structuredFields).includes(tail), "the record must not carry the argument text");
     });
+    test("drops a tool call whose arguments are a JSON array", () => {
+        const reported: unknown[] = [];
+        const progress = {
+            report: (p: unknown) => reported.push(p),
+        } as vscode.Progress<vscode.LanguageModelResponsePart>;
+
+        const dropped = emitPartsToVSCode(
+            [{ type: "tool_call", index: 0, id: "call_1", name: "t1", args: "[]" }],
+            progress
+        );
+
+        assert.deepStrictEqual(reported, [], "an array is not a tool input");
+        assert.deepStrictEqual(dropped, [{ id: "call_1", name: "t1" }]);
+    });
+
+    test("drops a tool call whose arguments are null", () => {
+        const reported: unknown[] = [];
+        const progress = {
+            report: (p: unknown) => reported.push(p),
+        } as vscode.Progress<vscode.LanguageModelResponsePart>;
+
+        const dropped = emitPartsToVSCode(
+            [{ type: "tool_call", index: 0, id: "call_1", name: "t1", args: "null" }],
+            progress
+        );
+
+        assert.deepStrictEqual(reported, [], "null is not a tool input");
+        assert.deepStrictEqual(dropped, [{ id: "call_1", name: "t1" }]);
+    });
+
     test("reports every data part without dropping any", () => {
         const reported: unknown[] = [];
         const progress = {

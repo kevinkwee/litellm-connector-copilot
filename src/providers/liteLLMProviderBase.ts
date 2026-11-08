@@ -42,7 +42,7 @@ import { ActiveRequestRegistry } from "./activeRequests";
  * - Model discovery (lives in the BackendRegistry, see
  *   `LiteLLMProviderRegistry.discoverModels`).
  * - VS Code protocol specifics (stream parsing, response part emission)
- * - Cross-backend routing (handled by VS Code 1.120 per-group config)
+ * - Cross-backend routing (handled by VS Code's per-group config)
  */
 export abstract class LiteLLMProviderBase {
     protected readonly _configManager: ConfigManager;

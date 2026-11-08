@@ -4,7 +4,7 @@ import { LiteLLMClient } from "../adapters/litellmClient";
 import type { BackendSession } from "../providers/backendSession";
 import { Logger } from "../utils/logger";
 import { normalizeAnthropicPromptCachingMode } from "../utils/promptCaching";
-import { deriveGroupNameFromUrl } from "../utils";
+import { deriveGroupNameFromUrl } from "../utils/groupNameFromUrl";
 import { normalizeProxyBaseUrl } from "../utils/proxyBaseUrl";
 import { DEFAULT_RETRY_BUDGET_MS } from "../utils/retryBudget";
 

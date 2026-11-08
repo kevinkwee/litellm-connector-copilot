@@ -9,6 +9,9 @@ import { ActiveRequestRegistry, type ActiveRequestPhase } from "../activeRequest
 import { CopilotMdManager, type CopilotMdEntry } from "../../observability";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
+import { Logger } from "../../utils/logger";
+import { calculateRequestCost, extractPricing } from "../../utils/pricingCalculator";
+import type { LiteLLMModelInfo } from "../../types";
 import { collectResponseText, TEST_USER_AGENT } from "../../test/utils/testMocks";
 import {
     runChatRequest,
@@ -183,7 +186,10 @@ suite("LiteLLM Chat Provider Cancellation", () => {
      * cancels it from the connector while the provider sits in its backoff. Only a
      * cancellation that reaches that sleep can end the turn inside 500 ms.
      */
-    async function runBackoffCancelledRequest(attemptBehaviour: () => ReadableStream<Uint8Array>): Promise<{
+    async function runBackoffCancelledRequest(
+        attemptBehaviour: () => ReadableStream<Uint8Array>,
+        modelInfo?: Record<string, unknown>
+    ): Promise<{
         reported: vscode.LanguageModelResponsePart[];
         chatCalls: number;
         exportStub: sinon.SinonStub;
@@ -203,6 +209,14 @@ suite("LiteLLM Chat Provider Cancellation", () => {
             inactivityTimeout: 60,
         });
         seedDiscoveredBackend(sandbox, provider, "model-1");
+        if (modelInfo) {
+            sandbox
+                .stub(
+                    (provider as unknown as { _registry: { getModelInfo: (id: string) => unknown } })._registry,
+                    "getModelInfo"
+                )
+                .returns(modelInfo);
+        }
         const reported: vscode.LanguageModelResponsePart[] = [];
         const exportStub = sandbox.stub(CopilotMdManager.instance, "exportEntry").resolves(undefined);
         const metricStub = sandbox.stub(LiteLLMTelemetry, "reportMetric");
@@ -300,14 +314,17 @@ suite("LiteLLM Chat Provider Cancellation", () => {
         );
     });
 
-    test("the cancelled metric reports the prompt of the attempt that ran", async () => {
+    test("the cancelled metric reports the spend of the attempt that ran", async () => {
         // The metric reads the same snapshot the transcript does, so a cancel during
-        // the sleep cannot report an attempt that never ran.
+        // the sleep cannot report an attempt that never ran, and the turn still states
+        // what it cost.
         const encoder = new TextEncoder();
+        const pricing = { input_cost_per_token: 0.000001, output_cost_per_token: 0.000002 };
         const { metricStub } = await runBackoffCancelledRequest(
             () =>
                 new ReadableStream<Uint8Array>({
                     start(controller) {
+                        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
                         controller.enqueue(
                             encoder.encode(
                                 'data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":100,"completion_tokens":10}}\n\n'
@@ -317,14 +334,60 @@ suite("LiteLLM Chat Provider Cancellation", () => {
                     pull(controller) {
                         controller.error(new TypeError("terminated"));
                     },
-                })
+                }),
+            pricing as unknown as Record<string, unknown>
         );
 
         const cancelledMetric = metricStub
             .getCalls()
-            .map((call) => call.args[0] as { status?: string; tokensIn?: number })
+            .map(
+                (call) =>
+                    call.args[0] as {
+                        status?: string;
+                        tokensIn?: number;
+                        tokensOut?: number;
+                        estimatedTotalCost?: number;
+                    }
+            )
             .find((metric) => metric.status === "cancelled");
-        assert.strictEqual(cancelledMetric?.tokensIn, 100);
+        const pricedAttempt = calculateRequestCost({
+            promptTokens: 100,
+            completionTokens: 10,
+            cachedTokens: 0,
+            cacheCreationInputTokens: 0,
+            pricing: extractPricing(pricing as unknown as LiteLLMModelInfo),
+        });
+        assert.deepStrictEqual(
+            {
+                prompt: cancelledMetric?.tokensIn,
+                output: cancelledMetric?.tokensOut,
+                cost: cancelledMetric?.estimatedTotalCost,
+            },
+            { prompt: 100, output: 10, cost: pricedAttempt.totalCost },
+            "the cancelled metric reports the attempt's prompt, output and cost"
+        );
+    });
+
+    test("writes the final usage line for a cancelled turn", async () => {
+        const debugStub = sandbox.stub(Logger, "debug");
+        const encoder = new TextEncoder();
+        await runBackoffCancelledRequest(
+            () =>
+                new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+                    },
+                    pull(controller) {
+                        controller.error(new TypeError("terminated"));
+                    },
+                })
+        );
+
+        const finalLines = debugStub
+            .getCalls()
+            .map((call) => String(call.args[0]))
+            .filter((message) => message.includes("[TokenUsage][Final]"));
+        assert.strictEqual(finalLines.length, 1, "a cancelled turn publishes its token totals once");
     });
 
     test("cancels a request that is still waiting for response headers", async () => {

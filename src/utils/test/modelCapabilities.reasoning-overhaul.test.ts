@@ -43,7 +43,7 @@ suite("modelCapabilities - Reasoning Overhaul", () => {
             assert.ok(result.includes("high"));
         });
 
-        test("uses DEFAULT_REASONING_EFFORTS when only supports_reasoning is true", () => {
+        test("uses the canonical effort list when only supports_reasoning is true", () => {
             // When supports_reasoning is true and supported_openai_params is absent (provider
             // didn't populate the field), fall back to showing the default effort ladder.
             const modelInfo: LiteLLMModelInfo = {

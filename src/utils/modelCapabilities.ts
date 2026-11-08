@@ -1,6 +1,11 @@
 import type * as vscode from "vscode";
 import type { LiteLLMModelInfo, ModelCapabilityOverride, SupportedReasoningEffort } from "../types";
 import { getDefaultEffort, getEffectiveEfforts } from "../config/modelOverrides";
+import {
+    CANONICAL_REASONING_EFFORTS,
+    REASONING_EFFORT_FLAGS,
+    readDeclaredReasoningEfforts,
+} from "../config/reasoningEfforts";
 
 /**
  * Static parameter limitations for known model families.
@@ -113,7 +118,7 @@ export function deriveCapabilitiesFromModelInfo(
     // Check supported_openai_params array for capability detection
     const supportedParams = modelInfo?.supported_openai_params ?? [];
 
-    const hasExplicitReasoningEffort = Object.keys(LITELLM_REASONING_EFFORT_MAPPING).some(
+    const hasExplicitReasoningEffort = Object.keys(REASONING_EFFORT_FLAGS).some(
         (key) => modelInfo?.[key as keyof LiteLLMModelInfo] === true
     );
 
@@ -195,37 +200,6 @@ export function capabilitiesToVSCode(
     };
 }
 
-/**
- * Mapping of LiteLLM reasoning effort fields to standard effort values.
- * This supports the 5 LiteLLM reasoning effort levels for model picker UI.
- */
-const LITELLM_REASONING_EFFORT_MAPPING: Record<string, SupportedReasoningEffort> = {
-    supports_none_reasoning_effort: "none",
-    supports_minimal_reasoning_effort: "minimal",
-    supports_low_reasoning_effort: "low",
-    supports_xlow_reasoning_effort: "low",
-    supports_medium_reasoning_effort: "medium",
-    supports_high_reasoning_effort: "high",
-    supports_xhigh_reasoning_effort: "xhigh",
-    supports_max_reasoning_effort: "max",
-} as const satisfies Record<string, SupportedReasoningEffort>;
-
-/**
- * Default supported reasoning efforts when model explicitly supports reasoning
- * but doesn't specify exact effort levels (supports_reasoning: true).
- * Exposing every level keeps the picker usable for a model the proxy describes
- * with no finer detail.
- */
-const DEFAULT_REASONING_EFFORTS: readonly SupportedReasoningEffort[] = [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-];
-
 /** Output tokens reserved when the model info declares no output limit. */
 const DEFAULT_RESERVED_OUTPUT_TOKENS = 16000;
 
@@ -240,9 +214,7 @@ function hasReasoningSignal(modelInfo?: LiteLLMModelInfo): boolean {
     if (modelInfo.supports_reasoning === true) {
         return true;
     }
-    return Object.keys(LITELLM_REASONING_EFFORT_MAPPING).some(
-        (key) => modelInfo[key as keyof LiteLLMModelInfo] === true
-    );
+    return Object.keys(REASONING_EFFORT_FLAGS).some((key) => modelInfo[key as keyof LiteLLMModelInfo] === true);
 }
 
 /**
@@ -267,7 +239,7 @@ function reasoningEffortParamStatus(modelInfo?: LiteLLMModelInfo): boolean | nul
     if (Array.isArray(params) && params.length > 0) {
         return params.includes("reasoning_effort");
     }
-    // params is absent, null, or empty array — treat as unknown (not explicitly excluded)
+    // An absent, null or empty params list is unknown rather than explicitly excluded.
     return null;
 }
 
@@ -276,7 +248,7 @@ function reasoningEffortParamStatus(modelInfo?: LiteLLMModelInfo): boolean | nul
  *
  * The explicit `supports_<level>_reasoning_effort` fields are the base set, and
  * a `forceMandatory` override replaces them. A model that reports only
- * `supports_reasoning` gets `DEFAULT_REASONING_EFFORTS`. An empty result means no
+ * `supports_reasoning` gets `CANONICAL_REASONING_EFFORTS`. An empty result means no
  * effort picker.
  */
 export function getSupportedReasoningEfforts(
@@ -292,7 +264,7 @@ export function getSupportedReasoningEfforts(
     // An explicit false wins over any override. Explicit effort fields the proxy
     // reports alongside it stay authoritative.
     if (modelInfo?.supports_reasoning === false) {
-        const explicitEfforts = extractExplicitReasoningEfforts(modelInfo);
+        const explicitEfforts = readDeclaredReasoningEfforts(modelInfo);
         if (explicitEfforts !== undefined) {
             return explicitEfforts;
         }
@@ -300,7 +272,7 @@ export function getSupportedReasoningEfforts(
     }
 
     const paramStatus = reasoningEffortParamStatus(modelInfo);
-    const explicitEfforts = extractExplicitReasoningEfforts(modelInfo);
+    const explicitEfforts = readDeclaredReasoningEfforts(modelInfo);
     if (paramStatus === false && explicitEfforts === undefined) {
         return [];
     }
@@ -322,45 +294,10 @@ export function getSupportedReasoningEfforts(
     }
 
     if (hasReasoningSignal(modelInfo)) {
-        return DEFAULT_REASONING_EFFORTS;
+        return CANONICAL_REASONING_EFFORTS;
     }
 
     return [];
-}
-
-/**
- * Extract reasoning efforts from explicit effort level fields in LiteLLM model info.
- * Example: supports_high_reasoning_effort: true → includes "high"
- *
- * Returns `undefined` when no explicit effort fields are present at all (so callers
- * can fall back to defaults). Returns an array (possibly empty) when at least one
- * explicit effort field is present — this respects explicit `false` values from
- * LiteLLM rather than falling back to the full default ladder.
- */
-function extractExplicitReasoningEfforts(modelInfo?: LiteLLMModelInfo): SupportedReasoningEffort[] | undefined {
-    if (!modelInfo) {
-        return undefined;
-    }
-
-    const efforts = new Set<SupportedReasoningEffort>();
-    let hasAnyExplicitField = false;
-    for (const [key, effortValue] of Object.entries(LITELLM_REASONING_EFFORT_MAPPING)) {
-        const value = modelInfo[key as keyof LiteLLMModelInfo];
-        if (value === true) {
-            efforts.add(effortValue);
-        }
-        if (value !== undefined && value !== null) {
-            hasAnyExplicitField = true;
-        }
-    }
-
-    if (!hasAnyExplicitField) {
-        return undefined;
-    }
-
-    // Sort efforts in standard order: none, minimal, low, medium, high, xhigh, max
-    const effortOrder: SupportedReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
-    return effortOrder.filter((e) => efforts.has(e));
 }
 
 /**
@@ -394,7 +331,7 @@ export function getDefaultReasoningEffort(
 
 /**
  * Per-effort descriptions shown alongside each option in VS Code's model picker hover popup.
- * VS Code renders these via `enumDescriptions` — one entry per enum value, in the same order.
+ * VS Code renders these via `enumDescriptions`, one entry per enum value, in the same order.
  * Without this array the picker shows only the label (e.g. "Medium") with no explanatory text,
  * meaning users have no guidance on what each effort level actually does.
  */
@@ -432,13 +369,13 @@ export function buildReasoningEffortConfigurationSchema(
                   // VS Code uses `title` as the section heading in the hover popup (e.g. "Thinking Effort").
                   title: string;
                   enum: SupportedReasoningEffort[];
-                  // Human-readable labels aligned with `enum` — shown in the picker list instead of raw values.
+                  // Human-readable labels aligned with `enum`, shown in the picker list instead of raw values.
                   enumItemLabels: string[];
                   // Per-item descriptions rendered next to each option in the hover popup.
                   // This is what causes VS Code to display the "Faster responses…" / "Balanced…" lines.
                   enumDescriptions: string[];
                   default?: SupportedReasoningEffort;
-                  // Must be "navigation" for VS Code 1.120 to surface this as an inline picker action
+                  // Must be "navigation" for VS Code to surface this as an inline picker action
                   // rather than hiding it in the secondary configuration UI.
                   group: "navigation";
               };
@@ -459,7 +396,7 @@ export function buildReasoningEffortConfigurationSchema(
                 title: "Thinking Effort",
                 enum: [...supportedEfforts],
                 enumItemLabels: supportedEfforts.map((effort) => effort.charAt(0).toUpperCase() + effort.slice(1)),
-                // Per-item descriptions — renders the explanatory text beside each effort option
+                // Per-item descriptions render the explanatory text beside each effort option.
                 // in the VS Code model-picker hover popup (e.g. "Balanced reasoning and speed").
                 enumDescriptions: supportedEfforts.map(getEffortDescription),
                 // VS Code's `getModelConfigurationDescription` uses `currentConfig[key] ?? propSchema.default`
@@ -554,9 +491,8 @@ export function mergeConfigurationSchemas(
  * - `versatile` when the model supports tools OR vision (general-purpose).
  * - `lightweight` when none of the above apply and the model has a small
  *   context window (proxy signal for "fast / cheap").
- * - `undefined` when none of the signals are conclusive — the picker
- *   already handles `undefined` by omitting the tag (the `case undefined`
- *   branch in its switch).
+ * - `undefined` when none of the signals is conclusive. The picker omits the tag
+ *   for `undefined` (the `case undefined` branch in its switch).
  *
  * Decision order matters: `powerful` > `versatile` > `lightweight` > undefined.
  * A model that meets the criteria for multiple tiers gets the highest one.

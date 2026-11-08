@@ -1,7 +1,7 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
 
-import { validateRequest } from "../../utils";
+import { validateRequest } from "../../utils/messageConversion";
 
 /** A tool call part with a fixed name and arguments, identified by `callId`. */
 function call(callId: string): vscode.LanguageModelToolCallPart {

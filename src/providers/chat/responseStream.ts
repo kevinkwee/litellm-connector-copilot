@@ -1,7 +1,7 @@
 import type { CancellationToken, LanguageModelResponsePart, Progress } from "vscode";
 import { LanguageModelTextPart } from "vscode";
 
-import { tryParseJSONObject } from "../../utils";
+import { tryParseJSONObject } from "../../utils/messageConversion";
 import { describeDroppedToolCalls, describeStoppedEarly } from "../../utils/connectorNotice";
 import { Logger } from "../../utils/logger";
 import { StructuredLogger } from "../../observability/structuredLogger";
@@ -24,6 +24,11 @@ export interface ResponseStreamContext {
     readonly requestId: string;
     /** Wire name to declared name, so a tool call reaches VS Code under a name it declared. */
     readonly wireToDeclaredNames?: ReadonlyMap<string, string>;
+    /**
+     * Thinking-block ids already used by earlier attempts of this request. Read as the
+     * starting number and updated with the last one used, so a retry never reuses an id.
+     */
+    readonly thinkingBlockIds?: { used: number };
     readonly inactivityTimeoutMs: number;
 }
 
@@ -55,7 +60,11 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
         timestamp: new Date().toISOString(),
     });
 
-    const streamingState = createInitialStreamingState(requestId, wireToDeclaredNames);
+    const streamingState = createInitialStreamingState(
+        requestId,
+        wireToDeclaredNames,
+        context.thinkingBlockIds?.used ?? 0
+    );
     let watchdog: NodeJS.Timeout | undefined;
     let eventCount = 0;
     let wasWatchdogAbort = false;
@@ -123,13 +132,68 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
             return;
         }
         Logger.warn(`[chatStream] request=${requestId} ${streamingState.droppedToolCalls.length} tool call(s) dropped`);
-        StructuredLogger.warn("stream.tool_calls_dropped", {
+        // Informational: the drop itself was recorded where it happened, and this entry
+        // records that the notice was shown.
+        StructuredLogger.info("stream.tool_calls_dropped", {
             requestId,
             eventCount,
             droppedToolCalls: streamingState.droppedToolCalls.map((call) => ({ id: call.id, name: call.name })),
         });
         progress.report(new LanguageModelTextPart(describeDroppedToolCalls(streamingState.droppedToolCalls)));
     };
+    /**
+     * Closes a turn whose stream has ended: recovers the tool calls it still holds, raises
+     * the reasoning-only sentinel for a reply that carried nothing but reasoning, then
+     * reports the notices the turn earned. A stream-end error after a proven `stop` runs
+     * this too, because that turn was answered and only its terminator was lost.
+     */
+    const settleCompletedTurn = (): void => {
+        // A cancelled stream delivers no tool calls: the host drops the parts
+        // reported after it cancels, and after a connector cancel a recovered
+        // call would reach the agent loop and run a tool the user just stopped.
+        if (!token.isCancellationRequested && hasBufferedToolCalls(streamingState)) {
+            recoverBufferedToolCalls("stream_completed_without_finish");
+        }
+
+        // `sawNormalFinish` is the `stop` proof, and it is the only proof this flag reads.
+        // A chat `tool_calls` finish never needs it: that call set `sawToolCallPart` before
+        // the emitter dropped it, so the reasoning-only guard below already leaves that turn
+        // alone. Apart from that finish, a call dropped without a `stop` was cut short by a
+        // length limit, a content filter or a closed stream.
+        const dropIsTheAnswer = streamingState.droppedToolCalls.length > 0 && sawNormalFinish;
+
+        // Reasoning-only detection needs all of: an event, no text, no call part either way,
+        // and no drop the `stop` proved. A turn that streamed text, or that produced such a
+        // drop, continues to its notices instead. It runs before the stop notice because a
+        // retried turn must not carry the notice of the attempt it replaced.
+        if (eventCount > 0 && !sawTextPart && !sawToolCallPart && !dropIsTheAnswer) {
+            Logger.warn(
+                `[chatStream] request=${requestId} Reasoning-only stream detected (${eventCount} events, ` +
+                    `no text/tool parts); surfacing as resumable empty-content error`
+            );
+            StructuredLogger.warn("stream.reasoning_only_response", {
+                requestId,
+                eventCount,
+                sawUsagePart,
+            });
+            throw new ReasoningOnlyError(eventCount, reasoningChars, sawNormalFinish);
+        }
+
+        // The stop notice comes first: it names the cause, and the drop notice reads
+        // as a consequence of it.
+        if (stoppedEarly) {
+            Logger.warn(`[chatStream] request=${requestId} Stream stopped by finish reason "${stoppedEarly.reason}"`);
+            StructuredLogger.warn("stream.stopped_early", {
+                requestId,
+                reason: stoppedEarly.reason,
+                eventCount,
+            });
+            progress.report(new LanguageModelTextPart(stoppedEarly.notice));
+        }
+
+        reportDroppedToolCalls();
+    };
+
     const resetWatchdog = () => {
         if (watchdog) {
             clearTimeout(watchdog);
@@ -220,65 +284,8 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
             throw new InactivityTimeoutError(inactivityTimeoutMs, eventCount);
         }
 
-        // A cancelled stream delivers no tool calls: the host drops the parts
-        // reported after it cancels, and after a connector cancel a recovered
-        // call would reach the agent loop and run a tool the user just stopped.
-        if (!token.isCancellationRequested && hasBufferedToolCalls(streamingState)) {
-            recoverBufferedToolCalls("stream_completed_without_finish");
-        }
-
-        // `sawNormalFinish` is the `stop` proof, and it is the only proof this flag reads.
-        // A chat `tool_calls` finish never needs it: that call set `sawToolCallPart` before
-        // the emitter dropped it, so the reasoning-only guard below already leaves that turn
-        // alone. Apart from that finish, a call dropped without a `stop` was cut short by a
-        // length limit, a content filter or a closed stream.
-        const dropIsTheAnswer = streamingState.droppedToolCalls.length > 0 && sawNormalFinish;
-
-        // Reasoning-only detection needs all of: an event, no text, no call part either way,
-        // and no drop the `stop` proved. A turn that streamed text, or that produced such a
-        // drop, continues to its notices instead. It runs before the stop notice because a
-        // retried turn must not carry the notice of the attempt it replaced.
-        if (eventCount > 0 && !sawTextPart && !sawToolCallPart && !dropIsTheAnswer) {
-            Logger.warn(
-                `[chatStream] request=${requestId} Reasoning-only stream detected (${eventCount} events, ` +
-                    `no text/tool parts); surfacing as resumable empty-content error`
-            );
-            StructuredLogger.warn("stream.reasoning_only_response", {
-                requestId,
-                eventCount,
-                sawUsagePart,
-            });
-            throw new ReasoningOnlyError(eventCount, reasoningChars, sawNormalFinish);
-        }
-
-        // The stop notice comes first: it names the cause, and the drop notice reads
-        // as a consequence of it.
-        if (stoppedEarly) {
-            Logger.warn(`[chatStream] request=${requestId} Stream stopped by finish reason "${stoppedEarly.reason}"`);
-            StructuredLogger.warn("stream.stopped_early", {
-                requestId,
-                reason: stoppedEarly.reason,
-                eventCount,
-            });
-            progress.report(new LanguageModelTextPart(stoppedEarly.notice));
-        }
-
-        reportDroppedToolCalls();
+        settleCompletedTurn();
     } catch (error: unknown) {
-        // Every error leaving this function is handled by the caller, which
-        // retries the recoverable sentinels and logs the final outcome. Log the
-        // attempt at warn so a recovered retry does not read as a failure in the
-        // channel.
-        Logger.warn(
-            `[chatStream] request=${requestId} Stream attempt failed after ${eventCount} events`,
-            toErrorLogFields(error)
-        );
-        StructuredLogger.warn("stream.attempt_failed", {
-            requestId,
-            eventCount,
-            ...toErrorLogFields(error),
-        });
-
         const isStreamEndError =
             !(error instanceof UpstreamStreamError) &&
             error instanceof Error &&
@@ -295,6 +302,39 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
                 return;
             }
         }
+
+        // A turn that already reported a proven `stop` is finished: the end error only
+        // says the terminator never arrived, and resuming a finished turn would pay for
+        // a full prompt and append text to an answer the model had ended. It closes the
+        // way a clean end does, so a reasoning-only or empty stop still reaches its retry.
+        if (isStreamEndError && sawNormalFinish) {
+            Logger.debug(
+                `[chatStream] request=${requestId} ignoring a stream-end error after a stop finish: ${error.message}`
+            );
+            StructuredLogger.info("stream.end_error_after_stop", { requestId, eventCount });
+            settleCompletedTurn();
+            return;
+        }
+
+        // A reasoning-only reply is a retry, not a failure: the retry loop records it as
+        // `request.reasoning_only_retry`, so it must not also read as a failed attempt,
+        // whether it was detected on the clean path or after a lost terminator.
+        if (error instanceof ReasoningOnlyError) {
+            throw error;
+        }
+
+        // The attempt really failed, and it is about to leave this layer: record it
+        // once here. The turn's outcome is recorded separately at the provider
+        // boundary, so a recovered retry never reads as a failure in the channel.
+        Logger.warn(
+            `[chatStream] request=${requestId} Stream attempt failed after ${eventCount} events`,
+            toErrorLogFields(error)
+        );
+        StructuredLogger.warn("stream.attempt_failed", {
+            requestId,
+            eventCount,
+            ...toErrorLogFields(error),
+        });
 
         // Belt-and-suspenders: if a watchdog abort coincided with an actual
         // stream error, classify it as the retryable inactivity sentinel.
@@ -315,5 +355,8 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
         // frame, reasoning-only retry, recovered tool calls) would otherwise
         // leave the upstream generating and billing until it finishes.
         cancelUpstreamBody(responseBody);
+        if (context.thinkingBlockIds) {
+            context.thinkingBlockIds.used = streamingState.thinkingBlockCounter;
+        }
     }
 }

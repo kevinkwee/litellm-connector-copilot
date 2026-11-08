@@ -1,6 +1,6 @@
 import * as assert from "assert";
 
-import { deriveGroupNameFromUrl } from "../../utils";
+import { deriveGroupNameFromUrl } from "../../utils/groupNameFromUrl";
 
 suite("deriveGroupNameFromUrl", () => {
     test("returns hostname from https URL", () => {

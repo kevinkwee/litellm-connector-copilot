@@ -1,7 +1,7 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
 
-import { convertMessages } from "../../utils";
+import { convertMessages } from "../../utils/messageConversion";
 
 suite("convertMessages reasoning", () => {
     test("convertMessages emits reasoning-only assistant message (resume support)", () => {

@@ -139,6 +139,140 @@ suite("processResponseStream", () => {
         );
     });
 
+    test("completes a stream whose last frame arrived without its blank line", async () => {
+        // The frame carried the model's stop, so the turn is answered even though the
+        // decoder reports the missing terminator; retrying it would append to a
+        // finished answer.
+        const recorder = createPartRecorder();
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(encoder.encode(`data: ${chatTextFrame("done")}\n\n`));
+                // The finish frame arrives with a single newline, so the decoder flushes
+                // it at EOF and then reports the missing terminator.
+                controller.enqueue(encoder.encode(`data: ${chatFinishFrame("stop")}\n`));
+                controller.close();
+            },
+        });
+
+        await processResponseStream({
+            responseBody: stream,
+            progress: recorder.progress,
+            token: new vscode.CancellationTokenSource().token,
+            requestId: REQUEST_ID,
+            inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+        });
+
+        assert.strictEqual(collectResponseText(recorder.parts), "done");
+    });
+
+    test("numbers thinking blocks onwards across attempts of one request", async () => {
+        // A retry that reused litellm-thinking-1 would be merged into the earlier
+        // reasoning item, showing the same reasoning twice.
+        const thinkingBlockIds = { used: 0 };
+        const first = createPartRecorder();
+        const second = createPartRecorder();
+        const context = (progress: vscode.Progress<vscode.LanguageModelResponsePart>) => ({
+            progress,
+            token: new vscode.CancellationTokenSource().token,
+            requestId: REQUEST_ID,
+            inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+            thinkingBlockIds,
+        });
+
+        // Each attempt is reasoning-only, which the provider retries; the ids are the
+        // subject here, so the sentinel is asserted rather than absorbed.
+        await assert.rejects(
+            processResponseStream({
+                ...context(first.progress),
+                responseBody: new SteppedSseStream([chatReasoningFrame("first"), SSE_DONE_FRAME], []).body,
+            }),
+            ReasoningOnlyError
+        );
+        await assert.rejects(
+            processResponseStream({
+                ...context(second.progress),
+                responseBody: new SteppedSseStream([chatReasoningFrame("second"), SSE_DONE_FRAME], []).body,
+            }),
+            ReasoningOnlyError
+        );
+
+        assert.deepStrictEqual(
+            [first.parts, second.parts].map((parts) => (parts[0] as unknown as { id?: string }).id),
+            ["litellm-thinking-1", "litellm-thinking-2"]
+        );
+    });
+
+    test("retries a reasoning-only reply whose last frame lost its blank line", async () => {
+        // The truncation is only the missing terminator; the turn still carried no
+        // answer, so it must reach the reasoning-only retry rather than complete.
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(encoder.encode(`data: ${chatReasoningFrame("thought")}\n\n`));
+                controller.enqueue(encoder.encode(`data: ${chatFinishFrame("stop")}\n`));
+                controller.close();
+            },
+        });
+
+        await assert.rejects(
+            processResponseStream({
+                responseBody: stream,
+                progress: IGNORE_PROGRESS,
+                token: new vscode.CancellationTokenSource().token,
+                requestId: REQUEST_ID,
+                inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+            }),
+            (error: unknown) => error instanceof ReasoningOnlyError && error.normalFinish === true
+        );
+    });
+
+    test("records a reasoning-only reply as a retry, not a failed attempt", async () => {
+        // The retry loop records the retry; a sentinel that is about to be retried must
+        // not also read as a failure in the channel.
+        const warnStub = sandbox.stub(StructuredLogger, "warn");
+
+        await assert.rejects(
+            processResponseStream({
+                responseBody: new SteppedSseStream([chatReasoningFrame("thought"), SSE_DONE_FRAME], []).body,
+                progress: IGNORE_PROGRESS,
+                token: new vscode.CancellationTokenSource().token,
+                requestId: REQUEST_ID,
+                inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+            }),
+            ReasoningOnlyError
+        );
+
+        assert.deepStrictEqual(
+            warnStub
+                .getCalls()
+                .map((call) => call.args[0])
+                .filter((event) => event === "stream.attempt_failed"),
+            []
+        );
+    });
+
+    test("retries an empty stop whose last frame lost its blank line", async () => {
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(encoder.encode(`data: ${chatFinishFrame("stop")}\n`));
+                controller.close();
+            },
+        });
+
+        await assert.rejects(
+            processResponseStream({
+                responseBody: stream,
+                progress: IGNORE_PROGRESS,
+                token: new vscode.CancellationTokenSource().token,
+                requestId: REQUEST_ID,
+                inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+            }),
+            (error: unknown) => error instanceof ReasoningOnlyError && error.reasoningChars === 0
+        );
+    });
+
     test("skips tool call recovery for a cancelled stream", async () => {
         const recorder = createPartRecorder();
         const tokenSource = new vscode.CancellationTokenSource();

@@ -70,7 +70,7 @@ import {
     getSupportedReasoningEfforts,
     derivePickerCategory,
 } from "../utils/modelCapabilities";
-import { deriveGroupNameFromUrl } from "../utils";
+import { deriveGroupNameFromUrl } from "../utils/groupNameFromUrl";
 import { sleepWithCancellation } from "../utils/transportRetry";
 import type { LiteLLMConfig, LiteLLMModelInfo } from "../types";
 import type { ConfigManager } from "../config/configManager";

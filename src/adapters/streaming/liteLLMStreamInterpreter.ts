@@ -1,11 +1,10 @@
-import { normalizeToolCallId } from "../../utils";
+import { normalizeToolCallId, tryParseJSONObject } from "../../utils/messageConversion";
 import { Logger } from "../../utils/logger";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import { redactedThinkingMetadata, signedThinkingMetadata } from "../../utils/thinkingBlocks";
 import { normalizeUsagePayload, type RawUsagePayload } from "./usagePayload";
-import { acceptResponsesToolCall, flushResponsesToolCalls, interpretResponsesEvent } from "./responsesEventInterpreter";
+import { interpretResponsesEvent } from "./responsesEventInterpreter";
 import {
-    formatAnonymousToolCallRecordId,
     ensureCurrentThinkingBlockId,
     nextThinkingBlockId,
     requestTag,
@@ -35,7 +34,7 @@ function toArgumentText(value: unknown): string {
 const INCOMPLETE_STREAM_END = "incomplete_stream_end";
 
 /**
- * Longest slice of unparsable tool call arguments a log may carry. A merged or
+ * Longest slice of unusable tool call arguments a log may carry. A merged or
  * truncated payload is only diagnosable from its content, and the cap keeps the
  * rest of the payload out of the logs.
  */
@@ -74,12 +73,11 @@ function logDroppedToolCallBuffer(
  * Returns a part for each chat-completions buffer this layer can deliver, records the
  * ones it cannot, skips ids already emitted, and clears the buffers.
  *
- * A buffer with invalid JSON arguments is still returned at a `tool_calls` finish,
+ * Arguments that are not a JSON object are still returned at a `tool_calls` finish,
  * where the model declares its calls complete, because the emitter is the layer that
- * drops it there: this layer records the parse failure at debug level and leaves the
- * single record of the drop to the emitter. At any other finish this layer drops the
- * call, records it on the state, and logs the drop itself, and the stream reader judges
- * from the finish whether the drop answered the turn.
+ * drops them there and owns the single warn record of the drop. At any other finish this
+ * layer drops the call, records it on the state, and logs that one record itself; the
+ * stream reader judges from the finish whether the drop answered the turn.
  */
 function settleChatToolCallBuffers(state: StreamingState, finishReason: string): EmittedPart[] {
     const parts: EmittedPart[] = [];
@@ -88,15 +86,17 @@ function settleChatToolCallBuffers(state: StreamingState, finishReason: string):
             logDroppedToolCallBuffer(state, "incomplete_at_finish", index, buffer, finishReason);
             continue;
         }
-        let isJsonValid = true;
-        try {
-            JSON.parse(buffer.args);
-        } catch {
-            isJsonValid = false;
-        }
+        const isJsonValid = tryParseJSONObject(buffer.args).ok;
         const isDuplicate = state.emittedToolCallIds.has(buffer.id);
+        if (isDuplicate) {
+            // A call already delivered is skipped silently: nothing ran, nothing failed.
+            continue;
+        }
         if (!isJsonValid) {
-            const fields = {
+            // The drop itself is recorded once, by the layer that drops it: the emitter at
+            // a `tool_calls` finish, and this layer otherwise. This entry carries the
+            // argument detail to both.
+            StructuredLogger.debug("stream.tool_call_args_invalid_json", {
                 requestId: state.requestId,
                 toolName: buffer.name,
                 normalizedId: buffer.id,
@@ -104,17 +104,7 @@ function settleChatToolCallBuffers(state: StreamingState, finishReason: string):
                 finishReason,
                 argsLength: buffer.args.length,
                 argsPreview: buffer.args.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS),
-            };
-            if (finishReason === "tool_calls" && !isDuplicate) {
-                // The call reaches the emitter, which drops it there and owns the single
-                // record for the drop.
-                StructuredLogger.debug("stream.tool_call_args_invalid_json", fields);
-            } else {
-                StructuredLogger.error("stream.tool_call_args_invalid_json", fields);
-            }
-        }
-        if (isDuplicate) {
-            continue;
+            });
         }
         if (!isJsonValid && finishReason !== "tool_calls") {
             logDroppedToolCallBuffer(state, "invalid_json_args", index, buffer, finishReason);
@@ -135,18 +125,13 @@ function settleChatToolCallBuffers(state: StreamingState, finishReason: string):
 }
 
 /**
- * True while tool call fragments remain buffered. A finish frame settles the
- * chat-completions buffers, and `output_item.done`, `response.completed`, or
- * `response.incomplete` settles keyed /responses calls. A `function_call`
- * `output_item.done`, or the end-of-stream flush, settles an anonymous call.
+ * True while chat-completions tool-call fragments remain buffered.
+ *
+ * Only that endpoint buffers: a `/responses` function call arrives complete on
+ * `output_item.done` and is emitted there.
  */
 export function hasBufferedToolCalls(state: StreamingState): boolean {
-    return (
-        state.toolCallBuffers.size > 0 ||
-        state.responseToolCallOrder.length > 0 ||
-        state.anonymousResponseToolName !== undefined ||
-        state.anonymousResponseToolArgs.length > 0
-    );
+    return state.toolCallBuffers.size > 0;
 }
 
 interface RawThinkingBlock {
@@ -387,41 +372,6 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
         finish: finishParts,
     });
 
-    // 3. Handle Gemini-style native format (sometimes passed through by LiteLLM)
-    if (data.candidates && Array.isArray(data.candidates) && data.candidates[0]) {
-        Logger.debug(`[interpretStreamEvent] Handling Gemini-format candidates`);
-        const candidate = data.candidates[0] as Record<string, unknown>;
-        const content = candidate.content as Record<string, unknown> | undefined;
-        if (content && Array.isArray(content.parts) && content.parts[0]) {
-            const part = content.parts[0] as Record<string, unknown>;
-            if (typeof part.text === "string" && part.text) {
-                Logger.trace(`[interpretStreamEvent] Gemini text part: ${part.text.length} chars`);
-                textParts.push({ type: "text", value: part.text });
-                StructuredLogger.trace("stream.gemini_text", {
-                    length: part.text.length,
-                });
-            }
-            const functionCall = part.functionCall as { name?: string; args?: unknown; id?: string } | undefined;
-            if (functionCall?.name) {
-                const argsJson = JSON.stringify(functionCall.args ?? {});
-                const resolvedName = resolveToolCallName(state, functionCall.name);
-                Logger.trace(`[interpretStreamEvent] Gemini function call: ${resolvedName}`);
-                toolCallParts.push({
-                    type: "tool_call",
-                    index: 0,
-                    id: functionCall.id,
-                    name: resolvedName,
-                    args: argsJson,
-                });
-                StructuredLogger.trace("stream.gemini_function_call", {
-                    name: resolvedName,
-                    id: functionCall.id,
-                    argsLength: argsJson.length,
-                });
-            }
-        }
-    }
-
     // Emit in deterministic order to match VS Code expectations
     const allParts = [...thinkingParts, ...textParts, ...toolCallParts, ...responseParts, ...dataParts, ...finishParts];
     Logger.trace(
@@ -440,52 +390,24 @@ export function interpretStreamEvent(json: unknown, state: StreamingState): Emit
 }
 
 /**
- * Settles every buffered tool call at a stream end that carried no
- * `response.completed`, `response.incomplete`, or other finish frame.
+ * Settles the chat-completions tool calls still buffered at a stream end that carried no
+ * finish frame. Chat completions is the only endpoint that buffers tool calls.
  *
  * Emits:
- * - The keyed and anonymous /responses calls the interpreter can deliver
  * - The chat-completions tool calls a non-`tool_calls` finish frame would emit
  * - A finish part with reason "incomplete_stream_end"
  *
- * A call the interpreter cannot deliver is logged, and one whose arguments do not
- * parse is also recorded on `droppedToolCalls`, so the turn can explain which tool did
- * not run.
+ * A call the interpreter cannot deliver is logged, and one whose arguments are not a
+ * JSON object is also recorded on `droppedToolCalls`, so the turn can explain which tool
+ * did not run.
  */
 export function flushPendingBuffers(state: StreamingState): EmittedPart[] {
     const parts: EmittedPart[] = [];
 
-    // The keyed /responses calls settle through the same helper the
-    // `response.completed` path uses, so one rule drops a call whichever frame ends the
-    // stream.
-    const toolCallIndex = flushResponsesToolCalls(state, parts);
-
-    // The anonymous /responses buffer is not part of the keyed map, so it settles here
-    // through the same rule. The guard keeps an empty buffer from logging a drop for a
-    // call that never existed.
-    if (state.anonymousResponseToolName || state.anonymousResponseToolArgs) {
-        const anonymousCall = acceptResponsesToolCall(state, {
-            id: formatAnonymousToolCallRecordId(state),
-            name: state.anonymousResponseToolName,
-            args: state.anonymousResponseToolArgs,
-        });
-        if (anonymousCall) {
-            parts.push({
-                type: "tool_call",
-                index: toolCallIndex,
-                id: `anonymous_${Date.now()}`,
-                name: anonymousCall.name,
-                args: anonymousCall.args,
-            });
-            Logger.debug(`[flushPendingBuffers] Flushed anonymous tool call: ${anonymousCall.name}`);
-        }
-    }
-    state.anonymousResponseToolName = undefined;
-    state.anonymousResponseToolArgs = "";
-
-    // Chat-completions buffers settle by the rules of a non-`tool_calls` finish
-    // frame, so a call is never emitted without an id or a name, or with invalid JSON
-    // arguments.
+    // A stream that ends here can still hold chat-completions tool calls the model
+    // finished sending, so they settle by the rules of a non-`tool_calls` finish frame:
+    // a call is never emitted without an id or a name, or with arguments that are not a
+    // JSON object.
     parts.push(...settleChatToolCallBuffers(state, INCOMPLETE_STREAM_END));
 
     Logger.debug(`[flushPendingBuffers] Emitting ${parts.length} flushed parts with incomplete_stream_end signal`);

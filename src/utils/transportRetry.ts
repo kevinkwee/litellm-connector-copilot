@@ -202,6 +202,51 @@ export function isTransportRetriableError(err: unknown): boolean {
     );
 }
 
+/** Connection-phase codes that prove the request never reached the proxy. */
+const CONNECT_PHASE_CODES: ReadonlySet<string> = new Set([
+    "ECONNREFUSED",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+/** The transport error code a failure carries. `fetch` puts it on the `cause`. */
+function transportErrorCode(error: unknown): string | undefined {
+    if (!error || typeof error !== "object") {
+        return undefined;
+    }
+    const cause = (error as { cause?: unknown }).cause;
+    if (cause && typeof cause === "object") {
+        const causeCode = (cause as { code?: unknown }).code;
+        if (typeof causeCode === "string") {
+            return causeCode;
+        }
+    }
+    const code = (error as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+}
+
+/**
+ * True when an error proves the request never reached the proxy.
+ *
+ * Only a connect-phase code on the failure itself or on its `fetch` cause proves the
+ * proxy saw nothing. A socket that opened and then failed (a reset, a hang-up, a headers
+ * timeout) may already be billed upstream, so such an attempt counts as reached and keeps
+ * its prompt in the request totals. An `UpstreamStreamError` came from the proxy, so it is
+ * never a connect-phase failure, whatever its upstream `code` field says.
+ *
+ * One attempt can make several HTTP calls (a connector-parameter strip-and-retry, the
+ * `/responses` fallback, the `include_usage` retry), and only the error that ends the
+ * attempt is classified here.
+ */
+export function failedBeforeReachingProxy(error: unknown): boolean {
+    if (error instanceof UpstreamStreamError) {
+        return false;
+    }
+    const code = transportErrorCode(error);
+    return code !== undefined && CONNECT_PHASE_CODES.has(code);
+}
+
 export function sleepWithCancellation(ms: number, token?: vscode.CancellationToken): Promise<void> {
     if (token?.isCancellationRequested) {
         return Promise.resolve();

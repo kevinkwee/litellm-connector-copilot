@@ -6,7 +6,6 @@ import { Logger } from "../../utils/logger";
 import { appendRateLimitHint } from "../../utils/rateLimitNotice";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
 import { StructuredLogger } from "../../observability/structuredLogger";
-import { logFinalUsageEnvelope } from "../../observability/finalUsageEnvelope";
 import {
     findRejectedParameter,
     isUnsupportedParameterError,
@@ -17,6 +16,7 @@ import { describeFailureForLog, toErrorLogFields } from "../base/errorLogFields"
 import { parseApiError } from "../base/apiErrorMessage";
 import { exportRequestOutcome, recordCancelledTurn, type RequestOutcomeContext } from "../base/requestOutcome";
 import { isReasoningEffortRejection, rejectsReasoningEffortParameter } from "../base/proxyParameterRejection";
+import { buildUsageReportFields, logUsageTotals, toUsageMetricFields } from "../base/usageReport";
 
 /** What every outcome of one chat turn reports. */
 interface TurnReportBase {
@@ -54,57 +54,21 @@ export interface FailedTurnReport extends TurnReportBase {
 export function reportTurnSuccess(report: SuccessfulTurnReport): void {
     // One read of the request totals backs the metric, the final usage line and the transcript.
     const outcomeContext = report.outcomeContext();
-    const { usage: snapshot } = outcomeContext;
-    const tokensOut = snapshot.outputTokens;
-    const tokensIn = snapshot.promptTokens;
-    const reasoningTokens = snapshot.reasoningTokens || undefined;
-    const cachedTokens = snapshot.cachedTokens || undefined;
-    const systemPromptTokens = snapshot.systemPromptTokens || undefined;
-    const toolTokens = snapshot.toolTokens || undefined;
-    const acceptedPredictionTokens = snapshot.acceptedPredictionTokens || undefined;
-    const rejectedPredictionTokens = snapshot.rejectedPredictionTokens || undefined;
-    const cacheCreationInputTokens = snapshot.cacheCreationInputTokens || undefined;
-    const estimatedInputCost = snapshot.estimatedInputCost;
-    const estimatedOutputCost = snapshot.estimatedOutputCost;
-    const estimatedTotalCost = snapshot.estimatedTotalCost;
+    const fields = buildUsageReportFields(outcomeContext.usage);
 
     LiteLLMTelemetry.reportMetric({
         requestId: report.requestId,
         model: report.modelId,
         durationMs: report.durationMs,
-        tokensIn,
-        tokensOut,
-        promptCacheTokens: cachedTokens,
-        cacheCreationInputTokens,
-        reasoningTokens,
-        toolTokens,
-        acceptedPredictionTokens,
-        rejectedPredictionTokens,
+        ...toUsageMetricFields(fields),
         reservedOutputTokens: report.reservedOutputTokens,
         totalTokenMax: report.totalTokenMax,
-        estimatedInputCost,
-        estimatedOutputCost,
-        estimatedTotalCost,
         status: "success",
         caller: report.caller,
-        cacheReadRatio: cachedTokens !== undefined && tokensIn ? cachedTokens / tokensIn : undefined,
     });
-    logFinalUsageEnvelope(report.requestId, report.modelId, report.caller, {
-        tokensIn,
-        tokensOut,
-        cachedTokens,
-        cacheCreationInputTokens,
-        reasoningTokens,
-        toolTokens,
-        acceptedPredictionTokens,
-        rejectedPredictionTokens,
-        systemPromptTokens,
+    logUsageTotals(report.requestId, report.modelId, report.caller, fields, outcomeContext.usage.sawUpstreamUsage, {
         reservedOutputTokens: report.reservedOutputTokens,
         totalTokenMax: report.totalTokenMax,
-        sawUsageDataPart: snapshot.sawUpstreamUsage,
-        estimatedInputCost,
-        estimatedOutputCost,
-        estimatedTotalCost,
     });
 
     exportRequestOutcome(outcomeContext, { status: "success", durationMs: report.durationMs });
@@ -192,12 +156,20 @@ export function describeTurnFailure(error: unknown, modelId: string): string {
     }
     if (isReasoningEffortRejection(rejectionBody) && !namesAnotherParameter(rejectionBody)) {
         // Dropping the effort at the proxy would leave the picker offering levels that
-        // are silently discarded, so the notice points at the declaration the picker
-        // reads instead.
+        // are silently discarded, so the notice points at the configuration the picker
+        // reads. A proxy-written refusal names a parameter it never forwarded and already
+        // recommends its own fix; an upstream refusal means LiteLLM did forward it, so the
+        // parameter has to stop being sent at all.
+        const refusedByProxy = /UnsupportedParamsError|does not support parameters/i.test(rejectionBody);
         message += rejectsReasoningEffortParameter(rejectionBody)
-            ? `. This model rejected the reasoning-effort parameter itself, so no level will be accepted. ` +
-              `Set supports_reasoning: false and its supports_<level>_reasoning_effort entries to false in the ` +
-              `LiteLLM model config, then run Reload Models.`
+            ? refusedByProxy
+                ? `. The proxy does not list reasoning_effort for this deployment, so no level reaches the ` +
+                  `model. Add allowed_openai_params: ["reasoning_effort"] to its litellm_params and run Reload ` +
+                  `Models; if the upstream itself refuses the parameter, set supports_reasoning: false and its ` +
+                  `supports_<level>_reasoning_effort entries to false instead.`
+                : `. The upstream refused the reasoning_effort parameter, so no level will be accepted. Set ` +
+                  `supports_reasoning: false and its supports_<level>_reasoning_effort entries to false in the ` +
+                  `LiteLLM model config, then run Reload Models.`
             : `. This model rejected its reasoning effort. Declare exactly the levels it accepts with ` +
               `supports_<level>_reasoning_effort: true in the LiteLLM model config (a reasoning model ` +
               `with no level flags and no override is offered every level, none to max), or list them ` +
@@ -243,15 +215,17 @@ export function reportTurnFailure(report: FailedTurnReport): void {
     });
 
     const outcomeContext = report.outcomeContext();
+    const fields = buildUsageReportFields(outcomeContext.usage);
     LiteLLMTelemetry.reportMetric({
         requestId: report.requestId,
         model: report.modelId,
         durationMs: report.durationMs,
-        tokensIn: outcomeContext.usage.promptTokens,
+        ...toUsageMetricFields(fields),
         status: "failure",
         error: describeFailureForLog(report.error),
         caller: report.caller,
     });
+    logUsageTotals(report.requestId, report.modelId, report.caller, fields, outcomeContext.usage.sawUpstreamUsage);
 
     const message = describeTurnFailure(report.error, report.modelId);
     // A failure before the body exists has nothing to render, which the context

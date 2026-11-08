@@ -177,7 +177,7 @@ export interface ModelOverride {
 
 /**
  * LiteLLM workspace-level configuration. Backend connection details
- * (baseUrl, apiKey) are delivered by VS Code 1.120 per-group
+ * (baseUrl, apiKey) are delivered by VS Code per-group
  * `options.configuration` payloads on every provider call; they are NOT
  * stored in workspace settings. This type only carries workspace-scoped
  * ergonomic toggles and overrides.
@@ -536,7 +536,7 @@ export interface LiteLLMResponseTool {
     strict: boolean;
 }
 
-/** A tool call the connector dropped because its arguments could not be parsed. */
+/** A tool call the connector dropped because its arguments were not a JSON object. */
 export interface DroppedToolCall {
     readonly id: string;
     readonly name: string;

@@ -305,7 +305,7 @@ suite("StreamTokenCapture", () => {
         } as unknown as LiteLLMModelInfo);
 
         capture.progress.report(asUsagePart({ prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 }));
-        capture.resetAccumulation();
+        capture.resetAccumulation({ reachedProxy: true });
         capture.progress.report(asUsagePart({ prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 }));
 
         const lastAttemptCost = capture.getSnapshot().estimatedTotalCost ?? 0;
@@ -333,7 +333,7 @@ suite("StreamTokenCapture", () => {
         const capture = new StreamTokenCapture("gpt-4", inner.progress);
 
         capture.progress.report(asUsagePart({ prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 }));
-        capture.resetAccumulation();
+        capture.resetAccumulation({ reachedProxy: true });
         capture.progress.report(asUsagePart({ prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 }));
 
         const forwarded = inner.parts
@@ -370,7 +370,7 @@ suite("StreamTokenCapture", () => {
             });
 
         capture.progress.report(asUsagePart(usageFrame(0)));
-        capture.resetAccumulation();
+        capture.resetAccumulation({ reachedProxy: true });
         capture.progress.report(asUsagePart(usageFrame(10)));
 
         const requestTotals = capture.getSpendSnapshot();
@@ -403,6 +403,74 @@ suite("StreamTokenCapture", () => {
         );
     });
 
+    test("a replaced attempt that never reached the proxy is not billed a prompt", () => {
+        // A refused connection was never charged for a prompt, so folding its estimate
+        // would price a request that never happened.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress);
+        capture.setEstimatedPromptTokens(500);
+
+        capture.resetAccumulation({ reachedProxy: false });
+        capture.progress.report(asUsagePart({ prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 }));
+
+        assert.deepStrictEqual(
+            { prompt: capture.getSpendSnapshot().promptTokens, output: capture.getSpendSnapshot().outputTokens },
+            { prompt: 120, output: 20 }
+        );
+    });
+
+    test("a refused attempt leaves no priced prompt in the request cost", () => {
+        // The total is what a support reader reads first, so the refused attempt's
+        // estimate must not survive inside it.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress, {
+            input_cost_per_token: 0.000001,
+            output_cost_per_token: 0.000002,
+        } as unknown as LiteLLMModelInfo);
+        capture.setEstimatedPromptTokens(500);
+
+        capture.resetAccumulation({ reachedProxy: false });
+        capture.progress.report(asUsagePart({ prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 }));
+
+        const totals = capture.getSpendSnapshot();
+        const secondAttemptAlone = calculateRequestCost({
+            promptTokens: 120,
+            completionTokens: 20,
+            cachedTokens: 0,
+            cacheCreationInputTokens: 0,
+            pricing: extractPricing({
+                input_cost_per_token: 0.000001,
+                output_cost_per_token: 0.000002,
+            } as unknown as LiteLLMModelInfo),
+        });
+        assert.deepStrictEqual(
+            {
+                total: totals.estimatedTotalCost,
+                input: totals.estimatedInputCost,
+                output: totals.estimatedOutputCost,
+            },
+            {
+                total: secondAttemptAlone.totalCost,
+                input: secondAttemptAlone.inputCost,
+                output: secondAttemptAlone.outputCost,
+            },
+            "the refused attempt's priced estimate stays out of every cost"
+        );
+    });
+
+    test("a replaced attempt that reached the proxy keeps its prompt estimate", () => {
+        // An attempt the proxy received is billed even though it streamed no usage
+        // frame, so its prompt estimate stays in the totals.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress);
+        capture.setEstimatedPromptTokens(500);
+
+        capture.resetAccumulation({ reachedProxy: true });
+        capture.progress.report(asUsagePart({ prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 }));
+
+        assert.strictEqual(capture.getSpendSnapshot().promptTokens, 620);
+    });
+
     test("a retried request reports upstream usage when an earlier attempt streamed it", () => {
         // The fold is what keeps the flag true once a reset clears the estimator, so a
         // turn whose earlier attempt reported usage is never relabelled as an estimate.
@@ -410,7 +478,7 @@ suite("StreamTokenCapture", () => {
         const capture = new StreamTokenCapture("gpt-4", inner.progress);
 
         capture.progress.report(asUsagePart({ prompt_tokens: 10, completion_tokens: 2 }));
-        capture.resetAccumulation();
+        capture.resetAccumulation({ reachedProxy: true });
         capture.progress.report(asTextPart("second attempt"));
 
         assert.strictEqual(capture.getSpendSnapshot().sawUpstreamUsage, true);
@@ -424,7 +492,7 @@ suite("StreamTokenCapture", () => {
         capture.setEstimatedPromptTokens(500);
 
         capture.progress.report(asTextPart("first attempt"));
-        capture.resetAccumulation();
+        capture.resetAccumulation({ reachedProxy: true });
         capture.progress.report(asTextPart("second attempt"));
 
         const requestTotals = capture.getSpendSnapshot();
@@ -670,7 +738,7 @@ suite("StreamTokenCapture", () => {
         });
         tracking.report(redacted);
 
-        // Local estimate stays at zero — the upstream usage DataPart (when
+        // The local estimate stays at zero while the upstream usage DataPart (when
         // it arrives) is the authoritative source.
         const snapshot = capture.getSnapshot();
         assert.strictEqual(snapshot.reasoningTokens, 0, "redacted data must not be counted as visible reasoning");
@@ -683,7 +751,7 @@ suite("StreamTokenCapture", () => {
 
     test("signature-only thinking parts (display=omitted) do not advance the reasoning buffer", () => {
         // Anthropic's `display: "omitted"` mode streams a thinking block
-        // with no `thinking_delta` events — only a single `signature_delta`
+        // with no `thinking_delta` events, only a single `signature_delta`
         // that closes the block. The connector must still forward the part
         // to VS Code but the value is empty so the local token count stays
         // at zero (the upstream `usage.reasoning_tokens` will be

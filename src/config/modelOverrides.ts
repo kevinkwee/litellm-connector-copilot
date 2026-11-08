@@ -2,34 +2,10 @@ import * as vscode from "vscode";
 import type { LiteLLMModelInfo, ModelOverride, SupportedReasoningEffort } from "../types";
 import { Logger } from "../utils/logger";
 import { getDefaultReasoningEffort } from "../utils/modelCapabilities";
+import { CANONICAL_REASONING_EFFORTS, readDeclaredReasoningEfforts } from "./reasoningEfforts";
 import bundledOverridesSource from "./modelOverrides.json";
 
 const bundledOverridesData: unknown = bundledOverridesSource;
-
-/**
- * Local copy of LiteLLM reasoning effort field mapping.
- * Kept in sync with src/utils/modelCapabilities.ts.
- */
-const LITELLM_REASONING_EFFORT_MAPPING: Record<string, SupportedReasoningEffort> = {
-    supports_none_reasoning_effort: "none",
-    supports_minimal_reasoning_effort: "minimal",
-    supports_low_reasoning_effort: "low",
-    supports_xlow_reasoning_effort: "low",
-    supports_medium_reasoning_effort: "medium",
-    supports_high_reasoning_effort: "high",
-    supports_xhigh_reasoning_effort: "xhigh",
-    supports_max_reasoning_effort: "max",
-} as const satisfies Record<string, SupportedReasoningEffort>;
-
-const CANONICAL_REASONING_EFFORTS: readonly SupportedReasoningEffort[] = [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-];
 
 const MODEL_OVERRIDES_SETTING_KEY = "litellm-connector.modelOverrides";
 
@@ -165,24 +141,6 @@ export function findOverride(modelId: string, config?: vscode.WorkspaceConfigura
     return undefined;
 }
 
-function getExplicitReasoningEfforts(modelInfo?: LiteLLMModelInfo): SupportedReasoningEffort[] | undefined {
-    if (!modelInfo) {
-        return undefined;
-    }
-    const explicitEfforts: SupportedReasoningEffort[] = [];
-    let hasAnyExplicitField = false;
-    for (const [key, value] of Object.entries(LITELLM_REASONING_EFFORT_MAPPING)) {
-        const fieldValue = modelInfo[key as keyof LiteLLMModelInfo];
-        if (fieldValue === true) {
-            explicitEfforts.push(value as SupportedReasoningEffort);
-        }
-        if (fieldValue !== undefined && fieldValue !== null) {
-            hasAnyExplicitField = true;
-        }
-    }
-    return hasAnyExplicitField ? explicitEfforts : undefined;
-}
-
 /**
  * Resolves a model's reasoning effort levels from its override and the proxy's
  * reasoning data.
@@ -214,9 +172,7 @@ export function getEffectiveEfforts(
             return overrideEfforts ?? [...CANONICAL_REASONING_EFFORTS];
         }
 
-        const explicitEfforts = getExplicitReasoningEfforts(modelInfo)
-            ?.filter(isSupportedReasoningEffort)
-            .filter((effort, index, arr) => arr.indexOf(effort) === index);
+        const explicitEfforts = readDeclaredReasoningEfforts(modelInfo);
         if (explicitEfforts !== undefined) {
             return explicitEfforts;
         }
@@ -233,9 +189,7 @@ export function getEffectiveEfforts(
     }
 
     // No override: check explicit effort fields first, then fall back to canonical.
-    const explicitEfforts = getExplicitReasoningEfforts(modelInfo)
-        ?.filter(isSupportedReasoningEffort)
-        .filter((effort, index, arr) => arr.indexOf(effort) === index);
+    const explicitEfforts = readDeclaredReasoningEfforts(modelInfo);
     if (explicitEfforts !== undefined) {
         return explicitEfforts;
     }
@@ -293,5 +247,4 @@ export function getDefaultEffort(
     return undefined;
 }
 
-export { CANONICAL_REASONING_EFFORTS };
 export type { ModelOverride } from "../types";

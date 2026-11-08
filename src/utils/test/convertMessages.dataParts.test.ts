@@ -1,7 +1,7 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
 
-import { convertMessages } from "../../utils";
+import { convertMessages } from "../../utils/messageConversion";
 import type { OpenAIChatMessage } from "../../types";
 
 suite("convertMessages data parts", () => {

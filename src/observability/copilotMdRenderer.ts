@@ -91,7 +91,7 @@ export interface CopilotMdEntry {
     durationMs: number;
     /** The per-request UUID already generated for `Logger.info("Chat request started | RequestID: ...")`. */
     ourRequestId: string;
-    /** Time-to-first-token in ms (first text/tool part timestamp − startTime), if observed. */
+    /** Time-to-first-token in ms (first text/tool part timestamp - startTime), if observed. */
     timeToFirstTokenMs: number | undefined;
     /** The model id actually used (post-override). Usually equals `model`; emitted as `resolved model`. */
     resolvedModel: string;
@@ -562,7 +562,7 @@ function roleToString(role: vscode.LanguageModelChatMessageRole): string {
             return "Assistant";
         // System role is part of the proposed API surface (`LanguageModelChatMessageRole.System = 3`)
         // and is used by some upstream callers. Handle it defensively even though
-        // the stable 1.120 enum only declares User/Assistant.
+        // the stable role enum only declares User/Assistant.
         default:
             return "System";
     }

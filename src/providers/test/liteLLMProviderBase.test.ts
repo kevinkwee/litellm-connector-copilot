@@ -435,7 +435,7 @@ suite("LiteLLMProviderBase", () => {
         });
 
         test("falls back to the BackendRegistry when options.configuration is missing", async () => {
-            // VS Code 1.120 does NOT carry the per-group config on
+            // VS Code does NOT carry the per-group config on
             // `ProvideLanguageModelChatResponseOptions`. The response path
             // falls back to the in-memory `LiteLLMProviderRegistry` keyed
             // by the namespaced model id. The model object on the wire no

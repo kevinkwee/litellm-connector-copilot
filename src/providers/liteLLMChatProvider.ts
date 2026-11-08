@@ -44,6 +44,7 @@ import {
     HeadersTimeoutError,
     ReasoningOnlyError,
     isTransportRetriableError,
+    failedBeforeReachingProxy,
     buildResumeMessages,
     selectResumableContent,
     sleepWithCancellation,
@@ -70,7 +71,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         options: vscode.PrepareLanguageModelChatModelOptions,
         token: CancellationToken
     ): Promise<LanguageModelChatInformation[]> {
-        // VS Code 1.120 supplies the per-group `configuration` on the options.
+        // VS Code supplies the per-group `configuration` on the options.
         // We pass the full options through to the base discovery path, which
         // discovers from that per-group configuration.
         const opts = options as vscode.PrepareLanguageModelChatModelOptions & {
@@ -274,6 +275,12 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // Output already streamed when an attempt starts. An attempt that adds to it
             // proves the upstream is working, so the retry clock starts over.
             let outputAtAttemptStart = 0;
+            // One counter per request, so a retry numbers its thinking blocks onwards
+            // instead of reusing the ids the previous attempt already delivered.
+            const thinkingBlockIds = { used: 0 };
+            // Whether the attempt that just ended reached the proxy, read by the fold at
+            // the top of the next attempt. Only a connect-phase failure proves it did not.
+            let previousAttemptReachedProxy = true;
             while (true) {
                 try {
                     // A cancel that landed before this attempt stops here, so a
@@ -291,8 +298,9 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         // that never started. Its spend is folded into the request totals
                         // here, and the estimator then starts clean so the usage part
                         // describes only the attempt that follows.
-                        tokenCapture.resetAccumulation();
+                        tokenCapture.resetAccumulation({ reachedProxy: previousAttemptReachedProxy });
                     }
+                    previousAttemptReachedProxy = true;
                     outputAtAttemptStart = accumulator.text.length + accumulator.thinking.length;
                     // A retry starts a fresh header wait, so the request is back in the
                     // phase the picker labels "waiting for headers".
@@ -364,6 +372,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         requestId,
                         wireToDeclaredNames: toolNames.wireToDeclared,
                         inactivityTimeoutMs: (streamCfg.inactivityTimeout ?? 60) * 1000,
+                        thinkingBlockIds,
                     });
 
                     // A cancelled stream ends without an error, so without this
@@ -432,7 +441,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                             const delay = retryBudget.clipDelay(backoffDelayMs(emptyAttempt, emptyBaseDelayMs));
                             Logger.warn(
                                 `[transportRetry] request=${requestId} reasoning-only response, retry ${emptyAttempt}/${maxEmptyRetries} ` +
-                                    `(resuming with ${accumulator.thinking.length} reasoning chars)`
+                                    `(carrying ${accumulator.thinking.length} reasoning chars, replayable: ${modelInfo?.mode !== "responses"})`
                             );
                             StructuredLogger.warn("request.reasoning_only_retry", {
                                 requestId,
@@ -456,8 +465,12 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         // that empty would misdescribe it.
                         const isEmptyReply =
                             err.reasoningChars === 0 && err.normalFinish && accumulator.thinking.length === 0;
+                        // A `/responses` retry cannot replay the reasoning, so it resends the
+                        // request; the notice therefore counts retry attempts rather than resumes.
                         const afterAttempts =
-                            emptyAttempt > 0 ? `after ${emptyAttempt} resume attempt(s)` : "on the first attempt";
+                            emptyAttempt > 0
+                                ? `after ${emptyAttempt} retry attempt${emptyAttempt === 1 ? "" : "s"}`
+                                : "on the first attempt";
                         const reason = isEmptyReply
                             ? `LiteLLM: model returned an empty reply (no text, reasoning or tool call) ` +
                               `${afterAttempts}; try resending.`
@@ -520,6 +533,10 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
 
                     attempt += 1;
                     resumed = true;
+                    // A connect-phase failure is the only proof the request never reached
+                    // the proxy; every later failure may already be billed upstream, so the
+                    // fold keeps its prompt.
+                    previousAttemptReachedProxy = !failedBeforeReachingProxy(err);
                     const delay = retryBudget.clipDelay(backoffDelayMs(attempt, retryBaseDelayMs));
                     logTransportRetry(
                         requestId,

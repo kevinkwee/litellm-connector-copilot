@@ -34,8 +34,8 @@ export class LiteLLMTelemetry {
         Logger.info(
             `[TokenUsage] request_id=${metric.requestId} caller=${metric.caller ?? "unknown"} model=${
                 metric.model
-            } status=${metric.status} duration_ms=${metric.durationMs ?? 0} tokens_in=${metric.tokensIn ?? 0} tokens_out=${
-                metric.tokensOut ?? 0
+            } status=${metric.status} duration_ms=${metric.durationMs ?? 0} tokens_in=${metric.tokensIn ?? "n/a"} tokens_out=${
+                metric.tokensOut ?? "n/a"
             } cache_read_ratio=${metric.cacheReadRatio ?? "n/a"} prompt_cache_tokens=${
                 metric.promptCacheTokens ?? "n/a"
             } cache_creation_input_tokens=${metric.cacheCreationInputTokens ?? "n/a"} reasoning_tokens=${

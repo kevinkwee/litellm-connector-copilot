@@ -7,6 +7,8 @@ import { LiteLLMClient } from "../../adapters/litellmClient";
 import type { OpenAIChatCompletionRequest } from "../../types";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
+import { Logger } from "../../utils/logger";
+import { HeadersTimeoutError } from "../../utils/transportRetry";
 import { TEST_USER_AGENT } from "../../test/utils/testMocks";
 import {
     findErrorTextPart,
@@ -376,6 +378,47 @@ suite("LiteLLM Chat Provider Retry", () => {
         );
     });
 
+    test("a retried turn numbers its thinking blocks onwards", async () => {
+        // Reusing litellm-thinking-1 would let the host merge the retried reasoning into
+        // the earlier item, showing the same reasoning twice.
+        const provider = new LiteLLMChatProvider(userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 1,
+            networkRetryDelayMs: 1,
+            emptyResponseRetries: 2,
+            emptyResponseRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const chatStub = sandbox.stub(LiteLLMClient.prototype, "chat");
+        chatStub
+            .onFirstCall()
+            .callsFake(async () => sseStream([{ choices: [{ delta: { reasoning_content: "first" } }] }]));
+        chatStub
+            .onSecondCall()
+            .callsFake(async () =>
+                sseStream([
+                    { choices: [{ delta: { reasoning_content: "second" } }] },
+                    { choices: [{ delta: { content: "answer" } }] },
+                ])
+            );
+        const reported: vscode.LanguageModelResponsePart[] = [];
+
+        await runChatRequest(provider, reported);
+
+        assert.deepStrictEqual(
+            reported
+                .map((part) => part as unknown as { id?: string; value?: unknown })
+                .filter((part) => typeof part.value === "string" && part.id !== undefined)
+                .map((part) => part.id),
+            ["litellm-thinking-1", "litellm-thinking-2"]
+        );
+    });
+
     test("a blocked retry is recorded as a decision, not as a second failure", async () => {
         const errorStub = sandbox.stub(StructuredLogger, "error");
         const infoStub = sandbox.stub(StructuredLogger, "info");
@@ -519,9 +562,116 @@ suite("LiteLLM Chat Provider Retry", () => {
 
         const failedMetric = metricStub
             .getCalls()
-            .map((call) => call.args[0] as { status?: string; tokensIn?: number })
+            .map((call) => call.args[0] as { status?: string; tokensIn?: number; tokensOut?: number })
             .find((metric) => metric.status === "failure");
-        assert.strictEqual(failedMetric?.tokensIn, 220);
+        assert.deepStrictEqual(
+            { prompt: failedMetric?.tokensIn, output: failedMetric?.tokensOut },
+            { prompt: 220, output: 30 },
+            "a failed turn reports the spend of both attempts, not zero output"
+        );
+    });
+
+    test("a turn that recovered from a refused connection bills only the attempt that ran", async () => {
+        // A refused connection never reached the proxy, so its prompt estimate must not
+        // be reported as spend.
+        const metricStub = sandbox.stub(LiteLLMTelemetry, "reportMetric");
+        const provider = new LiteLLMChatProvider(userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 1,
+            networkRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const chatStub = sandbox.stub(LiteLLMClient.prototype, "chat");
+        chatStub.onFirstCall().callsFake(async () => {
+            throw new TypeError("fetch failed", { cause: { code: "ECONNREFUSED" } });
+        });
+        chatStub
+            .onSecondCall()
+            .callsFake(async () =>
+                sseStream([
+                    { choices: [{ delta: { content: "answer" } }] },
+                    { choices: [{ delta: {} }], usage: { prompt_tokens: 120, completion_tokens: 20 } },
+                ])
+            );
+
+        await runChatRequest(provider, []);
+
+        const successMetric = metricStub
+            .getCalls()
+            .map((call) => call.args[0] as { status?: string; tokensIn?: number })
+            .find((metric) => metric.status === "success");
+        assert.strictEqual(successMetric?.tokensIn, 120, "the refused attempt's estimate is not billed");
+    });
+
+    test("a turn that recovered from a headers timeout keeps that attempt's prompt", async () => {
+        // The proxy may have received that request even though it never answered, so the
+        // attempt stays billable rather than being written off.
+        const metricStub = sandbox.stub(LiteLLMTelemetry, "reportMetric");
+        const provider = new LiteLLMChatProvider(userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 1,
+            headersTimeoutMs: 1_000,
+            networkRetryDelayMs: 1,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        const chatStub = sandbox.stub(LiteLLMClient.prototype, "chat");
+        chatStub.onFirstCall().callsFake(async () => {
+            throw new HeadersTimeoutError(1_000);
+        });
+        chatStub
+            .onSecondCall()
+            .callsFake(async () =>
+                sseStream([
+                    { choices: [{ delta: { content: "answer" } }] },
+                    { choices: [{ delta: {} }], usage: { prompt_tokens: 120, completion_tokens: 20 } },
+                ])
+            );
+
+        await runChatRequest(provider, []);
+
+        const successMetric = metricStub
+            .getCalls()
+            .map((call) => call.args[0] as { status?: string; tokensIn?: number })
+            .find((metric) => metric.status === "success");
+        assert.ok(
+            (successMetric?.tokensIn ?? 0) > 120,
+            "the timed-out attempt keeps its prompt estimate alongside the answered one"
+        );
+    });
+
+    test("a failed turn writes the final usage line", async () => {
+        const debugStub = sandbox.stub(Logger, "debug");
+        const provider = new LiteLLMChatProvider(userAgent);
+        const providerWithConfig = provider as unknown as {
+            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
+        };
+        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
+            url: "http://localhost:4000",
+            networkRetries: 0,
+            inactivityTimeout: 60,
+        });
+        seedDiscoveredBackend(sandbox, provider, "model-1");
+        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async () => {
+            throw new TypeError("fetch failed", { cause: { code: "ECONNREFUSED" } });
+        });
+
+        await runChatRequest(provider, []);
+
+        const finalLines = debugStub
+            .getCalls()
+            .map((call) => String(call.args[0]))
+            .filter((message) => message.includes("[TokenUsage][Final]"));
+        assert.strictEqual(finalLines.length, 1, "a failed turn publishes its token totals once");
     });
 
     test("transport retry resends the unchanged request when the attempt produced nothing", async () => {
@@ -884,7 +1034,7 @@ suite("LiteLLM Chat Provider Retry", () => {
         assert.strictEqual(sent.length, 2, "reasoning-only budget must be exhausted");
         const emptyExhaustedText = findErrorTextPart(reported);
         assert.ok(emptyExhaustedText, "exhausted reasoning-only retries must surface as an error text part");
-        assert.match(emptyExhaustedText, /reasoning-only response.*after 1 resume attempt/);
+        assert.match(emptyExhaustedText, /reasoning-only response.*after 1 retry attempt/);
     });
 
     test("reasoning-only retries do not consume the transport retry budget", async () => {

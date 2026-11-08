@@ -18,7 +18,7 @@ export function formatConnectorNotice(message: string): string {
 
 /**
  * Returns the notice that explains tool calls the connector dropped because their
- * arguments could not be parsed. The notice already starts with the blank line that
+ * arguments were not a JSON object. The notice already starts with the blank line that
  * puts it in its own block, so a caller must not prepend another.
  */
 export function describeDroppedToolCalls(calls: readonly DroppedToolCall[]): string {

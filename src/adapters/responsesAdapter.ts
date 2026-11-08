@@ -7,7 +7,7 @@ import type {
     LiteLLMResponseTool,
     OpenAIChatMessageContentItem,
 } from "../types";
-import { normalizeToolCallId } from "../utils";
+import { normalizeToolCallId } from "../utils/messageConversion";
 import { Logger } from "../utils/logger";
 
 /**

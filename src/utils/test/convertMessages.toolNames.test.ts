@@ -1,7 +1,7 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
 
-import { convertMessages } from "../../utils";
+import { convertMessages } from "../../utils/messageConversion";
 
 suite("convertMessages tool names", () => {
     test("convertMessages sanitizes a replayed tool call when no wire-name map is supplied", () => {

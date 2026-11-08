@@ -3,6 +3,7 @@ import type { TokenSnapshot } from "../../adapters/streaming/streamTokenCapture"
 import type { OpenAIChatCompletionRequest } from "../../types";
 import type { ChatSessionIdSource } from "../../utils/chatSessionId";
 import { LiteLLMTelemetry } from "../../utils/telemetry";
+import { buildUsageReportFields, logUsageTotals, toUsageMetricFields } from "./usageReport";
 import { exportCopilotMdEntry, type CopilotMdEntry } from "../../observability";
 
 /** The request facts shared by every outcome report. */
@@ -76,14 +77,16 @@ export function recordCancelledTurn(
     context: RequestOutcomeContext,
     options: { durationMs: number; statusReason: string }
 ): void {
+    const fields = buildUsageReportFields(context.usage);
     LiteLLMTelemetry.reportMetric({
         requestId: context.requestId,
         model: context.model.id,
         durationMs: options.durationMs,
-        tokensIn: context.usage.promptTokens,
+        ...toUsageMetricFields(fields),
         status: "cancelled",
         caller: context.caller,
     });
+    logUsageTotals(context.requestId, context.model.id, context.caller, fields, context.usage.sawUpstreamUsage);
     exportRequestOutcome(context, {
         status: "canceled",
         durationMs: options.durationMs,

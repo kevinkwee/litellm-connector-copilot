@@ -1,6 +1,6 @@
 import * as assert from "assert";
 
-import { normalizeToolCallId } from "../../utils";
+import { normalizeToolCallId } from "../../utils/messageConversion";
 
 suite("normalizeToolCallId", () => {
     test("normalizeToolCallId handles edge cases", () => {

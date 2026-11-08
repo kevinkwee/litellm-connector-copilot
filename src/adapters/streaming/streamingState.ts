@@ -2,8 +2,8 @@
  * The stream state both endpoints of the interpreter share, the shape of the parts it
  * emits, and the helpers over that state.
  *
- * They live here rather than in either endpoint module because the chat-completions
- * path, the Gemini passthrough and the `/responses` path all use them.
+ * They live here rather than in either endpoint module because the chat-completions path
+ * and the `/responses` path both use them.
  */
 
 import { sanitizeToolName } from "../../utils/toolNameUtils";
@@ -38,15 +38,7 @@ export interface StreamingState {
     toolCallBuffers: Map<number, ChatToolCallBuffer>;
     /** Call ids already delivered, so a repeated id cannot execute a tool twice. */
     emittedToolCallIds: Set<string>;
-    responseToolCallBuffers: Map<string, { id: string; name?: string; args: string }>;
-    responseToolCallOrder: string[];
     mergeReasoningContentInChoices: boolean;
-    /**
-     * Anonymous tool buffering: used when upstream streams tool args before emitting a stable
-     * call_id. If multiple anonymous calls interleave without call_ids they cannot be disambiguated.
-     */
-    anonymousResponseToolName: string | undefined;
-    anonymousResponseToolArgs: string;
     /**
      * Thinking-block id allocation. Text deltas of one Anthropic
      * thinking block share an id so VS Code and the Agents window merge them
@@ -57,36 +49,35 @@ export interface StreamingState {
     thinkingBlockCounter: number;
     currentThinkingBlockId: string | undefined;
     /**
-     * Calls dropped because their arguments could not be parsed. The stream reader names
+     * Calls dropped because their arguments were not a JSON object. The stream reader names
      * them in a notice when the attempt completes; an attempt that throws, for a retry or a
      * failure, discards them.
      */
     readonly droppedToolCalls: DroppedToolCall[];
 }
 
+/**
+ * Starts the state for one attempt.
+ *
+ * `thinkingBlockStart` is the last block number an earlier attempt of the same request
+ * used, so a retry numbers its blocks onwards instead of reusing `litellm-thinking-1`,
+ * which the host would merge into the earlier reasoning item.
+ */
 export function createInitialStreamingState(
     requestId?: string,
-    wireToDeclaredNames?: ReadonlyMap<string, string>
+    wireToDeclaredNames?: ReadonlyMap<string, string>,
+    thinkingBlockStart = 0
 ): StreamingState {
     return {
         requestId,
         wireToDeclaredNames,
         toolCallBuffers: new Map(),
         emittedToolCallIds: new Set(),
-        responseToolCallBuffers: new Map(),
-        responseToolCallOrder: [],
         mergeReasoningContentInChoices: false,
-        anonymousResponseToolName: undefined,
-        anonymousResponseToolArgs: "",
-        thinkingBlockCounter: 0,
+        thinkingBlockCounter: thinkingBlockStart,
         currentThinkingBlockId: undefined,
         droppedToolCalls: [],
     };
-}
-
-/** The record id for an anonymous `/responses` call, scoped to the stream that buffered it. */
-export function formatAnonymousToolCallRecordId(state: StreamingState): string {
-    return `anonymous_${state.requestId ?? "stream"}`;
 }
 
 /** Formats the request id into a log tag, so concurrent streams stay distinguishable. */
