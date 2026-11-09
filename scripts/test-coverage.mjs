@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, rmSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, rmSync, readdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath, URL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { setTimeout, clearTimeout } from "node:timers";
 import process from "node:process";
@@ -51,8 +52,32 @@ if (!existsSync(testResultsDir)) {
   mkdirSync(testResultsDir, { recursive: true });
 }
 
+// The junit report is the only proof the suite actually loaded.
+const junitReportPath = join(testResultsDir, "test-results.xml");
+
+function countReportedTestCases() {
+  if (!existsSync(junitReportPath)) {
+    return 0;
+  }
+  const report = readFileSync(junitReportPath, "utf8");
+  return report.split("<testcase").length - 1;
+}
+
+/**
+ * A test host that quits before the suite loads still exits with code 0 and an
+ * empty coverage summary, which would report a broken run as a green one.
+ */
+function exitAfterRun(exitCode) {
+  if (exitCode === 0 && countReportedTestCases() === 0) {
+    console.error(
+      `No test cases were reported in ${junitReportPath}. The VS Code test host exited before the suite ran, so this run proves nothing and fails instead of passing.`
+    );
+    process.exit(1);
+  }
+  process.exit(exitCode);
+}
+
 const testArgs = [
-  "--args=--no-sandbox",
   "--coverage",
   "--coverage-output",
   "coverage",
@@ -63,6 +88,65 @@ const testArgs = [
   "--coverage-reporter",
   "text-summary",
 ];
+
+const HIDDEN_DESKTOP_LAUNCHER = fileURLToPath(new URL("./hidden-desktop-launcher.ps1", import.meta.url));
+const HIDDEN_DESKTOP_LOG = join(process.cwd(), ".vscode-test", "test-host-output.log");
+// Only the launcher knows the desktop it created, and it passes the name as an argument.
+// An inherited environment variable therefore cannot make a run skip the launcher and open
+// a test window on the developer's desktop.
+const HIDDEN_DESKTOP_ARGUMENT = /^--hidden-desktop=lmcr-test-[0-9a-f]{32}$/;
+const launchDesktopArgument = process.argv.slice(2).find((arg) => arg.startsWith("--hidden-desktop="));
+const onHiddenDesktop = launchDesktopArgument !== undefined && HIDDEN_DESKTOP_ARGUMENT.test(launchDesktopArgument);
+
+/**
+ * The VS Code test host is a real Electron window, so on Windows it takes focus when it
+ * opens and interrupts whatever the developer is doing. The test CLI forwards no launch
+ * switches, so no launch switch can prevent it. The desktop the run starts on can: a window
+ * can only take focus on the desktop that currently receives input, so the launcher starts
+ * the whole run on a newly created desktop instead. There is no fallback, so a launcher
+ * failure leaves the developer's desktop untouched.
+ */
+function runOnHiddenDesktop() {
+  mkdirSync(dirname(HIDDEN_DESKTOP_LOG), { recursive: true });
+  const powershell = join(
+    process.env.SystemRoot ?? "C:\\Windows",
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe"
+  );
+  const launcher = spawnSync(
+    powershell,
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      HIDDEN_DESKTOP_LAUNCHER,
+      "-NodeExecutable",
+      process.execPath,
+      "-ScriptPath",
+      fileURLToPath(import.meta.url),
+      "-LogPath",
+      HIDDEN_DESKTOP_LOG,
+      "-WorkingDirectory",
+      process.cwd(),
+      "-TimeoutSeconds",
+      String(Math.ceil(TEST_TIMEOUT_MS / 1000) + 60),
+    ],
+    { stdio: "inherit" }
+  );
+  if (launcher.error) {
+    console.error(`The hidden desktop launcher could not start: ${launcher.error.message}`);
+    return 1;
+  }
+  return launcher.status ?? 1;
+}
+
+if (process.platform === "win32" && !onHiddenDesktop) {
+  process.exit(runOnHiddenDesktop());
+}
 
 const hasXvfb =
   process.platform === "linux" &&
@@ -111,7 +195,7 @@ child.on("exit", (code, signal) => {
     process.exit(TIMEOUT_EXIT_CODE);
   }
   if (typeof code === "number") {
-    process.exit(code);
+    exitAfterRun(code);
   } else if (signal) {
     console.error(`Process terminated by signal: ${signal}`);
     process.exit(1);

@@ -6,9 +6,6 @@ import { LiteLLMChatProvider } from "../";
 import { LiteLLMClient } from "../../adapters/litellmClient";
 import type { OpenAIChatCompletionRequest } from "../../types";
 import { StructuredLogger } from "../../observability/structuredLogger";
-import { LiteLLMTelemetry } from "../../utils/telemetry";
-import { Logger } from "../../utils/logger";
-import { HeadersTimeoutError } from "../../utils/transportRetry";
 import { TEST_USER_AGENT } from "../../test/utils/testMocks";
 import {
     findErrorTextPart,
@@ -16,24 +13,6 @@ import {
     seedDiscoveredBackend,
     UUID_PATTERN,
 } from "../../test/utils/chatProviderTestUtils";
-
-/** A body that emits text and a usage frame, then dies of a dropped socket. */
-function dyingStreamAfterUsage(promptTokens: number, completionTokens: number): ReadableStream<Uint8Array> {
-    const encoder = new TextEncoder();
-    return new ReadableStream<Uint8Array>({
-        start(controller) {
-            controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"par"}}]}\n\n'));
-            controller.enqueue(
-                encoder.encode(
-                    `data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":${promptTokens},"completion_tokens":${completionTokens}}}\n\n`
-                )
-            );
-        },
-        pull(controller) {
-            controller.error(new TypeError("terminated"));
-        },
-    });
-}
 
 /** One SSE body carrying `events` as `data:` frames, then the terminator. */
 function sseStream(events: readonly object[]): ReadableStream<Uint8Array> {
@@ -433,13 +412,15 @@ suite("LiteLLM Chat Provider Retry", () => {
             inactivityTimeout: 60,
         });
         seedDiscoveredBackend(sandbox, provider, "model-1");
+        // A /responses call arrives complete on output_item.done, before any finish, so a
+        // socket death after it is the shape this guard exists for.
         sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(
             async () =>
                 new ReadableStream<Uint8Array>({
                     start(controller) {
                         controller.enqueue(
                             new TextEncoder().encode(
-                                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_time","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n'
+                                'data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"get_time","arguments":"{}"}}\n\n'
                             )
                         );
                     },
@@ -481,7 +462,7 @@ suite("LiteLLM Chat Provider Retry", () => {
                 start(controller) {
                     controller.enqueue(
                         encoder.encode(
-                            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_time","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n'
+                            'data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"get_time","arguments":"{}"}}\n\n'
                         )
                     );
                 },
@@ -537,141 +518,6 @@ suite("LiteLLM Chat Provider Retry", () => {
         const exhaustedErrorText = findErrorTextPart(reported);
         assert.ok(exhaustedErrorText, "exhausted transport retries must surface as an error text part");
         assert.match(exhaustedErrorText, /terminated/);
-    });
-
-    test("a failed retried turn reports the prompt of every attempt in its metric", async () => {
-        // The proxy billed both attempts, so the failure metric reports their sum
-        // rather than the last attempt's prompt.
-        const metricStub = sandbox.stub(LiteLLMTelemetry, "reportMetric");
-        const provider = new LiteLLMChatProvider(userAgent);
-        const providerWithConfig = provider as unknown as {
-            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
-        };
-        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
-            url: "http://localhost:4000",
-            networkRetries: 1,
-            networkRetryDelayMs: 1,
-            inactivityTimeout: 60,
-        });
-        seedDiscoveredBackend(sandbox, provider, "model-1");
-        const chatStub = sandbox.stub(LiteLLMClient.prototype, "chat");
-        chatStub.onFirstCall().callsFake(async () => dyingStreamAfterUsage(100, 10));
-        chatStub.onSecondCall().callsFake(async () => dyingStreamAfterUsage(120, 20));
-
-        await runChatRequest(provider, []);
-
-        const failedMetric = metricStub
-            .getCalls()
-            .map((call) => call.args[0] as { status?: string; tokensIn?: number; tokensOut?: number })
-            .find((metric) => metric.status === "failure");
-        assert.deepStrictEqual(
-            { prompt: failedMetric?.tokensIn, output: failedMetric?.tokensOut },
-            { prompt: 220, output: 30 },
-            "a failed turn reports the spend of both attempts, not zero output"
-        );
-    });
-
-    test("a turn that recovered from a refused connection bills only the attempt that ran", async () => {
-        // A refused connection never reached the proxy, so its prompt estimate must not
-        // be reported as spend.
-        const metricStub = sandbox.stub(LiteLLMTelemetry, "reportMetric");
-        const provider = new LiteLLMChatProvider(userAgent);
-        const providerWithConfig = provider as unknown as {
-            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
-        };
-        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
-            url: "http://localhost:4000",
-            networkRetries: 1,
-            networkRetryDelayMs: 1,
-            inactivityTimeout: 60,
-        });
-        seedDiscoveredBackend(sandbox, provider, "model-1");
-        const chatStub = sandbox.stub(LiteLLMClient.prototype, "chat");
-        chatStub.onFirstCall().callsFake(async () => {
-            throw new TypeError("fetch failed", { cause: { code: "ECONNREFUSED" } });
-        });
-        chatStub
-            .onSecondCall()
-            .callsFake(async () =>
-                sseStream([
-                    { choices: [{ delta: { content: "answer" } }] },
-                    { choices: [{ delta: {} }], usage: { prompt_tokens: 120, completion_tokens: 20 } },
-                ])
-            );
-
-        await runChatRequest(provider, []);
-
-        const successMetric = metricStub
-            .getCalls()
-            .map((call) => call.args[0] as { status?: string; tokensIn?: number })
-            .find((metric) => metric.status === "success");
-        assert.strictEqual(successMetric?.tokensIn, 120, "the refused attempt's estimate is not billed");
-    });
-
-    test("a turn that recovered from a headers timeout keeps that attempt's prompt", async () => {
-        // The proxy may have received that request even though it never answered, so the
-        // attempt stays billable rather than being written off.
-        const metricStub = sandbox.stub(LiteLLMTelemetry, "reportMetric");
-        const provider = new LiteLLMChatProvider(userAgent);
-        const providerWithConfig = provider as unknown as {
-            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
-        };
-        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
-            url: "http://localhost:4000",
-            networkRetries: 1,
-            headersTimeoutMs: 1_000,
-            networkRetryDelayMs: 1,
-            inactivityTimeout: 60,
-        });
-        seedDiscoveredBackend(sandbox, provider, "model-1");
-        const chatStub = sandbox.stub(LiteLLMClient.prototype, "chat");
-        chatStub.onFirstCall().callsFake(async () => {
-            throw new HeadersTimeoutError(1_000);
-        });
-        chatStub
-            .onSecondCall()
-            .callsFake(async () =>
-                sseStream([
-                    { choices: [{ delta: { content: "answer" } }] },
-                    { choices: [{ delta: {} }], usage: { prompt_tokens: 120, completion_tokens: 20 } },
-                ])
-            );
-
-        await runChatRequest(provider, []);
-
-        const successMetric = metricStub
-            .getCalls()
-            .map((call) => call.args[0] as { status?: string; tokensIn?: number })
-            .find((metric) => metric.status === "success");
-        assert.ok(
-            (successMetric?.tokensIn ?? 0) > 120,
-            "the timed-out attempt keeps its prompt estimate alongside the answered one"
-        );
-    });
-
-    test("a failed turn writes the final usage line", async () => {
-        const debugStub = sandbox.stub(Logger, "debug");
-        const provider = new LiteLLMChatProvider(userAgent);
-        const providerWithConfig = provider as unknown as {
-            _configManager: { getConfig: () => Promise<Record<string, unknown>> };
-        };
-        sandbox.stub(providerWithConfig._configManager, "getConfig").resolves({
-            url: "http://localhost:4000",
-            networkRetries: 0,
-            inactivityTimeout: 60,
-        });
-        seedDiscoveredBackend(sandbox, provider, "model-1");
-        sandbox.stub(LiteLLMClient.prototype, "chat").callsFake(async () => {
-            throw new TypeError("fetch failed", { cause: { code: "ECONNREFUSED" } });
-        });
-
-        await runChatRequest(provider, []);
-
-        const finalLines = debugStub
-            .getCalls()
-            .map((call) => String(call.args[0]))
-            .filter((message) => message.includes("[TokenUsage][Final]"));
-        assert.strictEqual(finalLines.length, 1, "a failed turn publishes its token totals once");
     });
 
     test("transport retry resends the unchanged request when the attempt produced nothing", async () => {

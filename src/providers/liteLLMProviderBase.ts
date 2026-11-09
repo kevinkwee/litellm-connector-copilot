@@ -24,11 +24,12 @@ import { ActiveRequestRegistry } from "./activeRequests";
 /**
  * Shared orchestration base for all LiteLLM-backed VS Code language model providers.
  *
- * Single-provider architecture: every request is routed to the backend whose
- * configuration VS Code passes on the originating call (`options.configuration`).
- * We do NOT maintain a global cross-backend model list or parse model IDs to
- * resolve a backend. VS Code already isolates per-group calls; our job is to
- * honor that and not second-guess it.
+ * One chat provider serves every configured group. Discovery receives each group's
+ * credentials in `options.configuration`. At response time `options.configuration` is used
+ * when it carries both a base URL and a key, and otherwise the registry is asked by model
+ * object and then by id. That id fallback is what can route two groups on one host to the
+ * same credentials, as the BackendRegistry Contract section of `AGENTS.md` documents. The
+ * registry is the only routing state.
  *
  * Responsibilities:
  * - Wiring the BackendRegistry's `onDidChange` event to VS Code's
@@ -42,7 +43,7 @@ import { ActiveRequestRegistry } from "./activeRequests";
  * - Model discovery (lives in the BackendRegistry, see
  *   `LiteLLMProviderRegistry.discoverModels`).
  * - VS Code protocol specifics (stream parsing, response part emission)
- * - Cross-backend routing (handled by VS Code's per-group config)
+ * - Cross-backend routing (the registry resolves it from the model object, then the id)
  */
 export abstract class LiteLLMProviderBase {
     protected readonly _configManager: ConfigManager;

@@ -6,7 +6,7 @@ import type {
     OpenAIUsagePayload,
     OpenAIUsagePromptTokenDetails,
 } from "../../types";
-import { calculateRequestCost, extractPricing, type RequestCost } from "../../utils/pricingCalculator";
+import { calculateRequestCost, extractPricing, normalizeCost, type RequestCost } from "../../utils/pricingCalculator";
 
 /**
  * Snapshot of the tracked token counts. Values prefer upstream usage when available
@@ -88,10 +88,11 @@ export class StreamTokenCapture {
         rejectedPredictionTokens: 0,
         inputCost: 0,
         outputCost: 0,
-        totalCost: 0,
     };
     /** Whether any attempt this request replaced reported upstream usage. */
     private _spentSawUpstreamUsage = false;
+    /** Set when the attempt the turn ended on was never billed by the proxy. */
+    private _lastAttemptUnbilled = false;
     private _upstream?: OpenAIUsagePayload;
 
     // Pre-computed input token estimates (set by caller before request)
@@ -164,15 +165,27 @@ export class StreamTokenCapture {
         this._spent.acceptedPredictionTokens += replaced.acceptedPredictionTokens;
         this._spent.rejectedPredictionTokens += replaced.rejectedPredictionTokens;
         this._spent.outputCost += outputCost;
-        // Derived from the folded sides, so a refused attempt cannot leave a priced
-        // prompt inside the total.
-        this._spent.totalCost += inputCost + outputCost;
 
         this._textBuffer = "";
         this._reasoningBuffer = "";
         this._toolCallTokens = 0;
         this._sawUpstreamUsage = false;
         this._upstream = undefined;
+    }
+
+    /**
+     * Ends the last attempt as one the proxy never billed.
+     *
+     * A connect-phase failure never arrived, and any 4xx the proxy answered is recorded at
+     * zero cost, because the proxy prices only a request that streamed. The request totals
+     * then drop the attempt's prompt tokens, cache tokens and input cost, so a call the
+     * proxy never charged is not billed.
+     *
+     * Call it once, after the last attempt: {@link resetAccumulation} does not clear the
+     * flag, so a later attempt would inherit a zeroed prompt.
+     */
+    endAttemptUnbilled(): void {
+        this._lastAttemptUnbilled = true;
     }
 
     /**
@@ -183,28 +196,35 @@ export class StreamTokenCapture {
      * stays a context value, because it measures the prompt rather than spend.
      *
      * An attempt a retry replaced contributes its prompt only when it reached the proxy.
-     * The attempt the turn ended on is always counted, because it is the last reading the
-     * connector has: a turn whose final attempt never connected therefore reports that
-     * attempt's estimate rather than under-reporting its spend.
+     * An attempt the provider marked unbilled with {@link endAttemptUnbilled} contributes
+     * no prompt tokens, cache tokens or input cost, because the proxy recorded no cost for
+     * it.
      */
     getSpendSnapshot(): TokenSnapshot {
         const last = this.getSnapshot();
+        const lastPromptTokens = this._lastAttemptUnbilled ? 0 : last.promptTokens;
+        const lastCachedTokens = this._lastAttemptUnbilled ? 0 : last.cachedTokens;
+        const lastCacheCreationTokens = this._lastAttemptUnbilled ? 0 : last.cacheCreationInputTokens;
+        const lastInputCost = this._lastAttemptUnbilled ? 0 : (last.estimatedInputCost ?? 0);
+        const lastOutputCost = last.estimatedOutputCost ?? 0;
         const hasCost = last.estimatedInputCost !== undefined || last.estimatedOutputCost !== undefined;
         return {
             ...last,
-            promptTokens: last.promptTokens + this._spent.promptTokens,
+            promptTokens: lastPromptTokens + this._spent.promptTokens,
             completionTokens: last.completionTokens + this._spent.completionTokens,
             outputTokens: last.outputTokens + this._spent.outputTokens,
             toolTokens: last.toolTokens + this._spent.toolTokens,
             reasoningTokens: last.reasoningTokens + this._spent.reasoningTokens,
             acceptedPredictionTokens: last.acceptedPredictionTokens + this._spent.acceptedPredictionTokens,
             rejectedPredictionTokens: last.rejectedPredictionTokens + this._spent.rejectedPredictionTokens,
-            cachedTokens: last.cachedTokens + this._spent.cachedTokens,
-            cacheCreationInputTokens: last.cacheCreationInputTokens + this._spent.cacheCreationInputTokens,
+            cachedTokens: lastCachedTokens + this._spent.cachedTokens,
+            cacheCreationInputTokens: lastCacheCreationTokens + this._spent.cacheCreationInputTokens,
             sawUpstreamUsage: last.sawUpstreamUsage || this._spentSawUpstreamUsage,
-            estimatedInputCost: hasCost ? (last.estimatedInputCost ?? 0) + this._spent.inputCost : undefined,
-            estimatedOutputCost: hasCost ? (last.estimatedOutputCost ?? 0) + this._spent.outputCost : undefined,
-            estimatedTotalCost: hasCost ? (last.estimatedTotalCost ?? 0) + this._spent.totalCost : undefined,
+            estimatedInputCost: hasCost ? normalizeCost(lastInputCost + this._spent.inputCost) : undefined,
+            estimatedOutputCost: hasCost ? normalizeCost(lastOutputCost + this._spent.outputCost) : undefined,
+            estimatedTotalCost: hasCost
+                ? normalizeCost(lastInputCost + lastOutputCost + this._spent.inputCost + this._spent.outputCost)
+                : undefined,
         };
     }
 
@@ -216,7 +236,6 @@ export class StreamTokenCapture {
             this._upstream?.completion_tokens_details;
 
         const snapshot: TokenSnapshot = {
-            // Input: prefer upstream, fall back to pre-computed estimate
             promptTokens: this._upstream?.prompt_tokens ?? this._estimatedPromptTokens,
             cachedTokens: promptDetails?.cached_tokens ?? 0,
             cacheCreationInputTokens: promptDetails?.cache_creation_input_tokens ?? 0,

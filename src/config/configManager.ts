@@ -141,10 +141,9 @@ export class ConfigManager {
     /**
      * Retrieves the current LiteLLM workspace-level configuration.
      *
-     * Backend connection details (baseUrl, apiKey) are NOT read here. They are
-     * delivered by VS Code per-group `options.configuration` payloads on every
-     * provider call. This method returns only workspace-scoped ergonomic toggles
-     * and overrides.
+     * Backend connection details (baseUrl, apiKey) are NOT read here: they arrive in
+     * VS Code's per-group `options.configuration` and are carried by the registry. This
+     * method returns only workspace-scoped ergonomic toggles and overrides.
      */
     async getConfig(): Promise<LiteLLMConfig> {
         const workspaceConfig = vscode.workspace.getConfiguration();

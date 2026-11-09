@@ -308,7 +308,6 @@ suite("StreamTokenCapture", () => {
         capture.resetAccumulation({ reachedProxy: true });
         capture.progress.report(asUsagePart({ prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 }));
 
-        const lastAttemptCost = capture.getSnapshot().estimatedTotalCost ?? 0;
         const requestTotals = capture.getSpendSnapshot();
 
         assert.deepStrictEqual(
@@ -316,13 +315,15 @@ suite("StreamTokenCapture", () => {
                 prompt: requestTotals.promptTokens,
                 output: requestTotals.outputTokens,
                 cost: requestTotals.estimatedTotalCost,
+                outputCost: requestTotals.estimatedOutputCost,
             },
             {
                 prompt: 220,
                 output: 30,
-                cost: lastAttemptCost + 100 * 0.000001 + 10 * 0.000002,
+                cost: 0.00028,
+                outputCost: 0.00006,
             },
-            "the totals add the replaced attempt"
+            "the totals add the replaced attempt without a floating-point artifact"
         );
     });
 
@@ -360,22 +361,12 @@ suite("StreamTokenCapture", () => {
                 rejected_prediction_tokens: 17 + offset,
             },
         });
-        const attemptCost = (offset: number) =>
-            calculateRequestCost({
-                promptTokens: 100 + offset,
-                completionTokens: 10 + offset,
-                cachedTokens: 3 + offset,
-                cacheCreationInputTokens: 5 + offset,
-                pricing: extractPricing(modelInfo as unknown as LiteLLMModelInfo),
-            });
 
         capture.progress.report(asUsagePart(usageFrame(0)));
         capture.resetAccumulation({ reachedProxy: true });
         capture.progress.report(asUsagePart(usageFrame(10)));
 
         const requestTotals = capture.getSpendSnapshot();
-        const first = attemptCost(0);
-        const second = attemptCost(10);
 
         assert.deepStrictEqual(
             {
@@ -397,8 +388,8 @@ suite("StreamTokenCapture", () => {
                 tool: 32,
                 accepted: 36,
                 rejected: 44,
-                inputCost: first.inputCost + second.inputCost,
-                outputCost: first.outputCost + second.outputCost,
+                inputCost: 0.000174,
+                outputCost: 0.00006,
             }
         );
     });
@@ -469,6 +460,39 @@ suite("StreamTokenCapture", () => {
         capture.progress.report(asUsagePart({ prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 }));
 
         assert.strictEqual(capture.getSpendSnapshot().promptTokens, 620);
+    });
+
+    test("an unbilled attempt keeps its output and drops its prompt", () => {
+        // A refused or 4xx-rejected attempt costs the proxy nothing, so its prompt
+        // estimate must not reach the request totals while its output still does.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress, {
+            input_cost_per_token: 0.000001,
+            output_cost_per_token: 0.000002,
+        } as unknown as LiteLLMModelInfo);
+        capture.setEstimatedPromptTokens(500);
+        capture.progress.report(asTextPart("partial answer"));
+
+        capture.endAttemptUnbilled();
+
+        const totals = capture.getSpendSnapshot();
+        assert.deepStrictEqual(
+            {
+                prompt: totals.promptTokens,
+                cached: totals.cachedTokens,
+                someOutput: totals.outputTokens > 0,
+                inputCost: totals.estimatedInputCost,
+                totalCost: totals.estimatedTotalCost,
+            },
+            {
+                prompt: 0,
+                cached: 0,
+                someOutput: true,
+                inputCost: 0,
+                totalCost: totals.estimatedOutputCost,
+            },
+            "an unbilled attempt is priced for its output only"
+        );
     });
 
     test("a retried request reports upstream usage when an earlier attempt streamed it", () => {

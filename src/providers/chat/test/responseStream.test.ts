@@ -203,6 +203,182 @@ suite("processResponseStream", () => {
         );
     });
 
+    test("completes a finished turn when the watchdog fires afterwards", async () => {
+        // The silence came after the answer, not in place of it, so the turn is done and
+        // the silence is not recorded as a failure of that turn.
+        const infoStub = sandbox.stub(StructuredLogger, "info");
+        const recorder = createPartRecorder();
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream<Uint8Array>(
+            {
+                start(controller) {
+                    controller.enqueue(encoder.encode(`data: ${chatTextFrame("done")}\n\n`));
+                    controller.enqueue(encoder.encode(`data: ${chatFinishFrame("stop")}\n\n`));
+                },
+                async pull(controller) {
+                    // Silence after the finish, long enough for the watchdog to fire.
+                    await new Promise((resolve) => setTimeout(resolve, 200));
+                    controller.close();
+                },
+            },
+            { highWaterMark: 0 }
+        );
+
+        await processResponseStream({
+            responseBody: stream,
+            progress: recorder.progress,
+            token: new vscode.CancellationTokenSource().token,
+            requestId: REQUEST_ID,
+            inactivityTimeoutMs: 10,
+        });
+
+        assert.deepStrictEqual(
+            {
+                text: collectResponseText(recorder.parts),
+                failureAfterFinish: infoStub.getCalls().some((call) => call.args[0] === "stream.failure_after_finish"),
+            },
+            { text: "done", failureAfterFinish: false },
+            "a silence after the finish is not a failure of that turn"
+        );
+    });
+
+    test("records no failure after the finish for a reasoning-only stop", async () => {
+        // The sentinel the settlement raises is a retry, not a failure: nothing may be
+        // recorded as failed on the way out.
+        const infoStub = sandbox.stub(StructuredLogger, "info");
+
+        await assert.rejects(
+            processResponseStream({
+                responseBody: new SteppedSseStream(
+                    [chatReasoningFrame("thought"), chatFinishFrame("stop"), SSE_DONE_FRAME],
+                    []
+                ).body,
+                progress: IGNORE_PROGRESS,
+                token: new vscode.CancellationTokenSource().token,
+                requestId: REQUEST_ID,
+                inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+            }),
+            ReasoningOnlyError
+        );
+
+        assert.deepStrictEqual(
+            infoStub
+                .getCalls()
+                .map((call) => call.args[0])
+                .filter((event) => event === "stream.failure_after_finish"),
+            []
+        );
+    });
+
+    test("surfaces an error frame that arrives after the answer finished", async () => {
+        // The proxy reported a failure, so the rejection must reach the turn instead of
+        // being hidden behind the completed text.
+        await assert.rejects(
+            processResponseStream({
+                responseBody: new SteppedSseStream(
+                    [
+                        chatTextFrame("done"),
+                        chatFinishFrame("stop"),
+                        JSON.stringify({ error: { message: "rejected after the finish", code: 400 } }),
+                        SSE_DONE_FRAME,
+                    ],
+                    []
+                ).body,
+                progress: IGNORE_PROGRESS,
+                token: new vscode.CancellationTokenSource().token,
+                requestId: REQUEST_ID,
+                inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+            }),
+            UpstreamStreamError
+        );
+    });
+
+    test("surfaces an error frame after a reasoning-only finished reply", async () => {
+        // The error frame must not be mistaken for an empty reply the retry loop would
+        // resend: that would retry a hard failure.
+        await assert.rejects(
+            processResponseStream({
+                responseBody: new SteppedSseStream(
+                    [
+                        chatReasoningFrame("thought"),
+                        chatFinishFrame("stop"),
+                        JSON.stringify({ error: { message: "rejected after the finish", code: 400 } }),
+                        SSE_DONE_FRAME,
+                    ],
+                    []
+                ).body,
+                progress: IGNORE_PROGRESS,
+                token: new vscode.CancellationTokenSource().token,
+                requestId: REQUEST_ID,
+                inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+            }),
+            UpstreamStreamError
+        );
+    });
+
+    test("completes a tool turn whose last frame lost its blank line", async () => {
+        // Every tool turn on the proxy fork ends with a tool_calls finish, whose calls the
+        // model declared complete: a lost terminator must not fail the turn after they ran.
+        const recorder = createPartRecorder();
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(
+                    encoder.encode(
+                        `data: ${JSON.stringify({
+                            choices: [
+                                {
+                                    delta: {
+                                        tool_calls: [
+                                            { index: 0, id: "call_1", function: { name: "ls", arguments: "{}" } },
+                                        ],
+                                    },
+                                    finish_reason: "tool_calls",
+                                },
+                            ],
+                        })}\n`
+                    )
+                );
+                // The frame arrives without its blank line, so the decoder flushes it and
+                // then reports the missing terminator.
+                controller.close();
+            },
+        });
+
+        await processResponseStream({
+            responseBody: stream,
+            progress: recorder.progress,
+            token: new vscode.CancellationTokenSource().token,
+            requestId: REQUEST_ID,
+            inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+        });
+
+        assert.deepStrictEqual(
+            collectToolCalls(recorder.parts).map((call) => call.name),
+            ["ls"]
+        );
+        assert.strictEqual(collectResponseText(recorder.parts), "", "a finished turn carries no notice");
+    });
+
+    test("completes an answer whose socket dies after the stop", async () => {
+        // A read error after the model ended its turn cannot be repaired by resending it.
+        const recorder = createPartRecorder();
+        const stream = createSeveredSseStream(
+            [chatTextFrame("done"), chatFinishFrame("stop")],
+            new TypeError("terminated")
+        );
+
+        await processResponseStream({
+            responseBody: stream,
+            progress: recorder.progress,
+            token: new vscode.CancellationTokenSource().token,
+            requestId: REQUEST_ID,
+            inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+        });
+
+        assert.strictEqual(collectResponseText(recorder.parts), "done");
+    });
+
     test("retries a reasoning-only reply whose last frame lost its blank line", async () => {
         // The truncation is only the missing terminator; the turn still carried no
         // answer, so it must reach the reasoning-only retry rather than complete.
@@ -609,6 +785,32 @@ suite("processResponseStream", () => {
         });
 
         assert.match(collectResponseText(parts), /was not run/);
+    });
+
+    test("drops a call whose arguments are a JSON array when the stream settles", async () => {
+        // A JSON array parses but is not a tool input object, so the settlement at stream
+        // end must refuse it rather than hand an array to the tool.
+        const { parts, progress } = createPartRecorder();
+        const stream = new SteppedSseStream(
+            [
+                chatToolCallHeaderFrame("call_array", "read_file"),
+                chatToolCallArgumentsFrame('[{"path":"a.ts"}]'),
+                chatFinishFrame("stop"),
+                SSE_DONE_FRAME,
+            ],
+            []
+        ).body;
+
+        await processResponseStream({
+            responseBody: stream,
+            progress,
+            token: new vscode.CancellationTokenSource().token,
+            requestId: REQUEST_ID,
+            inactivityTimeoutMs: STREAM_INACTIVITY_MS,
+        });
+
+        assert.deepStrictEqual(collectToolCalls(parts), [], "a JSON array is not a tool input");
+        assert.match(collectResponseText(parts), /\[litellm-connector\].*"read_file" tool was not run/);
     });
 
     test("explains a /responses call dropped for unreadable arguments", async () => {

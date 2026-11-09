@@ -4,6 +4,7 @@ import { getDefaultEffort, getEffectiveEfforts } from "../config/modelOverrides"
 import {
     CANONICAL_REASONING_EFFORTS,
     REASONING_EFFORT_FLAGS,
+    highestReasoningEffort,
     readDeclaredReasoningEfforts,
 } from "../config/reasoningEfforts";
 
@@ -326,7 +327,7 @@ export function getDefaultReasoningEffort(
         }
     }
 
-    return supportedEfforts[supportedEfforts.length - 1];
+    return highestReasoningEffort(supportedEfforts);
 }
 
 /**

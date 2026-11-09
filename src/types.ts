@@ -176,11 +176,10 @@ export interface ModelOverride {
 }
 
 /**
- * LiteLLM workspace-level configuration. Backend connection details
- * (baseUrl, apiKey) are delivered by VS Code per-group
- * `options.configuration` payloads on every provider call; they are NOT
- * stored in workspace settings. This type only carries workspace-scoped
- * ergonomic toggles and overrides.
+ * LiteLLM workspace-level configuration. Backend connection details (baseUrl, apiKey)
+ * arrive in VS Code's per-group `options.configuration` at discovery time and are
+ * carried by the registry afterwards. They are NOT stored in workspace settings. This
+ * type only carries workspace-scoped ergonomic toggles and overrides.
  */
 export interface LiteLLMConfig {
     inactivityTimeout?: number;

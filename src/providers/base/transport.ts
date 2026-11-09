@@ -5,14 +5,13 @@ import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types"
 import type { TransportDeps } from "./types";
 import { describeFailureForLog, toErrorLogFields } from "./errorLogFields";
 import type { RateLimitWaitLedger } from "../../utils/rateLimitRetryPolicy";
+import { LiteLLMConfigurationError } from "../../utils/transportRetry";
 
 /**
  * Sends a LiteLLM request to the configured endpoint.
  *
- * The single-provider design means routing is direct: the
- * `LiteLLMClient` is constructed from the baseUrl/apiKey passed on the
- * originating VS Code call (via `options.configuration`). There is no
- * global state consulted for routing and no model-id parsing.
+ * The caller resolves which backend a request belongs to and passes its baseUrl and
+ * apiKey in, so this layer holds no routing state.
  */
 export class Transport {
     private readonly configManager: TransportDeps["configManager"];
@@ -76,14 +75,15 @@ export class Transport {
         const apiKey = typeof configuration?.apiKey === "string" ? configuration.apiKey.trim() : "";
 
         // The provider terminates a rejected configuration and logs it with the request
-        // id, so the transport only throws.
+        // id, so the transport only throws. The error type is the connector's own, which
+        // is what tells the provider that no request reached the proxy.
         if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) {
-            throw new Error(
+            throw new LiteLLMConfigurationError(
                 `No baseUrl provided in call-time configuration for model "${request.model}". Configure the LiteLLM provider group in VS Code's Language Models view.`
             );
         }
         if (!apiKey) {
-            throw new Error(
+            throw new LiteLLMConfigurationError(
                 `No apiKey provided in call-time configuration for model "${request.model}". Configure the LiteLLM provider group in VS Code's Language Models view.`
             );
         }

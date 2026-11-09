@@ -1,8 +1,7 @@
 import * as vscode from "vscode";
 import type { LiteLLMModelInfo, ModelOverride, SupportedReasoningEffort } from "../types";
 import { Logger } from "../utils/logger";
-import { getDefaultReasoningEffort } from "../utils/modelCapabilities";
-import { CANONICAL_REASONING_EFFORTS, readDeclaredReasoningEfforts } from "./reasoningEfforts";
+import { CANONICAL_REASONING_EFFORTS, highestReasoningEffort, readDeclaredReasoningEfforts } from "./reasoningEfforts";
 import bundledOverridesSource from "./modelOverrides.json";
 
 const bundledOverridesData: unknown = bundledOverridesSource;
@@ -11,16 +10,9 @@ const MODEL_OVERRIDES_SETTING_KEY = "litellm-connector.modelOverrides";
 
 let bundledOverridesCache: ModelOverride[] | undefined;
 
+/** True for a level the connector's single effort table knows. */
 function isSupportedReasoningEffort(value: unknown): value is SupportedReasoningEffort {
-    return (
-        value === "none" ||
-        value === "minimal" ||
-        value === "low" ||
-        value === "medium" ||
-        value === "high" ||
-        value === "xhigh" ||
-        value === "max"
-    );
+    return typeof value === "string" && (CANONICAL_REASONING_EFFORTS as readonly string[]).includes(value);
 }
 
 function normalizeEfforts(efforts: unknown): SupportedReasoningEffort[] | undefined {
@@ -235,13 +227,13 @@ export function getDefaultEffort(
         }
 
         if (override.supportsReasoning === true || modelInfo?.supports_reasoning) {
-            return getDefaultReasoningEffort(efforts);
+            return highestReasoningEffort(efforts);
         }
         return undefined;
     }
 
     if (modelInfo?.supports_reasoning) {
-        return getDefaultReasoningEffort(CANONICAL_REASONING_EFFORTS);
+        return highestReasoningEffort(CANONICAL_REASONING_EFFORTS);
     }
 
     return undefined;

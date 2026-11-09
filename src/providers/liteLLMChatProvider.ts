@@ -35,6 +35,7 @@ import {
 } from "../adapters/tokenUtils";
 
 import { StreamTokenCapture } from "../adapters/streaming/streamTokenCapture";
+import { LiteLLMApiError } from "../adapters/litellmClient";
 import type { OpenAIChatCompletionRequest } from "../types";
 import { RequestCancellation } from "../utils/requestCancellation";
 import type { RequestOutcomeContext } from "./base/requestOutcome";
@@ -42,6 +43,7 @@ import { DEFAULT_RETRY_BUDGET_MS, RetryBudget, retryBudgetError } from "../utils
 import {
     StreamedTextAccumulator,
     HeadersTimeoutError,
+    LiteLLMConfigurationError,
     ReasoningOnlyError,
     isTransportRetriableError,
     failedBeforeReachingProxy,
@@ -55,6 +57,23 @@ import {
 
 /** Headers-timeout retries one request may spend. */
 const MAX_HEADERS_TIMEOUT_RETRIES = 1;
+
+/**
+ * True when the failure proves the proxy billed nothing for the attempt.
+ *
+ * A request the connector refuses for an incomplete configuration never leaves it, so
+ * nothing reached the proxy. The proxy records a failure that never streamed at zero cost,
+ * which covers every 4xx it answered, including the ones it raises after the upstream call
+ * has started, such as a context-window rejection or a rate limit. A 5xx may have streamed
+ * before failing, so it stays priced. A connect-phase failure is covered separately by
+ * `failedBeforeReachingProxy`.
+ */
+function isUnbilledFailure(error: unknown): boolean {
+    if (error instanceof LiteLLMConfigurationError) {
+        return true;
+    }
+    return error instanceof LiteLLMApiError && error.status < 500;
+}
 
 /**
  * Chat provider implementation for VS Code's LanguageModelChatProvider.
@@ -180,6 +199,17 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             sessionIdSource: resolvedSession.source,
         });
 
+        // Whether the attempt that just ended reached the proxy, read by the fold at the
+        // top of the next attempt and by the outcome report. Only a connect-phase failure
+        // proves it did not. Classified from that attempt's own error, before any wrapper
+        // is put around it.
+        let previousAttemptReachedProxy = true;
+        // Whether that attempt got as far as sending its request. A resume that fails while
+        // the request is built never reaches the proxy, so it is not priced. A transport
+        // refusal before the `fetch`, such as a missing base URL or key, is covered by
+        // `LiteLLMConfigurationError`.
+        let attemptSent = false;
+
         try {
             // Resolve the backend baseUrl for the `.copilotmd` metadata `url:` line.
             // The registry is the single source of truth for (namespaced id → backend);
@@ -278,19 +308,16 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             // One counter per request, so a retry numbers its thinking blocks onwards
             // instead of reusing the ids the previous attempt already delivered.
             const thinkingBlockIds = { used: 0 };
-            // Whether the attempt that just ended reached the proxy, read by the fold at
-            // the top of the next attempt. Only a connect-phase failure proves it did not.
-            let previousAttemptReachedProxy = true;
             while (true) {
+                // A cancel that landed before this attempt stops here, outside the per-attempt
+                // catch, so that catch classifies the attempt that actually ran. A cancel that
+                // followed a refused connection therefore leaves that attempt's "never reached
+                // the proxy" verdict in place instead of overwriting it.
+                if (requestCancellation.isCancellationRequested) {
+                    Logger.debug(`[transportRetry] request=${requestId} cancelled before attempt ${attempt}; aborting`);
+                    throw Object.assign(new Error("Operation cancelled by user"), { name: "CancellationError" });
+                }
                 try {
-                    // A cancel that landed before this attempt stops here, so a
-                    // cancelled turn sends no further request.
-                    if (requestCancellation.isCancellationRequested) {
-                        Logger.debug(
-                            `[transportRetry] request=${requestId} cancelled before attempt ${attempt}; aborting`
-                        );
-                        throw Object.assign(new Error("Operation cancelled by user"), { name: "CancellationError" });
-                    }
                     if (resumed) {
                         // The attempt being replaced keeps its accounting until the next
                         // request actually starts, so a turn cancelled during the backoff
@@ -301,6 +328,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         tokenCapture.resetAccumulation({ reachedProxy: previousAttemptReachedProxy });
                     }
                     previousAttemptReachedProxy = true;
+                    attemptSent = false;
                     outputAtAttemptStart = accumulator.text.length + accumulator.thinking.length;
                     // A retry starts a fresh header wait, so the request is back in the
                     // phase the picker labels "waiting for headers".
@@ -353,6 +381,7 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     // cannot strand an upstream response. A setting changed mid-turn
                     // still applies to the next attempt.
                     const streamCfg = await this._configManager.getConfig();
+                    attemptSent = true;
                     stream = await this.sendRequestWithRetry(
                         requestBodyBuilt,
                         model,
@@ -386,6 +415,9 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                     tokenCapture.flushUsage();
                     break;
                 } catch (err: unknown) {
+                    // Classified first, from this attempt's own error: the branches below
+                    // may wrap it, and a wrapper hides a connect-phase code.
+                    previousAttemptReachedProxy = !failedBeforeReachingProxy(err);
                     if (requestCancellation.isCancellationRequested) {
                         // A cancellation mid-stream ends the body without an error,
                         // whether the host asked for it (user Stop, agent-loop
@@ -533,10 +565,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
 
                     attempt += 1;
                     resumed = true;
-                    // A connect-phase failure is the only proof the request never reached
-                    // the proxy; every later failure may already be billed upstream, so the
-                    // fold keeps its prompt.
-                    previousAttemptReachedProxy = !failedBeforeReachingProxy(err);
                     const delay = retryBudget.clipDelay(backoffDelayMs(attempt, retryBaseDelayMs));
                     logTransportRetry(
                         requestId,
@@ -573,6 +601,15 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             });
         } catch (err: unknown) {
             const durationMs = LiteLLMTelemetry.endTimer(startTime);
+
+            // A turn that never reached the proxy, or that the proxy answered with a 4xx, is
+            // not priced: the proxy records a failure that never streamed at zero cost, so a
+            // prompt estimate here would report spend it never recorded. A cancel inherits the
+            // verdict of the attempt it interrupted through `previousAttemptReachedProxy`, and
+            // a refusal that was not retried is read from its own error.
+            if (!attemptSent || !previousAttemptReachedProxy || isUnbilledFailure(err)) {
+                tokenCapture.endAttemptUnbilled();
+            }
 
             if (requestCancellation.cancelledByConnector) {
                 // The connector ended this turn, not the host: VS Code is still

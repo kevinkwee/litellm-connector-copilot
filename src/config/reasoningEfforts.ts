@@ -19,6 +19,18 @@ export const CANONICAL_REASONING_EFFORTS: readonly SupportedReasoningEffort[] = 
 ];
 
 /**
+ * The highest level an ascending effort list offers, or `undefined` for an empty list.
+ *
+ * The picker's list is ordered, and its last entry is the default a model receives, so
+ * this one rule serves the picker and `modelOverrides` alike.
+ */
+export function highestReasoningEffort(
+    efforts: readonly SupportedReasoningEffort[]
+): SupportedReasoningEffort | undefined {
+    return efforts.length > 0 ? efforts[efforts.length - 1] : undefined;
+}
+
+/**
  * The `/model/info` flag that declares each reasoning-effort level.
  *
  * The proxy's model config declares every level a model accepts, and nothing implies a

@@ -299,6 +299,14 @@ function resolveRates(pricing: ModelPricing, promptTokens: number): PricingRates
     };
 }
 
+/**
+ * Removes the floating-point artifacts a cost sum leaves behind, so a derived total
+ * prints the same digits its parts do.
+ */
+export function normalizeCost(value: number): number {
+    return Number.parseFloat(value.toFixed(12));
+}
+
 export function calculateRequestCost(input: CostCalculationInput): RequestCost {
     const { promptTokens, completionTokens, cachedTokens, cacheCreationInputTokens, pricing } = input;
     if (!pricing) {
@@ -328,10 +336,11 @@ export function calculateRequestCost(input: CostCalculationInput): RequestCost {
     const outputCost = (rates.outputCostPerToken ?? 0) * Math.max(completionTokens, 0);
     const totalCost = inputCost + outputCost;
 
-    // Normalize floating point artifacts to a consistent precision.
-    const round = (value: number): number => Number.parseFloat(value.toFixed(12));
-
-    return { inputCost: round(inputCost), outputCost: round(outputCost), totalCost: round(totalCost) };
+    return {
+        inputCost: normalizeCost(inputCost),
+        outputCost: normalizeCost(outputCost),
+        totalCost: normalizeCost(totalCost),
+    };
 }
 
 export function derivePriceCategory(pricing: ModelPricing | undefined): string | undefined {

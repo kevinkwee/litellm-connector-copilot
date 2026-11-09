@@ -26,6 +26,9 @@ import {
 /** Retry backoff long enough that only a cancellation can end the request promptly. */
 const BACKOFF_MS = 5_000;
 
+/** Per-token rates, so an estimated cost is observable in the metrics. */
+const MODEL_PRICING = { input_cost_per_token: 0.000001, output_cost_per_token: 0.000002 };
+
 suite("LiteLLM Chat Provider Cancellation", () => {
     let sandbox: sinon.SinonSandbox;
 
@@ -265,6 +268,24 @@ suite("LiteLLM Chat Provider Cancellation", () => {
         });
 
         assert.strictEqual(chatCalls, 1);
+    });
+
+    test("prices nothing for a refusal that a backoff cancel interrupted", async () => {
+        // The cancel inherits the refused attempt's verdict instead of replacing it, so the
+        // cancelled turn reports no prompt for a connection the proxy never accepted.
+        const { metricStub } = await runBackoffCancelledRequest(() => {
+            throw new TypeError("fetch failed", { cause: { code: "ECONNREFUSED" } });
+        }, MODEL_PRICING);
+
+        const cancelled = metricStub
+            .getCalls()
+            .map((call) => call.args[0] as Record<string, unknown>)
+            .find((metric) => metric.status === "cancelled");
+        assert.deepStrictEqual(
+            { prompt: cancelled?.tokensIn, inputCost: cancelled?.estimatedInputCost },
+            { prompt: 0, inputCost: 0 },
+            "a refused connection is priced for nothing even when a cancel ends the retry"
+        );
     });
 
     test("ends the reasoning-only backoff at once when the connector cancels", async () => {

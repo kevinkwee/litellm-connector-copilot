@@ -79,6 +79,9 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
     let stoppedEarly: { reason: string; notice: string } | undefined;
     // Proof that the model chose to end its turn, not merely that bytes stopped.
     let sawNormalFinish = false;
+    // Set by any finish that ends the turn: `stop` or a `tool_calls` set the model
+    // declared complete. A failure after one of them cannot be repaired by resending.
+    let sawTurnEndingFinish = false;
     const controller = new AbortController();
 
     const emitParts = (parts: EmittedPart[]): void => {
@@ -95,6 +98,9 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
                 stoppedEarly = describeStoppedEarly(part.reason) ?? stoppedEarly;
                 if (part.reason === "stop") {
                     sawNormalFinish = true;
+                }
+                if (part.reason === "stop" || part.reason === "tool_calls") {
+                    sawTurnEndingFinish = true;
                 }
             }
         }
@@ -144,8 +150,9 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
     /**
      * Closes a turn whose stream has ended: recovers the tool calls it still holds, raises
      * the reasoning-only sentinel for a reply that carried nothing but reasoning, then
-     * reports the notices the turn earned. A stream-end error after a proven `stop` runs
-     * this too, because that turn was answered and only its terminator was lost.
+     * reports the notices the turn earned. A transport failure after a proven `stop` or
+     * `tool_calls` finish runs this too, because that turn had already delivered its answer
+     * or its calls, and only its terminator or its socket was lost.
      */
     const settleCompletedTurn = (): void => {
         // A cancelled stream delivers no tool calls: the host drops the parts
@@ -279,13 +286,23 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
         // there suppresses its endError), so the abort lands HERE on the
         // normal path, not in the catch block. Surface it as the retryable
         // sentinel BEFORE reasoning-only detection: a watchdog abort kills
-        // the stream regardless of whether reasoning was emitted.
-        if (wasWatchdogAbort) {
+        // the stream regardless of whether reasoning was emitted. A turn that
+        // already declared its end is settled instead, because the silence came
+        // after the answer, not in place of it.
+        if (wasWatchdogAbort && !sawTurnEndingFinish) {
             throw new InactivityTimeoutError(inactivityTimeoutMs, eventCount);
         }
 
         settleCompletedTurn();
     } catch (error: unknown) {
+        // The reader's own sentinel is thrown by the settlement inside the try, so it must
+        // leave here untouched: the retry loop owns it, and letting it reach the
+        // post-finish branch below would record a failure for a turn that simply had
+        // nothing to say.
+        if (error instanceof ReasoningOnlyError) {
+            throw error;
+        }
+
         const isStreamEndError =
             !(error instanceof UpstreamStreamError) &&
             error instanceof Error &&
@@ -303,24 +320,25 @@ export async function processResponseStream(context: ResponseStreamContext): Pro
             }
         }
 
-        // A turn that already reported a proven `stop` is finished: the end error only
-        // says the terminator never arrived, and resuming a finished turn would pay for
-        // a full prompt and append text to an answer the model had ended. It closes the
-        // way a clean end does, so a reasoning-only or empty stop still reaches its retry.
-        if (isStreamEndError && sawNormalFinish) {
-            Logger.debug(
-                `[chatStream] request=${requestId} ignoring a stream-end error after a stop finish: ${error.message}`
-            );
-            StructuredLogger.info("stream.end_error_after_stop", { requestId, eventCount });
+        // A turn that already declared its end is finished, whatever transport failure came
+        // afterwards: a lost terminator or a read error. Resending it would pay for a full
+        // prompt and could append text to an answer the model had ended, and for a
+        // `tool_calls` finish the calls have already run.
+        //
+        // An upstream error frame is not a transport failure: the proxy reported that the
+        // request failed, and the rejection has to reach the turn instead of being hidden
+        // behind a completed reply.
+        if (sawTurnEndingFinish && !(error instanceof UpstreamStreamError)) {
+            // Sanitized fields only: a mid-stream failure detail can carry generated content,
+            // so the structured fields below are the record, not the message.
+            Logger.debug(`[chatStream] request=${requestId} ignoring a transport failure after the turn's finish`);
+            StructuredLogger.info("stream.failure_after_finish", {
+                requestId,
+                eventCount,
+                ...toErrorLogFields(error),
+            });
             settleCompletedTurn();
             return;
-        }
-
-        // A reasoning-only reply is a retry, not a failure: the retry loop records it as
-        // `request.reasoning_only_retry`, so it must not also read as a failed attempt,
-        // whether it was detected on the clean path or after a lost terminator.
-        if (error instanceof ReasoningOnlyError) {
-            throw error;
         }
 
         // The attempt really failed, and it is about to leave this layer: record it

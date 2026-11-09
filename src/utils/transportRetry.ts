@@ -24,6 +24,20 @@ export class InactivityTimeoutError extends Error {
 }
 
 /**
+ * Thrown when the provider configuration is incomplete, before a request leaves the
+ * connector.
+ *
+ * No request reaches the proxy, so the attempt is priced at nothing. The message names the
+ * missing configuration field, because it is the only explanation the user gets.
+ */
+export class LiteLLMConfigurationError extends Error {
+    public constructor(message: string) {
+        super(message);
+        this.name = "LiteLLMConfigurationError";
+    }
+}
+
+/**
  * Sentinel for a request that produced no response headers within its budget.
  *
  * The proxy buffers the first streamed chunk before it writes headers, so a slow
