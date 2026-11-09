@@ -165,6 +165,70 @@ suite("Transport Retry Utilities", () => {
         assert.strictEqual(failedBeforeReachingProxy(refused), true);
     });
 
+    test("failedBeforeReachingProxy counts every code that can only mean no connection", () => {
+        const codes = [
+            "ECONNREFUSED",
+            "ENOTFOUND",
+            "EAI_AGAIN",
+            "UND_ERR_CONNECT_TIMEOUT",
+            "DEPTH_ZERO_SELF_SIGNED_CERT",
+            "SELF_SIGNED_CERT_IN_CHAIN",
+            "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+            "UNABLE_TO_GET_ISSUER_CERT",
+            "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+            "CERT_HAS_EXPIRED",
+            "ERR_TLS_CERT_ALTNAME_INVALID",
+        ];
+        const unproven = codes.filter(
+            (code) => !failedBeforeReachingProxy(new TypeError("fetch failed", { cause: { code } }))
+        );
+
+        assert.deepStrictEqual(unproven, [], "each of these codes proves the connection never opened");
+    });
+
+    test("failedBeforeReachingProxy counts a route failure only when the connect attempt failed", () => {
+        // The kernel reports these codes on an open socket too, and there the proxy may
+        // already have billed the prompt, so only a failed connect counts.
+        const routeCodes = ["EHOSTUNREACH", "ENETUNREACH", "EHOSTDOWN", "ENETDOWN"];
+        const onOpenSocket = routeCodes.map((code) =>
+            failedBeforeReachingProxy(new TypeError("terminated", { cause: { code, syscall: "read" } }))
+        );
+        const whileConnecting = routeCodes.map((code) =>
+            failedBeforeReachingProxy(new TypeError("fetch failed", { cause: { code, syscall: "connect" } }))
+        );
+
+        assert.deepStrictEqual(
+            { onOpenSocket, whileConnecting },
+            { onOpenSocket: [false, false, false, false], whileConnecting: [true, true, true, true] }
+        );
+    });
+
+    test("failedBeforeReachingProxy treats other open-socket failures as reached", () => {
+        // None of these names a connect attempt, so each one counts as a request the proxy
+        // may have billed.
+        const codes = ["ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET", "ECONNABORTED"];
+        const reached = codes.map((code) =>
+            failedBeforeReachingProxy(new TypeError("terminated", { cause: { code, syscall: "read" } }))
+        );
+
+        assert.deepStrictEqual(reached, [false, false, false, false], "an open socket keeps its prompt");
+    });
+
+    test("failedBeforeReachingProxy proves a connect attempt from an aggregate failure", () => {
+        // A multi-address connect raises an `AggregateError` carrying the code of the first
+        // address that failed.
+        const codes = ["EHOSTUNREACH", "ETIMEDOUT", "ECONNREFUSED"];
+        const verdicts = codes.map((code) =>
+            failedBeforeReachingProxy(
+                new TypeError("fetch failed", {
+                    cause: Object.assign(new AggregateError([], `connect ${code}`), { code }),
+                })
+            )
+        );
+
+        assert.deepStrictEqual(verdicts, [true, true, true], "no address connected, so nothing was sent");
+    });
+
     test("failedBeforeReachingProxy keeps a socket that opened, whatever its code", () => {
         const reset = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
 

@@ -216,12 +216,24 @@ export function isTransportRetriableError(err: unknown): boolean {
     );
 }
 
-/** Connection-phase codes that prove the request never reached the proxy. */
-const CONNECT_PHASE_CODES: ReadonlySet<string> = new Set([
+/**
+ * Codes that can only mean no request was ever written.
+ *
+ * The TLS codes belong here because a handshake failure happens before a single byte of
+ * the request is written, so the proxy saw nothing of a request the certificate rejected.
+ */
+const CONNECT_ONLY_CODES: ReadonlySet<string> = new Set([
     "ECONNREFUSED",
     "ENOTFOUND",
     "EAI_AGAIN",
     "UND_ERR_CONNECT_TIMEOUT",
+    "DEPTH_ZERO_SELF_SIGNED_CERT",
+    "SELF_SIGNED_CERT_IN_CHAIN",
+    "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "UNABLE_TO_GET_ISSUER_CERT",
+    "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+    "CERT_HAS_EXPIRED",
+    "ERR_TLS_CERT_ALTNAME_INVALID",
 ]);
 
 /** The transport error code a failure carries. `fetch` puts it on the `cause`. */
@@ -241,13 +253,36 @@ function transportErrorCode(error: unknown): string | undefined {
 }
 
 /**
+ * True when the failure happened while the client was still connecting.
+ *
+ * A failed connect names its call in `syscall`, and Node's multi-address connect reports an
+ * `AggregateError` whose attempts all failed to connect.
+ */
+function failedWhileConnecting(error: unknown): boolean {
+    for (const candidate of [error, (error as { cause?: unknown } | undefined)?.cause]) {
+        if (!candidate || typeof candidate !== "object") {
+            continue;
+        }
+        if (candidate instanceof AggregateError) {
+            return true;
+        }
+        if ((candidate as { syscall?: unknown }).syscall === "connect") {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
  * True when an error proves the request never reached the proxy.
  *
- * Only a connect-phase code on the failure itself or on its `fetch` cause proves the
- * proxy saw nothing. A socket that opened and then failed (a reset, a hang-up, a headers
- * timeout) may already be billed upstream, so such an attempt counts as reached and keeps
- * its prompt in the request totals. An `UpstreamStreamError` came from the proxy, so it is
- * never a connect-phase failure, whatever its upstream `code` field says.
+ * A code from the connect-only set proves it on its own: the address refused the connection,
+ * the name did not resolve, the connect timed out, or the TLS handshake failed. Beyond those,
+ * a failure that happened in `connect` proves it whatever its code carries, and so does the
+ * `AggregateError` a multi-address connect raises when no address accepted. A route failure
+ * the kernel reports on an open socket is not a connect failure, and the proxy may already
+ * have billed that prompt, so it counts as reached. An `UpstreamStreamError` came from the
+ * proxy, so it is never a connect-phase failure, whatever its upstream `code` field says.
  *
  * One attempt can make several HTTP calls (a connector-parameter strip-and-retry, the
  * `/responses` fallback, the `include_usage` retry), and only the error that ends the
@@ -258,7 +293,10 @@ export function failedBeforeReachingProxy(error: unknown): boolean {
         return false;
     }
     const code = transportErrorCode(error);
-    return code !== undefined && CONNECT_PHASE_CODES.has(code);
+    if (code !== undefined && CONNECT_ONLY_CODES.has(code)) {
+        return true;
+    }
+    return failedWhileConnecting(error);
 }
 
 export function sleepWithCancellation(ms: number, token?: vscode.CancellationToken): Promise<void> {

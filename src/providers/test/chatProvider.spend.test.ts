@@ -10,8 +10,12 @@ import { HeadersTimeoutError } from "../../utils/transportRetry";
 import { TEST_USER_AGENT } from "../../test/utils/testMocks";
 import { runChatRequest, seedDiscoveredBackend } from "../../test/utils/chatProviderTestUtils";
 
-/** A body that emits text and a usage frame, then dies of a dropped socket. */
-function dyingStreamAfterUsage(promptTokens: number, completionTokens: number): ReadableStream<Uint8Array> {
+/** A body that emits text and a usage frame, then dies with `error`. */
+function dyingStreamAfterUsage(
+    promptTokens: number,
+    completionTokens: number,
+    error: Error = new TypeError("terminated")
+): ReadableStream<Uint8Array> {
     const encoder = new TextEncoder();
     return new ReadableStream<Uint8Array>({
         start(controller) {
@@ -23,7 +27,7 @@ function dyingStreamAfterUsage(promptTokens: number, completionTokens: number): 
             );
         },
         pull(controller) {
-            controller.error(new TypeError("terminated"));
+            controller.error(error);
         },
     });
 }
@@ -257,6 +261,26 @@ suite("LiteLLM Chat Provider Spend", () => {
             { prompt: 100, output: 10 },
             "only the attempt that reached the proxy is billed"
         );
+    });
+
+    test("a route failure after the response opened keeps the attempt's prompt", async () => {
+        // The kernel reports these codes on an open socket too, where the proxy has already
+        // billed the prompt, so only a failed connect drops it.
+        const metricStub = sandbox.stub(LiteLLMTelemetry, "reportMetric");
+        const provider = createProvider({ networkRetries: 0 });
+        sandbox
+            .stub(LiteLLMClient.prototype, "chat")
+            .callsFake(async () =>
+                dyingStreamAfterUsage(
+                    100,
+                    10,
+                    new TypeError("terminated", { cause: { code: "EHOSTUNREACH", syscall: "read" } })
+                )
+            );
+
+        await runChatRequest(provider, []);
+
+        assert.strictEqual(metricOf(metricStub, "failure")?.tokensIn, 100);
     });
 
     test("a turn the connector refuses for a missing credential reports no prompt cost", async () => {

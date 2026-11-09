@@ -289,10 +289,10 @@ export abstract class LiteLLMProviderBase {
     }
 
     /**
-     * Sends a request to LiteLLM. Honors the per-group `options.configuration`
-     * passed by VS Code: baseUrl/apiKey are read from there, NEVER from
-     * global state. If `configuration` is missing, the request fails with a
-     * configuration-required error rather than silently mis-routing.
+     * Sends the request through `Transport` with the configuration its caller resolved for
+     * it, and returns the response body. That configuration is the only credential source:
+     * `getCallTimeConfiguration` resolves it per request. A request with no usable
+     * configuration is refused rather than mis-routed.
      */
     protected async sendRequestToLiteLLM(
         request: OpenAIChatCompletionRequest,
