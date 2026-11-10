@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.10-dev.20] - 2026-11-10
+
 ### Breaking Changes
 
 * **The 429 wait budget now covers one provider attempt**: `litellm-connector.rateLimitMaxDelaySeconds` bounded each HTTP call, so a strip-and-retry, a `/responses` fallback or an `include_usage` retry restarted the allowance and a rate-limited turn could wait several times over. Every resend inside one attempt now spends the same budget through a shared ledger, and a transport resume or a reasoning-only retry still starts a new one. (`src/utils/rateLimitRetryPolicy.ts`, `src/adapters/litellmClient.ts`, `src/providers/base/transport.ts`, `src/providers/liteLLMProviderBase.ts`)
