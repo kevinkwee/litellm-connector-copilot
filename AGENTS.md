@@ -306,7 +306,7 @@ When wrapping a caught error in a new one, pass the original through `cause` so 
 - Store API keys only as provider configuration: declare the group with `"secret": true` in the `languageModelChatProviders` contribution in `package.json`, and let VS Code encrypt it. **Never** store secrets in `globalState`.
 - No hardcoded API keys, tokens, or passwords.
 - Do not expose internal details in error messages to end users.
-- Use fake or anonymized data in tests, never real user data. Tests use mocked fetch and must never hit a real LiteLLM proxy.
+- Use fake or anonymized data in tests, never real user data. Tests must never hit a real LiteLLM proxy: they stub `fetch`, or point the real `fetch` at a local server the test starts itself.
 
 ## Observability
 
@@ -356,6 +356,7 @@ A proxy rejection body can echo the prompt, and a mid-stream failure detail can 
 
 - Write unit tests for all core logic. Unit tests are co-located with the module under test in `src/**/test/` as `*.test.ts` files. Integration tests live in `src/test/`. A suite that covers one unit but grows large splits by behaviour into aspect-suffixed files next to it (`chatProvider.retry.test.ts`, `chatProvider.cancellation.test.ts`), with the helpers they share in `src/test/utils/`.
 - Write integration tests for external integrations (the LiteLLM HTTP surface, VS Code protocol wiring).
+- `src/test/integration/runtimeFetch.test.ts` is the one client suite that sends real requests: it drives `LiteLLMClient` through the extension host's own `fetch` against a `node:http` server the test owns on the loopback interface. Every other client test stubs `fetch`, so only this suite sees the error shapes and stream behaviour the retry loop, the cancellation path, discovery and the spend accounting read from VS Code's bundled HTTP stack. Add a case there when new code depends on a runtime error shape or stream behaviour.
 - Distribute tests as a pyramid: many fast unit tests at the base, focused integration tests at the boundaries, and only a few end-to-end tests for critical user journeys.
 - Follow Arrange-Act-Assert (AAA) structure. ONE act per test, ONE logical assertion per test.
 - Tests MUST be independent, deterministic, and not depend on execution order.
