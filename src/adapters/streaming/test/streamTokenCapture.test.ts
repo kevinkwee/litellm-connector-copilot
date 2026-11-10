@@ -1,8 +1,8 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
-import type { OpenAIUsagePayload } from "../../../types";
+import type { LiteLLMModelInfo, OpenAIUsagePayload } from "../../../types";
 import { StreamTokenCapture } from "../streamTokenCapture";
-import { calculateRequestCost } from "../../../utils/pricingCalculator";
+import { calculateRequestCost, extractPricing } from "../../../utils/pricingCalculator";
 import { normalizeUsagePayload, type RawUsagePayload } from "../usagePayload";
 
 suite("StreamTokenCapture", () => {
@@ -80,6 +80,60 @@ suite("StreamTokenCapture", () => {
 
         const snapshot = capture.getSnapshot();
         assert.ok(snapshot.toolTokens > 0, "expected tool tokens to be estimated");
+    });
+
+    test("a tool-only reply reports its tool tokens as output and prices them", () => {
+        const reportedParts: vscode.LanguageModelDataPart[] = [];
+        const progress: vscode.Progress<vscode.LanguageModelResponsePart> = {
+            report: (part) => {
+                if (part instanceof vscode.LanguageModelDataPart && part.mimeType === "usage") {
+                    reportedParts.push(part);
+                }
+            },
+        };
+        const capture = new StreamTokenCapture("model-x", progress, {
+            model: "model-x",
+            pricing: { inputCostPerToken: 1e-6, outputCostPerToken: 2e-6 },
+        });
+
+        capture.progress.report(asToolCallPart("myTool", { a: 1 }));
+        capture.flushUsage();
+
+        const snapshot = capture.getSnapshot();
+        assert.ok(snapshot.toolTokens > 0);
+        assert.strictEqual(snapshot.completionTokens, 0, "a tool-only reply emits no text");
+        assert.strictEqual(snapshot.outputTokens, snapshot.toolTokens);
+        assert.strictEqual(snapshot.estimatedOutputCost, snapshot.toolTokens * 2e-6);
+
+        assert.strictEqual(reportedParts.length, 1);
+        const emitted = JSON.parse(Buffer.from(reportedParts[0].data).toString("utf-8")) as OpenAIUsagePayload;
+        assert.strictEqual(emitted.completion_tokens, snapshot.toolTokens);
+        assert.strictEqual(emitted.total_tokens, snapshot.toolTokens);
+    });
+
+    test("a reply with text and a tool call sums both into the output estimate", () => {
+        const { progress } = createInnerProgress();
+        const capture = new StreamTokenCapture("model-x", progress);
+
+        capture.progress.report(asTextPart("here is the answer"));
+        capture.progress.report(asToolCallPart("myTool", { a: 1 }));
+
+        const snapshot = capture.getSnapshot();
+        assert.ok(snapshot.completionTokens > 0);
+        assert.ok(snapshot.toolTokens > 0);
+        assert.strictEqual(snapshot.outputTokens, snapshot.completionTokens + snapshot.toolTokens);
+    });
+
+    test("upstream completion tokens stay authoritative over the local estimate", () => {
+        const { progress } = createInnerProgress();
+        const capture = new StreamTokenCapture("model-x", progress);
+
+        capture.progress.report(asTextPart("a long stretch of generated text"));
+        capture.progress.report(asToolCallPart("myTool", { a: 1 }));
+        capture.progress.report(asUsagePart({ prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 }));
+
+        const snapshot = capture.getSnapshot();
+        assert.strictEqual(snapshot.outputTokens, 2);
     });
 
     test("captures upstream usage from data part and prefers it over internal counts", () => {
@@ -218,6 +272,7 @@ suite("StreamTokenCapture", () => {
             cacheCreationInputTokens: 5,
             systemPromptTokens: 0,
             completionTokens: 25,
+            outputTokens: 25,
             reasoningTokens: 0,
             toolTokens: 0,
             acceptedPredictionTokens: 0,
@@ -229,10 +284,245 @@ suite("StreamTokenCapture", () => {
         });
 
         assert.strictEqual(reportedParts.length, 1);
-        const forwardedUsage = JSON.parse(Buffer.from(reportedParts[0].data).toString("utf-8"));
+        const parsedForwarded: unknown = JSON.parse(Buffer.from(reportedParts[0].data).toString("utf-8"));
+        const forwardedUsage = parsedForwarded as {
+            estimated_input_cost?: number;
+            estimated_output_cost?: number;
+            estimated_total_cost?: number;
+        };
         assert.strictEqual(forwardedUsage.estimated_input_cost, expectedCost.inputCost);
         assert.strictEqual(forwardedUsage.estimated_output_cost, expectedCost.outputCost);
         assert.strictEqual(forwardedUsage.estimated_total_cost, expectedCost.totalCost);
+    });
+
+    test("a retried request reports every attempt it replaced in its totals", () => {
+        // Each attempt the proxy ran is billed, and the resumed request pays for the
+        // replayed text again, so the request totals are the sum.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress, {
+            input_cost_per_token: 0.000001,
+            output_cost_per_token: 0.000002,
+        } as unknown as LiteLLMModelInfo);
+
+        capture.progress.report(asUsagePart({ prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 }));
+        capture.resetAccumulation({ reachedProxy: true });
+        capture.progress.report(asUsagePart({ prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 }));
+
+        const requestTotals = capture.getSpendSnapshot();
+
+        assert.deepStrictEqual(
+            {
+                prompt: requestTotals.promptTokens,
+                output: requestTotals.outputTokens,
+                cost: requestTotals.estimatedTotalCost,
+                outputCost: requestTotals.estimatedOutputCost,
+            },
+            {
+                prompt: 220,
+                output: 30,
+                cost: 0.00028,
+                outputCost: 0.00006,
+            },
+            "the totals add the replaced attempt without a floating-point artifact"
+        );
+    });
+
+    test("a retried request keeps the forwarded usage part describing one attempt", () => {
+        // The host reads the usage part for context size, so it must not grow with
+        // the retries the request made.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress);
+
+        capture.progress.report(asUsagePart({ prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 }));
+        capture.resetAccumulation({ reachedProxy: true });
+        capture.progress.report(asUsagePart({ prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 }));
+
+        const forwarded = inner.parts
+            .filter((part) => part instanceof vscode.LanguageModelDataPart && part.mimeType === "usage")
+            .at(-1) as vscode.LanguageModelDataPart;
+        const payload = JSON.parse(Buffer.from(forwarded.data).toString("utf-8")) as { prompt_tokens: number };
+        assert.strictEqual(payload.prompt_tokens, 120, "the forwarded usage part stays one attempt");
+    });
+
+    test("a retried request sums every usage detail, not just the prompt and output", () => {
+        // Cache, reasoning, tool and prediction counts also reach the final usage line
+        // and the transcript, so a lost fold would under-report them on a retried turn.
+        const inner = createInnerProgress();
+        const modelInfo = { input_cost_per_token: 0.000001, output_cost_per_token: 0.000002 };
+        const capture = new StreamTokenCapture("gpt-4", inner.progress, modelInfo as unknown as LiteLLMModelInfo);
+        const usageFrame = (offset: number): Record<string, unknown> => ({
+            prompt_tokens: 100 + offset,
+            completion_tokens: 10 + offset,
+            prompt_tokens_details: { cached_tokens: 3 + offset, cache_creation_input_tokens: 5 + offset },
+            completion_tokens_details: {
+                reasoning_tokens: 7 + offset,
+                tool_tokens: 11 + offset,
+                accepted_prediction_tokens: 13 + offset,
+                rejected_prediction_tokens: 17 + offset,
+            },
+        });
+
+        capture.progress.report(asUsagePart(usageFrame(0)));
+        capture.resetAccumulation({ reachedProxy: true });
+        capture.progress.report(asUsagePart(usageFrame(10)));
+
+        const requestTotals = capture.getSpendSnapshot();
+
+        assert.deepStrictEqual(
+            {
+                completion: requestTotals.completionTokens,
+                cached: requestTotals.cachedTokens,
+                cacheWrite: requestTotals.cacheCreationInputTokens,
+                reasoning: requestTotals.reasoningTokens,
+                tool: requestTotals.toolTokens,
+                accepted: requestTotals.acceptedPredictionTokens,
+                rejected: requestTotals.rejectedPredictionTokens,
+                inputCost: requestTotals.estimatedInputCost,
+                outputCost: requestTotals.estimatedOutputCost,
+            },
+            {
+                completion: 30,
+                cached: 16,
+                cacheWrite: 20,
+                reasoning: 24,
+                tool: 32,
+                accepted: 36,
+                rejected: 44,
+                inputCost: 0.000174,
+                outputCost: 0.00006,
+            }
+        );
+    });
+
+    test("a replaced attempt that never reached the proxy is not billed a prompt", () => {
+        // A refused connection was never charged for a prompt, so folding its estimate
+        // would price a request that never happened.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress);
+        capture.setEstimatedPromptTokens(500);
+
+        capture.resetAccumulation({ reachedProxy: false });
+        capture.progress.report(asUsagePart({ prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 }));
+
+        assert.deepStrictEqual(
+            { prompt: capture.getSpendSnapshot().promptTokens, output: capture.getSpendSnapshot().outputTokens },
+            { prompt: 120, output: 20 }
+        );
+    });
+
+    test("a refused attempt leaves no priced prompt in the request cost", () => {
+        // The total is what a support reader reads first, so the refused attempt's
+        // estimate must not survive inside it.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress, {
+            input_cost_per_token: 0.000001,
+            output_cost_per_token: 0.000002,
+        } as unknown as LiteLLMModelInfo);
+        capture.setEstimatedPromptTokens(500);
+
+        capture.resetAccumulation({ reachedProxy: false });
+        capture.progress.report(asUsagePart({ prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 }));
+
+        const totals = capture.getSpendSnapshot();
+        const secondAttemptAlone = calculateRequestCost({
+            promptTokens: 120,
+            completionTokens: 20,
+            cachedTokens: 0,
+            cacheCreationInputTokens: 0,
+            pricing: extractPricing({
+                input_cost_per_token: 0.000001,
+                output_cost_per_token: 0.000002,
+            } as unknown as LiteLLMModelInfo),
+        });
+        assert.deepStrictEqual(
+            {
+                total: totals.estimatedTotalCost,
+                input: totals.estimatedInputCost,
+                output: totals.estimatedOutputCost,
+            },
+            {
+                total: secondAttemptAlone.totalCost,
+                input: secondAttemptAlone.inputCost,
+                output: secondAttemptAlone.outputCost,
+            },
+            "the refused attempt's priced estimate stays out of every cost"
+        );
+    });
+
+    test("a replaced attempt that reached the proxy keeps its prompt estimate", () => {
+        // An attempt the proxy received is billed even though it streamed no usage
+        // frame, so its prompt estimate stays in the totals.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress);
+        capture.setEstimatedPromptTokens(500);
+
+        capture.resetAccumulation({ reachedProxy: true });
+        capture.progress.report(asUsagePart({ prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 }));
+
+        assert.strictEqual(capture.getSpendSnapshot().promptTokens, 620);
+    });
+
+    test("an unbilled attempt keeps its output and drops its prompt", () => {
+        // A refused or 4xx-rejected attempt costs the proxy nothing, so its prompt
+        // estimate must not reach the request totals while its output still does.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress, {
+            input_cost_per_token: 0.000001,
+            output_cost_per_token: 0.000002,
+        } as unknown as LiteLLMModelInfo);
+        capture.setEstimatedPromptTokens(500);
+        capture.progress.report(asTextPart("partial answer"));
+
+        capture.endAttemptUnbilled();
+
+        const totals = capture.getSpendSnapshot();
+        assert.deepStrictEqual(
+            {
+                prompt: totals.promptTokens,
+                cached: totals.cachedTokens,
+                someOutput: totals.outputTokens > 0,
+                inputCost: totals.estimatedInputCost,
+                totalCost: totals.estimatedTotalCost,
+            },
+            {
+                prompt: 0,
+                cached: 0,
+                someOutput: true,
+                inputCost: 0,
+                totalCost: totals.estimatedOutputCost,
+            },
+            "an unbilled attempt is priced for its output only"
+        );
+    });
+
+    test("a retried request reports upstream usage when an earlier attempt streamed it", () => {
+        // The fold is what keeps the flag true once a reset clears the estimator, so a
+        // turn whose earlier attempt reported usage is never relabelled as an estimate.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress);
+
+        capture.progress.report(asUsagePart({ prompt_tokens: 10, completion_tokens: 2 }));
+        capture.resetAccumulation({ reachedProxy: true });
+        capture.progress.report(asTextPart("second attempt"));
+
+        assert.strictEqual(capture.getSpendSnapshot().sawUpstreamUsage, true);
+    });
+
+    test("a retried request without a usage frame reports an estimate", () => {
+        // The prompt is then a local estimate, which must not be read as evidence
+        // that the gateway streamed its own counts.
+        const inner = createInnerProgress();
+        const capture = new StreamTokenCapture("gpt-4", inner.progress);
+        capture.setEstimatedPromptTokens(500);
+
+        capture.progress.report(asTextPart("first attempt"));
+        capture.resetAccumulation({ reachedProxy: true });
+        capture.progress.report(asTextPart("second attempt"));
+
+        const requestTotals = capture.getSpendSnapshot();
+
+        assert.strictEqual(requestTotals.sawUpstreamUsage, false);
+        assert.strictEqual(requestTotals.promptTokens, 1000, "both estimates are counted");
     });
 
     test("captures LiteLLM Anthropic cache counters and bills writes at the cache-write price", () => {
@@ -282,6 +572,86 @@ suite("StreamTokenCapture", () => {
         // Reads: 400 * 2e-7 = 0.00008; writes: 100 * 2.5e-6 = 0.00025
         assert.strictEqual(snapshot.estimatedInputCost, 0.00133);
         assert.strictEqual(snapshot.estimatedOutputCost, 0.000075);
+    });
+
+    test("bills one-hour cache writes at their own rate on the forwarded usage part", () => {
+        const { parts, progress } = createInnerProgress();
+        const capture = new StreamTokenCapture("claude-opus", progress, {
+            model: "claude-opus",
+            mode: "chat",
+            litellm_provider: "anthropic",
+            pricing: {
+                inputCostPerToken: 3e-6,
+                cacheCreationCostPerToken: 3.75e-6,
+                // Anthropic bills a one-hour write at twice the input rate.
+                cacheCreation1hCostPerToken: 6e-6,
+            },
+        });
+
+        capture.progress.report(
+            asUsagePart(
+                normalizeUsagePayload({
+                    prompt_tokens: 1000,
+                    completion_tokens: 0,
+                    total_tokens: 1000,
+                    prompt_tokens_details: {
+                        cache_creation_input_tokens: 100,
+                        cache_creation_token_details: {
+                            ephemeral_5m_input_tokens: 40,
+                            ephemeral_1h_input_tokens: 60,
+                        },
+                    },
+                } as RawUsagePayload)
+            )
+        );
+
+        // Non-cached input: (1000 - 0 - 100) * 3e-6 = 0.0027
+        // Writes: 40 * 3.75e-6 = 0.00015, 60 * 6e-6 = 0.00036
+        const usage = parts.find((part) => part instanceof vscode.LanguageModelDataPart) as
+            vscode.LanguageModelDataPart | undefined;
+        assert.ok(usage, "expected the forwarded usage part");
+        const payload = JSON.parse(Buffer.from(usage.data).toString("utf-8")) as { estimated_input_cost?: number };
+        assert.strictEqual(payload.estimated_input_cost, 0.00321);
+        assert.strictEqual(capture.getSnapshot().estimatedInputCost, 0.00321);
+    });
+
+    test("keeps the cache-write split across a second usage frame", () => {
+        // Upstream may report usage mid-stream and again at the end of the same
+        // attempt. The merge must not lose the tiers, or every cache write falls back
+        // to the five-minute rate.
+        const { parts, progress } = createInnerProgress();
+        const capture = new StreamTokenCapture("claude-opus", progress, {
+            model: "claude-opus",
+            mode: "chat",
+            litellm_provider: "anthropic",
+            pricing: {
+                inputCostPerToken: 3e-6,
+                cacheCreationCostPerToken: 3.75e-6,
+                cacheCreation1hCostPerToken: 6e-6,
+            },
+        });
+        const usageFrame = (): vscode.LanguageModelDataPart =>
+            asUsagePart(
+                normalizeUsagePayload({
+                    prompt_tokens: 1000,
+                    completion_tokens: 0,
+                    total_tokens: 1000,
+                    prompt_tokens_details: {
+                        cache_creation_input_tokens: 100,
+                        cache_creation_token_details: {
+                            ephemeral_5m_input_tokens: 40,
+                            ephemeral_1h_input_tokens: 60,
+                        },
+                    },
+                } as RawUsagePayload)
+            );
+
+        capture.progress.report(usageFrame());
+        capture.progress.report(usageFrame());
+
+        const usage = parts[parts.length - 1] as vscode.LanguageModelDataPart;
+        const payload = JSON.parse(Buffer.from(usage.data).toString("utf-8")) as { estimated_input_cost?: number };
+        assert.strictEqual(payload.estimated_input_cost, 0.00321, "the second frame keeps the tiers");
     });
 
     test("counts ThinkingPart as reasoning and plain TextPart as completion only", () => {
@@ -392,7 +762,7 @@ suite("StreamTokenCapture", () => {
         });
         tracking.report(redacted);
 
-        // Local estimate stays at zero — the upstream usage DataPart (when
+        // The local estimate stays at zero while the upstream usage DataPart (when
         // it arrives) is the authoritative source.
         const snapshot = capture.getSnapshot();
         assert.strictEqual(snapshot.reasoningTokens, 0, "redacted data must not be counted as visible reasoning");
@@ -405,7 +775,7 @@ suite("StreamTokenCapture", () => {
 
     test("signature-only thinking parts (display=omitted) do not advance the reasoning buffer", () => {
         // Anthropic's `display: "omitted"` mode streams a thinking block
-        // with no `thinking_delta` events — only a single `signature_delta`
+        // with no `thinking_delta` events, only a single `signature_delta`
         // that closes the block. The connector must still forward the part
         // to VS Code but the value is empty so the local token count stays
         // at zero (the upstream `usage.reasoning_tokens` will be

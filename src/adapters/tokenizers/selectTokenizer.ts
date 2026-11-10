@@ -2,20 +2,14 @@ import type { LiteLLMModelInfo } from "../../types";
 import { HeuristicTokenizer } from "./heuristicTokenizer";
 import type { Tokenizer } from "./types";
 
-export function selectTokenizer(modelId: string, modelInfo?: LiteLLMModelInfo): Tokenizer {
-    // OpenAI and compatible models (most LiteLLM proxies) use Tiktoken (cl100k_base)
-    const provider = modelInfo?.litellm_provider || "";
-    const isOpenAICompatible =
-        provider === "openai" ||
-        provider === "azure" ||
-        modelId.startsWith("gpt-") ||
-        modelId.startsWith("text-embedding-");
-
-    if (isOpenAICompatible) {
-        return new HeuristicTokenizer();
-    }
-
-    // For other providers (Anthropic, Google, etc.), we still use heuristic
-    // until we add their specific tokenizers.
+/**
+ * Returns the tokenizer that estimates token counts for a model.
+ *
+ * The heuristic estimator serves every model. It deliberately overestimates, so an
+ * unfamiliar provider vocabulary cannot undercount the prompt. Every call site
+ * already passes the model id and info, so a per-family tokenizer can be selected
+ * here without a signature change.
+ */
+export function selectTokenizer(_modelId: string, _modelInfo?: LiteLLMModelInfo): Tokenizer {
     return new HeuristicTokenizer();
 }

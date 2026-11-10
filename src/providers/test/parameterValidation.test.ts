@@ -1,13 +1,12 @@
 import * as assert from "assert";
 import { LiteLLMProviderBase } from "../liteLLMProviderBase";
 import type { LiteLLMModelInfo } from "../../types";
-import { createMockSecrets } from "../../test/utils/testMocks";
 
 suite("Parameter Validation from supported_openai_params", () => {
     // Create a concrete implementation for testing
     class TestableLiteLLMProvider extends LiteLLMProviderBase {
         constructor() {
-            super(createMockSecrets({}), "test-agent");
+            super("test-agent");
         }
 
         public testIsParameterSupported(

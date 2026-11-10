@@ -10,9 +10,9 @@ import { LiteLLMClient } from "../../adapters/litellmClient";
  * architecture. The model id returned to VS Code is namespaced
  * `<routingIdentity>/<rawModelName>` so the response path can route
  * unambiguously. The `name` field shown to the user is the raw model
- * name only (no namespace leak). The picker groups models via
- * `category.label` which is the user-entered group name (or URL hostname
- * fallback).
+ * name only (no namespace leak). The picker groups models by the
+ * `(vendor, groupName)` lookup, not by `category`, which is a capability tier.
+ * The backend label the user sees in `detail` is the URL hostname.
  */
 suite("LiteLLM model display", () => {
     let sandbox: sinon.SinonSandbox;
@@ -26,14 +26,7 @@ suite("LiteLLM model display", () => {
     });
 
     test("uses namespaced id, raw model_name as the user-facing name, vendor field for picker grouping", async () => {
-        const mockSecrets: vscode.SecretStorage = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            onDidChange: (_listener: unknown) => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
-
-        const provider = new LiteLLMChatProvider(mockSecrets, "test-agent");
+        const provider = new LiteLLMChatProvider("test-agent");
         const token = new vscode.CancellationTokenSource().token;
 
         sandbox.stub(LiteLLMClient.prototype, "getModelInfo").resolves({
@@ -61,9 +54,9 @@ suite("LiteLLM model display", () => {
 
         assert.strictEqual(models.length, 1);
         // The model id VS Code receives is namespaced
-        // (`<routingIdentity>/<rawModelName>`) so the response path can
-        // route unambiguously. The `name` is the raw model name only —
-        // the user does not see the routing prefix in the picker.
+        // (`<routingIdentity>/<rawModelName>`) so the response path can route
+        // unambiguously. The `name` is the raw model name only, so the user does
+        // not see the routing prefix in the picker.
         assert.strictEqual(models[0].id, "example/gpt-4o");
         assert.strictEqual(models[0].name, "gpt-4o");
         assert.strictEqual((models[0] as unknown as { vendor: string }).vendor, "openai");
@@ -75,8 +68,7 @@ suite("LiteLLM model display", () => {
         // `ILanguageModelsService.getLanguageModelGroups()` lookup, NOT by
         // reading `metadata.category`. We assert on `vendor` here because
         // that's the field the picker actually reads. The user-visible
-        // identifier of the backend is also surfaced via `detail` and
-        // `tooltip` for the hover/tooltip experience.
+        // identifier of the backend is also surfaced via `detail` and `tooltip`.
         assert.strictEqual((models[0] as unknown as { detail: string }).detail, "example");
         assert.strictEqual(
             (models[0] as unknown as { tooltip?: string }).tooltip,
@@ -86,7 +78,6 @@ suite("LiteLLM model display", () => {
         // Regression guard: `category` MUST be a string literal or `undefined`
         // for the picker not to crash on `getCategoryLabel`. Anything else
         // (object, null, number) triggers `TypeError: a.charAt is not a function`.
-        // See `.investigate/vscode-picker-charAt-bug.md`.
         const category = (models[0] as unknown as { category?: unknown }).category;
         assert.ok(
             category === undefined || typeof category === "string",
@@ -95,14 +86,7 @@ suite("LiteLLM model display", () => {
     });
 
     test("populates pricing fields when backend returns pricing and displayPricingInPicker is enabled", async () => {
-        const mockSecrets: vscode.SecretStorage = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            onDidChange: (_listener: unknown) => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
-
-        const provider = new LiteLLMChatProvider(mockSecrets, "test-agent");
+        const provider = new LiteLLMChatProvider("test-agent");
 
         // Force config defaults to include displayPricingInPicker: true
         const providerAny = provider as unknown as {
@@ -111,8 +95,6 @@ suite("LiteLLM model display", () => {
         sandbox.stub(providerAny._configManager, "getConfig").resolves({
             inactivityTimeout: 60,
             disableCaching: true,
-            disableQuotaToolRedaction: false,
-            enableModelOverrides: true,
             modelCapabilitiesOverrides: {},
             forceResponsesEndpoint: false,
             allowChatCompletionsFallback: false,
@@ -131,7 +113,7 @@ suite("LiteLLM model display", () => {
                         mode: "responses",
                         max_output_tokens: 4096,
                         max_input_tokens: 8192,
-                        // Pricing (per-token) — will be scaled to per-1M for VS Code fields
+                        // Pricing (per-token), scaled to per-1M for the VS Code fields
                         input_cost_per_token: 0.000001,
                         output_cost_per_token: 0.000005,
                         cache_read_input_token_cost: 0.0000001,
@@ -177,14 +159,7 @@ suite("LiteLLM model display", () => {
     });
 
     test("adds cache indicator to detail string for models with prompt caching support", async () => {
-        const mockSecrets: vscode.SecretStorage = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            onDidChange: (_listener: unknown) => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
-
-        const provider = new LiteLLMChatProvider(mockSecrets, "test-agent");
+        const provider = new LiteLLMChatProvider("test-agent");
         const token = new vscode.CancellationTokenSource().token;
 
         sandbox.stub(LiteLLMClient.prototype, "getModelInfo").resolves({
@@ -223,14 +198,7 @@ suite("LiteLLM model display", () => {
     });
 
     test("does not add cache indicator to detail string for models without prompt caching support", async () => {
-        const mockSecrets: vscode.SecretStorage = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            onDidChange: (_listener: unknown) => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
-
-        const provider = new LiteLLMChatProvider(mockSecrets, "test-agent");
+        const provider = new LiteLLMChatProvider("test-agent");
         const token = new vscode.CancellationTokenSource().token;
 
         sandbox.stub(LiteLLMClient.prototype, "getModelInfo").resolves({
@@ -268,14 +236,7 @@ suite("LiteLLM model display", () => {
     });
 
     test("sets string category 'versatile' on models with tools and vision (balanced)", async () => {
-        const mockSecrets: vscode.SecretStorage = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            onDidChange: (_listener: unknown) => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
-
-        const provider = new LiteLLMChatProvider(mockSecrets, "test-agent");
+        const provider = new LiteLLMChatProvider("test-agent");
         const token = new vscode.CancellationTokenSource().token;
 
         sandbox.stub(LiteLLMClient.prototype, "getModelInfo").resolves({
@@ -315,14 +276,7 @@ suite("LiteLLM model display", () => {
     });
 
     test("sets string category 'powerful' on reasoning-capable models", async () => {
-        const mockSecrets: vscode.SecretStorage = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            onDidChange: (_listener: unknown) => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
-
-        const provider = new LiteLLMChatProvider(mockSecrets, "test-agent");
+        const provider = new LiteLLMChatProvider("test-agent");
         const token = new vscode.CancellationTokenSource().token;
 
         sandbox.stub(LiteLLMClient.prototype, "getModelInfo").resolves({
@@ -355,14 +309,7 @@ suite("LiteLLM model display", () => {
     });
 
     test("sets string category 'lightweight' on small models without tools/vision/reasoning", async () => {
-        const mockSecrets: vscode.SecretStorage = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            onDidChange: (_listener: unknown) => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
-
-        const provider = new LiteLLMChatProvider(mockSecrets, "test-agent");
+        const provider = new LiteLLMChatProvider("test-agent");
         const token = new vscode.CancellationTokenSource().token;
 
         sandbox.stub(LiteLLMClient.prototype, "getModelInfo").resolves({
@@ -394,17 +341,10 @@ suite("LiteLLM model display", () => {
     });
 
     test("the 'unknown model_name' fallback is filtered out before reaching VS Code (picker safety net)", async () => {
-        const mockSecrets: vscode.SecretStorage = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            onDidChange: (_listener: unknown) => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
-
-        const provider = new LiteLLMChatProvider(mockSecrets, "test-agent");
+        const provider = new LiteLLMChatProvider("test-agent");
         const token = new vscode.CancellationTokenSource().token;
 
-        // Backend returns an entry with NO model_name — registry short-circuits
+        // Backend returns an entry with NO model_name, so the registry short-circuits
         // to the "unknown" fallback path with `isUserSelectable: false`. That
         // model is filtered out by discoverFromSession before reaching VS Code,
         // so the picker can never see it. This guards the indirect crash

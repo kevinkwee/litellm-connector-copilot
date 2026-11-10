@@ -11,6 +11,7 @@ export function makeMinimalSnapshot(): TokenSnapshot {
         cacheCreationInputTokens: 0,
         systemPromptTokens: 0,
         completionTokens: 50,
+        outputTokens: 50,
         reasoningTokens: 0,
         toolTokens: 0,
         acceptedPredictionTokens: 0,

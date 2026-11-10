@@ -11,6 +11,15 @@ import { dirname, join } from "node:path";
  */
 
 /**
+ * The subset of a JSON-schema property declaration these assertions inspect.
+ */
+interface ManifestProperty {
+    type?: string;
+    enum?: string[];
+    items?: { type?: string; enum?: string[] };
+}
+
+/**
  * Walks up from this compiled module to the repository root and returns the
  * first ancestor holding the extension manifest. The depth is not stable
  * across build layouts (tsc emits under `out/src/...`), so the search keeps
@@ -95,5 +104,78 @@ suite("Agents Window Compatibility Manifest", () => {
             typeof manifest.main === "string" && manifest.main.length > 0,
             "main field must exist. The Agents window disables code-carrying extensions unless capabilities declare support"
         );
+    });
+
+    test("offers max in both effort enums and declares forceMandatory", () => {
+        const contributes = manifest.contributes as Record<string, unknown>;
+        const properties = (contributes.configuration as Record<string, unknown>).properties as Record<
+            string,
+            { items?: { properties?: Record<string, ManifestProperty> } }
+        >;
+        const overrideProperties = properties["litellm-connector.modelOverrides"].items?.properties;
+        assert.ok(overrideProperties, "modelOverrides item properties must exist");
+
+        // `SupportedReasoningEffort` includes `max`, so the schema must offer it
+        // or a valid override is flagged by the settings editor.
+        const effortsEnum = overrideProperties.reasoningEfforts?.items?.enum;
+        assert.ok(
+            effortsEnum?.includes("max"),
+            `reasoningEfforts must offer 'max'; got: ${JSON.stringify(effortsEnum)}`
+        );
+        const defaultEffortEnum = overrideProperties.defaultEffort?.enum;
+        assert.ok(
+            defaultEffortEnum?.includes("max"),
+            `defaultEffort must offer 'max'; got: ${JSON.stringify(defaultEffortEnum)}`
+        );
+        assert.strictEqual(
+            overrideProperties.forceMandatory?.type,
+            "boolean",
+            "forceMandatory must be declared as a boolean"
+        );
+    });
+
+    test("declares no model discovery change-notification timing settings", () => {
+        const contributes = manifest.contributes as Record<string, unknown>;
+        const properties = (contributes.configuration as Record<string, unknown>).properties as Record<string, unknown>;
+        assert.strictEqual("litellm-connector.discoveryFireDebounceMs" in properties, false);
+        assert.strictEqual("litellm-connector.discoveryFireMinIntervalMs" in properties, false);
+    });
+
+    test("declares the two routing settings as opt-in booleans", () => {
+        const contributes = manifest.contributes as Record<string, unknown>;
+        const properties = (contributes.configuration as Record<string, unknown>).properties as Record<
+            string,
+            ManifestProperty & { default?: unknown }
+        >;
+
+        for (const key of ["forceResponsesEndpoint", "allowChatCompletionsFallback"]) {
+            const declared = properties[`litellm-connector.${key}`];
+            assert.ok(declared, `${key} must be declared`);
+            assert.strictEqual(declared.type, "boolean", `${key} must be a boolean`);
+            assert.strictEqual(declared.default, false, `${key} must default to false`);
+        }
+    });
+
+    test("declares both request time bounds as top-level number settings", () => {
+        const contributes = manifest.contributes as Record<string, unknown>;
+        const properties = (contributes.configuration as Record<string, unknown>).properties as Record<
+            string,
+            ManifestProperty & { default?: unknown; minimum?: unknown; maximum?: unknown }
+        >;
+
+        // A settings entry nested inside another entry is valid JSON and is still
+        // invisible to VS Code, so the shape is asserted, not just the key.
+        const expected: Record<string, { default: number; minimum: number; maximum: number }> = {
+            "litellm-connector.headersTimeout": { default: 300, minimum: 1, maximum: 300 },
+            "litellm-connector.retryBudgetSeconds": { default: 300, minimum: 0, maximum: 3_600 },
+        };
+        for (const [key, bounds] of Object.entries(expected)) {
+            const declared = properties[key];
+            assert.ok(declared, `${key} must be declared as a top-level setting`);
+            assert.strictEqual(declared.type, "number", `${key} must be a number`);
+            assert.strictEqual(declared.default, bounds.default, `${key} default`);
+            assert.strictEqual(declared.minimum, bounds.minimum, `${key} minimum`);
+            assert.strictEqual(declared.maximum, bounds.maximum, `${key} maximum`);
+        }
     });
 });

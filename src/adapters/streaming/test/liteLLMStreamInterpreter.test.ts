@@ -1,19 +1,12 @@
 import * as assert from "assert";
-import * as sinon from "sinon";
-import {
-    interpretStreamEvent,
-    createInitialStreamingState,
-    flushPendingBuffers,
-    hasBufferedToolCalls,
-} from "../liteLLMStreamInterpreter";
-import { StructuredLogger } from "../../../observability/structuredLogger";
-import { Logger } from "../../../utils/logger";
+import { interpretStreamEvent } from "../liteLLMStreamInterpreter";
+import { createInitialStreamingState } from "../streamingState";
 import { UpstreamStreamError } from "../../../utils/transportRetry";
 
 declare const suite: (name: string, fn: () => void) => void;
 declare const test: (name: string, fn: () => void) => void;
 
-suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
+suite("LiteLLMStreamInterpreter: Tool Call Regressions", () => {
     test("should clear buffered tool calls when stream aborts before finish", () => {
         const state = createInitialStreamingState();
 
@@ -97,23 +90,20 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
         assert.deepStrictEqual(order, ["thinking", "text"]);
     });
 
-    test("should parse LiteLLM /responses tool calls and flush on completed", () => {
+    test("reports the usage of a completed /responses turn after its tool call was flushed", () => {
         const state = createInitialStreamingState();
 
-        // Tool call arrives in fragments
-        interpretStreamEvent(
+        // The bridge sends its function calls complete on `output_item.done`.
+        const doneParts = interpretStreamEvent(
             {
-                type: "response.output_tool_call.delta",
-                delta: { id: "call-resp", name: "tc_responses", arguments: "{" },
+                type: "response.output_item.done",
+                item: { type: "function_call", call_id: "call-resp", name: "tc_responses", arguments: '{"x":1}' },
             },
             state
         );
-        interpretStreamEvent(
-            {
-                type: "response.output_tool_call.delta",
-                delta: { id: "call-resp", arguments: '"x":1}' },
-            },
-            state
+        assert.deepStrictEqual(
+            doneParts.flatMap((part) => (part.type === "tool_call" ? [part.args] : [])),
+            ['{"x":1}']
         );
 
         const parts = interpretStreamEvent(
@@ -124,29 +114,17 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
             state
         );
 
-        const toolCall = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCall && toolCall.type === "tool_call");
-        if (toolCall && toolCall.type === "tool_call") {
-            assert.strictEqual(toolCall.name, "tc_responses");
-            assert.strictEqual(toolCall.args, '{"x":1}');
-        }
-
         const usage = parts.find((p) => p.type === "data");
         assert.ok(usage, "expected usage data part to be emitted");
         assert.strictEqual(usage.type, "data");
         if (usage.type === "data") {
             assert.strictEqual(usage.mimeType, "usage");
-            // OpenAI API spec: nested completion_tokens_details.reasoning_tokens and prompt_tokens_details.cached_tokens
+            // A payload without detail objects reports the counts only: the
+            // connector leaves an unreported detail undefined instead of zero.
             assert.deepStrictEqual(usage.value, {
                 prompt_tokens: 1,
                 completion_tokens: 2,
                 total_tokens: 3,
-                prompt_tokens_details: {
-                    cached_tokens: 0,
-                },
-                completion_tokens_details: {
-                    reasoning_tokens: 0,
-                },
             });
         }
     });
@@ -206,231 +184,48 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
         }
     });
 
-    test("should flush /responses tool calls on output_item.done when no completed frame", () => {
+    test("reports a completed response as a stop finish", () => {
         const state = createInitialStreamingState();
 
-        interpretStreamEvent(
-            {
-                type: "response.output_tool_call.delta",
-                delta: { id: "call-resp-2", name: "tc2", arguments: "{" },
-            },
-            state
-        );
-        interpretStreamEvent(
-            {
-                type: "response.output_tool_call.delta",
-                delta: { id: "call-resp-2", arguments: '"y":true}' },
-            },
-            state
-        );
-
-        const parts = interpretStreamEvent({ type: "response.output_item.done" }, state);
-        const toolCall = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCall && toolCall.type === "tool_call");
-        if (toolCall && toolCall.type === "tool_call") {
-            assert.strictEqual(toolCall.name, "tc2");
-            assert.strictEqual(toolCall.args, '{"y":true}');
-        }
-    });
-
-    test("should buffer response.output_item.delta with call_id and emit on output_item.done", () => {
-        const state = createInitialStreamingState();
-
-        // Delta 1 — name + partial args, with call_id
-        let parts = interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", call_id: "call_abc123", name: "search_tool", arguments: '{"query":' },
-            },
-            state
-        );
-        assert.strictEqual(parts.length, 0, "should buffer, not emit yet");
-
-        // Delta 2 — remaining args, same call_id
-        parts = interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", call_id: "call_abc123", arguments: '"hello"}' },
-            },
-            state
-        );
-        assert.strictEqual(parts.length, 0, "still buffered");
-
-        // Done — should emit the specific call
-        parts = interpretStreamEvent(
-            {
-                type: "response.output_item.done",
-                item: {
-                    type: "function_call",
-                    call_id: "call_abc123",
-                    name: "search_tool",
-                    arguments: '{"query":"hello"}',
-                },
-            },
-            state
-        );
-
-        const toolCallPart = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCallPart, "should emit tool_call part on output_item.done");
-        assert.ok(toolCallPart.type === "tool_call");
-        assert.strictEqual(toolCallPart.id, "call_abc123");
-        assert.strictEqual(toolCallPart.name, "search_tool");
-        assert.strictEqual(toolCallPart.args, '{"query":"hello"}');
-
-        // Buffer should be cleared for this callId
-        assert.strictEqual(state.responseToolCallBuffers.size, 0);
-    });
-
-    test("should buffer anonymous output_item.delta (no call_id) and emit on done", () => {
-        const state = createInitialStreamingState();
-
-        // Delta without call_id — anonymous buffering
-        let parts = interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", name: "anon_tool", arguments: '{"x":' },
-            },
-            state
-        );
-        assert.strictEqual(parts.length, 0, "buffered anonymously");
-
-        // Done without call_id — emit from anonymous buffer
-        parts = interpretStreamEvent(
-            {
-                type: "response.output_item.done",
-                item: { type: "function_call", arguments: '{"x":1}' },
-            },
-            state
-        );
-
-        const toolCallPart = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCallPart, "should emit anonymous tool_call part");
-        assert.ok(toolCallPart.type === "tool_call");
-        assert.strictEqual(toolCallPart.id, "anonymous");
-        assert.strictEqual(toolCallPart.name, "anon_tool");
-
-        // Anonymous buffer should be reset
-        assert.strictEqual(state.anonymousResponseToolArgs, "");
-        assert.strictEqual(state.anonymousResponseToolName, undefined);
-    });
-
-    test("should not re-emit on response.completed what was already flushed by output_item.done", () => {
-        const state = createInitialStreamingState();
-
-        // Buffer via output_item.delta
-        interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", call_id: "c1", name: "tool1", arguments: '{"a":1}' },
-            },
-            state
-        );
-
-        // Flush via output_item.done — removes from responseToolCallOrder
-        interpretStreamEvent(
-            {
-                type: "response.output_item.done",
-                item: { type: "function_call", call_id: "c1", name: "tool1", arguments: '{"a":1}' },
-            },
-            state
-        );
-
-        // response.completed should NOT re-emit already-flushed call
         const parts = interpretStreamEvent(
             { type: "response.completed", response: { usage: { input_tokens: 1, output_tokens: 2 } } },
             state
         );
-        const toolCallParts = parts.filter((p) => p.type === "tool_call");
-        assert.strictEqual(toolCallParts.length, 0, "should not double-emit flushed tool call");
+
+        const finishes = parts.filter((part) => part.type === "finish");
+        assert.deepStrictEqual(finishes, [{ type: "finish", reason: "stop" }]);
     });
 
-    test("should preserve legacy flush-all behavior when output_item.done has no item", () => {
+    test("reports a completed response the bridge marked incomplete without a stop finish", () => {
         const state = createInitialStreamingState();
 
-        // Legacy path: output_tool_call.delta populates buffer
-        interpretStreamEvent(
-            {
-                type: "response.output_tool_call.delta",
-                delta: { id: "legacy-id", name: "legacy_tool", arguments: '{"z":9}' },
-            },
-            state
-        );
-
-        // output_item.done with no item → flush all
-        const parts = interpretStreamEvent({ type: "response.output_item.done" }, state);
-        const toolCallPart = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCallPart, "legacy flush-all should still work");
-        assert.ok(toolCallPart.type === "tool_call");
-        assert.strictEqual(toolCallPart.name, "legacy_tool");
-        assert.strictEqual(state.responseToolCallBuffers.size, 0, "buffer cleared after flush-all");
-    });
-
-    test("should parse Gemini native tool call shape", () => {
-        const state = createInitialStreamingState();
         const parts = interpretStreamEvent(
             {
-                candidates: [
-                    {
-                        content: {
-                            parts: [
-                                {
-                                    functionCall: {
-                                        name: "gem_tool",
-                                        args: { city: "Paris" },
-                                    },
-                                },
-                            ],
-                        },
-                    },
-                ],
+                type: "response.completed",
+                response: { status: "incomplete", usage: { input_tokens: 1, output_tokens: 2 } },
             },
             state
         );
 
-        const toolCall = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCall && toolCall.type === "tool_call");
-        if (toolCall && toolCall.type === "tool_call") {
-            assert.strictEqual(toolCall.name, "gem_tool");
-            assert.strictEqual(toolCall.args, '{"city":"Paris"}');
-        }
+        assert.deepStrictEqual(
+            parts.filter((part) => part.type === "finish"),
+            [],
+            "a cut-short answer is not a normal finish"
+        );
     });
 
-    test("should suppress cache-control VS Code DataPart carrier objects", () => {
+    test("produces no part for a marshalled VS Code object carrying usage", () => {
         const state = createInitialStreamingState();
         const parts = interpretStreamEvent(
             {
                 $mid: 1,
-                mimeType: "application/vnd.cache-control+json",
-                data: "ZXBoZW1lcmFs",
+                mimeType: "usage",
+                data: Buffer.from('{"prompt_tokens":1}').toString("base64"),
             },
             state
         );
 
         assert.deepStrictEqual(parts, []);
-    });
-
-    test("should pass through non-cache-control VS Code DataPart carrier objects", () => {
-        const state = createInitialStreamingState();
-        const parts = interpretStreamEvent(
-            {
-                $mid: 2,
-                mimeType: "usage",
-                data: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
-            },
-            state
-        );
-
-        assert.strictEqual(parts.length, 1);
-        const [part] = parts;
-        assert.strictEqual(part.type, "data");
-        if (part.type === "data") {
-            assert.strictEqual(part.mimeType, "usage");
-            assert.deepStrictEqual(part.value, {
-                prompt_tokens: 1,
-                completion_tokens: 2,
-                total_tokens: 3,
-            });
-        }
     });
 
     test("should normalize tool call ids on update and merge name/args", () => {
@@ -673,30 +468,13 @@ suite("LiteLLMStreamInterpreter - Tool Call Regressions", () => {
             },
             state
         );
-        assert.strictEqual(parts2.length, 2);
+        assert.strictEqual(parts2.length, 3);
         assert.strictEqual(parts2[1].type, "data");
+        assert.deepStrictEqual(parts2[2], { type: "finish", reason: "stop" });
 
-        // response.output_item.done
+        // An `output_item.done` for a non-call item carries nothing this layer emits.
         const parts3 = interpretStreamEvent({ type: "response.output_item.done" }, state);
-        assert.strictEqual(parts3[0].type, "finish");
-    });
-
-    test("should handle Gemini native format", () => {
-        const state = createInitialStreamingState();
-        const chunk = {
-            candidates: [
-                {
-                    content: {
-                        parts: [{ text: "hello" }],
-                    },
-                },
-            ],
-        };
-        const parts = interpretStreamEvent(chunk, state);
-        assert.strictEqual(parts[0].type, "text");
-        const textPart = parts[0];
-        assert.strictEqual(textPart.type, "text");
-        assert.strictEqual(textPart.value, "hello");
+        assert.deepStrictEqual(parts3, []);
     });
 });
 
@@ -871,789 +649,5 @@ suite("Upstream error frames", () => {
             secondParts.flatMap((part) => (part.type === "text" ? [part.value] : [])),
             [" that never closes"]
         );
-    });
-});
-
-suite("Tool call argument deltas", () => {
-    function toolCallFrame(toolCall: Record<string, unknown>): Record<string, unknown> {
-        return { choices: [{ delta: { tool_calls: [{ index: 0, ...toolCall }] } }] };
-    }
-
-    function emittedArgs(state: ReturnType<typeof createInitialStreamingState>): string[] {
-        const parts = interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
-        return parts.flatMap((part) => (part.type === "tool_call" ? [part.args] : []));
-    }
-
-    test("serializes an object arguments delta so the call still parses", () => {
-        const state = createInitialStreamingState();
-        interpretStreamEvent(
-            toolCallFrame({ id: "call_obj", function: { name: "read_file", arguments: { p: 1 } } }),
-            state
-        );
-
-        assert.deepStrictEqual(emittedArgs(state), ['{"p":1}']);
-    });
-
-    test("serializes an object arguments delta appended to an open call", () => {
-        const state = createInitialStreamingState();
-        interpretStreamEvent(toolCallFrame({ id: "call_obj", function: { name: "read_file", arguments: "" } }), state);
-        interpretStreamEvent(toolCallFrame({ function: { arguments: { p: 1 } } }), state);
-
-        assert.deepStrictEqual(emittedArgs(state), ['{"p":1}']);
-    });
-
-    test("ignores a numeric arguments delta", () => {
-        const state = createInitialStreamingState();
-        interpretStreamEvent(
-            toolCallFrame({ id: "call_num", function: { name: "read_file", arguments: '{"p":1}' } }),
-            state
-        );
-        interpretStreamEvent(toolCallFrame({ function: { arguments: 0 } }), state);
-
-        assert.deepStrictEqual(emittedArgs(state), ['{"p":1}']);
-    });
-
-    test("ignores a null arguments delta", () => {
-        const state = createInitialStreamingState();
-        interpretStreamEvent(
-            toolCallFrame({ id: "call_null", function: { name: "read_file", arguments: '{"p":1}' } }),
-            state
-        );
-        interpretStreamEvent(toolCallFrame({ function: { arguments: null } }), state);
-
-        assert.deepStrictEqual(emittedArgs(state), ['{"p":1}']);
-    });
-});
-
-suite("flushPendingBuffers Unit Tests", () => {
-    test("flushes /responses-format tool calls and emits with reason: incomplete_stream_end", () => {
-        const state = createInitialStreamingState();
-
-        // Simulate buffered /responses tool calls
-        state.responseToolCallBuffers.set("call-id-1", { id: "call-id-1", name: "search", args: '{"q":"test"}' });
-        state.responseToolCallOrder = ["call-id-1"];
-
-        const parts = flushPendingBuffers(state);
-
-        assert.ok(parts.length >= 2, "Should emit tool call + finish part");
-        const toolCallPart = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCallPart && toolCallPart.type === "tool_call");
-        if (toolCallPart && toolCallPart.type === "tool_call") {
-            assert.strictEqual(toolCallPart.name, "search");
-        }
-        const finishPart = parts[parts.length - 1];
-        assert.strictEqual(finishPart.type, "finish");
-        assert.strictEqual((finishPart as unknown as { reason: string; type: string }).reason, "incomplete_stream_end");
-        assert.strictEqual(state.responseToolCallBuffers.size, 0, "Buffers should be cleared");
-        assert.strictEqual(state.responseToolCallOrder.length, 0);
-    });
-
-    test("flushes anonymous tool calls when buffered", () => {
-        const state = createInitialStreamingState();
-
-        state.anonymousResponseToolName = "execute_code";
-        state.anonymousResponseToolArgs = '{"code":"print(123)"}';
-
-        const parts = flushPendingBuffers(state);
-
-        const toolCallPart = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCallPart && toolCallPart.type === "tool_call");
-        if (toolCallPart && toolCallPart.type === "tool_call") {
-            assert.strictEqual(toolCallPart.name, "execute_code");
-        }
-        assert.strictEqual(state.anonymousResponseToolName, undefined, "Anonymous state should be cleared");
-        assert.strictEqual(state.anonymousResponseToolArgs, "");
-    });
-
-    test("skips malformed tool call args and still emits valid ones", () => {
-        const state = createInitialStreamingState();
-        state.toolCallBuffers.set(0, { id: "bad-call", name: "badtool", args: "{invalid" });
-        state.toolCallBuffers.set(1, { id: "good-call", name: "goodtool", args: '{"ok":true}' });
-
-        const parts = flushPendingBuffers(state);
-
-        assert.deepStrictEqual(
-            parts.flatMap((part) => (part.type === "tool_call" ? [part.name] : [])),
-            ["goodtool"]
-        );
-    });
-
-    test("handles empty buffers gracefully and still emits finish", () => {
-        const state = createInitialStreamingState();
-
-        const parts = flushPendingBuffers(state);
-
-        // Should emit at least a finish part even with empty buffers
-        assert.strictEqual(parts.length, 1, "Should emit one finish part");
-        const finishPart = parts[0];
-        assert.strictEqual(finishPart.type, "finish");
-        assert.strictEqual((finishPart as unknown as { reason: string; type: string }).reason, "incomplete_stream_end");
-    });
-
-    test("skips an unnamed /responses call instead of inventing a tool name", () => {
-        const state = createInitialStreamingState();
-        state.responseToolCallBuffers.set("call-x", { id: "call-x", args: '{"q":1}' });
-        state.responseToolCallOrder = ["call-x"];
-
-        const parts = flushPendingBuffers(state);
-
-        assert.deepStrictEqual(
-            parts.filter((part) => part.type === "tool_call"),
-            []
-        );
-    });
-
-    test("omits malformed anonymous arguments from its warning", () => {
-        const state = createInitialStreamingState();
-        const warnStub = sinon.stub(Logger, "warn");
-        state.anonymousResponseToolName = "execute_code";
-        state.anonymousResponseToolArgs = '{"secret":"token-123"';
-
-        try {
-            flushPendingBuffers(state);
-        } finally {
-            warnStub.restore();
-        }
-
-        assert.deepStrictEqual(
-            warnStub.getCalls().map((call) => String(call.args[0]).includes("token-123")),
-            [false]
-        );
-    });
-
-    test("drops an id-less chat-completions buffer instead of inventing a call id", () => {
-        const state = createInitialStreamingState();
-        state.toolCallBuffers.set(0, { id: "", name: "tool", args: '{"mode":"background"}' });
-
-        const parts = flushPendingBuffers(state);
-
-        assert.deepStrictEqual(
-            parts.filter((part) => part.type === "tool_call"),
-            []
-        );
-    });
-
-    test("skips a chat-completions buffer whose call id was already emitted", () => {
-        const state = createInitialStreamingState();
-        state.emittedToolCallIds.add("fc_call_dup");
-        state.toolCallBuffers.set(0, { id: "fc_call_dup", name: "read_file", args: '{"p":1}' });
-
-        const parts = flushPendingBuffers(state);
-
-        assert.deepStrictEqual(
-            parts.filter((part) => part.type === "tool_call"),
-            []
-        );
-    });
-});
-
-suite("hasBufferedToolCalls", () => {
-    test("is false for a fresh stream", () => {
-        assert.strictEqual(hasBufferedToolCalls(createInitialStreamingState()), false);
-    });
-
-    test("is true while a chat-completions tool call is open", () => {
-        const state = createInitialStreamingState();
-        interpretStreamEvent(
-            { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "ls" } }] } }] },
-            state
-        );
-
-        assert.strictEqual(hasBufferedToolCalls(state), true);
-    });
-
-    test("is true while a /responses tool call is open", () => {
-        const state = createInitialStreamingState();
-        interpretStreamEvent(
-            {
-                type: "response.output_item.delta",
-                item: { type: "function_call", call_id: "call_1", name: "ls", arguments: "{" },
-            },
-            state
-        );
-
-        assert.strictEqual(hasBufferedToolCalls(state), true);
-    });
-
-    test("is true while an anonymous /responses tool call is open", () => {
-        const state = createInitialStreamingState();
-        interpretStreamEvent(
-            { type: "response.output_item.delta", item: { type: "function_call", arguments: "{" } },
-            state
-        );
-
-        assert.strictEqual(hasBufferedToolCalls(state), true);
-    });
-
-    test("is false once a finish frame settles the chat-completions buffers", () => {
-        const state = createInitialStreamingState();
-        interpretStreamEvent(
-            {
-                choices: [
-                    { delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "ls", arguments: "{}" } }] } },
-                ],
-            },
-            state
-        );
-        interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
-
-        assert.strictEqual(hasBufferedToolCalls(state), false);
-    });
-});
-
-suite("Tool Call Args Corruption Logging", () => {
-    let sandbox: sinon.SinonSandbox;
-
-    setup(() => {
-        sandbox = sinon.createSandbox();
-    });
-
-    teardown(() => {
-        sandbox.restore();
-    });
-
-    test("logs an error-level event and drops the buffered call when args are invalid and finish_reason is stop", () => {
-        const state = createInitialStreamingState();
-        const errorStub = sandbox.stub(StructuredLogger, "error");
-        const invalidArgs = '{"incomplete":';
-
-        interpretStreamEvent(
-            {
-                choices: [
-                    {
-                        delta: {
-                            tool_calls: [
-                                {
-                                    index: 0,
-                                    id: "call_corrupt",
-                                    function: { name: "bad_tool", arguments: invalidArgs },
-                                },
-                            ],
-                        },
-                    },
-                ],
-            },
-            state
-        );
-        const parts = interpretStreamEvent({ choices: [{ finish_reason: "stop" }] }, state);
-
-        assert.strictEqual(
-            parts.find((p) => p.type === "tool_call"),
-            undefined
-        );
-        const corruptionCalls = errorStub
-            .getCalls()
-            .filter((call) => call.args[0] === "stream.tool_call_args_invalid_json");
-        assert.strictEqual(corruptionCalls.length, 1);
-        const fields = corruptionCalls[0].args[1] as Record<string, unknown>;
-        assert.strictEqual(fields.toolName, "bad_tool");
-        assert.strictEqual(fields.finishReason, "stop");
-        assert.strictEqual(fields.argsLength, invalidArgs.length);
-        assert.strictEqual(fields.argsPreview, invalidArgs);
-        assert.ok(String(fields.normalizedId).startsWith("fc_"));
-    });
-
-    test("still emits the buffered call when finish_reason is tool_calls, and logs the error-level event", () => {
-        const state = createInitialStreamingState();
-        const errorStub = sandbox.stub(StructuredLogger, "error");
-        const invalidArgs = '{"incomplete":';
-
-        interpretStreamEvent(
-            {
-                choices: [
-                    {
-                        delta: {
-                            tool_calls: [
-                                {
-                                    index: 0,
-                                    id: "call_corrupt",
-                                    function: { name: "bad_tool", arguments: invalidArgs },
-                                },
-                            ],
-                        },
-                    },
-                ],
-            },
-            state
-        );
-        const parts = interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
-
-        const toolCall = parts.find((p) => p.type === "tool_call");
-        assert.ok(toolCall, "Should still emit the buffered call");
-        if (toolCall && toolCall.type === "tool_call") {
-            assert.strictEqual(toolCall.name, "bad_tool");
-            assert.strictEqual(toolCall.args, invalidArgs);
-        }
-        const corruptionCalls = errorStub
-            .getCalls()
-            .filter((call) => call.args[0] === "stream.tool_call_args_invalid_json");
-        assert.strictEqual(corruptionCalls.length, 1);
-        const fields = corruptionCalls[0].args[1] as Record<string, unknown>;
-        assert.strictEqual(fields.finishReason, "tool_calls");
-    });
-
-    test("flushPendingBuffers logs an error-level event when skipping malformed buffered args", () => {
-        const state = createInitialStreamingState();
-        const errorStub = sandbox.stub(StructuredLogger, "error");
-
-        state.toolCallBuffers.set(0, { id: "bad-call", name: "badtool", args: "{invalid" });
-        state.toolCallBuffers.set(1, { id: "good-call", name: "goodtool", args: '{"ok":true}' });
-
-        const parts = flushPendingBuffers(state);
-
-        const emitted = parts.filter((p) => p.type === "tool_call");
-        assert.strictEqual(emitted.length, 1);
-        if (emitted[0] && emitted[0].type === "tool_call") {
-            assert.strictEqual(emitted[0].name, "goodtool");
-        }
-        const corruptionCalls = errorStub
-            .getCalls()
-            .filter((call) => call.args[0] === "stream.tool_call_args_invalid_json");
-        assert.strictEqual(corruptionCalls.length, 1);
-        const fields = corruptionCalls[0].args[1] as Record<string, unknown>;
-        assert.strictEqual(fields.normalizedId, "bad-call");
-        assert.strictEqual(fields.toolName, "badtool");
-        assert.strictEqual(fields.argsPreview, "{invalid");
-    });
-
-    test("still reports the corrupt arguments of a call whose id was already emitted", () => {
-        const state = createInitialStreamingState();
-        const errorStub = sandbox.stub(StructuredLogger, "error");
-        state.emittedToolCallIds.add("fc_call_dup");
-        state.toolCallBuffers.set(0, { id: "fc_call_dup", name: "read_file", args: '{"p":' });
-
-        interpretStreamEvent({ choices: [{ finish_reason: "stop" }] }, state);
-
-        assert.strictEqual(
-            errorStub.getCalls().filter((call) => call.args[0] === "stream.tool_call_args_invalid_json").length,
-            1
-        );
-    });
-
-    test("tags a malformed /responses call skipped by recovery with its request id", () => {
-        const state = createInitialStreamingState("req-responses");
-        const errorStub = sandbox.stub(StructuredLogger, "error");
-        state.responseToolCallBuffers.set("call-bad", { id: "call-bad", name: "search", args: "{invalid" });
-        state.responseToolCallOrder = ["call-bad"];
-
-        flushPendingBuffers(state);
-
-        assert.deepStrictEqual(
-            errorStub
-                .getCalls()
-                .filter((call) => call.args[0] === "stream.tool_call_args_invalid_json")
-                .map((call) => (call.args[1] as Record<string, unknown>).requestId),
-            ["req-responses"]
-        );
-    });
-});
-
-suite("Dropped tool call buffer logging", () => {
-    const DROPPED_EVENT = "stream.tool_call_buffer_dropped";
-    const REQUEST_ID = "req-7";
-    let sandbox: sinon.SinonSandbox;
-
-    setup(() => {
-        sandbox = sinon.createSandbox();
-    });
-
-    teardown(() => {
-        sandbox.restore();
-    });
-
-    function toolCallDelta(toolCall: Record<string, unknown>): Record<string, unknown> {
-        return { choices: [{ delta: { tool_calls: [{ index: 0, ...toolCall }] } }] };
-    }
-
-    function droppedEventFields(warnStub: sinon.SinonStub): Record<string, unknown>[] {
-        return warnStub
-            .getCalls()
-            .filter((call) => call.args[0] === DROPPED_EVENT)
-            .map((call) => call.args[1] as Record<string, unknown>);
-    }
-
-    test("reports an id-less buffer discarded at finish", () => {
-        const state = createInitialStreamingState(REQUEST_ID);
-        const warnStub = sandbox.stub(StructuredLogger, "warn");
-        interpretStreamEvent(toolCallDelta({ function: { arguments: '{"mode":"background"}' } }), state);
-
-        interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
-
-        assert.deepStrictEqual(droppedEventFields(warnStub), [
-            {
-                requestId: REQUEST_ID,
-                reason: "incomplete_at_finish",
-                index: 0,
-                finishReason: "tool_calls",
-                hasId: false,
-                argsLength: '{"mode":"background"}'.length,
-            },
-        ]);
-    });
-
-    test("reports a buffer with no arguments discarded at finish", () => {
-        const state = createInitialStreamingState(REQUEST_ID);
-        const warnStub = sandbox.stub(StructuredLogger, "warn");
-        interpretStreamEvent(
-            toolCallDelta({ id: "call_empty", function: { name: "list_files", arguments: "" } }),
-            state
-        );
-
-        interpretStreamEvent({ choices: [{ finish_reason: "stop" }] }, state);
-
-        assert.deepStrictEqual(droppedEventFields(warnStub), [
-            {
-                requestId: REQUEST_ID,
-                reason: "incomplete_at_finish",
-                index: 0,
-                finishReason: "stop",
-                hasId: true,
-                argsLength: 0,
-            },
-        ]);
-    });
-
-    test("reports a complete call with invalid JSON arguments discarded at a non-tool finish", () => {
-        const state = createInitialStreamingState(REQUEST_ID);
-        const warnStub = sandbox.stub(StructuredLogger, "warn");
-        interpretStreamEvent(
-            toolCallDelta({ id: "call_cut", function: { name: "write_file", arguments: '{"path":"a.ts","con' } }),
-            state
-        );
-
-        interpretStreamEvent({ choices: [{ finish_reason: "length" }] }, state);
-
-        assert.deepStrictEqual(droppedEventFields(warnStub), [
-            {
-                requestId: REQUEST_ID,
-                reason: "invalid_json_args",
-                index: 0,
-                finishReason: "length",
-                hasId: true,
-                argsLength: '{"path":"a.ts","con'.length,
-            },
-        ]);
-    });
-
-    test("reports an id-less buffer dropped by premature-end recovery", () => {
-        const state = createInitialStreamingState(REQUEST_ID);
-        const warnStub = sandbox.stub(StructuredLogger, "warn");
-        interpretStreamEvent(toolCallDelta({ function: { arguments: '{"mode":"background"}' } }), state);
-
-        flushPendingBuffers(state);
-
-        assert.deepStrictEqual(droppedEventFields(warnStub), [
-            {
-                requestId: REQUEST_ID,
-                reason: "incomplete_at_finish",
-                index: 0,
-                finishReason: "incomplete_stream_end",
-                hasId: false,
-                argsLength: '{"mode":"background"}'.length,
-            },
-        ]);
-    });
-
-    test("reports a buffer replaced by a new call id at the same index", () => {
-        const state = createInitialStreamingState(REQUEST_ID);
-        const warnStub = sandbox.stub(StructuredLogger, "warn");
-        interpretStreamEvent(
-            toolCallDelta({ id: "call_first", function: { name: "read_file", arguments: '{"p"' } }),
-            state
-        );
-
-        interpretStreamEvent(
-            toolCallDelta({ id: "call_second", function: { name: "list_files", arguments: "" } }),
-            state
-        );
-
-        assert.deepStrictEqual(droppedEventFields(warnStub), [
-            {
-                requestId: REQUEST_ID,
-                reason: "replaced_by_new_id",
-                index: 0,
-                finishReason: undefined,
-                hasId: true,
-                argsLength: '{"p"'.length,
-            },
-        ]);
-    });
-
-    test("stays silent when the buffered tool call is emitted", () => {
-        const state = createInitialStreamingState(REQUEST_ID);
-        const warnStub = sandbox.stub(StructuredLogger, "warn");
-        interpretStreamEvent(
-            toolCallDelta({ id: "call_ok", function: { name: "read_file", arguments: '{"p":1}' } }),
-            state
-        );
-
-        interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
-
-        assert.deepStrictEqual(droppedEventFields(warnStub), []);
-    });
-
-    test("stays silent when invalid JSON arguments are still emitted at a tool_calls finish", () => {
-        const state = createInitialStreamingState(REQUEST_ID);
-        const warnStub = sandbox.stub(StructuredLogger, "warn");
-        interpretStreamEvent(
-            toolCallDelta({ id: "call_cut", function: { name: "write_file", arguments: '{"path":' } }),
-            state
-        );
-
-        interpretStreamEvent({ choices: [{ finish_reason: "tool_calls" }] }, state);
-
-        assert.deepStrictEqual(droppedEventFields(warnStub), []);
-    });
-
-    test("stays silent for an invalid buffer whose call id was already emitted", () => {
-        const state = createInitialStreamingState(REQUEST_ID);
-        const warnStub = sandbox.stub(StructuredLogger, "warn");
-        state.emittedToolCallIds.add("call_dup");
-        state.toolCallBuffers.set(0, { id: "call_dup", name: "read_file", args: '{"p":' });
-
-        interpretStreamEvent({ choices: [{ finish_reason: "stop" }] }, state);
-
-        assert.deepStrictEqual(droppedEventFields(warnStub), []);
-    });
-
-    test("reports a malformed buffer skipped by premature-end recovery", () => {
-        const state = createInitialStreamingState(REQUEST_ID);
-        const warnStub = sandbox.stub(StructuredLogger, "warn");
-        state.toolCallBuffers.set(0, { id: "call_cut", name: "write_file", args: "{invalid" });
-
-        flushPendingBuffers(state);
-
-        assert.deepStrictEqual(droppedEventFields(warnStub), [
-            {
-                requestId: REQUEST_ID,
-                reason: "invalid_json_args",
-                index: 0,
-                finishReason: "incomplete_stream_end",
-                hasId: true,
-                argsLength: "{invalid".length,
-            },
-        ]);
-    });
-});
-
-suite("Anthropic prompt-cache usage parsing", () => {
-    test("normalizes LiteLLM Anthropic usage counters on chat frames", () => {
-        const state = createInitialStreamingState();
-
-        const parts = interpretStreamEvent(
-            {
-                choices: [{ delta: {}, finish_reason: "stop" }],
-                usage: {
-                    prompt_tokens: 1000,
-                    completion_tokens: 50,
-                    total_tokens: 1050,
-                    prompt_tokens_details: { cached_tokens: 400, cache_creation_tokens: 100 },
-                    cache_creation_input_tokens: 100,
-                    cache_read_input_tokens: 400,
-                },
-            },
-            state
-        );
-
-        const usagePart = parts.find((p) => p.type === "data" && p.mimeType === "usage");
-        assert.ok(usagePart && usagePart.type === "data");
-        const usage = usagePart.value as {
-            prompt_tokens_details?: { cached_tokens?: number; cache_creation_input_tokens?: number };
-        };
-        assert.strictEqual(usage.prompt_tokens_details?.cached_tokens, 400);
-        assert.strictEqual(usage.prompt_tokens_details?.cache_creation_input_tokens, 100);
-    });
-
-    test("forwards top-level Anthropic cache counters on response.completed", () => {
-        const state = createInitialStreamingState();
-
-        const parts = interpretStreamEvent(
-            {
-                type: "response.completed",
-                response: {
-                    usage: {
-                        input_tokens: 200,
-                        output_tokens: 10,
-                        cache_creation_input_tokens: 40,
-                        cache_read_input_tokens: 60,
-                    },
-                },
-            },
-            state
-        );
-
-        const usagePart = parts.find((p) => p.type === "data" && p.mimeType === "usage");
-        assert.ok(usagePart && usagePart.type === "data");
-        const usage = usagePart.value as {
-            prompt_tokens_details?: { cached_tokens?: number; cache_creation_input_tokens?: number };
-        };
-        assert.strictEqual(usage.prompt_tokens_details?.cached_tokens, 60);
-        assert.strictEqual(usage.prompt_tokens_details?.cache_creation_input_tokens, 40);
-    });
-});
-
-suite("Anthropic thinking block preservation", () => {
-    test("streams text deltas under one id and seals the block with signature metadata", () => {
-        const state = createInitialStreamingState();
-
-        const first = interpretStreamEvent({ choices: [{ delta: { reasoning_content: "First " } }] }, state);
-        const second = interpretStreamEvent({ choices: [{ delta: { reasoning_content: "chunk" } }] }, state);
-        const seal = interpretStreamEvent(
-            {
-                choices: [
-                    {
-                        delta: {
-                            reasoning_content: "",
-                            thinking_blocks: [{ type: "thinking", thinking: "First chunk", signature: "SIG1" }],
-                        },
-                    },
-                ],
-            },
-            state
-        );
-
-        for (const part of [...first, ...second]) {
-            assert.strictEqual(part.type, "thinking");
-            assert.strictEqual((part as { id?: string }).id, "litellm-thinking-1");
-            assert.ok((part as { value: string }).value.length > 0);
-        }
-        const sealed = seal[0];
-        assert.strictEqual(sealed.type, "thinking");
-        assert.strictEqual((sealed as { id?: string }).id, "litellm-thinking-1");
-        const metadata = (sealed as { metadata?: Record<string, unknown> }).metadata;
-        assert.strictEqual(metadata?.signature, "SIG1");
-        assert.strictEqual(metadata?._completeThinking, "First chunk");
-    });
-
-    test("seals an omitted-display block with an empty text replay", () => {
-        const state = createInitialStreamingState();
-
-        const parts = interpretStreamEvent(
-            {
-                choices: [
-                    {
-                        delta: {
-                            reasoning_content: "",
-                            thinking_blocks: [{ type: "thinking", thinking: "", signature: "SIG2" }],
-                        },
-                    },
-                ],
-            },
-            state
-        );
-
-        assert.strictEqual(parts.length, 1);
-        assert.strictEqual(parts[0].type, "thinking");
-        assert.strictEqual((parts[0] as { id?: string }).id, "litellm-thinking-1");
-        const metadata = (parts[0] as { metadata?: Record<string, unknown> }).metadata;
-        assert.strictEqual(metadata?.signature, "SIG2");
-        assert.strictEqual(metadata?._completeThinking, "");
-    });
-
-    test("emits redacted blocks as redactedData metadata", () => {
-        const state = createInitialStreamingState();
-
-        const parts = interpretStreamEvent(
-            {
-                choices: [
-                    {
-                        delta: {
-                            reasoning_content: "",
-                            thinking_blocks: [{ type: "redacted_thinking", data: "ENC3" }],
-                        },
-                    },
-                ],
-            },
-            state
-        );
-
-        assert.strictEqual(parts.length, 1);
-        const metadata = (parts[0] as { metadata?: Record<string, unknown> }).metadata;
-        assert.strictEqual(metadata?.redactedData, "ENC3");
-        assert.strictEqual(metadata?.signature, undefined);
-        assert.strictEqual(metadata?._completeThinking, undefined);
-    });
-
-    test("starts a fresh id after a sealed block", () => {
-        const state = createInitialStreamingState();
-
-        interpretStreamEvent({ choices: [{ delta: { reasoning_content: "block one" } }] }, state);
-        const firstSeal = interpretStreamEvent(
-            {
-                choices: [
-                    {
-                        delta: {
-                            reasoning_content: "",
-                            thinking_blocks: [{ type: "thinking", thinking: "block one", signature: "SIG1" }],
-                        },
-                    },
-                ],
-            },
-            state
-        );
-        const laterText = interpretStreamEvent({ choices: [{ delta: { reasoning_content: "block two" } }] }, state);
-        const secondSeal = interpretStreamEvent(
-            {
-                choices: [
-                    {
-                        delta: {
-                            reasoning_content: "",
-                            thinking_blocks: [{ type: "thinking", thinking: "block two", signature: "SIG9" }],
-                        },
-                    },
-                ],
-            },
-            state
-        );
-
-        assert.strictEqual((firstSeal[0] as { id?: string }).id, "litellm-thinking-1");
-        assert.strictEqual((laterText[0] as { id?: string }).id, "litellm-thinking-2");
-        assert.strictEqual((secondSeal[0] as { id?: string }).id, "litellm-thinking-2");
-    });
-
-    test("ignores unsigned thinking_blocks entries", () => {
-        const state = createInitialStreamingState();
-
-        const parts = interpretStreamEvent(
-            {
-                choices: [
-                    {
-                        delta: {
-                            reasoning_content: "piece",
-                            thinking_blocks: [{ type: "thinking", thinking: "piece" }],
-                        },
-                    },
-                ],
-            },
-            state
-        );
-
-        const thinkingParts = parts.filter((p) => p.type === "thinking");
-        assert.strictEqual(thinkingParts.length, 1, "only the text delta part is emitted");
-        const metadata = (thinkingParts[0] as { metadata?: Record<string, unknown> }).metadata;
-        assert.strictEqual(metadata, undefined);
-    });
-
-    test("ignores blocks with malformed signature or data fields", () => {
-        const state = createInitialStreamingState();
-
-        const parts = interpretStreamEvent(
-            {
-                choices: [
-                    {
-                        delta: {
-                            reasoning_content: "",
-                            thinking_blocks: [
-                                { type: "thinking", signature: 42, thinking: "x" },
-                                { type: "redacted_thinking", data: 42 },
-                            ],
-                        },
-                    },
-                ],
-            },
-            state
-        );
-
-        assert.strictEqual(parts.filter((p) => p.type === "thinking").length, 0);
     });
 });

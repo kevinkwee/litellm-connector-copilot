@@ -1,13 +1,12 @@
 /**
  * Observability layer for the provider request pipeline.
  *
- * Provides structured JSONL logging, audit trails, and the `.copilotmd`
- * request-log export for end-to-end request visibility.
+ * Provides structured JSONL logging and the `.copilotmd` request-log export
+ * for end-to-end request visibility.
  */
 
 export { StructuredLogger } from "./structuredLogger";
-export { AuditTrail } from "./auditTrail";
-export type { LogLevel, EventType, LogEvent, AuditSummary } from "./types";
+export type { LogLevel, EventType, LogEvent } from "./types";
 
 // `.copilotmd` request-log export, byte-compatible with VS Code Copilot's
 // Chat Debug View export format. See `copilotMdRenderer.ts` for the format

@@ -1,14 +1,24 @@
 import * as vscode from "vscode";
+import { tryParseJSONObject } from "../../utils/messageConversion";
 import { Logger } from "../../utils/logger";
-import { isCacheControlMimeType } from "../../utils";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import { TOOL_ARGS_PREVIEW_MAX_CHARS } from "./liteLLMStreamInterpreter";
-import type { EmittedPart } from "./liteLLMStreamInterpreter";
+import type { EmittedPart } from "./streamingState";
+import type { DroppedToolCall } from "../../types";
 
+/**
+ * Reports `parts` to VS Code and returns every tool call whose arguments are not a JSON object.
+ *
+ * Such a call is not reported: a tool must only ever run on the arguments the model
+ * supplied. A part missing its id or name is skipped without being returned, because a
+ * call with no id or name can neither run nor be named in a notice. The caller decides how
+ * to explain a returned drop, so nothing here writes user-facing text.
+ */
 export function emitPartsToVSCode(
     parts: EmittedPart[],
     progress: vscode.Progress<vscode.LanguageModelResponsePart | vscode.LanguageModelDataPart>
-): void {
+): readonly DroppedToolCall[] {
+    const droppedToolCalls: DroppedToolCall[] = [];
     Logger.trace(`[vscodePartEmitter] Emitting ${parts.length} parts to VS Code`);
     StructuredLogger.trace("vscode.emit_parts_start", {
         partCount: parts.length,
@@ -36,18 +46,6 @@ export function emitPartsToVSCode(
                 break;
             }
             case "data": {
-                // Defense-in-depth: the interpreter drops cache-control carrier
-                // objects, but this boundary is the last chance to prevent VS Code
-                // from recycling opaque prompt-cache metadata into future LLM input.
-                if (isCacheControlMimeType(part.mimeType)) {
-                    Logger.trace(`[vscodePartEmitter] Part #${idx}: data (cache_control) - DROPPED`);
-                    StructuredLogger.trace("vscode.data_part_dropped", {
-                        partIndex: idx,
-                        reason: "cache_control_mimeType",
-                        mimeType: part.mimeType,
-                    });
-                    break;
-                }
                 const mimeType = part.mimeType;
 
                 // The `usage` mimetype must stay raw. `LanguageModelDataPart.json()` would
@@ -114,45 +112,42 @@ export function emitPartsToVSCode(
             case "tool_call": {
                 if (part.id && part.name) {
                     Logger.trace(`[vscodePartEmitter] Part #${idx}: tool_call, name=${part.name} id=${part.id}`);
-                    try {
-                        const argsRaw = part.args;
-                        const args: Record<string, unknown> =
-                            typeof argsRaw === "string" && argsRaw
-                                ? (JSON.parse(argsRaw) as Record<string, unknown>)
-                                : {};
+                    const argsRaw = part.args;
+                    const parsedArgs =
+                        typeof argsRaw === "string" && argsRaw
+                            ? tryParseJSONObject(argsRaw)
+                            : { ok: true as const, value: {} };
+                    if (parsedArgs.ok) {
                         Logger.trace(
-                            `[vscodePartEmitter] Tool call args parsed successfully, keys: ${Object.keys(args).join(", ")}`
+                            `[vscodePartEmitter] Tool call args parsed successfully, keys: ${Object.keys(parsedArgs.value).join(", ")}`
                         );
-                        progress.report(new vscode.LanguageModelToolCallPart(part.id, part.name, args));
+                        progress.report(new vscode.LanguageModelToolCallPart(part.id, part.name, parsedArgs.value));
                         StructuredLogger.trace("vscode.tool_call_part_emitted", {
                             partIndex: idx,
                             toolName: part.name,
                             id: part.id,
                             argsLength: argsRaw?.length ?? 0,
-                            argKeys: Object.keys(args),
+                            argKeys: Object.keys(parsedArgs.value),
                         });
-                    } catch (parseErr) {
-                        Logger.warn(`[vscodePartEmitter] Part #${idx}: Failed to parse tool call arguments`, {
-                            toolName: part.name,
-                            id: part.id,
-                            argsPreview:
-                                typeof part.args === "string"
-                                    ? part.args.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS)
-                                    : "<non-string>",
-                            error: parseErr instanceof Error ? parseErr.message : String(parseErr),
-                        });
-                        // Fallback: emit with raw string if the consumer can handle it, or empty object
-                        progress.report(new vscode.LanguageModelToolCallPart(part.id, part.name, {}));
-                        StructuredLogger.error("vscode.tool_call_parse_failed", {
+                    } else {
+                        // One warn record: arguments that are not a JSON object are a
+                        // degraded turn the connector handles with a notice, not a failure,
+                        // and this layer is the one that drops the call.
+                        Logger.warn(
+                            `[vscodePartEmitter] Part #${idx}: Dropped a tool call whose arguments are not a JSON object`,
+                            {
+                                toolName: part.name,
+                                id: part.id,
+                                argsPreview: argsRaw.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS),
+                            }
+                        );
+                        droppedToolCalls.push({ id: part.id, name: part.name });
+                        StructuredLogger.warn("vscode.tool_call_parse_failed", {
                             partIndex: idx,
                             toolName: part.name,
                             id: part.id,
-                            argsLength: typeof part.args === "string" ? part.args.length : 0,
-                            argsPreview:
-                                typeof part.args === "string"
-                                    ? part.args.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS)
-                                    : "<non-string>",
-                            error: parseErr instanceof Error ? parseErr.message : String(parseErr),
+                            argsLength: argsRaw.length,
+                            argsPreview: argsRaw.slice(0, TOOL_ARGS_PREVIEW_MAX_CHARS),
                         });
                     }
                 } else {
@@ -182,5 +177,7 @@ export function emitPartsToVSCode(
     Logger.trace(`[vscodePartEmitter] Finished emitting ${parts.length} parts to VS Code`);
     StructuredLogger.trace("vscode.emit_parts_complete", {
         partCount: parts.length,
+        droppedToolCalls: droppedToolCalls.length,
     });
+    return droppedToolCalls;
 }

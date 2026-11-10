@@ -5,11 +5,14 @@ import { LiteLLMRateLimitError } from "../../adapters/litellmClient";
 import {
     StreamedTextAccumulator,
     ReasoningOnlyError,
+    HeadersTimeoutError,
     InactivityTimeoutError,
     UpstreamStreamError,
     isTransportRetriableError,
+    failedBeforeReachingProxy,
     backoffDelayMs,
     buildResumeMessages,
+    selectResumableContent,
     sleepWithCancellation,
 } from "../transportRetry";
 
@@ -78,6 +81,10 @@ suite("Transport Retry Utilities", () => {
             assert.ok(isTransportRetriableError(new Error(message)), `expected retriable: ${message}`);
         }
         assert.ok(isTransportRetriableError(new InactivityTimeoutError(60_000, 3)));
+        assert.ok(
+            isTransportRetriableError(new HeadersTimeoutError(120_000)),
+            "a request that never got headers is worth a fresh attempt"
+        );
         assert.ok(isTransportRetriableError(new Error("Some prefix, then terminated")));
         // non-Error values are not retriable
         assert.strictEqual(isTransportRetriableError("terminated"), false);
@@ -151,9 +158,95 @@ suite("Transport Retry Utilities", () => {
         assert.strictEqual(isTransportRetriableError(new Error("some unrelated failure")), false);
     });
 
+    test("failedBeforeReachingProxy reads the connect-phase code from the cause", () => {
+        // Node's fetch puts the socket code on the cause, not on the error itself.
+        const refused = new TypeError("fetch failed", { cause: { code: "ECONNREFUSED" } });
+
+        assert.strictEqual(failedBeforeReachingProxy(refused), true);
+    });
+
+    test("failedBeforeReachingProxy counts every code that can only mean no connection", () => {
+        const codes = [
+            "ECONNREFUSED",
+            "ENOTFOUND",
+            "EAI_AGAIN",
+            "UND_ERR_CONNECT_TIMEOUT",
+            "DEPTH_ZERO_SELF_SIGNED_CERT",
+            "SELF_SIGNED_CERT_IN_CHAIN",
+            "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+            "UNABLE_TO_GET_ISSUER_CERT",
+            "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+            "CERT_HAS_EXPIRED",
+            "ERR_TLS_CERT_ALTNAME_INVALID",
+        ];
+        const unproven = codes.filter(
+            (code) => !failedBeforeReachingProxy(new TypeError("fetch failed", { cause: { code } }))
+        );
+
+        assert.deepStrictEqual(unproven, [], "each of these codes proves the connection never opened");
+    });
+
+    test("failedBeforeReachingProxy counts a route failure only when the connect attempt failed", () => {
+        // The kernel reports these codes on an open socket too, and there the proxy may
+        // already have billed the prompt, so only a failed connect counts.
+        const routeCodes = ["EHOSTUNREACH", "ENETUNREACH", "EHOSTDOWN", "ENETDOWN"];
+        const onOpenSocket = routeCodes.map((code) =>
+            failedBeforeReachingProxy(new TypeError("terminated", { cause: { code, syscall: "read" } }))
+        );
+        const whileConnecting = routeCodes.map((code) =>
+            failedBeforeReachingProxy(new TypeError("fetch failed", { cause: { code, syscall: "connect" } }))
+        );
+
+        assert.deepStrictEqual(
+            { onOpenSocket, whileConnecting },
+            { onOpenSocket: [false, false, false, false], whileConnecting: [true, true, true, true] }
+        );
+    });
+
+    test("failedBeforeReachingProxy treats other open-socket failures as reached", () => {
+        // None of these names a connect attempt, so each one counts as a request the proxy
+        // may have billed.
+        const codes = ["ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET", "ECONNABORTED"];
+        const reached = codes.map((code) =>
+            failedBeforeReachingProxy(new TypeError("terminated", { cause: { code, syscall: "read" } }))
+        );
+
+        assert.deepStrictEqual(reached, [false, false, false, false], "an open socket keeps its prompt");
+    });
+
+    test("failedBeforeReachingProxy proves a connect attempt from an aggregate failure", () => {
+        // A multi-address connect raises an `AggregateError` carrying the code of the first
+        // address that failed.
+        const codes = ["EHOSTUNREACH", "ETIMEDOUT", "ECONNREFUSED"];
+        const verdicts = codes.map((code) =>
+            failedBeforeReachingProxy(
+                new TypeError("fetch failed", {
+                    cause: Object.assign(new AggregateError([], `connect ${code}`), { code }),
+                })
+            )
+        );
+
+        assert.deepStrictEqual(verdicts, [true, true, true], "no address connected, so nothing was sent");
+    });
+
+    test("failedBeforeReachingProxy keeps a socket that opened, whatever its code", () => {
+        const reset = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+
+        assert.deepStrictEqual(
+            {
+                reset: failedBeforeReachingProxy(reset),
+                timeout: failedBeforeReachingProxy(new HeadersTimeoutError(1_000)),
+                upstream: failedBeforeReachingProxy(
+                    new UpstreamStreamError(undefined, "ECONNREFUSED", undefined, "boom")
+                ),
+                plain: failedBeforeReachingProxy("nope"),
+            },
+            { reset: false, timeout: false, upstream: false, plain: false }
+        );
+    });
+
     test("StreamedTextAccumulator classifies text, tool call, and thinking parts", () => {
         const accumulator = new StreamedTextAccumulator();
-        assert.ok(accumulator.isEmpty, "fresh accumulator is empty");
 
         accumulator.add(new vscode.LanguageModelTextPart("Hello "));
         accumulator.add(thinkingPart("deep "));
@@ -164,20 +257,59 @@ suite("Transport Retry Utilities", () => {
         assert.strictEqual(accumulator.text, "Hello world");
         assert.strictEqual(accumulator.thinking, "deep thought");
         assert.ok(accumulator.sawToolCall);
-        assert.strictEqual(accumulator.isEmpty, false);
-
-        accumulator.reset();
-        assert.ok(accumulator.isEmpty);
-        assert.strictEqual(accumulator.text, "");
-        assert.strictEqual(accumulator.thinking, "");
-        assert.strictEqual(accumulator.sawToolCall, false);
     });
 
     test("StreamedTextAccumulator ignores non-text, non-thinking parts", () => {
         const accumulator = new StreamedTextAccumulator();
         const usagePart = new vscode.LanguageModelDataPart(new TextEncoder().encode("{}"), "usage");
         accumulator.add(usagePart);
-        assert.ok(accumulator.isEmpty, "data parts must not affect resume content");
+        assert.strictEqual(
+            selectResumableContent(accumulator, { canReplayReasoning: true }),
+            undefined,
+            "data parts must not affect resume content"
+        );
+    });
+
+    test("selectResumableContent treats whitespace-only text and reasoning as nothing", () => {
+        // Leading and trailing whitespace is trimmed, so blank output counts as
+        // nothing to continue.
+        const accumulator = new StreamedTextAccumulator();
+        accumulator.add(new vscode.LanguageModelTextPart("\n\n"));
+        assert.strictEqual(selectResumableContent(accumulator, { canReplayReasoning: true }), undefined);
+
+        accumulator.add(thinkingPart("   "));
+        assert.strictEqual(selectResumableContent(accumulator, { canReplayReasoning: true }), undefined);
+
+        accumulator.add(new vscode.LanguageModelTextPart("answer"));
+        assert.deepStrictEqual(selectResumableContent(accumulator, { canReplayReasoning: true }), {
+            text: "\n\nanswer",
+            thinking: "   ",
+        });
+    });
+
+    test("selectResumableContent drops reasoning an endpoint cannot replay", () => {
+        // `/responses` has no field for `reasoning_content`, so a reasoning-only
+        // attempt has nothing a resume could carry and is resent unchanged rather
+        // than answered with a bare "Continue" nudge.
+        const accumulator = new StreamedTextAccumulator();
+        accumulator.add(thinkingPart("partial reasoning"));
+
+        assert.strictEqual(selectResumableContent(accumulator, { canReplayReasoning: false }), undefined);
+        assert.deepStrictEqual(selectResumableContent(accumulator, { canReplayReasoning: true }), {
+            text: "",
+            thinking: "partial reasoning",
+        });
+    });
+
+    test("selectResumableContent keeps text on an endpoint that cannot replay reasoning", () => {
+        const accumulator = new StreamedTextAccumulator();
+        accumulator.add(new vscode.LanguageModelTextPart("partial answer"));
+        accumulator.add(thinkingPart("partial reasoning"));
+
+        assert.deepStrictEqual(selectResumableContent(accumulator, { canReplayReasoning: false }), {
+            text: "partial answer",
+            thinking: "",
+        });
     });
 
     test("buildResumeMessages appends one assistant turn with text and reasoning", () => {

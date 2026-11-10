@@ -39,6 +39,59 @@ suite("SSE Decoder Unit Tests", () => {
         assert.deepStrictEqual(results, ['{"text": "hello"}']);
     });
 
+    test("decodes a code point split across the final two chunks", async () => {
+        // The trailing event has no blank-line separator, so it is flushed from
+        // the buffer once the stream ends, and the split code point is already
+        // reassembled by the streaming decode of the second chunk.
+        const payload = 'data: {"text":"caf\u00e9"}\n\n';
+        const tail = 'data: {"text":"na\u00efve"}';
+        const bytes = new TextEncoder().encode(payload + tail);
+        const tailStart = bytes.length - new TextEncoder().encode(tail).length;
+        // Split between the two bytes of `ï` (0xC3 0xAF) so the code point spans both chunks.
+        const splitAt = tailStart + 'data: {"text":"na'.length + 1;
+
+        const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(bytes.slice(0, splitAt));
+                controller.enqueue(bytes.slice(splitAt));
+                controller.close();
+            },
+        });
+
+        const results: string[] = [];
+        await assert.rejects(async () => {
+            for await (const chunk of decodeSSE(stream)) {
+                results.push(chunk);
+            }
+        });
+
+        assert.deepStrictEqual(results, ['{"text":"café"}', '{"text":"naïve"}']);
+    });
+
+    test("decodes a truncated final code point as the replacement character", async () => {
+        const complete = new TextEncoder().encode('data: {"text":"caf\u00e9"}\n\n');
+        const truncated = new TextEncoder().encode('data: {"text":"na');
+
+        const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(complete);
+                // Ends after the first byte of a two-byte code point.
+                controller.enqueue(truncated);
+                controller.enqueue(new Uint8Array([0xc3]));
+                controller.close();
+            },
+        });
+
+        const results: string[] = [];
+        await assert.rejects(async () => {
+            for await (const chunk of decodeSSE(stream)) {
+                results.push(chunk);
+            }
+        });
+
+        assert.deepStrictEqual(results, ['{"text":"café"}', '{"text":"na\uFFFD']);
+    });
+
     test("rejoins multiline data lines within a single event", async () => {
         const stream = new ReadableStream<Uint8Array>({
             start(controller) {
@@ -119,7 +172,7 @@ suite("SSE Decoder Unit Tests", () => {
             for await (const payload of decodeSSE(stream)) {
                 results.push(payload);
             }
-        } catch (_err) {
+        } catch {
             threwError = true;
         }
 
@@ -165,5 +218,28 @@ suite("SSE Decoder Unit Tests", () => {
         );
         // Only the complete payload should be yielded
         assert.deepStrictEqual(results, ['{"text": "hello"}']);
+    });
+
+    test("reports activity for a chunk that yields no payload", async () => {
+        // A keep-alive comment frame carries bytes but no event, so a caller that
+        // resets an inactivity bound per payload would see silence here.
+        let activityReports = 0;
+        const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode(": keep-alive\n\n"));
+                controller.enqueue(new TextEncoder().encode('data: {"text": "hi"}\n\n'));
+                controller.close();
+            },
+        });
+
+        const results: string[] = [];
+        for await (const payload of decodeSSE(stream, undefined, undefined, () => {
+            activityReports++;
+        })) {
+            results.push(payload);
+        }
+
+        assert.deepStrictEqual(results, ['{"text": "hi"}']);
+        assert.strictEqual(activityReports, 2, "one report per chunk read, including the keep-alive");
     });
 });

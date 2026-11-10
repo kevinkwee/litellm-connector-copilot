@@ -1,35 +1,70 @@
 import * as assert from "assert";
 
-import { CONNECTOR_NOTICE_PREFIX, formatConnectorNotice, splitConnectorNotice } from "../connectorNotice";
+import {
+    CONNECTOR_NOTICE_PREFIX,
+    describeDroppedToolCalls,
+    describeStoppedEarly,
+    formatConnectorNotice,
+} from "../connectorNotice";
 
 suite("connectorNotice", () => {
     test("formatConnectorNotice prefixes the message", () => {
         assert.strictEqual(formatConnectorNotice("boom"), `${CONNECTOR_NOTICE_PREFIX} boom`);
     });
 
-    test("splitConnectorNotice keeps text that only mentions the prefix", () => {
-        const modelText = `Use ${CONNECTOR_NOTICE_PREFIX} only for connector output.`;
-        const split = splitConnectorNotice(modelText);
-
-        assert.strictEqual(split.modelText, modelText);
-        assert.strictEqual(split.notice, undefined);
+    test("formatConnectorNotice prefixes an empty message", () => {
+        assert.ok(formatConnectorNotice("").startsWith(`${CONNECTOR_NOTICE_PREFIX} `));
     });
 
-    test("splitConnectorNotice separates a notice that starts a new block", () => {
-        const split = splitConnectorNotice(`feat: partial${"\n\n"}${CONNECTOR_NOTICE_PREFIX} stopped at the limit`);
+    suite("describeStoppedEarly", () => {
+        test("names the output token limit for a length finish", () => {
+            const described = describeStoppedEarly("length");
 
-        assert.strictEqual(split.modelText, "feat: partial");
-        assert.strictEqual(split.notice, "stopped at the limit");
+            assert.strictEqual(described?.reason, "length");
+            assert.ok(described.notice.includes("output token limit"));
+        });
+
+        test("names the content filter for a content_filter finish", () => {
+            const described = describeStoppedEarly("content_filter");
+
+            assert.strictEqual(described?.reason, "content_filter");
+            assert.ok(described.notice.includes("content filter"));
+        });
+
+        test("starts the notice on its own block", () => {
+            const described = describeStoppedEarly("length");
+            assert.ok(described);
+
+            assert.ok(described.notice.startsWith(`\n\n${CONNECTOR_NOTICE_PREFIX} `));
+        });
+
+        test("returns nothing for a finish reason that completes the answer", () => {
+            assert.strictEqual(describeStoppedEarly("stop"), undefined);
+        });
+
+        test("returns nothing when the stream reported no finish reason", () => {
+            assert.strictEqual(describeStoppedEarly(undefined), undefined);
+        });
     });
 
-    test("splitConnectorNotice separates a notice that starts the response", () => {
-        const split = splitConnectorNotice(`${CONNECTOR_NOTICE_PREFIX} failed`);
+    suite("describeDroppedToolCalls", () => {
+        test("names the single tool it dropped", () => {
+            const notice = describeDroppedToolCalls([{ id: "call_1", name: "read_file" }]);
 
-        assert.strictEqual(split.modelText, "");
-        assert.strictEqual(split.notice, "failed");
-    });
+            assert.ok(notice.startsWith(`\n\n${CONNECTOR_NOTICE_PREFIX} `));
+            assert.ok(notice.includes(`the "read_file" tool was not run`));
+        });
 
-    test("splitConnectorNotice returns the whole text when there is no notice", () => {
-        assert.deepStrictEqual(splitConnectorNotice("feat: add a thing"), { modelText: "feat: add a thing" });
+        test("names each tool once and counts the calls", () => {
+            const notice = describeDroppedToolCalls([
+                { id: "call_1", name: "read_file" },
+                { id: "call_2", name: "read_file" },
+                { id: "call_3", name: "search_files" },
+            ]);
+
+            assert.ok(notice.includes("3 tool calls"), "the count matches the calls, not the names");
+            assert.ok(notice.includes(`the "read_file", "search_files" tools were not run`));
+            assert.strictEqual(notice.split(`"read_file"`).length - 1, 1, "a repeated name is named once");
+        });
     });
 });

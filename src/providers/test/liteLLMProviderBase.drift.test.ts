@@ -10,19 +10,11 @@ suite("Model Drift Detection & State Persistence", () => {
     let sandbox: sinon.SinonSandbox;
     let provider: LiteLLMChatProvider;
     let configManager: ConfigManager;
-    let mockSecrets: vscode.SecretStorage;
 
     setup(() => {
         sandbox = sinon.createSandbox();
-        mockSecrets = {
-            get: sandbox.stub().resolves(undefined),
-            store: sandbox.stub().resolves(undefined),
-            delete: sandbox.stub().resolves(undefined),
-            keys: sandbox.stub().resolves([]),
-            onDidChange: new vscode.EventEmitter<vscode.SecretStorageChangeEvent>().event,
-        } as unknown as vscode.SecretStorage;
 
-        provider = new LiteLLMChatProvider(mockSecrets, "test-agent");
+        provider = new LiteLLMChatProvider("test-agent");
         configManager = (provider as unknown as { _configManager: ConfigManager })._configManager;
     });
 
@@ -138,10 +130,9 @@ suite("Model Drift Detection & State Persistence", () => {
             } as unknown as BackendSession["client"],
         };
 
-        // Discovery no longer threads groupName through to convertProviderConfiguration —
-        // the URL is the routing identity. The picker's label is derived separately. We
-        // match on the configuration payload (second arg) to return the right session.
-        sandbox.stub(configManager, "convertProviderConfiguration").callsFake((_groupName, config) => {
+        // The URL is the routing identity and the picker label is derived from it,
+        // so discovery matches sessions on the configuration payload alone.
+        sandbox.stub(configManager, "convertProviderConfiguration").callsFake((config) => {
             if (config === config1) {
                 return mockSession1;
             }
@@ -216,7 +207,7 @@ suite("Model Drift Detection & State Persistence", () => {
         assert.strictEqual(fired.length, 1, "change event should fire only on the first call");
     });
 
-    test("clearModelCache clears per-config cache", async () => {
+    test("a model reload clears the per-config discovery cache", async () => {
         const config = {
             providerName: "test-group",
             baseUrl: "http://localhost:4000",
@@ -245,7 +236,7 @@ suite("Model Drift Detection & State Persistence", () => {
             new vscode.CancellationTokenSource().token
         );
 
-        provider.clearModelCache();
+        provider.reloadModelDiscovery();
 
         const rediscoverStub = mockSession.client.getModelInfo as sinon.SinonStub;
         rediscoverStub.resetHistory();

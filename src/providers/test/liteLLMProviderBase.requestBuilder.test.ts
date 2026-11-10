@@ -3,7 +3,15 @@ import * as sinon from "sinon";
 import * as assert from "assert";
 import { RequestBuilder } from "../base/requestBuilder";
 import { ConfigManager } from "../../config/configManager";
-import type { LiteLLMModelInfo } from "../../types";
+import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types";
+
+/** Builds one request body, discarding the tool-name mapping the test does not read. */
+async function buildRequest(
+    builder: RequestBuilder,
+    ...args: Parameters<RequestBuilder["buildOpenAIChatRequest"]>
+): Promise<OpenAIChatCompletionRequest> {
+    return (await builder.buildOpenAIChatRequest(...args)).request;
+}
 
 suite("RequestBuilder", () => {
     let sandbox: sinon.SinonSandbox;
@@ -16,7 +24,6 @@ suite("RequestBuilder", () => {
         builder = new RequestBuilder({
             configManager,
             getReasoningEffort: () => undefined,
-            detectQuotaToolRedaction: (messages, tools) => ({ tools, confidence: "none" as const }),
             stripUnsupportedParametersFromRequest: () => {},
             isParameterSupported: () => true,
             getUnsupportedParameters: () => new Set<string>(),
@@ -24,7 +31,6 @@ suite("RequestBuilder", () => {
             // per-model picker selections arrive via `options.modelConfiguration`.
             getTelemetryOptions: (options: vscode.ProvideLanguageModelChatResponseOptions) => ({
                 caller: "test",
-                justification: undefined,
                 modelConfiguration: ((options as unknown as { modelConfiguration?: Record<string, unknown> })
                     .modelConfiguration ?? {}) as Record<string, unknown>,
             }),
@@ -42,7 +48,11 @@ suite("RequestBuilder", () => {
 
     test("buildOpenAIChatRequest caps max_tokens to model maxOutputTokens", async () => {
         configManager.getConfig.resolves({});
-        const model = { id: "gpt-x", maxInputTokens: 100, maxOutputTokens: 50 } as vscode.LanguageModelChatInformation;
+        const model = {
+            id: "group-a/gpt-x",
+            maxInputTokens: 100,
+            maxOutputTokens: 50,
+        } as vscode.LanguageModelChatInformation;
         const messages: vscode.LanguageModelChatRequestMessage[] = [
             {
                 role: vscode.LanguageModelChatMessageRole.User,
@@ -51,7 +61,8 @@ suite("RequestBuilder", () => {
             },
         ];
 
-        const req = await builder.buildOpenAIChatRequest(
+        const req = await buildRequest(
+            builder,
             messages,
             model,
             { modelOptions: {} } as vscode.ProvideLanguageModelChatResponseOptions,
@@ -62,8 +73,146 @@ suite("RequestBuilder", () => {
         sinon.assert.match(req.stream, true);
     });
 
+    suite("reasoning effort gate", () => {
+        const model = {
+            id: "group-a/gpt-x",
+            maxInputTokens: 100,
+            maxOutputTokens: 50,
+        } as vscode.LanguageModelChatInformation;
+        const messages: vscode.LanguageModelChatRequestMessage[] = [
+            {
+                role: vscode.LanguageModelChatMessageRole.User,
+                content: [new vscode.LanguageModelTextPart("hi")],
+                name: undefined,
+            },
+        ];
+        const options = (effort: string) =>
+            ({
+                modelOptions: {},
+                modelConfiguration: { reasoningEffort: effort },
+            }) as unknown as vscode.ProvideLanguageModelChatResponseOptions;
+
+        /** Builder whose effort source is the picker selection, as the provider wires it. */
+        const buildWithEffort = async (modelInfo: LiteLLMModelInfo, effort: string) =>
+            buildRequest(
+                new RequestBuilder({
+                    configManager,
+                    getReasoningEffort: (callOptions) =>
+                        (callOptions as unknown as { modelConfiguration?: { reasoningEffort?: string } })
+                            .modelConfiguration?.reasoningEffort,
+                    stripUnsupportedParametersFromRequest: () => {},
+                    isParameterSupported: () => true,
+                    getUnsupportedParameters: () => new Set<string>(),
+                    getTelemetryOptions: () => ({ caller: "test", modelConfiguration: {} }),
+                    usageOptOutModels: new Set(),
+                    extractRawModelName: (id: string) => id.slice(id.indexOf("/") + 1),
+                }),
+                messages,
+                model,
+                options(effort),
+                modelInfo,
+                "caller"
+            );
+
+        /** Points `modelOverrides` at one entry, so the id the gate uses decides the list. */
+        const buildWithOverride = async (pattern: string) => {
+            sandbox.stub(vscode.workspace, "getConfiguration").returns({
+                get: (key: string, defaultValue?: unknown) => {
+                    if (key === "litellm-connector.modelOverrides") {
+                        return [
+                            {
+                                match: pattern,
+                                supportsReasoning: true,
+                                reasoningEfforts: ["low", "high"],
+                                forceMandatory: true,
+                            },
+                        ];
+                    }
+                    if (key === "litellm-connector.enableModelOverrides") {
+                        return true;
+                    }
+                    return defaultValue;
+                },
+            } as unknown as vscode.WorkspaceConfiguration);
+            return buildWithEffort({} as LiteLLMModelInfo, "high");
+        };
+
+        test("keeps the effort when an override matches the namespaced id, as the picker does", async () => {
+            // The picker resolves the list under the namespaced id, so an override
+            // anchored to that id must also reach the request path.
+            configManager.getConfig.resolves({});
+
+            const request = await buildWithOverride("^group-a/gpt-x$");
+
+            assert.strictEqual(request.reasoning_effort, "high");
+        });
+
+        test("drops the effort when an override matches only the raw name", async () => {
+            // The picker never sees this override, so it offers no level and the request
+            // must not carry one.
+            configManager.getConfig.resolves({});
+
+            const request = await buildWithOverride("^gpt-x$");
+
+            assert.strictEqual(request.reasoning_effort, undefined);
+        });
+
+        test("sends the picker effort when the model offers that level", async () => {
+            configManager.getConfig.resolves({});
+            const modelInfo = { supports_reasoning: true, supports_high_reasoning_effort: true } as LiteLLMModelInfo;
+
+            const request = await buildWithEffort(modelInfo, "high");
+
+            assert.strictEqual(request.reasoning_effort, "high");
+        });
+
+        test("sends the effort when the model declares the level, though its parameter list omits it", async () => {
+            // The picker offers the level from the declaration alone, so the request
+            // must carry it even when `supported_openai_params` does not list it. A
+            // deployment whose proxy still refuses it answers with guidance, which is
+            // the documented outcome of a wrong declaration.
+            configManager.getConfig.resolves({});
+            const modelInfo = {
+                supports_reasoning: true,
+                supports_high_reasoning_effort: true,
+                supported_openai_params: ["stream", "tools"],
+            } as unknown as LiteLLMModelInfo;
+
+            const request = await buildWithEffort(modelInfo, "high");
+
+            assert.strictEqual(request.reasoning_effort, "high");
+        });
+
+        test("drops a saved effort the model no longer offers", async () => {
+            // VS Code merges a previously picked level into every request without
+            // re-checking the schema, and hides the control once the model offers
+            // nothing, so the connector must not send it.
+            configManager.getConfig.resolves({});
+            const modelInfo = { supports_reasoning: false } as LiteLLMModelInfo;
+
+            const request = await buildWithEffort(modelInfo, "high");
+
+            assert.strictEqual(request.reasoning_effort, undefined);
+        });
+
+        test("drops a saved effort the model no longer offers, though it offers others", async () => {
+            // The control stays visible while the list is non-empty, so the user can recover;
+            // the stale level does not reach a model whose declaration dropped it.
+            configManager.getConfig.resolves({});
+            const modelInfo = { supports_reasoning: true, supports_low_reasoning_effort: true } as LiteLLMModelInfo;
+
+            const request = await buildWithEffort(modelInfo, "high");
+
+            assert.strictEqual(request.reasoning_effort, undefined);
+        });
+    });
+
     suite("temperature from modelConfiguration", () => {
-        const model = { id: "gpt-x", maxInputTokens: 100, maxOutputTokens: 50 } as vscode.LanguageModelChatInformation;
+        const model = {
+            id: "group-a/gpt-x",
+            maxInputTokens: 100,
+            maxOutputTokens: 50,
+        } as vscode.LanguageModelChatInformation;
         const messages: vscode.LanguageModelChatRequestMessage[] = [
             {
                 role: vscode.LanguageModelChatMessageRole.User,
@@ -77,7 +226,8 @@ suite("RequestBuilder", () => {
         });
 
         test("applies per-model temperature set in the VS Code model configuration", async () => {
-            const req = await builder.buildOpenAIChatRequest(
+            const req = await buildRequest(
+                builder,
                 messages,
                 model,
                 {
@@ -92,7 +242,8 @@ suite("RequestBuilder", () => {
         });
 
         test("caller-supplied modelOptions.temperature wins over per-model configuration", async () => {
-            const req = await builder.buildOpenAIChatRequest(
+            const req = await buildRequest(
+                builder,
                 messages,
                 model,
                 {
@@ -107,7 +258,8 @@ suite("RequestBuilder", () => {
         });
 
         test("omits temperature when no explicit value is configured", async () => {
-            const req = await builder.buildOpenAIChatRequest(
+            const req = await buildRequest(
+                builder,
                 messages,
                 model,
                 { modelOptions: {} } as vscode.ProvideLanguageModelChatResponseOptions,
@@ -125,13 +277,11 @@ suite("RequestBuilder", () => {
             const gatedBuilder = new RequestBuilder({
                 configManager,
                 getReasoningEffort: () => undefined,
-                detectQuotaToolRedaction: (messages, tools) => ({ tools, confidence: "none" as const }),
                 stripUnsupportedParametersFromRequest: () => {},
                 isParameterSupported: (param: string) => param !== "temperature",
                 getUnsupportedParameters: () => new Set<string>(),
                 getTelemetryOptions: (options: vscode.ProvideLanguageModelChatResponseOptions) => ({
                     caller: "test",
-                    justification: undefined,
                     modelConfiguration: ((options as unknown as { modelConfiguration?: Record<string, unknown> })
                         .modelConfiguration ?? {}) as Record<string, unknown>,
                 }),
@@ -143,7 +293,8 @@ suite("RequestBuilder", () => {
             });
             const modelInfo = { supported_openai_params: ["stream", "tools"] } as LiteLLMModelInfo;
 
-            const req = await gatedBuilder.buildOpenAIChatRequest(
+            const req = await buildRequest(
+                gatedBuilder,
                 messages,
                 model,
                 {
@@ -160,7 +311,11 @@ suite("RequestBuilder", () => {
 
     test("buildOpenAIChatRequest preserves tool_choice when ToolMode is Required", async () => {
         configManager.getConfig.resolves({});
-        const model = { id: "gpt-x", maxInputTokens: 100, maxOutputTokens: 50 } as vscode.LanguageModelChatInformation;
+        const model = {
+            id: "group-a/gpt-x",
+            maxInputTokens: 100,
+            maxOutputTokens: 50,
+        } as vscode.LanguageModelChatInformation;
         const messages: vscode.LanguageModelChatRequestMessage[] = [
             {
                 role: vscode.LanguageModelChatMessageRole.User,
@@ -170,7 +325,8 @@ suite("RequestBuilder", () => {
         ];
         const modelInfo = { mode: "chat" } as LiteLLMModelInfo;
 
-        const req = await builder.buildOpenAIChatRequest(
+        const req = await buildRequest(
+            builder,
             messages,
             model,
             {
@@ -193,11 +349,10 @@ suite("RequestBuilder", () => {
         const builderWithGating = new RequestBuilder({
             configManager,
             getReasoningEffort: () => undefined,
-            detectQuotaToolRedaction: (messages, tools) => ({ tools, confidence: "none" as const }),
             stripUnsupportedParametersFromRequest: () => {},
             isParameterSupported: (param: string) => param !== "tool_choice", // tool_choice not supported
             getUnsupportedParameters: () => new Set<string>(),
-            getTelemetryOptions: () => ({ caller: "test", justification: undefined, modelConfiguration: {} }),
+            getTelemetryOptions: () => ({ caller: "test", modelConfiguration: {} }),
             usageOptOutModels: new Set(),
             extractRawModelName: (id: string) => {
                 const slash = id.indexOf("/");
@@ -220,7 +375,8 @@ suite("RequestBuilder", () => {
         ];
         const modelInfo = { model: "gpt-5.6", supported_openai_params: ["tools"] } as LiteLLMModelInfo;
 
-        const req = await builderWithGating.buildOpenAIChatRequest(
+        const req = await buildRequest(
+            builderWithGating,
             messages,
             model,
             {
@@ -253,7 +409,8 @@ suite("RequestBuilder", () => {
         ];
         const modelInfo = { model: "gpt-4", supported_openai_params: ["tools", "tool_choice"] } as LiteLLMModelInfo;
 
-        const req = await builder.buildOpenAIChatRequest(
+        const req = await buildRequest(
+            builder,
             messages,
             model,
             {
@@ -268,73 +425,6 @@ suite("RequestBuilder", () => {
 
         // tool_choice should be "auto" when model supports it and tools are present
         assert.strictEqual(req.tool_choice, "auto");
-    });
-
-    test("buildOpenAIChatRequest skips trimming when autoTrimMessages is disabled", async () => {
-        configManager.getConfig.resolves({ autoTrimMessages: false });
-        const model = {
-            id: "gpt-x",
-            maxInputTokens: 10,
-            maxOutputTokens: 5,
-        } as vscode.LanguageModelChatInformation;
-        const longText = "word ".repeat(500);
-        const messages: vscode.LanguageModelChatRequestMessage[] = [
-            {
-                role: vscode.LanguageModelChatMessageRole.User,
-                content: [new vscode.LanguageModelTextPart(longText)],
-                name: undefined,
-            },
-            {
-                role: vscode.LanguageModelChatMessageRole.User,
-                content: [new vscode.LanguageModelTextPart("hi")],
-                name: undefined,
-            },
-        ];
-
-        const req = await builder.buildOpenAIChatRequest(
-            messages,
-            model,
-            { modelOptions: {} } as vscode.ProvideLanguageModelChatResponseOptions,
-            undefined,
-            "caller"
-        );
-
-        // The oversized first message is untouched because trimming is skipped.
-        assert.strictEqual(req.messages.length, 2);
-    });
-
-    test("buildOpenAIChatRequest trims when autoTrimMessages is enabled", async () => {
-        configManager.getConfig.resolves({ autoTrimMessages: true });
-        const model = {
-            id: "gpt-x",
-            maxInputTokens: 10,
-            maxOutputTokens: 5,
-        } as vscode.LanguageModelChatInformation;
-        const longText = "word ".repeat(500);
-        const messages: vscode.LanguageModelChatRequestMessage[] = [
-            {
-                role: vscode.LanguageModelChatMessageRole.User,
-                content: [new vscode.LanguageModelTextPart(longText)],
-                name: undefined,
-            },
-            {
-                role: vscode.LanguageModelChatMessageRole.User,
-                content: [new vscode.LanguageModelTextPart("hi")],
-                name: undefined,
-            },
-        ];
-
-        const req = await builder.buildOpenAIChatRequest(
-            messages,
-            model,
-            { modelOptions: {} } as vscode.ProvideLanguageModelChatResponseOptions,
-            undefined,
-            "caller"
-        );
-
-        // Only the recent message fits the tiny budget, so the oversized one is dropped.
-        assert.strictEqual(req.messages.length, 1);
-        assert.strictEqual(req.messages[0].content, "hi");
     });
 
     suite("Anthropic prompt caching", () => {
@@ -360,13 +450,11 @@ suite("RequestBuilder", () => {
         }
 
         setup(() => {
-            // getTelemetryOptions receives the full VS Code options object here
-            // because `modelOptions` is the per-request opt-out channel.
             configManager.getConfig.resolves({});
         });
 
         test("marks Anthropic requests with the default 5m ephemeral CachePoint", async () => {
-            const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), anthropicInfo, "call");
+            const req = await buildRequest(builder, messages, claudeModel, options({}), anthropicInfo, "call");
 
             assert.deepStrictEqual(req.cache_control, { type: "ephemeral" });
         });
@@ -374,7 +462,7 @@ suite("RequestBuilder", () => {
         test("adds ttl 1h when the setting requests the 1-hour tier", async () => {
             configManager.getConfig.resolves({ anthropicPromptCaching: "1h" });
 
-            const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), anthropicInfo, "call");
+            const req = await buildRequest(builder, messages, claudeModel, options({}), anthropicInfo, "call");
 
             assert.deepStrictEqual(req.cache_control, { type: "ephemeral", ttl: "1h" });
         });
@@ -382,7 +470,7 @@ suite("RequestBuilder", () => {
         test("omits the marker when the setting is off", async () => {
             configManager.getConfig.resolves({ anthropicPromptCaching: "off" });
 
-            const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), anthropicInfo, "call");
+            const req = await buildRequest(builder, messages, claudeModel, options({}), anthropicInfo, "call");
 
             assert.strictEqual(req.cache_control, undefined);
         });
@@ -390,7 +478,7 @@ suite("RequestBuilder", () => {
         test("omits the marker for non-Anthropic models", async () => {
             const openaiInfo = { litellm_provider: "openai" } as LiteLLMModelInfo;
 
-            const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), openaiInfo, "call");
+            const req = await buildRequest(builder, messages, claudeModel, options({}), openaiInfo, "call");
 
             assert.strictEqual(req.cache_control, undefined);
         });
@@ -401,19 +489,7 @@ suite("RequestBuilder", () => {
                 supports_prompt_caching: false,
             } as LiteLLMModelInfo;
 
-            const req = await builder.buildOpenAIChatRequest(messages, claudeModel, options({}), noCachingInfo, "call");
-
-            assert.strictEqual(req.cache_control, undefined);
-        });
-
-        test("omits the marker when the caller opts out via modelOptions", async () => {
-            const req = await builder.buildOpenAIChatRequest(
-                messages,
-                claudeModel,
-                options({ promptCaching: false }),
-                anthropicInfo,
-                "call"
-            );
+            const req = await buildRequest(builder, messages, claudeModel, options({}), noCachingInfo, "call");
 
             assert.strictEqual(req.cache_control, undefined);
         });
@@ -422,12 +498,11 @@ suite("RequestBuilder", () => {
             const learnedBuilder = new RequestBuilder({
                 configManager,
                 getReasoningEffort: () => undefined,
-                detectQuotaToolRedaction: (messages, tools) => ({ tools, confidence: "none" as const }),
                 stripUnsupportedParametersFromRequest: () => {},
                 isParameterSupported: () => true,
                 getUnsupportedParameters: (id: string) =>
                     id.includes("claude") ? new Set(["cache_control"]) : new Set<string>(),
-                getTelemetryOptions: () => ({ caller: "test", justification: undefined, modelConfiguration: {} }),
+                getTelemetryOptions: () => ({ caller: "test", modelConfiguration: {} }),
                 usageOptOutModels: new Set(),
                 extractRawModelName: (id: string) => {
                     const slash = id.indexOf("/");
@@ -435,13 +510,7 @@ suite("RequestBuilder", () => {
                 },
             });
 
-            const req = await learnedBuilder.buildOpenAIChatRequest(
-                messages,
-                claudeModel,
-                options({}),
-                anthropicInfo,
-                "call"
-            );
+            const req = await buildRequest(learnedBuilder, messages, claudeModel, options({}), anthropicInfo, "call");
 
             assert.strictEqual(req.cache_control, undefined);
         });
@@ -450,12 +519,11 @@ suite("RequestBuilder", () => {
             const learnedBuilder = new RequestBuilder({
                 configManager,
                 getReasoningEffort: () => undefined,
-                detectQuotaToolRedaction: (messages, tools) => ({ tools, confidence: "none" as const }),
                 stripUnsupportedParametersFromRequest: () => {},
                 isParameterSupported: () => true,
                 getUnsupportedParameters: (id: string) =>
                     id.includes("gpt-") ? new Set(["cache_control"]) : new Set<string>(),
-                getTelemetryOptions: () => ({ caller: "test", justification: undefined, modelConfiguration: {} }),
+                getTelemetryOptions: () => ({ caller: "test", modelConfiguration: {} }),
                 usageOptOutModels: new Set(),
                 extractRawModelName: (id: string) => {
                     const slash = id.indexOf("/");
@@ -463,13 +531,7 @@ suite("RequestBuilder", () => {
                 },
             });
 
-            const req = await learnedBuilder.buildOpenAIChatRequest(
-                messages,
-                claudeModel,
-                options({}),
-                anthropicInfo,
-                "call"
-            );
+            const req = await buildRequest(learnedBuilder, messages, claudeModel, options({}), anthropicInfo, "call");
 
             assert.deepStrictEqual(req.cache_control, { type: "ephemeral" });
         });
@@ -517,7 +579,7 @@ suite("RequestBuilder", () => {
             } as vscode.LanguageModelChatInformation;
             const modelInfo = { litellm_provider: "deepseek" } as LiteLLMModelInfo;
 
-            const req = await builder.buildOpenAIChatRequest(messages, model, options(true), modelInfo, "caller");
+            const req = await buildRequest(builder, messages, model, options(true), modelInfo, "caller");
 
             assert.strictEqual(req.messages[1].reasoning_content, "");
         });
@@ -530,7 +592,7 @@ suite("RequestBuilder", () => {
             } as vscode.LanguageModelChatInformation;
             const modelInfo = { litellm_provider: "openai" } as LiteLLMModelInfo;
 
-            const req = await builder.buildOpenAIChatRequest(messages, model, options(true), modelInfo, "caller");
+            const req = await buildRequest(builder, messages, model, options(true), modelInfo, "caller");
 
             assert.strictEqual(req.messages[1].reasoning_content, undefined);
         });
@@ -543,7 +605,7 @@ suite("RequestBuilder", () => {
             } as vscode.LanguageModelChatInformation;
             const modelInfo = { litellm_provider: "deepseek" } as LiteLLMModelInfo;
 
-            const req = await builder.buildOpenAIChatRequest(messages, model, options(false), modelInfo, "caller");
+            const req = await buildRequest(builder, messages, model, options(false), modelInfo, "caller");
 
             assert.strictEqual(req.messages[1].reasoning_content, undefined);
         });
@@ -555,7 +617,7 @@ suite("RequestBuilder", () => {
                 maxOutputTokens: 100,
             } as vscode.LanguageModelChatInformation;
 
-            const req = await builder.buildOpenAIChatRequest(messages, model, options(true), undefined, "caller");
+            const req = await buildRequest(builder, messages, model, options(true), undefined, "caller");
 
             assert.strictEqual(req.messages[1].reasoning_content, "");
         });

@@ -10,9 +10,9 @@ import {
 import * as sinon from "sinon";
 import * as vscode from "vscode";
 import { StructuredLogger } from "../../observability/structuredLogger";
-import type { LiteLLMModelInfo, LiteLLMModelInfoResponse } from "../../types";
 import { Logger } from "../../utils/logger";
 import type { RateLimitFailure } from "../../utils/rateLimitRetryPolicy";
+import { HeadersTimeoutError } from "../../utils/transportRetry";
 
 function createRateLimitResponse(retryAfter?: string): Response {
     return new Response("Rate limit exceeded", {
@@ -61,21 +61,14 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.strictEqual(headers["User-Agent"], userAgent);
     });
 
-    test("getHeaders includes Cache-Control: no-cache when disabled", () => {
+    test("getHeaders never sets a Cache-Control header", () => {
         const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
         // @ts-expect-error - accessing private method for testing
-        const headers = client.getHeaders("gpt-4");
-        assert.strictEqual(headers["Cache-Control"], "no-cache");
+        const headers = client.getHeaders();
+        assert.strictEqual(headers["Cache-Control"], undefined, "the fork reads the body directive, not this header");
     });
 
-    test("getHeaders bypasses Cache-Control for Claude models", () => {
-        const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
-        // @ts-expect-error - accessing private method for testing
-        const headers = client.getHeaders("claude-3-sonnet");
-        assert.strictEqual(headers["Cache-Control"], undefined);
-    });
-
-    test("chat includes no_cache in body when disabled", async () => {
+    test("chat sends a top-level cache directive when caching is disabled", async () => {
         const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
         const fetchStub = sandbox.stub(global, "fetch").resolves({
             ok: true,
@@ -88,14 +81,13 @@ suite("LiteLLM Client Unit Tests", () => {
         const requestInit = args0[1] as RequestInit | undefined;
         const bodyStr = requestInit?.body as string | undefined;
         const body = bodyStr ? (JSON.parse(bodyStr) as Record<string, unknown>) : {};
-        assert.strictEqual(body.no_cache, undefined);
-        assert.strictEqual(body["no-cache"], undefined);
-        const extraBody = body.extra_body as Record<string, unknown> | undefined;
-        const cache = extraBody?.cache as Record<string, unknown> | undefined;
-        assert.strictEqual(cache?.["no-cache"], true);
+        assert.deepStrictEqual(body.cache, { "no-cache": true });
+        assert.strictEqual(body.extra_body, undefined);
+        const headers = (requestInit?.headers as Record<string, string>) ?? {};
+        assert.strictEqual(headers["Cache-Control"], undefined, "the fork reads the body directive, not the header");
     });
 
-    test("chat bypasses no_cache for Claude models", async () => {
+    test("chat sends the cache directive for Claude models too", async () => {
         const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
         const fetchStub = sandbox.stub(global, "fetch").resolves({
             ok: true,
@@ -108,13 +100,109 @@ suite("LiteLLM Client Unit Tests", () => {
         const requestInit = args0[1] as RequestInit | undefined;
         const bodyStr = requestInit?.body as string | undefined;
         const body = bodyStr ? (JSON.parse(bodyStr) as Record<string, unknown>) : {};
-        assert.strictEqual(body.no_cache, undefined);
-        assert.strictEqual(body["no-cache"], undefined);
-        assert.strictEqual(body.extra_body, undefined);
-        const headers = (requestInit?.headers as Record<string, string>) ?? {};
-        assert.strictEqual(headers["Cache-Control"], undefined);
+        assert.deepStrictEqual(body.cache, { "no-cache": true }, "the proxy cache is not provider specific");
     });
 
+    test("chat omits the cache directive when caching is enabled", async () => {
+        const client = new LiteLLMClient(config, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch").resolves({
+            ok: true,
+            body: new ReadableStream(),
+        } as Response);
+
+        await client.chat({ model: "gpt-4", messages: [] });
+
+        const requestInit = fetchStub.getCall(0).args[1] as RequestInit | undefined;
+        const bodyStr = requestInit?.body as string | undefined;
+        const body = bodyStr ? (JSON.parse(bodyStr) as Record<string, unknown>) : {};
+        assert.strictEqual(body.cache, undefined);
+    });
+
+    test("a /responses request carries the cache directive too", async () => {
+        const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch").resolves({
+            ok: true,
+            body: new ReadableStream(),
+        } as Response);
+
+        await client.chat({ model: "gpt-4", messages: [{ role: "user", content: "hi" }] }, "responses");
+
+        const url = fetchStub.getCall(0).args[0];
+        assert.strictEqual(url, "http://localhost:4000/responses");
+        const requestInit = fetchStub.getCall(0).args[1] as RequestInit | undefined;
+        const body = JSON.parse(String(requestInit?.body)) as Record<string, unknown>;
+        assert.deepStrictEqual(body.cache, { "no-cache": true }, "the proxy cache is not endpoint specific");
+    });
+
+    test("posts to the normalized base even when the configured URL has an endpoint path", async () => {
+        const client = new LiteLLMClient({ url: "https://p/v1/chat/completions/", key: "k" }, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch").resolves({
+            ok: true,
+            body: new ReadableStream(),
+        } as Response);
+
+        await client.chat({ model: "gpt-4", messages: [] });
+
+        assert.strictEqual(fetchStub.getCall(0).args[0], "https://p/v1/chat/completions");
+    });
+
+    test("cancels the 5xx body before retrying", async () => {
+        const client = new LiteLLMClient(config, userAgent);
+        let cancelled = false;
+        const failingBody = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode("boom"));
+            },
+            cancel() {
+                cancelled = true;
+            },
+        });
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.onCall(0).resolves(new Response(failingBody, { status: 503, statusText: "Service Unavailable" }));
+        fetchStub.onCall(1).resolves(createStreamResponse());
+
+        await client.chat({ model: "gpt-4", messages: [] });
+
+        assert.strictEqual(fetchStub.callCount, 2, "a 5xx is retried");
+        assert.strictEqual(cancelled, true, "the retried response must not keep its body open");
+    });
+
+    test("cancels the 429 body before waiting", async () => {
+        const client = new LiteLLMClient(config, userAgent);
+        let cancelled = false;
+        const rateLimitBody = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode("slow down"));
+            },
+            cancel() {
+                cancelled = true;
+            },
+        });
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.onCall(0).resolves(
+            new Response(rateLimitBody, {
+                status: 429,
+                statusText: "Too Many Requests",
+                headers: { "retry-after": "0.01" },
+            })
+        );
+        fetchStub.onCall(1).resolves(createStreamResponse());
+
+        await client.chat({ model: "gpt-4", messages: [] });
+
+        assert.strictEqual(fetchStub.callCount, 2, "a 429 is retried within the budget");
+        assert.strictEqual(cancelled, true, "the waited-on response must not keep its body open");
+    });
+
+    test("a response with no body throws without logging an error", async () => {
+        // The throw reaches the turn boundary, which records the failure once.
+        const client = new LiteLLMClient(config, userAgent);
+        const errorStub = sandbox.stub(Logger, "error");
+        sandbox.stub(global, "fetch").resolves(new Response(null, { status: 200 }));
+
+        await assert.rejects(() => client.chat({ model: "m", messages: [] }), /No response body/);
+        sinon.assert.notCalled(errorStub);
+    });
     test("getEndpoint resolves correctly", () => {
         const client = new LiteLLMClient(config, userAgent);
         // @ts-expect-error - accessing private method for testing
@@ -125,14 +213,14 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.strictEqual(client.getEndpoint(undefined), "/chat/completions");
     });
 
-    test("chat retries without caching if unsupported parameter error occurs", async () => {
+    test("chat retries once when the proxy refuses the cache directive", async () => {
         const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
 
         const errorResponse = {
             ok: false,
-            status: 400,
-            statusText: "Bad Request",
-            text: async () => "Unsupported parameter: no_cache",
+            status: 403,
+            statusText: "Forbidden",
+            text: async () => "Not allowed to set no-cache as a cache control",
             clone: function () {
                 return this;
             },
@@ -150,29 +238,15 @@ suite("LiteLLM Client Unit Tests", () => {
 
         await client.chat({ model: "gpt-4", messages: [] });
 
-        assert.strictEqual(fetchStub.callCount, 2, "Should have retried");
+        assert.strictEqual(fetchStub.callCount, 2, "a refused directive is retried once");
 
-        // First call should have no_cache
         const firstCallInit = fetchStub.getCall(0).args[1] as RequestInit | undefined;
-        const firstCallBodyStr = firstCallInit?.body as string | undefined;
-        const firstCallBody = firstCallBodyStr ? (JSON.parse(firstCallBodyStr) as Record<string, unknown>) : {};
-        assert.strictEqual(firstCallBody.no_cache, undefined);
-        assert.strictEqual(firstCallBody["no-cache"], undefined);
-        const firstExtraBody = firstCallBody.extra_body as Record<string, unknown> | undefined;
-        const firstCache = firstExtraBody?.cache as Record<string, unknown> | undefined;
-        assert.strictEqual(firstCache?.["no-cache"], true);
-        const firstCallHeaders = (firstCallInit?.headers as Record<string, string>) ?? {};
-        assert.strictEqual(firstCallHeaders["Cache-Control"], "no-cache");
+        const firstCallBody = JSON.parse(String(firstCallInit?.body)) as Record<string, unknown>;
+        assert.deepStrictEqual(firstCallBody.cache, { "no-cache": true });
 
-        // Second call should NOT have no_cache or Cache-Control
         const secondCallInit = fetchStub.getCall(1).args[1] as RequestInit | undefined;
-        const secondCallBodyStr = secondCallInit?.body as string | undefined;
-        const secondCallBody = secondCallBodyStr ? (JSON.parse(secondCallBodyStr) as Record<string, unknown>) : {};
-        assert.strictEqual(secondCallBody.no_cache, undefined);
-        assert.strictEqual(secondCallBody["no-cache"], undefined);
-        assert.strictEqual(secondCallBody.extra_body, undefined);
-        const secondCallHeaders = (secondCallInit?.headers as Record<string, string>) ?? {};
-        assert.strictEqual(secondCallHeaders["Cache-Control"], undefined);
+        const secondCallBody = JSON.parse(String(secondCallInit?.body)) as Record<string, unknown>;
+        assert.strictEqual(secondCallBody.cache, undefined, "the retry omits the refused directive");
     });
 
     test("chat surfaces a rejected model parameter instead of stripping and resending it", async () => {
@@ -205,6 +279,7 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.strictEqual(findRejectedParameter("Unsupported parameter: 'temperature'"), "temperature");
         assert.strictEqual(findRejectedParameter('unknown parameter "top_p"'), "top_p");
         assert.strictEqual(findRejectedParameter("unexpected keyword argument 'stop'"), "stop");
+        assert.strictEqual(findRejectedParameter("extraneous key [cache_control] is not permitted"), "cache_control");
         assert.strictEqual(
             findRejectedParameter('{"error":{"message":"Unsupported parameter: temperature","param":"temperature"}}'),
             "temperature"
@@ -225,11 +300,13 @@ suite("LiteLLM Client Unit Tests", () => {
     test("isUnsupportedParameterError only matches parameter-rejection bodies", () => {
         assert.strictEqual(isUnsupportedParameterError("Unsupported parameter: temperature"), true);
         assert.strictEqual(isUnsupportedParameterError("Extra inputs are not permitted"), true);
+        assert.strictEqual(isUnsupportedParameterError("extraneous key [cache_control] is not permitted"), true);
         assert.strictEqual(isUnsupportedParameterError("Maximum context length exceeded"), false);
     });
 
-    test("chat strips the cache-bypass flag and header when the backend rejects them", async () => {
-        const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
+    test("chat strips the cache directive on a 400 that names it as an unknown parameter", async () => {
+        const onUnsupportedParameter = sandbox.stub();
+        const client = new LiteLLMClient({ ...config, disableCaching: true, onUnsupportedParameter }, userAgent);
 
         const errorResponse = {
             ok: false,
@@ -251,23 +328,15 @@ suite("LiteLLM Client Unit Tests", () => {
         fetchStub.onCall(0).resolves(errorResponse as unknown as Response);
         fetchStub.onCall(1).resolves(successResponse as unknown as Response);
 
-        // The connector adds exactly this shape when caching is disabled.
-        await client.chat({ model: "gpt-4", messages: [], extra_body: { cache: { "no-cache": true } } });
+        await client.chat({ model: "gpt-4", messages: [] });
 
-        assert.strictEqual(fetchStub.callCount, 2);
-
-        const firstCallInit = fetchStub.getCall(0).args[1] as RequestInit | undefined;
-        const firstCallBody = JSON.parse(String(firstCallInit?.body)) as Record<string, unknown>;
-        const firstExtraBody = firstCallBody.extra_body as Record<string, unknown> | undefined;
-        const firstCache = firstExtraBody?.cache as Record<string, unknown> | undefined;
-        assert.strictEqual(firstCache?.["no-cache"], true);
+        assert.strictEqual(fetchStub.callCount, 2, "a rejected directive is retried once");
 
         const retryCallInit = fetchStub.getCall(1).args[1] as RequestInit | undefined;
         const retryCallBody = JSON.parse(String(retryCallInit?.body)) as Record<string, unknown>;
-        assert.strictEqual(retryCallBody.extra_body, undefined);
+        assert.strictEqual(retryCallBody.cache, undefined);
 
-        const retryHeaders = (retryCallInit?.headers as Record<string, string>) ?? {};
-        assert.strictEqual(retryHeaders["Cache-Control"], undefined);
+        sinon.assert.calledWith(onUnsupportedParameter, "gpt-4", "cache");
     });
 
     test("chat strips a rejected cache_control marker and records the incompatibility", async () => {
@@ -437,6 +506,82 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.strictEqual(fetchStub.getCall(1).args[0], "http://localhost:4000/model/info");
     });
 
+    test("getModelInfo names the URL it will try next in its fallback warning", async () => {
+        const warnStub = sandbox.stub(Logger, "warn");
+        const client = new LiteLLMClient({ url: "http://localhost:4000/v1", key: "test-key" }, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.onCall(0).resolves({ ok: false, status: 404, statusText: "Not Found" } as unknown as Response);
+        fetchStub.onCall(1).resolves({
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            json: sandbox.stub().resolves({ data: [] }),
+        } as unknown as Response);
+
+        await client.getModelInfo();
+
+        const fallbackWarnings = warnStub
+            .getCalls()
+            .filter((call) => String(call.args[0]).includes("trying fallback URL"))
+            .map((call) => String(call.args[0]));
+        assert.deepStrictEqual(fallbackWarnings, [
+            "Model info endpoint returned 404, trying fallback URL: http://localhost:4000/model/info",
+        ]);
+    });
+
+    test("getModelInfo cancels the 404 body before trying the next URL", async () => {
+        const client = new LiteLLMClient({ url: "http://localhost:4000/v1", key: "test-key" }, userAgent);
+        const cancel = sandbox.stub().resolves();
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.onCall(0).resolves({
+            ok: false,
+            status: 404,
+            statusText: "Not Found",
+            body: { cancel },
+        } as unknown as Response);
+        fetchStub.onCall(1).resolves({
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            json: sandbox.stub().resolves({ data: [] }),
+        } as unknown as Response);
+
+        await client.getModelInfo();
+
+        sinon.assert.calledOnce(cancel);
+    });
+
+    test("getModelInfo cancels the failing body before throwing", async () => {
+        const client = new LiteLLMClient(config, userAgent);
+        const cancel = sandbox.stub().resolves();
+
+        sandbox.stub(global, "fetch").resolves({
+            ok: false,
+            status: 500,
+            statusText: "Internal Server Error",
+            body: { cancel },
+        } as unknown as Response);
+
+        await assert.rejects(() => client.getModelInfo(), LiteLLMDiscoveryError);
+
+        sinon.assert.calledOnce(cancel);
+    });
+
+    test("chat consumes the rejected body before the strip-and-retry", async () => {
+        const client = new LiteLLMClient({ ...config, disableCaching: true }, userAgent);
+        const rejection = new Response("Not allowed to set no-cache as a cache control", {
+            status: 403,
+            statusText: "Forbidden",
+        });
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.onCall(0).resolves(rejection);
+        fetchStub.onCall(1).resolves(createStreamResponse());
+
+        await client.chat({ model: "gpt-4", messages: [] });
+
+        assert.strictEqual(rejection.bodyUsed, true, "the rejection body must be read, not left open");
+    });
+
     test("getModelInfo throws with status details when response is not ok", async () => {
         const client = new LiteLLMClient(config, userAgent);
 
@@ -472,6 +617,26 @@ suite("LiteLLM Client Unit Tests", () => {
                 err.message.includes("Failed to fetch model info")
         );
         assert.ok(fetchStub.callCount > 1, "every candidate URL is tried before giving up");
+    });
+
+    test("getModelInfo does not promise a fallback when none remains", async () => {
+        const warnStub = sandbox.stub(Logger, "warn");
+        const client = new LiteLLMClient({ url: "http://localhost:4000", key: "test-key" }, userAgent);
+        sandbox.stub(global, "fetch").resolves({
+            ok: false,
+            status: 404,
+            statusText: "Not Found",
+        } as unknown as Response);
+
+        await assert.rejects(
+            () => client.getModelInfo(),
+            (err: unknown) => err instanceof LiteLLMDiscoveryError && err.status === 404
+        );
+
+        const fallbackWarnings = warnStub
+            .getCalls()
+            .filter((call) => String(call.args[0]).includes("trying fallback URL"));
+        assert.deepStrictEqual(fallbackWarnings, [], "a base URL without a fallback promises none");
     });
 
     test("chat does not resend a body when the rejection names nothing strippable", async () => {
@@ -550,6 +715,42 @@ suite("LiteLLM Client Unit Tests", () => {
         assert.strictEqual(abortSignal?.aborted, true);
     });
 
+    test("getModelInfo rejects with the discovery timeout when the body stalls after the headers", async () => {
+        const client = new LiteLLMClient({ ...config, discoveryTimeoutMs: 10 }, userAgent);
+        sandbox.stub(global, "fetch").callsFake(async (_input: string | URL | Request, init?: RequestInit) => {
+            const signal = init?.signal as AbortSignal | undefined;
+            const body = new ReadableStream({
+                start(controller) {
+                    // Abort reaches the body only through the signal, exactly as a
+                    // real fetch streams it, so the read stays pending until it fires.
+                    signal?.addEventListener("abort", () => controller.error(new Error("aborted")));
+                },
+            });
+            return new Response(body, { status: 200, statusText: "OK" });
+        });
+
+        await assert.rejects(() => client.getModelInfo(), /discovery timeout after 10ms/);
+    });
+
+    test("getModelInfo disposes its cancellation registration when the request settles", async () => {
+        const dispose = sinon.spy();
+        const token = {
+            onCancellationRequested: () => ({ dispose }),
+        } as unknown as vscode.CancellationToken;
+        const client = new LiteLLMClient(config, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch");
+
+        fetchStub.resolves(new Response(JSON.stringify({ data: [] }), { status: 200, statusText: "OK" }));
+        await client.getModelInfo(token);
+
+        assert.strictEqual(dispose.callCount, 1);
+
+        fetchStub.resolves(new Response("boom", { status: 500, statusText: "Internal Server Error" }));
+        await assert.rejects(() => client.getModelInfo(token));
+
+        assert.strictEqual(dispose.callCount, 2);
+    });
+
     test("fetchWithRetry retries on 429 with backoff", async () => {
         const client = new LiteLLMClient(config, userAgent);
         const fetchStub = sandbox.stub(global, "fetch");
@@ -583,6 +784,80 @@ suite("LiteLLM Client Unit Tests", () => {
         await client.chat({ model: "m", messages: [] });
 
         assert.strictEqual(fetchStub.callCount, 2);
+    });
+
+    test("does not retry a connection failure inside the client", async () => {
+        // The provider owns network retries: only it knows whether the failed
+        // attempt produced output, so only it can decide resend versus resume.
+        const client = new LiteLLMClient(config, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch").rejects(new TypeError("fetch failed"));
+
+        await assert.rejects(() => client.chat({ model: "m", messages: [] }), /fetch failed/);
+
+        assert.strictEqual(fetchStub.callCount, 1, "one wire call, and the provider decides whether to retry");
+    });
+
+    test("retries a 5xx response twice and then surfaces it", async () => {
+        // The client is the only layer that retries a 5xx.
+        const client = new LiteLLMClient(config, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch");
+        fetchStub.callsFake(async () => new Response("boom", { status: 503, statusText: "Service Unavailable" }));
+
+        await assert.rejects(() => client.chat({ model: "m", messages: [] }), LiteLLMApiError);
+
+        assert.strictEqual(fetchStub.callCount, 3, "one attempt plus two 5xx retries");
+    });
+
+    test("aborts the attempt and reports a headers timeout when the proxy never answers", async () => {
+        const client = new LiteLLMClient({ ...config, headersTimeoutMs: 5 }, userAgent);
+        const fetchStub = sandbox.stub(global, "fetch").callsFake(
+            (_input: string | URL | Request, init?: RequestInit) =>
+                new Promise<Response>((_resolve, reject) => {
+                    init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+                })
+        );
+
+        await assert.rejects(() => client.chat({ model: "m", messages: [] }), HeadersTimeoutError);
+
+        assert.strictEqual(fetchStub.callCount, 1, "the headers timeout is the client's last word");
+    });
+
+    test("keeps a user cancellation distinct from a headers timeout", async () => {
+        const client = new LiteLLMClient({ ...config, headersTimeoutMs: 5_000 }, userAgent);
+        sandbox.stub(global, "fetch").callsFake(
+            (_input: string | URL | Request, init?: RequestInit) =>
+                new Promise<Response>((_resolve, reject) => {
+                    init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+                })
+        );
+        const emitter = new vscode.EventEmitter<void>();
+        const token = {
+            isCancellationRequested: false,
+            onCancellationRequested: emitter.event,
+        } as vscode.CancellationToken;
+
+        const request = client.chat({ model: "m", messages: [] }, undefined, token);
+        emitter.fire();
+
+        await assert.rejects(() => request, /Operation cancelled by user/);
+    });
+
+    test("does not abort a response whose headers already arrived", async () => {
+        // The timer is armed on the controller that also governs the body, so a
+        // timer left running would abort a healthy stream once the header bound
+        // passed. The 300 s default hides that, which is why this test sets 5 ms.
+        const client = new LiteLLMClient({ ...config, headersTimeoutMs: 5 }, userAgent);
+        let capturedSignal: AbortSignal | undefined;
+        sandbox.stub(global, "fetch").callsFake((_input: string | URL | Request, init?: RequestInit) => {
+            capturedSignal = init?.signal ?? undefined;
+            return Promise.resolve(new Response(new ReadableStream(), { status: 200, statusText: "OK" }));
+        });
+
+        await client.chat({ model: "m", messages: [] });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        assert.ok(capturedSignal, "the request must carry a signal");
+        assert.strictEqual(capturedSignal.aborted, false, "the header timer must not outlive the headers");
     });
 
     test("rateLimitMaxDelayMs=0 disables 429 retries inside fetchWithRateLimit", async () => {
@@ -761,7 +1036,7 @@ suite("LiteLLM Client Unit Tests", () => {
         fetchStub.onCall(1).callsFake(async () => createStreamResponse());
         const warnStub = sandbox.stub(StructuredLogger, "warn");
 
-        await client.chat({ model: "m", messages: [] }, "chat", undefined, undefined, "req-123");
+        await client.chat({ model: "m", messages: [] }, "chat", undefined, "req-123");
 
         sinon.assert.calledWithExactly(
             warnStub,
@@ -778,7 +1053,7 @@ suite("LiteLLM Client Unit Tests", () => {
         fetchStub.onCall(1).callsFake(async () => createStreamResponse());
         const warnStub = sandbox.stub(Logger, "warn");
 
-        await client.chat({ model: "m", messages: [] }, "chat", undefined, undefined, "req-123");
+        await client.chat({ model: "m", messages: [] }, "chat", undefined, "req-123");
 
         sinon.assert.calledWith(
             warnStub,
@@ -815,40 +1090,6 @@ suite("LiteLLM Client Unit Tests", () => {
 
         await assert.rejects(() => client.chat({ model: "m", messages: [] }));
         assert.strictEqual(fetchStub.callCount, 1);
-    });
-
-    test("checkConnection handles empty or invalid data", async () => {
-        const client = new LiteLLMClient(config, userAgent);
-        sandbox.stub(client, "getModelInfo").resolves({
-            data: [] as { model_name?: string; model_info?: LiteLLMModelInfo }[],
-        } as unknown as LiteLLMModelInfoResponse);
-
-        const res = await client.checkConnection();
-        assert.strictEqual(res.modelCount, 0);
-        assert.deepStrictEqual(res.sampleModelIds, []);
-    });
-
-    test("checkConnection extracts model IDs correctly", async () => {
-        const client = new LiteLLMClient(config, userAgent);
-        sandbox.stub(client, "getModelInfo").resolves({
-            data: [{ model_name: "m1", model_info: { key: "k1" } }, { model_name: "m2" }, {}],
-        } as unknown as LiteLLMModelInfoResponse);
-
-        const res = await client.checkConnection();
-        assert.strictEqual(res.modelCount, 3);
-        assert.deepStrictEqual(res.sampleModelIds, ["k1", "m2", "unknown"]);
-    });
-
-    test("countTokens handles non-OK response", async () => {
-        const client = new LiteLLMClient(config, userAgent);
-        sandbox.stub(global, "fetch").resolves({
-            ok: false,
-            status: 400,
-            statusText: "Bad Request",
-            text: async () => "detailed error",
-        } as Response);
-
-        await assert.rejects(() => client.countTokens({ model: "m", prompt: "p" }), /Failed to count tokens/);
     });
 
     test("chat handles missing response body", async () => {

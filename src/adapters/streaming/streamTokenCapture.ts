@@ -6,11 +6,15 @@ import type {
     OpenAIUsagePayload,
     OpenAIUsagePromptTokenDetails,
 } from "../../types";
-import { calculateRequestCost, extractPricing, type RequestCost } from "../../utils/pricingCalculator";
+import { calculateRequestCost, extractPricing, normalizeCost, type RequestCost } from "../../utils/pricingCalculator";
 
 /**
- * Snapshot of all tracked token counts for a single request.
- * Values prefer upstream usage when available; fall back to internal counting.
+ * Snapshot of the tracked token counts. Values prefer upstream usage when available
+ * and fall back to internal counting.
+ *
+ * {@link StreamTokenCapture.getSnapshot} describes one attempt, which is what a usage
+ * part forwarded to the host carries because the host reads it for context size.
+ * {@link StreamTokenCapture.getSpendSnapshot} describes the whole request.
  */
 export interface TokenSnapshot {
     // Input side
@@ -20,7 +24,18 @@ export interface TokenSnapshot {
     systemPromptTokens: number;
 
     // Output side
+    /**
+     * The upstream `completion_tokens` when the gateway reported one, otherwise
+     * the local estimate of the text buffer, which includes thinking. An
+     * upstream count also covers tool-call output; the local estimate does not.
+     */
     completionTokens: number;
+    /**
+     * Output tokens the request produced. Upstream `completion_tokens` when the
+     * gateway reported it, otherwise the local estimate of text plus tool-call
+     * tokens.
+     */
+    outputTokens: number;
     reasoningTokens: number;
     toolTokens: number;
     acceptedPredictionTokens: number;
@@ -29,7 +44,7 @@ export interface TokenSnapshot {
     // Metadata
     sawUpstreamUsage: boolean;
 
-    // Pricing-aware cost estimation (USD). Zero when pricing unavailable.
+    // Pricing-aware cost estimation in USD. The fields are absent when the model declares no rates.
     estimatedInputCost?: number;
     estimatedOutputCost?: number;
     estimatedTotalCost?: number;
@@ -45,21 +60,39 @@ export interface TokenSnapshot {
  *   const capture = new StreamTokenCapture(modelId, innerProgress, modelInfo);
  *   // pass capture.progress wherever you'd pass progress
  *   await sendRequest(..., capture.progress, ...);
- *   const snapshot = capture.getSnapshot();
+ *   const spend = capture.getSpendSnapshot();
  */
 export class StreamTokenCapture {
     private readonly _inner: vscode.Progress<vscode.LanguageModelResponsePart>;
-    private _modelId: string;
-    private _modelInfo?: LiteLLMModelInfo;
-    private _pricing: ReturnType<typeof extractPricing>;
+    private readonly _modelId: string;
+    private readonly _modelInfo?: LiteLLMModelInfo;
+    private readonly _pricing: ReturnType<typeof extractPricing>;
 
     // Accumulated internal counts (populated during streaming)
     private _textBuffer = "";
     private _reasoningBuffer = "";
     private _toolCallTokens = 0;
 
-    // Upstream usage (from DataPart or response.completed)
+    // Upstream usage (from a DataPart, `response.completed`, or `response.incomplete`)
     private _sawUpstreamUsage = false;
+    /** Spend of the attempts this request replaced, folded in before each reset. */
+    private readonly _spent = {
+        promptTokens: 0,
+        completionTokens: 0,
+        outputTokens: 0,
+        toolTokens: 0,
+        cachedTokens: 0,
+        cacheCreationInputTokens: 0,
+        reasoningTokens: 0,
+        acceptedPredictionTokens: 0,
+        rejectedPredictionTokens: 0,
+        inputCost: 0,
+        outputCost: 0,
+    };
+    /** Whether any attempt this request replaced reported upstream usage. */
+    private _spentSawUpstreamUsage = false;
+    /** Set when the attempt the turn ended on was never billed by the proxy. */
+    private _lastAttemptUnbilled = false;
     private _upstream?: OpenAIUsagePayload;
 
     // Pre-computed input token estimates (set by caller before request)
@@ -79,12 +112,6 @@ export class StreamTokenCapture {
         this._inner = inner;
         this._modelInfo = modelInfo;
         this._pricing = extractPricing(modelInfo);
-    }
-
-    public setModelInfo(modelId: string, modelInfo?: LiteLLMModelInfo): void {
-        this._modelInfo = modelInfo;
-        this._pricing = extractPricing(modelInfo);
-        this._modelId = modelId;
     }
 
     setEstimatedPromptTokens(count: number): void {
@@ -108,12 +135,37 @@ export class StreamTokenCapture {
     }
 
     /**
-     * Drops the token accounting accumulated for a partial response so a
-     * resumed attempt starts from a clean estimator state. The already-emitted
-     * parts stay counted in the request's input-token baseline on the next
-     * round (VS Code rebuilds history), so keeping them here would double-count.
+     * Ends the accounting for an attempt a retry replaces, so the next attempt starts
+     * from a clean estimator state.
+     *
+     * The proxy bills the replaced attempt too, so its spend is folded into the request
+     * totals that {@link getSpendSnapshot} reports. Keeping that accounting here would
+     * count it again, and a resume would also carry the streamed text in its own prompt.
+     *
+     * The prompt side is folded only when the attempt reached the proxy. A connect-phase
+     * failure never reached it, so that attempt's prompt count is the connector's own
+     * estimate and folding it would price a request that never happened. The folded total
+     * cost is derived from the folded sides, so the estimate cannot reappear inside it.
      */
-    resetAccumulation(): void {
+    resetAccumulation(options: { readonly reachedProxy: boolean }): void {
+        const replaced = this.getSnapshot();
+        const inputCost = options.reachedProxy ? (replaced.estimatedInputCost ?? 0) : 0;
+        const outputCost = replaced.estimatedOutputCost ?? 0;
+        if (options.reachedProxy) {
+            this._spent.promptTokens += replaced.promptTokens;
+            this._spent.cachedTokens += replaced.cachedTokens;
+            this._spent.cacheCreationInputTokens += replaced.cacheCreationInputTokens;
+            this._spent.inputCost += inputCost;
+        }
+        this._spent.completionTokens += replaced.completionTokens;
+        this._spent.outputTokens += replaced.outputTokens;
+        this._spent.reasoningTokens += replaced.reasoningTokens;
+        this._spentSawUpstreamUsage ||= replaced.sawUpstreamUsage;
+        this._spent.toolTokens += replaced.toolTokens;
+        this._spent.acceptedPredictionTokens += replaced.acceptedPredictionTokens;
+        this._spent.rejectedPredictionTokens += replaced.rejectedPredictionTokens;
+        this._spent.outputCost += outputCost;
+
         this._textBuffer = "";
         this._reasoningBuffer = "";
         this._toolCallTokens = 0;
@@ -121,6 +173,62 @@ export class StreamTokenCapture {
         this._upstream = undefined;
     }
 
+    /**
+     * Ends the last attempt as one the proxy never billed.
+     *
+     * A connect-phase failure never arrived, and any 4xx the proxy answered is recorded at
+     * zero cost, because the proxy prices only a request that streamed. The request totals
+     * then drop the attempt's prompt tokens, cache tokens and input cost, so a call the
+     * proxy never charged is not billed.
+     *
+     * Call it once, after the last attempt: {@link resetAccumulation} does not clear the
+     * flag, so a later attempt would inherit a zeroed prompt.
+     */
+    endAttemptUnbilled(): void {
+        this._lastAttemptUnbilled = true;
+    }
+
+    /**
+     * The request's totals: the last attempt plus every attempt it replaced.
+     *
+     * A retried turn is billed for each attempt the proxy ran, so this is what the
+     * metrics, the final usage line and the transcript record. `systemPromptTokens`
+     * stays a context value, because it measures the prompt rather than spend.
+     *
+     * An attempt a retry replaced contributes its prompt only when it reached the proxy.
+     * An attempt the provider marked unbilled with {@link endAttemptUnbilled} contributes
+     * no prompt tokens, cache tokens or input cost, because the proxy recorded no cost for
+     * it.
+     */
+    getSpendSnapshot(): TokenSnapshot {
+        const last = this.getSnapshot();
+        const lastPromptTokens = this._lastAttemptUnbilled ? 0 : last.promptTokens;
+        const lastCachedTokens = this._lastAttemptUnbilled ? 0 : last.cachedTokens;
+        const lastCacheCreationTokens = this._lastAttemptUnbilled ? 0 : last.cacheCreationInputTokens;
+        const lastInputCost = this._lastAttemptUnbilled ? 0 : (last.estimatedInputCost ?? 0);
+        const lastOutputCost = last.estimatedOutputCost ?? 0;
+        const hasCost = last.estimatedInputCost !== undefined || last.estimatedOutputCost !== undefined;
+        return {
+            ...last,
+            promptTokens: lastPromptTokens + this._spent.promptTokens,
+            completionTokens: last.completionTokens + this._spent.completionTokens,
+            outputTokens: last.outputTokens + this._spent.outputTokens,
+            toolTokens: last.toolTokens + this._spent.toolTokens,
+            reasoningTokens: last.reasoningTokens + this._spent.reasoningTokens,
+            acceptedPredictionTokens: last.acceptedPredictionTokens + this._spent.acceptedPredictionTokens,
+            rejectedPredictionTokens: last.rejectedPredictionTokens + this._spent.rejectedPredictionTokens,
+            cachedTokens: lastCachedTokens + this._spent.cachedTokens,
+            cacheCreationInputTokens: lastCacheCreationTokens + this._spent.cacheCreationInputTokens,
+            sawUpstreamUsage: last.sawUpstreamUsage || this._spentSawUpstreamUsage,
+            estimatedInputCost: hasCost ? normalizeCost(lastInputCost + this._spent.inputCost) : undefined,
+            estimatedOutputCost: hasCost ? normalizeCost(lastOutputCost + this._spent.outputCost) : undefined,
+            estimatedTotalCost: hasCost
+                ? normalizeCost(lastInputCost + lastOutputCost + this._spent.inputCost + this._spent.outputCost)
+                : undefined,
+        };
+    }
+
+    /** This attempt's counts, before the replaced attempts are folded in. */
     getSnapshot(): TokenSnapshot {
         const hasUpstream = this._sawUpstreamUsage && this._upstream !== undefined;
         const promptDetails: OpenAIUsagePromptTokenDetails | undefined = this._upstream?.prompt_tokens_details;
@@ -128,7 +236,6 @@ export class StreamTokenCapture {
             this._upstream?.completion_tokens_details;
 
         const snapshot: TokenSnapshot = {
-            // Input: prefer upstream, fall back to pre-computed estimate
             promptTokens: this._upstream?.prompt_tokens ?? this._estimatedPromptTokens,
             cachedTokens: promptDetails?.cached_tokens ?? 0,
             cacheCreationInputTokens: promptDetails?.cache_creation_input_tokens ?? 0,
@@ -137,6 +244,7 @@ export class StreamTokenCapture {
             // Output: prefer upstream, fall back to internal accumulation
             completionTokens:
                 this._upstream?.completion_tokens ?? countTokens(this._textBuffer, this._modelId, this._modelInfo),
+            outputTokens: this._resolveOutputTokens(),
             reasoningTokens:
                 completionDetails?.reasoning_tokens ??
                 countTokens(this._reasoningBuffer, this._modelId, this._modelInfo),
@@ -149,9 +257,11 @@ export class StreamTokenCapture {
 
         const cost: RequestCost = calculateRequestCost({
             promptTokens: snapshot.promptTokens,
-            completionTokens: snapshot.completionTokens,
+            completionTokens: snapshot.outputTokens,
             cachedTokens: snapshot.cachedTokens,
             cacheCreationInputTokens: snapshot.cacheCreationInputTokens,
+            cacheCreation5mTokens: promptDetails?.cache_creation_token_details?.ephemeral_5m_input_tokens,
+            cacheCreation1hTokens: promptDetails?.cache_creation_token_details?.ephemeral_1h_input_tokens,
             pricing: this._pricing,
         });
         if (this._pricing) {
@@ -164,11 +274,23 @@ export class StreamTokenCapture {
     }
 
     /**
+     * Output tokens for a request. The text buffer already holds the thinking
+     * text, so the local estimate adds the tool-call tokens only and reasoning
+     * is not counted twice.
+     */
+    private _resolveOutputTokens(): number {
+        if (typeof this._upstream?.completion_tokens === "number") {
+            return this._upstream.completion_tokens;
+        }
+        return countTokens(this._textBuffer, this._modelId, this._modelInfo) + this._toolCallTokens;
+    }
+
+    /**
      * Emits a usage DataPart to VS Code if no upstream usage was seen during streaming.
      * This ensures usage data is always reported, even for providers that don't send
      * usage in their streaming response.
      *
-     * Should be called after the stream completes and before getSnapshot().
+     * Should be called after the stream completes and before the snapshot is read.
      */
     flushUsage(): void {
         if (this._sawUpstreamUsage) {
@@ -179,16 +301,12 @@ export class StreamTokenCapture {
         // Build usage payload from accumulated counts
         const snapshot = this.getSnapshot();
 
-        // Don't emit usage if there's no meaningful token usage (empty stream)
-        // Check if any actual tokens were generated (not just estimated prompt tokens)
-        if (snapshot.completionTokens === 0 && snapshot.toolTokens === 0 && snapshot.reasoningTokens === 0) {
-            // No output tokens generated, don't emit usage
+        // An empty stream has no usage to report; prompt tokens are only an estimate.
+        if (snapshot.outputTokens === 0) {
             return;
         }
 
-        // For completion_tokens, use the max of text tokens and tool tokens
-        // This handles cases where only tool calls are streamed (no text)
-        const completionTokens = Math.max(snapshot.completionTokens, snapshot.toolTokens);
+        const completionTokens = snapshot.outputTokens;
 
         const usagePayload: OpenAIUsagePayload = {
             prompt_tokens: snapshot.promptTokens,
@@ -281,7 +399,7 @@ export class StreamTokenCapture {
 
     private _handleUsageDataPart(part: vscode.LanguageModelDataPart): void {
         try {
-            const parsed = JSON.parse(Buffer.from(part.data).toString("utf-8")) as OpenAIUsagePayload;
+            const parsed = JSON.parse(new TextDecoder().decode(part.data)) as OpenAIUsagePayload;
             this._sawUpstreamUsage = true;
 
             // Monotonic merge: when upstream sends multiple usage frames (e.g. mid-stream
@@ -300,8 +418,7 @@ export class StreamTokenCapture {
             }
 
             const promptDetails: OpenAIUsagePromptTokenDetails | undefined = this._upstream.prompt_tokens_details;
-            const completionCount =
-                this._upstream.completion_tokens ?? countTokens(this._textBuffer, this._modelId, this._modelInfo);
+            const completionCount = this._resolveOutputTokens();
             const promptCount = this._upstream.prompt_tokens ?? this._estimatedPromptTokens;
 
             const enriched: OpenAIUsagePayload = {
@@ -321,6 +438,10 @@ export class StreamTokenCapture {
                 completionTokens: enriched.completion_tokens ?? 0,
                 cachedTokens: enriched.prompt_tokens_details?.cached_tokens ?? 0,
                 cacheCreationInputTokens: enriched.prompt_tokens_details?.cache_creation_input_tokens ?? 0,
+                cacheCreation5mTokens:
+                    enriched.prompt_tokens_details?.cache_creation_token_details?.ephemeral_5m_input_tokens,
+                cacheCreation1hTokens:
+                    enriched.prompt_tokens_details?.cache_creation_token_details?.ephemeral_1h_input_tokens,
                 pricing: this._pricing,
             });
             enriched.estimated_input_cost = cost.inputCost;
@@ -350,6 +471,14 @@ export class StreamTokenCapture {
 
         const promptTokens = pick(prev.prompt_tokens, next.prompt_tokens) ?? 0;
         const completionTokens = pick(prev.completion_tokens, next.completion_tokens) ?? 0;
+        const cacheCreation5mTokens = pick(
+            prev.prompt_tokens_details?.cache_creation_token_details?.ephemeral_5m_input_tokens,
+            next.prompt_tokens_details?.cache_creation_token_details?.ephemeral_5m_input_tokens
+        );
+        const cacheCreation1hTokens = pick(
+            prev.prompt_tokens_details?.cache_creation_token_details?.ephemeral_1h_input_tokens,
+            next.prompt_tokens_details?.cache_creation_token_details?.ephemeral_1h_input_tokens
+        );
 
         return {
             prompt_tokens: promptTokens,
@@ -365,6 +494,16 @@ export class StreamTokenCapture {
                     prev.prompt_tokens_details?.cache_creation_input_tokens,
                     next.prompt_tokens_details?.cache_creation_input_tokens
                 ),
+                // The tiers are priced separately, so the split has to survive a
+                // second usage frame; without it every cache write is billed at the
+                // five-minute rate.
+                cache_creation_token_details:
+                    cacheCreation5mTokens === undefined && cacheCreation1hTokens === undefined
+                        ? undefined
+                        : {
+                              ephemeral_5m_input_tokens: cacheCreation5mTokens,
+                              ephemeral_1h_input_tokens: cacheCreation1hTokens,
+                          },
             },
             completion_tokens_details: {
                 reasoning_tokens: pick(

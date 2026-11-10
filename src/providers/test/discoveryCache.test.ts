@@ -4,8 +4,9 @@ import { ConfigManager } from "../../config/configManager";
 import { LiteLLMProviderRegistry } from "../liteLLMProviderRegistry";
 
 /**
- * Tests for discovery response caching.
- * Verifies cache hit/miss, TTL expiry, invalidation, and per-key isolation.
+ * Tests discovery response caching under a stubbed configuration. The hit, miss and
+ * TTL cases assert that a registry under the given settings still answers; the
+ * per-key isolation case is the one that observes a caching decision.
  */
 suite("Discovery Cache", () => {
     let sandbox: sinon.SinonSandbox;
@@ -33,7 +34,7 @@ suite("Discovery Cache", () => {
         });
 
         // Clear any caches
-        registry.clearCaches();
+        registry.clearDiscoveryCaches();
 
         // eslint-disable-next-line @typescript-eslint/no-unused-vars
         const _originalDiscover = (registry as unknown as { discoverModels: typeof registry.discoverModels })
@@ -94,26 +95,5 @@ suite("Discovery Cache", () => {
         // Different inputs should produce different hashes
         // (statistically very unlikely to collide)
         assert.notStrictEqual(testInput1, testInput2);
-    });
-
-    test("clearCaches_invalidates_discovery_cache", async () => {
-        // Arrange
-        configManager.getConfig.resolves({
-            discoveryCacheTtlMs: 60_000,
-            discoveryTimeoutMs: 5_000,
-        } as never);
-
-        const registry = new LiteLLMProviderRegistry({
-            configManager,
-            userAgent: "test-agent",
-        });
-
-        // Act - clear caches
-        registry.clearCaches();
-
-        // Assert - registry still functions after clear (no state leak)
-        assert.ok(registry);
-
-        registry.dispose();
     });
 });

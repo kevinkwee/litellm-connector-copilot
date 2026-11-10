@@ -4,16 +4,33 @@ import type {
     LiteLLMModelInfoResponse,
     OpenAIChatCompletionRequest,
     LiteLLMResponsesRequest,
-    LiteLLMModelInfo,
-    LiteLLMTokenCounterRequest,
-    LiteLLMTokenCounterResponse,
 } from "../types";
 import { transformToResponsesFormat } from "./responsesAdapter";
 import { StructuredLogger } from "../observability/structuredLogger";
 import { Logger } from "../utils/logger";
-import { isAnthropicModel } from "../utils/modelUtils";
-import { planRateLimitRetry, type RateLimitFailure, type RateLimitWaitSource } from "../utils/rateLimitRetryPolicy";
-import { LiteLLMTelemetry } from "../utils/telemetry";
+import {
+    planRateLimitRetry,
+    RateLimitWaitLedger,
+    type RateLimitFailure,
+    type RateLimitWaitSource,
+} from "../utils/rateLimitRetryPolicy";
+import { normalizeProxyBaseUrl } from "../utils/proxyBaseUrl";
+import { HeadersTimeoutError } from "../utils/transportRetry";
+
+/**
+ * Reads the `code` an error's cause carries. undici reports its own timeouts this
+ * way, and the property is not part of any error type.
+ */
+function readCauseCode(err: unknown): unknown {
+    if (!(err instanceof Error)) {
+        return undefined;
+    }
+    const cause: unknown = err.cause;
+    if (typeof cause !== "object" || cause === null || !("code" in cause)) {
+        return undefined;
+    }
+    return cause.code;
+}
 
 /**
  * Error thrown when a /model/info discovery request times out.
@@ -67,6 +84,8 @@ interface RateLimitFetchOptions {
     /** Ties the retry logs to the provider's request logs. */
     readonly requestId?: string;
     readonly token?: vscode.CancellationToken;
+    /** Waits already taken by this provider attempt, shared by every resend. */
+    readonly ledger: RateLimitWaitLedger;
 }
 
 interface RateLimitRetryLogEntry {
@@ -83,6 +102,7 @@ const UNSUPPORTED_PARAMETER_PHRASES = [
     "unrecognized request argument",
     "unexpected keyword argument",
     "extra inputs are not permitted",
+    "extraneous key",
     "does not support parameter",
 ];
 
@@ -101,19 +121,38 @@ export function isUnsupportedParameterError(bodyText: string): boolean {
  */
 export function findRejectedParameter(bodyText: string): string | undefined {
     const phrase =
-        /(?:unsupported|unknown|unrecognized|unexpected|invalid|extra|does\s+not\s+support)\s+(?:keyword\s+)?(?:parameter|argument|request argument|inputs?|keys?)s?(?:\s+supplied)?\s*/i;
+        /(?:unsupported|unknown|unrecognized|unexpected|invalid|extraneous|extra|does\s+not\s+support)\s+(?:keyword\s+)?(?:parameter|argument|request argument|inputs?|keys?)s?(?:\s+supplied)?\s*/i;
     const rest = bodyText.match(phrase);
     if (!rest || rest.index === undefined) {
         return undefined;
     }
     const afterPhrase = bodyText.slice(rest.index + rest[0].length);
     // Accepted shapes: `: temperature`, `: ['temperature']`, `: {'temperature': ...}`,
-    // `'temperature'`. Anything else (for example "Unsupported parameter for this
-    // model") names no parameter, and guessing one would mislead the user.
+    // `'temperature'`, and Bedrock's `[temperature]`. Anything else (for example
+    // "Unsupported parameter for this model") names no parameter, and guessing one
+    // would mislead the user.
+    // A name may carry dots (`stream_options.include_usage`) but cannot end with one:
+    // the proxy appends ". Received Model Group=..." to relayed provider errors.
+    const name = String.raw`[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*`;
     const named = afterPhrase.match(
-        /^(?:[:=]\s*['"`]?([A-Za-z0-9_.-]+)|[:=]\s*\[\s*['"`]([A-Za-z0-9_.-]+)|[:=]\s*\{\s*['"`]([A-Za-z0-9_.-]+)|['"`]([A-Za-z0-9_.-]+))/
+        new RegExp(
+            String.raw`^(?:[:=]\s*['"\`]?(${name})|[:=]\s*\[\s*['"\`](${name})|[:=]\s*\{\s*['"\`](${name})|['"\`](${name})|\[(${name})\])`
+        )
     );
-    return named?.[1] ?? named?.[2] ?? named?.[3] ?? named?.[4];
+    return named?.[1] ?? named?.[2] ?? named?.[3] ?? named?.[4] ?? named?.[5];
+}
+
+/**
+ * True when a rejection body says it refused an input, which is what separates a
+ * rejection of a connector-added parameter from a body that merely echoes the prompt.
+ *
+ * `isUnsupportedParameterError` covers the parameter wordings, including Bedrock's
+ * "extraneous key [<name>] is not permitted". The cache-bypass directive has a refusal
+ * that names no parameter at all: the proxy's cache-control check answers 403 with
+ * "Not allowed to set no-cache as a cache control" (`litellm/proxy/hooks/cache_control_check.py`).
+ */
+function saysItRefusedAnInput(errorText: string): boolean {
+    return isUnsupportedParameterError(errorText) || errorText.toLowerCase().includes("not allowed to set");
 }
 
 /**
@@ -136,11 +175,26 @@ export class LiteLLMDiscoveryError extends Error {
 export class LiteLLMClient {
     private static readonly DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
     private static readonly DEFAULT_RATE_LIMIT_MAX_DELAY_MS = 120_000;
+    /** Wait for response headers when the setting is absent. */
+    private static readonly DEFAULT_HEADERS_TIMEOUT_MS = 300_000;
+    /**
+     * The header limit the runtime's own fetch applies, reported when that limit rather
+     * than the setting ends a request. `ConfigManager.MAX_HEADERS_TIMEOUT_SECONDS` holds
+     * the same runtime fact, because the setting cannot exceed it.
+     */
+    private static readonly RUNTIME_HEADERS_TIMEOUT_MS = 300_000;
+    /** 5xx retries per call. The client is the only layer that retries a 5xx. */
+    private static readonly MAX_SERVER_ERROR_RETRIES = 2;
+    private static readonly SERVER_ERROR_RETRY_DELAY_MS = 1_000;
 
     constructor(
         private readonly config: LiteLLMClientConfig,
         private readonly userAgent: string
-    ) {}
+    ) {
+        // Every endpoint URL is `${config.url}${endpoint}`, so the base is
+        // normalized once here rather than at each call site.
+        this.config = { ...config, url: normalizeProxyBaseUrl(config.url) };
+    }
 
     /**
      * Fetches model information from the LiteLLM proxy.
@@ -151,124 +205,62 @@ export class LiteLLMClient {
         const timeoutMs = this.config.discoveryTimeoutMs ?? LiteLLMClient.DEFAULT_DISCOVERY_TIMEOUT_MS;
         const timer = setTimeout(() => controller.abort(new DiscoveryTimeoutError(timeoutMs)), timeoutMs);
 
-        if (token) {
-            token.onCancellationRequested(() => controller.abort());
-        }
-
         const urls = this.getModelInfoUrls();
+        const registration = token?.onCancellationRequested(() => controller.abort());
+
         Logger.trace(`Fetching model info from ${urls[0]}`);
         try {
             let lastResponse: Response | undefined;
-            for (const url of urls) {
+            for (const [urlIndex, url] of urls.entries()) {
                 const resp = await fetch(url, {
                     headers: this.getHeaders(),
                     signal: controller.signal,
                 });
                 if (resp.ok) {
-                    return resp.json() as Promise<LiteLLMModelInfoResponse>;
+                    // Awaited inside the try so the timeout and the cancellation
+                    // signal also cover a body that stalls after the headers.
+                    return (await resp.json()) as LiteLLMModelInfoResponse;
                 }
 
                 lastResponse = resp;
                 if (resp.status === 404) {
-                    Logger.warn(`Model info endpoint returned 404, trying fallback URL: ${url}`);
-                    continue;
+                    this.discardBody(resp);
+                    // A fallback that does not exist is not worth a warning: the throw
+                    // below is the failure the registry reports.
+                    if (urlIndex < urls.length - 1) {
+                        Logger.warn(`Model info endpoint returned 404, trying fallback URL: ${urls[urlIndex + 1]}`);
+                        continue;
+                    }
+                    break;
                 }
 
-                Logger.error(`Failed to fetch model info: ${resp.status} ${resp.statusText}`);
+                this.discardBody(resp);
                 throw new LiteLLMDiscoveryError(resp.status, resp.statusText);
             }
 
+            // The registry terminates this failure and logs it with the backend it belongs
+            // to, which this client does not know.
             const status = lastResponse?.status ?? 404;
             const statusText = lastResponse?.statusText ?? "Not Found";
-            Logger.error(`Failed to fetch model info after trying fallback URLs: ${status} ${statusText}`);
             throw new LiteLLMDiscoveryError(status, statusText);
         } catch (err) {
-            // Check if the error was caused by our timeout
             if (controller.signal.aborted && controller.signal.reason instanceof DiscoveryTimeoutError) {
-                Logger.warn(`Discovery timeout after ${timeoutMs}ms`);
                 throw controller.signal.reason;
             }
 
             throw err;
         } finally {
             clearTimeout(timer);
+            registration?.dispose();
         }
     }
 
     private getModelInfoUrls(): string[] {
-        const trimmed = this.config.url.replace(/\/+$/, "");
-        const stripTerminalEndpoint = (url: string): string =>
-            url.replace(/\/(?:chat\/completions|completions|responses|model\/info)$/i, "");
-        const stripV1 = (url: string): string => url.replace(/\/v1$/i, "");
-
-        const baseCandidates = new Set<string>([
-            trimmed,
-            stripTerminalEndpoint(trimmed),
-            stripV1(trimmed),
-            stripV1(stripTerminalEndpoint(trimmed)),
-            stripTerminalEndpoint(stripV1(trimmed)),
-        ]);
-
-        const urls: string[] = [];
-        for (const base of baseCandidates) {
-            if (!base) {
-                continue;
-            }
-            urls.push(`${base}/model/info`);
-        }
-        return urls;
-    }
-
-    /**
-     * Checks the connection to the LiteLLM proxy.
-     */
-    async checkConnection(
-        token?: vscode.CancellationToken
-    ): Promise<{ latencyMs: number; modelCount: number; sampleModelIds: string[] }> {
-        const startTime = Date.now();
-        const { data } = await this.getModelInfo(token);
-        const latencyMs = Date.now() - startTime;
-
-        const modelCount = Array.isArray(data) ? data.length : 0;
-        const sampleModelIds = Array.isArray(data)
-            ? data
-                  .slice(0, 5)
-                  .map(
-                      (entry: { model_info?: { key?: string }; model_name?: string }) =>
-                          entry.model_info?.key ?? entry.model_name ?? "unknown"
-                  )
-            : [];
-
-        return { latencyMs, modelCount, sampleModelIds };
-    }
-
-    /**
-     * Counts tokens for a prompt or messages using LiteLLM's token counter.
-     */
-    async countTokens(
-        request: LiteLLMTokenCounterRequest,
-        token?: vscode.CancellationToken
-    ): Promise<LiteLLMTokenCounterResponse> {
-        const controller = new AbortController();
-        if (token) {
-            token.onCancellationRequested(() => controller.abort());
-        }
-
-        Logger.trace(`Counting tokens for model ${request.model} at ${this.config.url}/utils/token_counter`);
-        const resp = await fetch(`${this.config.url}/utils/token_counter`, {
-            method: "POST",
-            headers: this.getHeaders(),
-            body: JSON.stringify(request),
-            signal: controller.signal,
-        });
-
-        if (!resp.ok) {
-            const errorText = await resp.text();
-            Logger.error(`Failed to count tokens: ${resp.status} ${resp.statusText} - ${errorText}`);
-            throw new Error(`Failed to count tokens: ${resp.status} ${resp.statusText}`);
-        }
-
-        return resp.json() as Promise<LiteLLMTokenCounterResponse>;
+        const base = this.config.url;
+        const withoutV1 = base.replace(/\/v1$/i, "");
+        return [...new Set([base, withoutV1].filter((candidate) => candidate.length > 0))].map(
+            (candidate) => `${candidate}/model/info`
+        );
     }
 
     /**
@@ -281,42 +273,36 @@ export class LiteLLMClient {
         request: OpenAIChatCompletionRequest,
         mode?: string,
         token?: vscode.CancellationToken,
-        modelInfo?: LiteLLMModelInfo,
-        requestId?: string
+        requestId?: string,
+        rateLimitLedger: RateLimitWaitLedger = new RateLimitWaitLedger()
     ): Promise<ReadableStream<Uint8Array>> {
         const endpoint = this.getEndpoint(mode);
         let body: OpenAIChatCompletionRequest | LiteLLMResponsesRequest = request;
 
-        const isAnthropic = isAnthropicModel(request.model, modelInfo);
-
-        if (this.config.disableCaching) {
-            if (isAnthropic) {
-                Logger.info(`Bypassing 'disable caching' for Anthropic/Claude model: ${request.model}`);
-                LiteLLMTelemetry.reportMetric({
-                    requestId: `bypass-${Math.random().toString(36).substring(7)}`,
-                    model: request.model,
-                    status: "caching_bypassed",
-                });
-            } else {
-                body = this.withNoCacheExtraBody(body);
-            }
-        }
-
         if (endpoint === "/responses") {
             body = transformToResponsesFormat(request);
-            if (this.config.disableCaching && !isAnthropic) {
-                body = this.withNoCacheExtraBody(body);
-            }
+        }
+        // LiteLLM reads the bypass from a top-level `cache` member, and lists
+        // `cache` in `all_litellm_params`, so LiteLLM consumes it and never
+        // forwards it upstream.
+        if (this.config.disableCaching) {
+            body = this.withNoCacheDirective(body);
         }
 
         Logger.trace(`Sending chat request to ${endpoint}`, { model: request.model });
         const url = `${this.config.url}${endpoint}`;
-        const rateLimitOptions: RateLimitFetchOptions = { model: request.model, endpoint, requestId, token };
+        const rateLimitOptions: RateLimitFetchOptions = {
+            model: request.model,
+            endpoint,
+            requestId,
+            token,
+            ledger: rateLimitLedger,
+        };
         let response = await this.fetchWithRateLimit(
             url,
             {
                 method: "POST",
-                headers: this.getHeaders(request.model, modelInfo),
+                headers: this.getHeaders(),
                 body: JSON.stringify(body),
             },
             rateLimitOptions
@@ -326,21 +312,19 @@ export class LiteLLMClient {
         // and retried. A parameter the proxy itself claimed to support is
         // reported instead: hiding it would send the same rejected body on
         // every later request.
-        if (response.status === 400) {
-            const retry = this.planConnectorParameterRetry(
-                await response.clone().text(),
-                body,
-                request.model,
-                modelInfo
-            );
-            if (retry) {
+        let rejectionText: string | undefined;
+        if (response.status === 400 || response.status === 403) {
+            rejectionText = await this.readBodyText(response, token);
+            const retryBody = this.planConnectorParameterRetry(rejectionText, body, request.model);
+            if (retryBody) {
                 Logger.warn(`Retrying ${request.model} without a connector-added parameter the proxy rejected`);
+                rejectionText = undefined;
                 response = await this.fetchWithRateLimit(
                     url,
                     {
                         method: "POST",
-                        headers: retry.headers,
-                        body: JSON.stringify(retry.body),
+                        headers: this.getHeaders(),
+                        body: JSON.stringify(retryBody),
                     },
                     rateLimitOptions
                 );
@@ -348,8 +332,9 @@ export class LiteLLMClient {
         }
 
         if (!response.ok) {
-            const errorText = await response.text();
-            Logger.error(`LiteLLM API error: ${response.status} ${response.statusText}`, errorText);
+            const errorText = rejectionText ?? (await this.readBodyText(response, token));
+            // The body can echo the prompt, so it stays on the error for the
+            // user-facing notice; the provider logs identifiers only.
             throw new LiteLLMApiError(
                 response.status,
                 errorText,
@@ -358,7 +343,6 @@ export class LiteLLMClient {
         }
 
         if (!response.body) {
-            Logger.error("No response body from LiteLLM API");
             throw new Error("No response body from LiteLLM API");
         }
 
@@ -366,16 +350,23 @@ export class LiteLLMClient {
     }
 
     /**
-     * Builds the retry body and headers for a 400 that rejects a parameter this
-     * connector adds itself. Returns undefined when the rejection names no such
-     * parameter, in which case the caller must surface the error instead.
+     * Builds the retry body for a 400 or 403 that rejects a parameter this
+     * connector adds itself. Returns undefined when the body does not read as a
+     * refusal, names no such parameter, or does not carry it, in which case the
+     * caller must surface the error instead.
      *
      * Two families qualify:
      * - `cache_control`, the Anthropic prompt-caching marker added by the
      *   request builder. It is reported through `onUnsupportedParameter` so
      *   later requests omit it without paying a failed round trip.
-     * - the cache-bypass flag added for `litellm-connector.disableCaching`
-     *   (`extra_body.cache["no-cache"]` plus its `Cache-Control` header).
+     * - the cache-bypass directive added for `litellm-connector.disableCaching`
+     *   (`cache["no-cache"]`). A key the proxy does not allow to set it answers
+     *   403, so the same strip-and-retry covers both statuses.
+     *
+     * The refusal requirement applies to both families. The rejection body can echo
+     * the prompt, and stripping and learning on a parameter name alone would let an
+     * unrelated 400 that quotes `cache_control` or `no-cache` disable prompt caching
+     * or the cache bypass for the session.
      *
      * Nothing else in the body is touched: any other parameter is either the
      * user's own configuration or was accepted by the proxy's capability data,
@@ -384,25 +375,24 @@ export class LiteLLMClient {
     private planConnectorParameterRetry(
         errorText: string,
         body: OpenAIChatCompletionRequest | LiteLLMResponsesRequest,
-        modelId: string,
-        modelInfo: LiteLLMModelInfo | undefined
-    ): { body: OpenAIChatCompletionRequest | LiteLLMResponsesRequest; headers: Record<string, string> } | undefined {
+        modelId: string
+    ): OpenAIChatCompletionRequest | LiteLLMResponsesRequest | undefined {
+        if (!saysItRefusedAnInput(errorText)) {
+            return undefined;
+        }
         const errorLower = errorText.toLowerCase();
         const promptCachingRejected = errorLower.includes("cache_control");
-        const cacheBypassRejected =
-            errorLower.includes("no-cache") ||
-            errorLower.includes("no_cache") ||
-            (errorLower.includes("cache") &&
-                (errorLower.includes("unknown parameter") ||
-                    errorLower.includes("unsupported parameter") ||
-                    errorLower.includes("extra inputs are not permitted")));
+        // The directive's own name is the standalone word `cache`, which the proxy's
+        // permission refusal reports as `no-cache`. A word boundary does not match
+        // across the underscore in `cache_control`, so the marker name alone leaves
+        // this family unmatched.
+        const cacheBypassRejected = /\bcache\b/.test(errorLower);
         if (!promptCachingRejected && !cacheBypassRejected) {
             return undefined;
         }
 
         const retryBody = JSON.parse(JSON.stringify(body)) as OpenAIChatCompletionRequest | LiteLLMResponsesRequest;
         const retryBodyRecord = retryBody as unknown as Record<string, unknown>;
-        const headers = this.getHeaders(modelId, modelInfo);
         let strippedSomething = false;
 
         if (promptCachingRejected && "cache_control" in retryBodyRecord) {
@@ -412,33 +402,19 @@ export class LiteLLMClient {
             strippedSomething = true;
         }
 
-        if (cacheBypassRejected) {
-            if (retryBody.extra_body && typeof retryBody.extra_body === "object") {
-                const extraBody = retryBody.extra_body as Record<string, unknown>;
-                const cache = extraBody.cache;
-                if (cache && typeof cache === "object" && "no-cache" in (cache as Record<string, unknown>)) {
-                    delete (cache as Record<string, unknown>)["no-cache"];
-                    strippedSomething = true;
-                    if (Object.keys(cache as Record<string, unknown>).length === 0) {
-                        delete extraBody.cache;
-                    }
-                }
-                if (Object.keys(extraBody).length === 0) {
-                    delete retryBody.extra_body;
-                }
-            }
-            if (headers["Cache-Control"] !== undefined) {
-                delete headers["Cache-Control"];
-                strippedSomething = true;
-            }
+        if (cacheBypassRejected && retryBody.cache !== undefined) {
+            Logger.info(`Stripping ${modelId} cache bypass: the proxy's key may not set no-cache`);
+            delete retryBodyRecord.cache;
+            this.config.onUnsupportedParameter?.(modelId, "cache");
+            strippedSomething = true;
         }
 
         // A body that did not change would be rejected identically, so do not
         // spend a second request on it.
-        return strippedSomething ? { body: retryBody, headers } : undefined;
+        return strippedSomething ? retryBody : undefined;
     }
 
-    private getHeaders(modelId?: string, modelInfo?: LiteLLMModelInfo): Record<string, string> {
+    private getHeaders(): Record<string, string> {
         const headers: Record<string, string> = {
             "Content-Type": "application/json",
             "User-Agent": this.userAgent,
@@ -446,12 +422,6 @@ export class LiteLLMClient {
         if (this.config.key) {
             headers.Authorization = `Bearer ${this.config.key}`;
             headers["X-API-Key"] = this.config.key;
-        }
-        if (this.config.disableCaching) {
-            const isAnthropic = modelId ? isAnthropicModel(modelId, modelInfo) : false;
-            if (!isAnthropic) {
-                headers["Cache-Control"] = "no-cache";
-            }
         }
         return headers;
     }
@@ -467,78 +437,87 @@ export class LiteLLMClient {
         return "/chat/completions";
     }
 
-    private withNoCacheExtraBody(
+    private withNoCacheDirective(
         body: OpenAIChatCompletionRequest | LiteLLMResponsesRequest
     ): OpenAIChatCompletionRequest | LiteLLMResponsesRequest {
-        const extraBody = body.extra_body ?? {};
-        const cache = (extraBody.cache ?? {}) as Record<string, unknown>;
-        cache["no-cache"] = true;
         return {
             ...body,
-            extra_body: {
-                ...extraBody,
-                cache,
-            },
+            cache: { ...body.cache, "no-cache": true },
         };
     }
 
-    private async fetchWithRetry(
-        url: string,
-        init: RequestInit,
-        options?: { retries?: number; delayMs?: number; token?: vscode.CancellationToken }
-    ): Promise<Response> {
-        const maxRetries = options?.retries ?? 2;
-        const delayMs = options?.delayMs ?? 1000;
-        let attempt = 0;
+    /**
+     * Sends one request and retries only a 5xx response.
+     *
+     * A connection failure is deliberately NOT retried here: the provider owns
+     * network retries, because only it knows whether the failed attempt produced
+     * output and therefore whether the request should resume or be resent
+     * unchanged. Retrying in both layers would multiply the attempts.
+     *
+     * The wait for response headers is bounded here, because the proxy buffers the
+     * first streamed chunk before it writes headers, which leaves the body watchdog
+     * nothing to watch. The runtime's fetch ignores a custom `dispatcher`, so the
+     * runtime's own 300 s header limit still applies to every request.
+     */
+    private async fetchWithRetry(url: string, init: RequestInit, token?: vscode.CancellationToken): Promise<Response> {
+        const headersTimeoutMs = this.headersTimeoutMs;
+        let serverErrorAttempt = 0;
         while (true) {
-            if (options?.token?.isCancellationRequested) {
+            if (token?.isCancellationRequested) {
                 throw new Error("Operation cancelled by user");
             }
 
             const controller = new AbortController();
-            const disposable = options?.token?.onCancellationRequested(() => controller.abort());
+            const disposable = token?.onCancellationRequested(() => controller.abort());
+            let headersTimedOut = false;
+            // The timer is armed on the controller whose signal also governs the body,
+            // so it must be cleared as soon as the headers arrive or the attempt ends.
+            // A timer left running would abort a healthy stream.
+            const headersTimer = setTimeout(() => {
+                headersTimedOut = true;
+                controller.abort();
+            }, headersTimeoutMs);
 
             try {
                 const response = await fetch(url, { ...init, signal: controller.signal });
-                if (!response) {
-                    if (attempt >= maxRetries) {
-                        throw new Error("No response returned from fetch");
-                    }
-                    attempt++;
-                    await this.sleep(delayMs, options?.token);
-                    continue;
-                }
-                if (response.ok || attempt >= maxRetries || response.status < 500 || response.status >= 600) {
+                if (response.ok || response.status < 500 || response.status >= 600) {
                     return response;
                 }
-                attempt++;
-                await this.sleep(delayMs, options?.token);
+                if (serverErrorAttempt >= LiteLLMClient.MAX_SERVER_ERROR_RETRIES) {
+                    return response;
+                }
+                serverErrorAttempt++;
+                this.discardBody(response);
             } catch (err: unknown) {
+                if (headersTimedOut) {
+                    throw new HeadersTimeoutError(headersTimeoutMs);
+                }
+                if (readCauseCode(err) === "UND_ERR_HEADERS_TIMEOUT") {
+                    // The runtime's fetch keeps its own 300 s header limit whatever
+                    // the setting says, so a request can fail here without the
+                    // setting having fired.
+                    throw new HeadersTimeoutError(LiteLLMClient.RUNTIME_HEADERS_TIMEOUT_MS, "runtime", { cause: err });
+                }
                 if (err instanceof Error && err.name === "AbortError") {
                     throw new Error("Operation cancelled by user", { cause: err });
                 }
-                // Cancellation raised by the inter-attempt sleep (or any nested
-                // cancellable helper) should propagate as cancellation, not be
-                // caught and re-fed into the retry loop.
-                if (err instanceof Error && err.message === "Operation cancelled by user") {
-                    throw err;
-                }
-                if (attempt >= maxRetries) {
-                    throw err;
-                }
-                attempt++;
-                await this.sleep(delayMs, options?.token);
+                throw err;
             } finally {
+                clearTimeout(headersTimer);
                 disposable?.dispose();
             }
+
+            await this.sleep(LiteLLMClient.SERVER_ERROR_RETRY_DELAY_MS, token);
         }
     }
 
     /**
-     * Fetches with retries on 429 rate limiting, within a total wait budget
-     * for this call. A budget of 0 disables the retries.
-     * {@link planRateLimitRetry} picks each wait. Other transient failures are
-     * retried by {@link fetchWithRetry}.
+     * Fetches with retries on 429 rate limiting, within the budget configured on the
+     * client and shared with every other call that sends the same provider attempt
+     * (`options.ledger`). A budget of 0 disables the retries.
+     * {@link planRateLimitRetry} picks each wait. A 5xx response is retried by
+     * {@link fetchWithRetry}; a connection failure is not, because the provider
+     * owns network retries.
      *
      * @throws LiteLLMRateLimitError when the client stops retrying a 429.
      */
@@ -548,7 +527,6 @@ export class LiteLLMClient {
         options: RateLimitFetchOptions
     ): Promise<Response> {
         const budgetMs = this.config.rateLimitMaxDelayMs ?? LiteLLMClient.DEFAULT_RATE_LIMIT_MAX_DELAY_MS;
-        let waitedMs = 0;
         let attempt = 0;
 
         while (true) {
@@ -556,22 +534,24 @@ export class LiteLLMClient {
                 throw new Error("Operation cancelled by user");
             }
 
-            const response = await this.fetchWithRetry(url, init, { token: options.token });
+            const response = await this.fetchWithRetry(url, init, options.token);
             if (response.status !== 429) {
                 return response;
             }
 
+            const waitedMs = options.ledger.waitedMs;
             const retryAfterMs = this.parseRetryAfterDelayMs(response);
             const decision = planRateLimitRetry({ attempt, waitedMs, budgetMs, retryAfterMs });
             if (decision.kind === "give_up") {
                 throw new LiteLLMRateLimitError(
                     { reason: decision.reason, waitedMs, budgetMs, retryAfterMs },
                     response.statusText,
-                    await response.text()
+                    await this.readBodyText(response, options.token)
                 );
             }
 
             attempt++;
+            this.discardBody(response);
             this.logRateLimitRetry(options, {
                 attempt,
                 delayMs: decision.delayMs,
@@ -579,7 +559,7 @@ export class LiteLLMClient {
                 budgetMs,
                 source: decision.source,
             });
-            waitedMs += decision.delayMs;
+            options.ledger.recordWait(decision.delayMs);
             await this.sleep(decision.delayMs, options.token);
         }
     }
@@ -595,6 +575,88 @@ export class LiteLLMClient {
             { requestId: options.requestId, ...entry },
             { requestId: options.requestId, model: options.model, endpoint: options.endpoint }
         );
+    }
+
+    private discardBody(response: Response): void {
+        // An unread body holds the connection open, so a retried request would
+        // keep both responses' sockets alive until the garbage collector runs.
+        void response.body?.cancel().catch(() => undefined);
+    }
+
+    /**
+     * Reads an error response body within the headers-timeout bound.
+     *
+     * The body watchdog starts only once the stream reaches the provider, so a
+     * proxy that stalls partway through an error body would otherwise hold the
+     * turn open for as long as it likes. The body is read through its own reader
+     * because `response.text()` locks the stream, and a locked stream cannot be
+     * cancelled, which would leave the connection open until the proxy finished.
+     *
+     * The status is what the caller acts on, so a body that times out resolves with
+     * the text decoded so far instead of failing the request, and a body the user
+     * cancelled stops the read and rejects.
+     */
+    private async readBodyText(response: Response, token?: vscode.CancellationToken): Promise<string> {
+        if (token?.isCancellationRequested) {
+            this.discardBody(response);
+            throw new Error("Operation cancelled by user");
+        }
+
+        const reader: ReadableStreamDefaultReader<Uint8Array> | undefined = response.body?.getReader();
+        if (!reader) {
+            // A response without a stream has nothing that can stall.
+            return await response.text();
+        }
+
+        const decoder = new TextDecoder();
+        let text = "";
+        const readAll = (async (): Promise<string> => {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    return text + decoder.decode();
+                }
+                text += decoder.decode(value, { stream: true });
+            }
+        })();
+
+        const cancelled = Symbol("cancelled");
+        const timedOut = Symbol("timedOut");
+        // Cancelling the reader resolves the pending read, so the reason is recorded
+        // before the cancel to keep the outcome unambiguous.
+        let stopReason: typeof cancelled | typeof timedOut | undefined;
+        const stopReading = async (): Promise<void> => {
+            await reader.cancel().catch(() => undefined);
+        };
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let registration: vscode.Disposable | undefined;
+        const cancellation = new Promise<typeof cancelled>((resolve) => {
+            registration = token?.onCancellationRequested(() => {
+                stopReason = cancelled;
+                void stopReading().then(() => resolve(cancelled));
+            });
+        });
+        const timeout = new Promise<typeof timedOut>((resolve) => {
+            timer = setTimeout(() => {
+                stopReason = timedOut;
+                void stopReading().then(() => resolve(timedOut));
+            }, this.headersTimeoutMs);
+        });
+
+        try {
+            await Promise.race([readAll, cancellation, timeout]);
+            if (stopReason === cancelled) {
+                throw new Error("Operation cancelled by user");
+            }
+            return stopReason === timedOut ? text : await readAll;
+        } finally {
+            clearTimeout(timer);
+            registration?.dispose();
+        }
+    }
+
+    private get headersTimeoutMs(): number {
+        return this.config.headersTimeoutMs ?? LiteLLMClient.DEFAULT_HEADERS_TIMEOUT_MS;
     }
 
     private sleep(ms: number, token?: vscode.CancellationToken): Promise<void> {

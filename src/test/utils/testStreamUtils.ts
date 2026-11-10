@@ -1,3 +1,5 @@
+import type * as vscode from "vscode";
+
 export function createMockSSEStream(chunks: string[]): ReadableStream<Uint8Array> {
     return new ReadableStream({
         start(controller) {
@@ -29,15 +31,15 @@ export function chatReasoningFrame(reasoning: string): string {
     return JSON.stringify({ choices: [{ delta: { reasoning_content: reasoning } }] });
 }
 
-export function chatToolCallHeaderFrame(id: string, name: string): string {
+export function chatToolCallHeaderFrame(id: string, name: string, index = 0): string {
     return JSON.stringify({
-        choices: [{ delta: { tool_calls: [{ index: 0, id, type: "function", function: { name, arguments: "" } }] } }],
+        choices: [{ delta: { tool_calls: [{ index, id, type: "function", function: { name, arguments: "" } }] } }],
     });
 }
 
-export function chatToolCallArgumentsFrame(argumentsJson: string): string {
+export function chatToolCallArgumentsFrame(argumentsJson: string, index = 0): string {
     return JSON.stringify({
-        choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: argumentsJson } }] } }],
+        choices: [{ delta: { tool_calls: [{ index, function: { arguments: argumentsJson } }] } }],
     });
 }
 
@@ -140,4 +142,67 @@ export function createMockToolCallStream(toolName: string, args: string): Readab
             controller.close();
         },
     });
+}
+
+/** Streams `frames`, then fails the next read the way a dropped socket does. */
+export function createSeveredSseStream(frames: readonly string[], failure: Error): ReadableStream<Uint8Array> {
+    const encoder = new TextEncoder();
+    let nextFrameIndex = 0;
+    return new ReadableStream<Uint8Array>(
+        {
+            pull(controller) {
+                if (nextFrameIndex >= frames.length) {
+                    controller.error(failure);
+                    return;
+                }
+                controller.enqueue(encoder.encode(`data: ${frames[nextFrameIndex]}\n\n`));
+                nextFrameIndex += 1;
+            },
+        },
+        { highWaterMark: 0 }
+    );
+}
+
+/**
+ * SSE body held open by comment frames before the given data frames. A comment frame
+ * carries bytes but completes no event, which is what a gateway in front of the proxy
+ * sends while its upstream is still working.
+ */
+export function createKeepAliveSseStream(
+    keepAliveCount: number,
+    gapMs: number,
+    frames: readonly string[]
+): ReadableStream<Uint8Array> {
+    const encoder = new TextEncoder();
+    let keepAlivesSent = 0;
+    let frameIndex = 0;
+    return new ReadableStream<Uint8Array>(
+        {
+            async pull(controller) {
+                if (keepAlivesSent < keepAliveCount) {
+                    keepAlivesSent += 1;
+                    await new Promise((resolve) => setTimeout(resolve, gapMs));
+                    controller.enqueue(encoder.encode(": keep-alive\n\n"));
+                    return;
+                }
+                if (frameIndex >= frames.length) {
+                    controller.close();
+                    return;
+                }
+                const frame = frames[frameIndex];
+                frameIndex += 1;
+                controller.enqueue(encoder.encode(`data: ${frame}\n\n`));
+            },
+        },
+        { highWaterMark: 0 }
+    );
+}
+
+/** Records every reported part and returns the progress that received them. */
+export function createPartRecorder(): {
+    parts: vscode.LanguageModelResponsePart[];
+    progress: vscode.Progress<vscode.LanguageModelResponsePart>;
+} {
+    const parts: vscode.LanguageModelResponsePart[] = [];
+    return { parts, progress: { report: (part) => parts.push(part) } };
 }

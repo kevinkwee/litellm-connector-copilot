@@ -46,8 +46,8 @@ suite("Telemetry Unit Tests", () => {
         assert.ok(loggerInfoStub.calledOnce);
         const infoMessage = firstArg<string>(loggerInfoStub);
         assert.ok(infoMessage.includes("[TokenUsage]"));
-        assert.ok(infoMessage.includes("tokens_in=0"));
-        assert.ok(infoMessage.includes("tokens_out=0"));
+        assert.ok(infoMessage.includes("tokens_in=n/a"), "an unreported count is missing, not zero");
+        assert.ok(infoMessage.includes("tokens_out=n/a"));
         assert.ok(infoMessage.includes("token_count_max=n/a"));
         assert.ok(infoMessage.includes("total_token_max=n/a"));
     });
@@ -101,7 +101,7 @@ suite("Telemetry Unit Tests", () => {
             model: "gpt-4",
             durationMs: 100,
             status: "success",
-            caller: "inline-edit",
+            caller: "core",
         };
 
         LiteLLMTelemetry.reportMetric(metric);
@@ -109,7 +109,7 @@ suite("Telemetry Unit Tests", () => {
         assert.ok(loggerDebugStub.calledOnce);
         const logMessage = firstArg<string>(loggerDebugStub);
         assert.ok(logMessage.includes("[Telemetry]"));
-        assert.ok(logMessage.includes('"caller":"inline-edit"'));
+        assert.ok(logMessage.includes('"caller":"core"'));
     });
 
     test("reportMetric handles metrics without caller", () => {
@@ -129,7 +129,7 @@ suite("Telemetry Unit Tests", () => {
     });
 
     test("reportMetric logs different caller contexts", () => {
-        const callers = ["scm-generator", "terminal-chat", "inline-completions"];
+        const callers = ["core", "unknown", "background-summarizer"];
 
         for (const caller of callers) {
             loggerDebugStub.resetHistory();

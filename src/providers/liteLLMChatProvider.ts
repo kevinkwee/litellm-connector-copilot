@@ -10,15 +10,21 @@ import type {
 } from "vscode";
 import { LanguageModelTextPart } from "vscode";
 
-import { tryParseJSONObject } from "../utils";
 import { formatConnectorNotice } from "../utils/connectorNotice";
 import { Logger } from "../utils/logger";
-import { appendRateLimitHint } from "../utils/rateLimitNotice";
+import type { ToolNameMapping } from "../utils/toolNameUtils";
 import { LiteLLMTelemetry } from "../utils/telemetry";
 import { LiteLLMProviderBase } from "./liteLLMProviderBase";
+import { processResponseStream } from "./chat/responseStream";
+import {
+    reportConnectorCancellation,
+    reportHostCancellation,
+    reportTurnFailure,
+    reportTurnSuccess,
+} from "./chat/turnReport";
+import { describeFailureForLog, toErrorLogFields } from "./base/errorLogFields";
 import { StructuredLogger } from "../observability/structuredLogger";
-import { ResponsePartCollector, exportCopilotMdEntry } from "../observability";
-import type { CopilotMdEntry } from "../observability";
+import { ResponsePartCollector } from "../observability";
 import { resolveChatSessionId } from "../utils/chatSessionId";
 import {
     countOpenAIChatMessagesTokens,
@@ -27,80 +33,52 @@ import {
     getReservedOutputTokens,
     getTotalTokenLimit,
 } from "../adapters/tokenUtils";
-import { decodeSSE } from "../adapters/sse/sseDecoder";
-import {
-    findRejectedParameter,
-    isUnsupportedParameterError,
-    LiteLLMApiError,
-    LiteLLMRateLimitError,
-} from "../adapters/litellmClient";
-import {
-    createInitialStreamingState,
-    interpretStreamEvent,
-    flushPendingBuffers,
-    hasBufferedToolCalls,
-} from "../adapters/streaming/liteLLMStreamInterpreter";
-import type { EmittedPart } from "../adapters/streaming/liteLLMStreamInterpreter";
-import { emitPartsToVSCode } from "../adapters/streaming/vscodePartEmitter";
-import type { EffortFallbackCache } from "../utils/reasoningEffortFallback";
+
 import { StreamTokenCapture } from "../adapters/streaming/streamTokenCapture";
+import { LiteLLMApiError } from "../adapters/litellmClient";
 import type { OpenAIChatCompletionRequest } from "../types";
+import { RequestCancellation } from "../utils/requestCancellation";
+import type { RequestOutcomeContext } from "./base/requestOutcome";
+import { DEFAULT_RETRY_BUDGET_MS, RetryBudget, retryBudgetError } from "../utils/retryBudget";
 import {
     StreamedTextAccumulator,
-    InactivityTimeoutError,
+    HeadersTimeoutError,
+    LiteLLMConfigurationError,
     ReasoningOnlyError,
-    UpstreamStreamError,
     isTransportRetriableError,
+    failedBeforeReachingProxy,
     buildResumeMessages,
+    selectResumableContent,
     sleepWithCancellation,
     backoffDelayMs,
     logTransportRetry,
+    formatDuration,
 } from "../utils/transportRetry";
 
-/**
- * Returns the notice for a finish reason that leaves the answer incomplete, or
- * `undefined` for reasons that need none. The returned notice begins a new block
- * (`\n\n`), as `splitConnectorNotice` requires for a notice after model text.
- */
-function describeStoppedEarly(reason: string | undefined): { reason: string; notice: string } | undefined {
-    if (reason === "length") {
-        return {
-            reason,
-            notice:
-                "\n\n" +
-                formatConnectorNotice(
-                    "The response stopped at the model's output token limit, so it is incomplete. " +
-                        "Raise the model's max output tokens, or ask it to continue."
-                ),
-        };
-    }
-    if (reason === "content_filter") {
-        return {
-            reason,
-            notice:
-                "\n\n" +
-                formatConnectorNotice(
-                    "The provider's content filter ended the response early; part of the answer was withheld."
-                ),
-        };
-    }
-    return undefined;
-}
+/** Headers-timeout retries one request may spend. */
+const MAX_HEADERS_TIMEOUT_RETRIES = 1;
 
 /**
- * Closes an upstream response body the stream loop may have stopped reading.
- * `decodeSSE` releases its reader lock before returning, so this is safe for an
- * open body (cancels the transfer), a closed one (no-op), or a locked or errored
- * one (the rejection is ignored, because there is nothing else to do about it).
+ * True when the failure proves the proxy billed nothing for the attempt.
+ *
+ * A request the connector refuses for an incomplete configuration never leaves it, so
+ * nothing reached the proxy. The proxy records a failure that never streamed at zero cost,
+ * which covers every 4xx it answered, including the ones it raises after the upstream call
+ * has started, such as a context-window rejection or a rate limit. A 5xx may have streamed
+ * before failing, so it stays priced. A connect-phase failure is covered separately by
+ * `failedBeforeReachingProxy`.
  */
-function cancelUpstreamBody(body: ReadableStream<Uint8Array>): void {
-    void body.cancel().catch(() => undefined);
+function isUnbilledFailure(error: unknown): boolean {
+    if (error instanceof LiteLLMConfigurationError) {
+        return true;
+    }
+    return error instanceof LiteLLMApiError && error.status < 500;
 }
 
 /**
  * Chat provider implementation for VS Code's LanguageModelChatProvider.
  *
- * All shared orchestration (model discovery, request building, trimming, parameter filtering,
+ * All shared orchestration (model discovery, request building, parameter filtering,
  * endpoint routing) is implemented in LiteLLMProviderBase.
  *
  * One instance serves every concurrent request (chat sessions, subagents, and background
@@ -108,81 +86,24 @@ function cancelUpstreamBody(body: ReadableStream<Uint8Array>): void {
  * buffers live for one upstream attempt, and the token capture lives for one request.
  */
 export class LiteLLMChatProvider extends LiteLLMProviderBase implements LanguageModelChatProvider {
-    constructor(secrets: vscode.SecretStorage, userAgent: string, effortFallbackCache?: EffortFallbackCache) {
-        super(secrets, userAgent, effortFallbackCache);
-    }
-
-    private logFinalUsageEnvelope(
-        requestId: string,
-        modelId: string,
-        caller: string,
-        usage: {
-            tokensIn?: number;
-            tokensOut?: number;
-            cachedTokens?: number;
-            cacheCreationInputTokens?: number;
-            reasoningTokens?: number;
-            toolTokens?: number;
-            acceptedPredictionTokens?: number;
-            rejectedPredictionTokens?: number;
-            systemPromptTokens?: number;
-            reservedOutputTokens?: number;
-            totalTokenMax?: number;
-            sawUsageDataPart: boolean;
-            estimatedInputCost?: number;
-            estimatedOutputCost?: number;
-            estimatedTotalCost?: number;
-        }
-    ): void {
-        Logger.debug(
-            `[TokenUsage][Final] request_id=${requestId} model=${modelId} caller=${caller} ` +
-                `tokens_in=${usage.tokensIn ?? "n/a"} tokens_out=${usage.tokensOut ?? "n/a"} ` +
-                `cached_tokens=${usage.cachedTokens ?? "n/a"} cache_creation_input_tokens=${
-                    usage.cacheCreationInputTokens ?? "n/a"
-                } ` +
-                `reasoning_tokens=${usage.reasoningTokens ?? "n/a"} tool_tokens=${usage.toolTokens ?? "n/a"} ` +
-                `accepted_prediction_tokens=${usage.acceptedPredictionTokens ?? "n/a"} rejected_prediction_tokens=${
-                    usage.rejectedPredictionTokens ?? "n/a"
-                } ` +
-                `system_prompt_tokens=${usage.systemPromptTokens ?? "n/a"} reserved_output_tokens=${
-                    usage.reservedOutputTokens ?? "n/a"
-                } ` +
-                `total_token_max=${usage.totalTokenMax ?? "n/a"} streamed_usage=${usage.sawUsageDataPart} ` +
-                `estimated_input_cost=${usage.estimatedInputCost ?? "n/a"} estimated_output_cost=${
-                    usage.estimatedOutputCost ?? "n/a"
-                } estimated_total_cost=${usage.estimatedTotalCost ?? "n/a"}`
-        );
-    }
-
     async provideLanguageModelChatInformation(
         options: vscode.PrepareLanguageModelChatModelOptions,
         token: CancellationToken
     ): Promise<LanguageModelChatInformation[]> {
-        // VS Code 1.120 supplies the per-group `configuration` on the options.
+        // VS Code supplies the per-group `configuration` on the options.
         // We pass the full options through to the base discovery path, which
         // discovers from that per-group configuration.
         const opts = options as vscode.PrepareLanguageModelChatModelOptions & {
             silent?: boolean;
             configuration?: Record<string, unknown>;
-            groupName?: string;
         };
         return this.discoverModels(
             {
                 silent: opts.silent ?? false,
                 configuration: opts.configuration,
-                groupName: opts.groupName,
             },
             token
         );
-    }
-
-    async provideTokenCount(
-        model: LanguageModelChatInformation,
-        text: string | LanguageModelChatRequestMessage,
-        token: CancellationToken,
-        configuration?: Record<string, unknown>
-    ): Promise<number> {
-        return super.provideTokenCount(model, text, token, configuration);
     }
 
     async provideLanguageModelChatResponse(
@@ -194,7 +115,9 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
     ): Promise<void> {
         const startTime = LiteLLMTelemetry.startTimer();
         const requestStartDate = new Date();
-        const requestId = Math.random().toString(36).substring(7);
+        // Twelve hex characters from a UUID, enough to correlate the log, the transcript and
+        // the live-request registry without carrying a full UUID everywhere.
+        const requestId = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
 
         // Hoisted to the outer scope so the failure/cancel paths in the catch
         // block can still emit a `.copilotmd` entry when the request got far
@@ -211,19 +134,9 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
         let requestBodyBuilt: OpenAIChatCompletionRequest | undefined;
         let activeMessages: readonly LanguageModelChatRequestMessage[] = messages;
 
-        // Extract caller/justification from options or model tags
-        const telemetry = this.getTelemetryOptions(options);
-        const modelWithTags = model as vscode.LanguageModelChatInformation & { tags?: string[] };
-        const caller = telemetry.caller || modelWithTags.tags?.[0] || "chat";
-        const justification = telemetry.justification;
+        const caller = this.getTelemetryOptions(options).caller;
 
-        let tokensIn: number | undefined;
-
-        Logger.info(
-            `Chat request started | RequestID: ${requestId} | Model: ${model.id} | Caller: ${caller} | Justification: ${
-                justification || "none"
-            }`
-        );
+        Logger.info(`Chat request started | RequestID: ${requestId} | Model: ${model.id} | Caller: ${caller}`);
         Logger.trace(
             `Chat request: received model id="${model.id}" name="${model.name}" hasOptionsConfig=${(options as { configuration?: unknown }).configuration !== undefined}`
         );
@@ -254,6 +167,49 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             { requestId, model: model.id, caller }
         );
 
+        // Created here, immediately before the `try`, so nothing between their
+        // creation and the `finally` can leave a registry entry or a host listener
+        // behind. The composite token is what every inner layer sees, so the
+        // connector's cancel command reaches all of them and a host cancellation
+        // propagates.
+        const requestCancellation = new RequestCancellation(token);
+        const activeRequest = this.activeRequests.register({
+            requestId,
+            model: model.id,
+            caller,
+            startedAt: requestStartDate.getTime(),
+            phase: "sending",
+            cancel: () => requestCancellation.cancelByConnector(),
+        });
+
+        // The fields every outcome of this request shares. Built on demand so the
+        // request totals and the response parts are read when the turn ends, not
+        // when it starts.
+        const outcomeContext = (): RequestOutcomeContext => ({
+            requestId,
+            model,
+            caller,
+            endpointUrl,
+            requestBodyBuilt,
+            activeMessages,
+            requestStartDate,
+            usage: tokenCapture.getSpendSnapshot(),
+            responseParts: responsePartCollector.parts,
+            sessionId,
+            sessionIdSource: resolvedSession.source,
+        });
+
+        // Whether the attempt that just ended reached the proxy, read by the fold at the
+        // top of the next attempt and by the outcome report. Only a connect-phase failure
+        // proves it did not. Classified from that attempt's own error, before any wrapper
+        // is put around it.
+        let previousAttemptReachedProxy = true;
+        // Whether that attempt got as far as sending its request. A resume that fails while
+        // the request is built never reaches the proxy, so it is not priced. A transport
+        // refusal before the `fetch`, such as a missing base URL or key, is covered by
+        // `LiteLLMConfigurationError`.
+        let attemptSent = false;
+
         try {
             // Resolve the backend baseUrl for the `.copilotmd` metadata `url:` line.
             // The registry is the single source of truth for (namespaced id → backend);
@@ -265,7 +221,11 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             const routingEntry = this._registry.lookup(model.id);
             endpointUrl = routingEntry?.baseUrl ?? "litellm-connector";
 
-            const requestBody = await this.buildOpenAIChatRequest(messages, model, options, modelInfo, caller);
+            const requestBuild = await this.buildOpenAIChatRequest(messages, model, options, modelInfo, caller);
+            const requestBody = requestBuild.request;
+            // Reassigned when a resume rebuilds the body, so the mapping always
+            // describes the tool list the current attempt sends.
+            let toolNames: ToolNameMapping = requestBuild.toolNames;
             // Sent even when the `.copilotmd` export is off: spend grouping is
             // independent of debug logging.
             requestBody.metadata = {
@@ -274,11 +234,11 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             };
             requestBodyBuilt = requestBody;
             // The model id in `model` is the namespaced `<routing>/<raw>`
-            // form VS Code hands us. The tokenizer heuristics (and the
-            // `isParameterSupported` / `usageOptOutModels` lookups inside the
-            // request builder) key off the raw model family, not the routing
-            // prefix. The request builder extracts the raw name internally
-            // before populating `request.model`.
+            // form VS Code hands us. The tokenizer heuristics and the
+            // `isParameterSupported` lookups key off the raw model family, not
+            // the routing prefix. The request builder extracts the raw name
+            // internally before populating `request.model`, while what a proxy
+            // taught us about a model is stored under the namespaced id.
             const rawModelIdForTokenizers = this.getRawModelName(model.id);
             const estimatedTransportInputTokens =
                 countOpenAIChatMessagesTokens(requestBody.messages, rawModelIdForTokenizers, modelInfo) +
@@ -298,9 +258,6 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             tokenCapture.setReservedOutputTokens(reservedOutputTokens);
             tokenCapture.setTotalTokenMax(totalTokenMax);
 
-            // Count the actual transport request after trimming/conversion.
-            tokensIn = estimatedTransportInputTokens;
-
             // A socket death (`terminated` / `fetch failed`) or inactivity abort
             // kills the upstream request but does NOT undo parts already emitted
             // to VS Code. Instead of surfacing the transport error (which shows
@@ -317,6 +274,10 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
             const retryBaseDelayMs = retryCfg.networkRetryDelayMs ?? 2000;
             const maxEmptyRetries = retryCfg.emptyResponseRetries ?? 2;
             const emptyBaseDelayMs = retryCfg.emptyResponseRetryDelayMs ?? 1000;
+            // Wall-clock bound on the retry phase. The Agents window harness never
+            // cancels a request, so without this bound a retrying turn would keep
+            // starting attempts until a counter ran out.
+            const retryBudget = new RetryBudget(retryCfg.retryBudgetMs ?? DEFAULT_RETRY_BUDGET_MS);
             const accumulator = new StreamedTextAccumulator();
             const trackedProgress: vscode.Progress<vscode.LanguageModelResponsePart> = {
                 report: (part) => {
@@ -325,95 +286,194 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                 },
             };
 
+            const restartBudgetAfterProgress = (): void => {
+                if (accumulator.text.length + accumulator.thinking.length > outputAtAttemptStart) {
+                    retryBudget.restart();
+                }
+            };
+
             let stream: ReadableStream<Uint8Array>;
             let attempt = 0;
             let emptyAttempt = 0;
+            // Resends spent on an attempt that proved an empty `stop`.
+            let emptyStopResends = 0;
+            // A headers timeout means the proxy never started answering, so one retry
+            // covers a transient stall. A second means the wait itself is the problem,
+            // and repeating it only multiplies a guaranteed failure.
+            let headersTimeoutAttempts = 0;
             let resumed = false;
+            // Output already streamed when an attempt starts. An attempt that adds to it
+            // proves the upstream is working, so the retry clock starts over.
+            let outputAtAttemptStart = 0;
+            // One counter per request, so a retry numbers its thinking blocks onwards
+            // instead of reusing the ids the previous attempt already delivered.
+            const thinkingBlockIds = { used: 0 };
             while (true) {
+                // A cancel that landed before this attempt stops here, outside the per-attempt
+                // catch, so that catch classifies the attempt that actually ran. A cancel that
+                // followed a refused connection therefore leaves that attempt's "never reached
+                // the proxy" verdict in place instead of overwriting it.
+                if (requestCancellation.isCancellationRequested) {
+                    Logger.debug(`[transportRetry] request=${requestId} cancelled before attempt ${attempt}; aborting`);
+                    throw Object.assign(new Error("Operation cancelled by user"), { name: "CancellationError" });
+                }
                 try {
-                    // VS Code may cancel (Stop/steer) during the backoff sleep.
-                    // A post-cancel request is pointless: the ext-host progress
-                    // wrapper drops all subsequently reported parts anyway.
-                    if (token.isCancellationRequested) {
-                        Logger.debug(
-                            `[transportRetry] request=${requestId} cancelled before attempt ${attempt}; aborting`
-                        );
-                        throw Object.assign(new Error("Operation cancelled by user"), { name: "CancellationError" });
-                    }
                     if (resumed) {
-                        // Both retry budgets resume mid-response: the
-                        // already-streamed reasoning + text is appended as
-                        // trailing assistant content so the model continues
-                        // where the previous attempt stopped. The wire body is
-                        // rebuilt because the body built before the loop still
-                        // carries the pre-stream messages. Both state variables
-                        // are committed only after the rebuild succeeds, so a
-                        // failed rebuild leaves the pair consistent.
-                        const resumedMessages = buildResumeMessages(messages, accumulator.text, accumulator.thinking);
-                        const resumedRequestBody = await this.buildOpenAIChatRequest(
-                            resumedMessages,
-                            model,
-                            options,
-                            modelInfo,
-                            caller
-                        );
-                        activeMessages = resumedMessages;
-                        requestBodyBuilt = resumedRequestBody;
-                        // Carry over the request metadata (which holds the
-                        // session id) so resumed attempts keep per-session
-                        // spend grouping in LiteLLM.
-                        requestBodyBuilt.metadata = { ...(requestBody.metadata ?? {}) };
-                        const resumedInputTokens =
-                            countOpenAIChatMessagesTokens(
-                                requestBodyBuilt.messages,
-                                rawModelIdForTokenizers,
-                                modelInfo
-                            ) + estimateToolTokens(requestBodyBuilt.tools);
-                        tokenCapture.setEstimatedPromptTokens(resumedInputTokens);
-                        tokenCapture.setReservedOutputTokens(
-                            getReservedOutputTokens(model, requestBodyBuilt.max_tokens, {
-                                estimatedInputTokens: resumedInputTokens,
-                                modelInfo,
-                            })
-                        );
-                        tokensIn = resumedInputTokens;
+                        // The attempt being replaced keeps its accounting until the next
+                        // request actually starts, so a turn cancelled during the backoff
+                        // sleep reports the attempt that ran, not an estimate for one
+                        // that never started. Its spend is folded into the request totals
+                        // here, and the estimator then starts clean so the usage part
+                        // describes only the attempt that follows.
+                        tokenCapture.resetAccumulation({ reachedProxy: previousAttemptReachedProxy });
                     }
+                    previousAttemptReachedProxy = true;
+                    attemptSent = false;
+                    outputAtAttemptStart = accumulator.text.length + accumulator.thinking.length;
+                    // A retry starts a fresh header wait, so the request is back in the
+                    // phase the picker labels "waiting for headers".
+                    activeRequest.setPhase("sending");
+                    if (resumed) {
+                        // A resume appends the already-streamed reasoning and text
+                        // as trailing assistant content so the model continues where
+                        // the previous attempt stopped. With nothing to continue, a
+                        // "Continue" nudge would ask the model to carry on with output
+                        // no attempt produced, so the request is resent unchanged.
+                        const resume = selectResumableContent(accumulator, {
+                            canReplayReasoning: modelInfo?.mode !== "responses",
+                        });
+                        if (!resume) {
+                            Logger.debug(
+                                `[transportRetry] request=${requestId} resending the unchanged request (no replayable output)`
+                            );
+                        } else {
+                            const resumedMessages = buildResumeMessages(messages, resume.text, resume.thinking);
+                            const resumedRequestBody = await this.buildOpenAIChatRequest(
+                                resumedMessages,
+                                model,
+                                options,
+                                modelInfo,
+                                caller
+                            );
+                            activeMessages = resumedMessages;
+                            requestBodyBuilt = resumedRequestBody.request;
+                            toolNames = resumedRequestBody.toolNames;
+                            // Carry over the request metadata (which holds the
+                            // session id) so resumed attempts keep per-session
+                            // spend grouping in LiteLLM.
+                            requestBodyBuilt.metadata = { ...(requestBody.metadata ?? {}) };
+                            const resumedInputTokens =
+                                countOpenAIChatMessagesTokens(
+                                    requestBodyBuilt.messages,
+                                    rawModelIdForTokenizers,
+                                    modelInfo
+                                ) + estimateToolTokens(requestBodyBuilt.tools);
+                            tokenCapture.setEstimatedPromptTokens(resumedInputTokens);
+                            tokenCapture.setReservedOutputTokens(
+                                getReservedOutputTokens(model, requestBodyBuilt.max_tokens, {
+                                    estimatedInputTokens: resumedInputTokens,
+                                    modelInfo,
+                                })
+                            );
+                        }
+                    }
+                    // Read before the response stream opens, so a config failure here
+                    // cannot strand an upstream response. A setting changed mid-turn
+                    // still applies to the next attempt.
+                    const streamCfg = await this._configManager.getConfig();
+                    attemptSent = true;
                     stream = await this.sendRequestWithRetry(
                         requestBodyBuilt,
-                        activeMessages,
                         model,
                         options,
                         trackedProgress,
-                        token,
+                        requestCancellation,
                         caller,
                         modelInfo,
                         requestId
                     );
-                    await this.processStreamingResponse(stream, trackedProgress, token, requestId);
+                    // Headers have arrived, so the request is now reading a body.
+                    activeRequest.setPhase("streaming");
+                    await processResponseStream({
+                        responseBody: stream,
+                        progress: trackedProgress,
+                        token: requestCancellation,
+                        requestId,
+                        wireToDeclaredNames: toolNames.wireToDeclared,
+                        inactivityTimeoutMs: (streamCfg.inactivityTimeout ?? 60) * 1000,
+                        thinkingBlockIds,
+                    });
+
+                    // A cancelled stream ends without an error, so without this
+                    // check the request would be reported and billed as a success.
+                    if (requestCancellation.isCancellationRequested) {
+                        Logger.debug(`[chatRequest] request=${requestId} cancelled after a clean stream end`);
+                        throw Object.assign(new Error("Operation cancelled by user"), { name: "CancellationError" });
+                    }
 
                     // Upstream may stream no usage frame; VS Code still needs one usage report.
                     tokenCapture.flushUsage();
                     break;
                 } catch (err: unknown) {
-                    if (token.isCancellationRequested) {
-                        // VS Code cancels mid-stream for its own reasons (user
-                        // Stop, agent-loop retries). The resulting abort ends
-                        // decodeSSE cleanly, which the reasoning-only detector
-                        // then misreads as empty content. Surfacing that would
-                        // falsely blame the upstream provider.
+                    // Classified first, from this attempt's own error: the branches below
+                    // may wrap it, and a wrapper hides a connect-phase code.
+                    previousAttemptReachedProxy = !failedBeforeReachingProxy(err);
+                    if (requestCancellation.isCancellationRequested) {
+                        // A cancellation mid-stream ends the body without an error,
+                        // whether the host asked for it (user Stop, agent-loop
+                        // retries) or the user cancelled from the connector's cancel
+                        // command. decodeSSE returns cleanly, which the
+                        // reasoning-only detector would otherwise misread as empty
+                        // content and blame on the upstream provider.
                         throw Object.assign(new Error("Operation cancelled by user"), {
                             name: "CancellationError",
                             cause: err,
                         });
                     }
                     if (err instanceof ReasoningOnlyError) {
-                        if (emptyAttempt < maxEmptyRetries && !token.isCancellationRequested) {
+                        // The previous attempt already delivered the answer, so an
+                        // attempt that streams nothing but its finish frame completed the
+                        // turn. New reasoning means the model was still working, so that
+                        // attempt restarts the retry clock, and only a `stop` finish proves
+                        // the model chose to end its turn.
+                        if (
+                            resumed &&
+                            accumulator.text.trim().length > 0 &&
+                            err.reasoningChars === 0 &&
+                            err.normalFinish
+                        ) {
+                            StructuredLogger.info("request.resume_completed_empty", {
+                                requestId,
+                                resumedTextChars: accumulator.text.length,
+                            });
+                            tokenCapture.flushUsage();
+                            break;
+                        }
+                        // A proven empty stop is resent once, not up to the whole empty
+                        // budget: the model declared it had nothing to say, so a second
+                        // resend mostly buys the same answer at full prompt cost.
+                        const emptyStopExhausted =
+                            err.normalFinish && err.reasoningChars === 0 && emptyStopResends >= 1;
+                        if (
+                            emptyAttempt < maxEmptyRetries &&
+                            !emptyStopExhausted &&
+                            !requestCancellation.isCancellationRequested
+                        ) {
+                            if (err.normalFinish && err.reasoningChars === 0) {
+                                emptyStopResends += 1;
+                            }
+                            restartBudgetAfterProgress();
+                            if (!retryBudget.markFailure()) {
+                                // The budget, not the reasoning-only count, ends the
+                                // turn, so the user must be told which setting bounded it.
+                                throw retryBudgetError(retryBudget.budgetMs, err);
+                            }
                             emptyAttempt += 1;
                             resumed = true;
-                            const delay = backoffDelayMs(emptyAttempt, emptyBaseDelayMs);
+                            const delay = retryBudget.clipDelay(backoffDelayMs(emptyAttempt, emptyBaseDelayMs));
                             Logger.warn(
                                 `[transportRetry] request=${requestId} reasoning-only response, retry ${emptyAttempt}/${maxEmptyRetries} ` +
-                                    `(resuming with ${accumulator.thinking.length} reasoning chars)`
+                                    `(carrying ${accumulator.thinking.length} reasoning chars, replayable: ${modelInfo?.mode !== "responses"})`
                             );
                             StructuredLogger.warn("request.reasoning_only_retry", {
                                 requestId,
@@ -422,73 +482,95 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                                 delayMs: delay,
                                 resumedReasoningChars: accumulator.thinking.length,
                             });
-                            tokenCapture.resetAccumulation();
-                            await sleepWithCancellation(delay, token);
+                            await sleepWithCancellation(delay, requestCancellation);
                             // Do NOT count this against the transport attempt
                             // budget; treat the next iteration as a fresh resume.
                             continue;
                         }
-                        // Exhausted: throw a distinct error so the chip explains
-                        // the failure instead of "no response was returned".
-                        Logger.error(
-                            `[transportRetry] request=${requestId} reasoning-only response persisted after ${emptyAttempt} resume attempt(s); failing request`
-                        );
-                        StructuredLogger.error("request.reasoning_only_exhausted", {
-                            requestId,
-                            attempts: emptyAttempt,
-                            config: maxEmptyRetries,
-                        });
-                        throw new Error(
-                            `LiteLLM: model returned reasoning-only response (no text or tool calls) ` +
-                                `after ${emptyAttempt} resume attempt(s). The upstream provider is ` +
-                                `truncating generation mid-reasoning; try resending.`,
-                            { cause: err }
-                        );
+                        // Exhausted: throw a distinct error so the chip explains the
+                        // failure instead of "no response was returned". The boundary
+                        // handler records this turn's failure once, so nothing is logged
+                        // here.
+                        // An empty reply is one that ended on a proven stop having produced
+                        // nothing at all. A length cut, or a resend that adds nothing to
+                        // reasoning the user already saw, was cut short instead, and calling
+                        // that empty would misdescribe it.
+                        const isEmptyReply =
+                            err.reasoningChars === 0 && err.normalFinish && accumulator.thinking.length === 0;
+                        // A `/responses` retry cannot replay the reasoning, so it resends the
+                        // request; the notice therefore counts retry attempts rather than resumes.
+                        const afterAttempts =
+                            emptyAttempt > 0
+                                ? `after ${emptyAttempt} retry attempt${emptyAttempt === 1 ? "" : "s"}`
+                                : "on the first attempt";
+                        const reason = isEmptyReply
+                            ? `LiteLLM: model returned an empty reply (no text, reasoning or tool call) ` +
+                              `${afterAttempts}; try resending.`
+                            : err.reasoningChars > 0
+                              ? `LiteLLM: model returned a reasoning-only response (no text or tool calls) ` +
+                                `${afterAttempts}. The upstream provider is truncating generation ` +
+                                `mid-reasoning; try resending.`
+                              : `LiteLLM: model returned no text or tool call ${afterAttempts}, and the ` +
+                                `response was cut short; try resending.`;
+                        throw new Error(reason, { cause: err });
+                    }
+
+                    if (err instanceof HeadersTimeoutError) {
+                        headersTimeoutAttempts += 1;
+                        if (headersTimeoutAttempts > MAX_HEADERS_TIMEOUT_RETRIES) {
+                            // The connector's timer uses the setting's value. The runtime's
+                            // limit fires at 300 s whatever the setting says.
+                            const detail =
+                                err.source === "runtime"
+                                    ? `The HTTP runtime's own header limit fired, which litellm-connector.headersTimeout cannot move.`
+                                    : `The last attempt waited ${formatDuration(err.timeoutMs)} (litellm-connector.headersTimeout).`;
+                            throw new Error(
+                                `LiteLLM: the proxy sent no response headers on ${headersTimeoutAttempts} attempts, ` +
+                                    `so the request is no longer retried. ${detail}`,
+                                { cause: err }
+                            );
+                        }
                     }
 
                     const isLastAttempt = attempt >= maxTransportRetries;
                     if (
-                        token.isCancellationRequested ||
+                        requestCancellation.isCancellationRequested ||
                         accumulator.sawToolCall ||
                         !isTransportRetriableError(err) ||
                         isLastAttempt
                     ) {
-                        // A tool call already reached VS Code before the stream
-                        // died: the agent loop may have executed it, so resending
-                        // this request could double-execute the tool. Not
-                        // recoverable here; log it loudly and rethrow.
+                        // A tool call already reached VS Code before the stream died: the
+                        // agent loop may have executed it, so resending this request could
+                        // double-execute the tool. That is a decision, recorded at info
+                        // level, and `request.failed` records the turn's outcome.
                         if (accumulator.sawToolCall && isTransportRetriableError(err) && !isLastAttempt) {
-                            Logger.error(
-                                `[transportRetry] request=${requestId} unrecoverable: tool call was already emitted before the transport error; not retrying to avoid double tool execution`,
-                                err
-                            );
-                            StructuredLogger.error("request.transport_retry_blocked_tool_call", {
+                            StructuredLogger.info("request.transport_retry_skipped", {
                                 requestId,
                                 attempt,
-                                error: err instanceof Error ? err.message : String(err),
+                                reason: "tool_call_delivered",
+                                ...toErrorLogFields(err),
                             });
                         }
                         // Rethrow so non-transport errors flow through the
-                        // shared catch handling below.
-                        if (attempt === 0) {
-                            this.logRequestPayloadOnFailure(requestBodyBuilt, err, {
-                                stage: "provideLanguageModelChatResponse",
-                                modelId: model.id,
-                                caller,
-                                modelInfoMode: modelInfo?.mode,
-                            });
-                        }
+                        // shared catch handling below, which records the turn's failure.
                         throw err;
+                    }
+
+                    restartBudgetAfterProgress();
+                    if (!retryBudget.markFailure()) {
+                        // The budget, not the attempt count, ends the turn here. The
+                        // boundary handler logs the failure, so this throw does not.
+                        throw retryBudgetError(retryBudget.budgetMs, err);
                     }
 
                     attempt += 1;
                     resumed = true;
-                    const delay = backoffDelayMs(attempt, retryBaseDelayMs);
+                    const delay = retryBudget.clipDelay(backoffDelayMs(attempt, retryBaseDelayMs));
                     logTransportRetry(
                         requestId,
                         attempt,
                         maxTransportRetries,
-                        err instanceof Error ? err.message : String(err),
+                        describeFailureForLog(err),
                         accumulator.text.length
                     );
                     StructuredLogger.warn("request.transport_retry", {
@@ -497,475 +579,86 @@ export class LiteLLMChatProvider extends LiteLLMProviderBase implements Language
                         maxRetries: maxTransportRetries,
                         delayMs: delay,
                         resumedTextChars: accumulator.text.length,
-                        error: err instanceof Error ? err.message : String(err),
-                        ...(err instanceof UpstreamStreamError
-                            ? {
-                                  upstreamStatus: err.status,
-                                  upstreamCode: err.code,
-                                  upstreamType: err.type,
-                              }
-                            : {}),
+                        ...toErrorLogFields(err),
                     });
-                    // Fresh attempt: drop partial-response token accounting so
-                    // the next usage snapshot reflects only the resumed stream.
-                    tokenCapture.resetAccumulation();
-                    await sleepWithCancellation(delay, token);
+                    await sleepWithCancellation(delay, requestCancellation);
                 }
             }
-
-            const snapshot = tokenCapture.getSnapshot();
-
-            const tokensOut = Math.max(snapshot.completionTokens, snapshot.toolTokens);
-            const tokensInForTelemetry = snapshot.promptTokens ?? tokensIn;
-            const reasoningTokens = snapshot.reasoningTokens || undefined;
-            const cachedTokens = snapshot.cachedTokens || undefined;
-            const systemPromptTokens = snapshot.systemPromptTokens || undefined;
-            const toolTokens = snapshot.toolTokens || undefined;
-            const acceptedPredictionTokens = snapshot.acceptedPredictionTokens || undefined;
-            const rejectedPredictionTokens = snapshot.rejectedPredictionTokens || undefined;
-            const cacheCreationInputTokens = snapshot.cacheCreationInputTokens || undefined;
-            const estimatedInputCost = snapshot.estimatedInputCost;
-            const estimatedOutputCost = snapshot.estimatedOutputCost;
-            const estimatedTotalCost = snapshot.estimatedTotalCost;
-
-            const metric = {
-                requestId,
-                model: model.id,
-                durationMs: LiteLLMTelemetry.endTimer(startTime),
-                tokensIn: tokensInForTelemetry,
-                tokensOut,
-                promptCacheTokens: cachedTokens,
-                cacheCreationInputTokens,
-                reasoningTokens,
-                toolTokens,
-                acceptedPredictionTokens,
-                rejectedPredictionTokens,
-                reservedOutputTokens,
-                totalTokenMax,
-                estimatedInputCost,
-                estimatedOutputCost,
-                estimatedTotalCost,
-                status: "success" as const,
-                caller,
-                cacheReadRatio:
-                    cachedTokens !== undefined && tokensInForTelemetry
-                        ? cachedTokens / tokensInForTelemetry
-                        : undefined,
-            };
-            LiteLLMTelemetry.reportMetric(metric);
-            this.logFinalUsageEnvelope(requestId, model.id, caller, {
-                tokensIn: tokensInForTelemetry,
-                tokensOut,
-                cachedTokens,
-                cacheCreationInputTokens,
-                reasoningTokens,
-                toolTokens,
-                acceptedPredictionTokens,
-                rejectedPredictionTokens,
-                systemPromptTokens,
-                reservedOutputTokens,
-                totalTokenMax,
-                sawUsageDataPart: snapshot.sawUpstreamUsage,
-                estimatedInputCost,
-                estimatedOutputCost,
-                estimatedTotalCost,
-            });
-
-            // Fire-and-forget `.copilotmd` export. Reads the opt-in setting
-            // inside `exportCopilotMdEntry`; when disabled this is a single
-            // config read + early return, negligible on the request hot path.
-            // Never awaited: a failed/slow export must not delay the user's
-            // already-streamed response.
-            void exportCopilotMdEntry({
-                debugName: caller,
-                id: requestId.slice(0, 8),
-                model: model.id,
-                url: endpointUrl ?? "litellm-connector",
-                maxPromptTokens: model.maxInputTokens,
-                maxResponseTokens: requestBodyBuilt.max_tokens,
-                location: undefined,
-                body: requestBodyBuilt,
-                requestMessages: activeMessages,
-                startTimeIso: requestStartDate.toISOString(),
-                endTimeIso: new Date().toISOString(),
-                durationMs: metric.durationMs,
-                ourRequestId: requestId,
-                timeToFirstTokenMs: undefined,
-                resolvedModel: model.id,
-                usage: snapshot,
-                responseParts: responsePartCollector.parts,
-                status: "success",
-                sessionId,
-                sessionIdSource: resolvedSession.source,
-            } satisfies CopilotMdEntry);
 
             // Usage data flows through StreamTokenCapture, which intercepts
-            // usage DataParts during streaming and enriches them.
-        } catch (err: unknown) {
-            let errorMessage = err instanceof Error ? err.message : String(err);
-            const errorStack = err instanceof Error ? err.stack : undefined;
-            const errorName = err instanceof Error ? err.constructor.name : typeof err;
-
-            if (errorMessage.includes("LiteLLM API error")) {
-                const statusMatch = errorMessage.match(/error: (\d+)/);
-                const statusCode = statusMatch ? parseInt(statusMatch[1], 10) : 400;
-                const errorParts = errorMessage.split("\n");
-                const errorText = errorParts.length > 1 ? errorParts.slice(1).join("\n") : "";
-                const parsedMessage = this.parseApiError(statusCode, errorText);
-                errorMessage = `LiteLLM Error (${model.id}): ${parsedMessage}`;
-
-                const rejectionBody = err instanceof LiteLLMApiError ? err.bodyText : errorText;
-                if (err instanceof LiteLLMRateLimitError) {
-                    errorMessage = appendRateLimitHint(errorMessage, err.failure);
-                } else if (isUnsupportedParameterError(rejectionBody)) {
-                    // Resending the identical body would fail the same way, so the
-                    // rejection is reported once with the proxy-side fix. Only
-                    // parameters the connector adds itself are ever stripped.
-                    const rejectedParameter = findRejectedParameter(rejectionBody);
-                    const subject = rejectedParameter ? `"${rejectedParameter}"` : "a model parameter";
-                    errorMessage +=
-                        `. The proxy rejected ${subject}: drop it there with additional_drop_params ` +
-                        `or drop_params in the LiteLLM model config, then reload the models.`;
-                } else if (
-                    parsedMessage.toLowerCase().includes("temperature") ||
-                    parsedMessage.toLowerCase().includes("unsupported value")
-                ) {
-                    errorMessage +=
-                        ". This model may not support certain parameters like temperature. Please check your model settings.";
-                }
-            }
-            // Node.js wraps network failures (ECONNREFUSED, DNS errors) as
-            // "TypeError: fetch failed" without surfacing the root cause in
-            // the error message. Extract the chained `.cause` so operators
-            // see the real reason (e.g. ECONNREFUSED) rather than a generic label.
-            const rootCause = err instanceof Error && err.cause instanceof Error ? err.cause.message : undefined;
-
-            // Log full error details to both Logger and StructuredLogger
-            Logger.error("Chat request failed", err);
-            StructuredLogger.error("request.failed", {
+            // usage DataParts during streaming and enriches them. The transcript
+            // export it drives is fire-and-forget: it reads the opt-in setting
+            // itself and is never awaited, so a slow write cannot delay a response
+            // the user already has.
+            reportTurnSuccess({
                 requestId,
-                model: model.id,
+                modelId: model.id,
                 caller,
-                errorName,
-                errorMessage,
-                errorStack,
-                rootCause,
-                stage: "provideLanguageModelChatResponse",
-            });
-
-            const metric = {
-                requestId,
-                model: model.id,
                 durationMs: LiteLLMTelemetry.endTimer(startTime),
-                tokensIn,
-                status: "failure" as const,
-                error: errorMessage,
-                caller,
-            };
-            LiteLLMTelemetry.reportMetric(metric);
+                reservedOutputTokens,
+                totalTokenMax,
+                outcomeContext,
+            });
+        } catch (err: unknown) {
+            const durationMs = LiteLLMTelemetry.endTimer(startTime);
 
-            // Fire-and-forget `.copilotmd` export for the failure case. Only
-            // emits when the request got far enough to have a built body; a
-            // failure before `buildOpenAIChatRequest` (e.g. a config error) has
-            // nothing meaningful to render and is skipped.
-            if (requestBodyBuilt && endpointUrl) {
-                void exportCopilotMdEntry({
-                    debugName: caller,
-                    id: requestId.slice(0, 8),
-                    model: model.id,
-                    url: endpointUrl ?? "litellm-connector",
-                    maxPromptTokens: model.maxInputTokens,
-                    maxResponseTokens: requestBodyBuilt.max_tokens,
-                    location: undefined,
-                    body: requestBodyBuilt,
-                    requestMessages: activeMessages,
-                    startTimeIso: requestStartDate.toISOString(),
-                    endTimeIso: new Date().toISOString(),
-                    durationMs: metric.durationMs,
-                    ourRequestId: requestId,
-                    timeToFirstTokenMs: undefined,
-                    resolvedModel: model.id,
-                    usage: tokenCapture.getSnapshot(),
-                    responseParts: responsePartCollector.parts,
-                    status: "failure",
-                    statusReason: errorMessage,
-                    sessionId,
-                    sessionIdSource: resolvedSession.source,
-                } satisfies CopilotMdEntry);
+            // A turn that never reached the proxy, or that the proxy answered with a 4xx, is
+            // not priced: the proxy records a failure that never streamed at zero cost, so a
+            // prompt estimate here would report spend it never recorded. A cancel inherits the
+            // verdict of the attempt it interrupted through `previousAttemptReachedProxy`, and
+            // a refusal that was not retried is read from its own error.
+            if (!attemptSent || !previousAttemptReachedProxy || isUnbilledFailure(err)) {
+                tokenCapture.endAttemptUnbilled();
+            }
+
+            if (requestCancellation.cancelledByConnector) {
+                // The connector ended this turn, not the host: VS Code is still
+                // waiting on the promise, so returning with a notice closes the turn
+                // and keeps whatever streamed. Throwing here would make the Agents
+                // window handler answer with a 502 and discard that output.
+                reportConnectorCancellation({
+                    requestId,
+                    modelId: model.id,
+                    caller,
+                    durationMs,
+                    responsePartCount: responsePartCollector.parts.length,
+                    outcomeContext,
+                });
+                trackingProgress.report(
+                    new LanguageModelTextPart(
+                        `\n\n${formatConnectorNotice("Request cancelled from the LiteLLM connector.")}`
+                    )
+                );
+                return;
             }
 
             if (token.isCancellationRequested) {
+                reportHostCancellation({
+                    requestId,
+                    modelId: model.id,
+                    caller,
+                    durationMs,
+                    outcomeContext,
+                });
                 throw Object.assign(new Error("Operation cancelled by user"), {
                     name: "CancellationError",
                     cause: err,
                 });
             }
 
-            // VS Code excludes an errored turn from the conversation history
-            // sent upstream, so a thrown error would erase everything the
-            // model already said this turn; on the next turn the model would
-            // see neither its own partial answer nor the failure. Completing
-            // with the error as an assistant text part keeps the turn in
-            // history; cancellation stays a throw because VS Code renders
-            // that state itself.
-            trackingProgress.report(new LanguageModelTextPart(`\n\n${formatConnectorNotice(errorMessage)}`));
-            Logger.warn(`Chat request surfaced as assistant error text instead of throwing | RequestID: ${requestId}`);
-        }
-    }
-
-    /**
-     * Processes an SSE streaming response from LiteLLM and emits VS Code response parts.
-     *
-     * Kept as `protected` to allow unit tests (and potential subclasses) to exercise the
-     * streaming pipeline deterministically without stubbing network layers.
-     */
-    protected async processStreamingResponse(
-        responseBody: ReadableStream<Uint8Array>,
-        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-        token: vscode.CancellationToken,
-        requestId: string
-    ): Promise<void> {
-        Logger.info(`[processStreamingResponse] request=${requestId} Starting stream processing`);
-        StructuredLogger.info("stream.processing_start", {
-            requestId,
-            timestamp: new Date().toISOString(),
-        });
-
-        const config = await this._configManager.getConfig();
-        const timeoutMs = (config.inactivityTimeout ?? 60) * 1000;
-        // Scoped to one upstream attempt: a resumed retry is a new upstream
-        // response, so nothing buffered by the failed attempt belongs to it.
-        const streamingState = createInitialStreamingState(requestId);
-        let watchdog: NodeJS.Timeout | undefined;
-        let eventCount = 0;
-        let wasWatchdogAbort = false;
-        // Content tracking for the reasoning-only detection: a cleanly-completed
-        // stream whose ONLY emissions were thinking parts is not a success for
-        // the agent loop (VS Code renders "no response was returned").
-        let sawTextPart = false;
-        let sawToolCallPart = false;
-        let sawUsagePart = false;
-        let reasoningChars = 0;
-        // Set by a `finish` part that ends the turn without completing it.
-        let stoppedEarly: { reason: string; notice: string } | undefined;
-
-        // Create an AbortController to actually cancel the stream on timeout
-        const controller = new AbortController();
-
-        const emitParts = (parts: EmittedPart[]): void => {
-            for (const part of parts) {
-                if (part.type === "text") {
-                    sawTextPart = true;
-                } else if (part.type === "tool_call") {
-                    sawToolCallPart = true;
-                } else if (part.type === "data" && part.mimeType === "usage") {
-                    sawUsagePart = true;
-                } else if (part.type === "thinking") {
-                    reasoningChars += typeof part.value === "string" ? part.value.length : part.value.join("").length;
-                } else if (part.type === "finish") {
-                    stoppedEarly = describeStoppedEarly(part.reason) ?? stoppedEarly;
-                }
-            }
-            emitPartsToVSCode(parts, progress);
-        };
-
-        // A stream that stops without a finish frame, whether it closes cleanly
-        // or is truncated, still holds tool calls the model fully streamed.
-        // Delivering them keeps the agent loop going instead of stalling it.
-        const recoverBufferedToolCalls = (reason: "stream_completed_without_finish" | "stream_incomplete"): number => {
-            const recoveredToolCalls = flushPendingBuffers(streamingState).filter((part) => part.type === "tool_call");
-            emitParts(recoveredToolCalls);
-            Logger.info(
-                `[processStreamingResponse] request=${requestId} Recovered ${recoveredToolCalls.length} buffered tool calls (${reason})`
-            );
-            StructuredLogger.info("stream.tool_calls_recovered", {
+            reportTurnFailure({
                 requestId,
-                reason,
-                eventCount,
-                toolCallsRecovered: recoveredToolCalls.length,
+                modelId: model.id,
+                caller,
+                durationMs,
+                error: err,
+                progress: trackingProgress,
+                outcomeContext,
             });
-            return recoveredToolCalls.length;
-        };
-
-        const resetWatchdog = () => {
-            if (watchdog) {
-                clearTimeout(watchdog);
-            }
-            watchdog = setTimeout(() => {
-                Logger.warn(
-                    `[processStreamingResponse] request=${requestId} Inactivity timeout after ${timeoutMs}ms (after ${eventCount} events)`
-                );
-                StructuredLogger.warn("stream.inactivity_timeout", {
-                    requestId,
-                    timeoutMs,
-                    eventCount,
-                });
-                wasWatchdogAbort = true;
-                controller.abort();
-            }, timeoutMs);
-        };
-
-        const cancellationListener = token.onCancellationRequested(() => {
-            // The listener runs synchronously inside whoever called cancel(),
-            // so this stack is the only fingerprint of the canceller, e.g.
-            // user action, Copilot agent-loop retry, or session teardown,
-            // which the CancellationToken API itself does not expose.
-            const cancellationStack = new Error().stack;
-            Logger.warn(
-                `[processStreamingResponse] request=${requestId} Cancellation requested from VS Code after ${eventCount} events (text=${sawTextPart}, toolCall=${sawToolCallPart}, usage=${sawUsagePart})`
-            );
-            StructuredLogger.warn("stream.cancellation_requested", {
-                requestId,
-                eventCount,
-                sawTextPart,
-                sawToolCallPart,
-                sawUsagePart,
-                stack: cancellationStack,
-            });
-            if (watchdog) {
-                clearTimeout(watchdog);
-            }
-            controller.abort();
-        });
-
-        try {
-            resetWatchdog();
-            Logger.debug(`[processStreamingResponse] Starting SSE decoder loop`);
-
-            for await (const payload of decodeSSE(responseBody, token, controller.signal)) {
-                resetWatchdog();
-                eventCount++;
-
-                Logger.trace(`[processStreamingResponse] Event #${eventCount} received, length=${payload.length}`);
-
-                const jsonResult = tryParseJSONObject(payload);
-                if (!jsonResult.ok) {
-                    Logger.trace(`[processStreamingResponse] Event #${eventCount}: Skipped (JSON parse failed)`);
-                    StructuredLogger.trace("stream.event_parse_skipped", {
-                        eventNumber: eventCount,
-                        payloadLength: payload.length,
-                    });
-                    continue;
-                }
-                const json = jsonResult.value;
-
-                Logger.trace(`[processStreamingResponse] Event #${eventCount}: Interpreting event`);
-                const parts = interpretStreamEvent(json, streamingState);
-                Logger.trace(
-                    `[processStreamingResponse] Event #${eventCount}: Got ${parts.length} parts, emitting to VS Code`
-                );
-                StructuredLogger.trace("stream.event_processed", {
-                    eventNumber: eventCount,
-                    partCount: parts.length,
-                });
-                emitParts(parts);
-            }
-
-            Logger.info(`[processStreamingResponse] Stream loop completed after ${eventCount} events`);
-            StructuredLogger.info("stream.processing_complete", {
-                eventCount,
-                reason: "stream_ended",
-            });
-
-            // A watchdog abort causes decodeSSE to END CLEANLY (the aborted flag
-            // there suppresses its endError), so the abort lands HERE on the
-            // normal path, not in the catch block. Surface it as the retryable
-            // sentinel BEFORE reasoning-only detection: a watchdog abort kills
-            // the stream regardless of whether reasoning was emitted.
-            if (wasWatchdogAbort) {
-                throw new InactivityTimeoutError(timeoutMs, eventCount);
-            }
-
-            // A cancelled stream's output is discarded by VS Code, so only a
-            // stream that ended on its own delivers its buffered tool calls.
-            if (!token.isCancellationRequested && hasBufferedToolCalls(streamingState)) {
-                recoverBufferedToolCalls("stream_completed_without_finish");
-            }
-
-            // Reasoning-only detection: a cleanly-completed stream that emitted
-            // ONLY thinking parts (plus perhaps a usage data part) contains
-            // nothing the agent loop can act on. VS Code renders it as
-            // "no response was returned" and kills the turn. Surface it to the
-            // retry loop as resumable: the partial reasoning is appended to the
-            // request so the model continues its thought.
-            if (eventCount > 0 && !sawTextPart && !sawToolCallPart) {
-                Logger.warn(
-                    `[processStreamingResponse] request=${requestId} Reasoning-only stream detected (${eventCount} events, ` +
-                        `no text/tool parts); surfacing as resumable empty-content error`
-                );
-                StructuredLogger.warn("stream.reasoning_only_response", {
-                    requestId,
-                    eventCount,
-                    sawUsagePart,
-                });
-                throw new ReasoningOnlyError(eventCount, reasoningChars);
-            }
-
-            // Deliberately after the reasoning-only check: if the model only
-            // reasoned before hitting its limit, the retry path is the better
-            // answer than a notice about a response that never appeared.
-            if (stoppedEarly) {
-                Logger.warn(
-                    `[processStreamingResponse] request=${requestId} Stream stopped by finish reason "${stoppedEarly.reason}"`
-                );
-                StructuredLogger.warn("stream.stopped_early", {
-                    requestId,
-                    reason: stoppedEarly.reason,
-                    eventCount,
-                });
-                progress.report(new LanguageModelTextPart(stoppedEarly.notice));
-            }
-        } catch (error: unknown) {
-            Logger.error(
-                `[processStreamingResponse] request=${requestId} Stream processing failed after ${eventCount} events`,
-                {
-                    error: error instanceof Error ? error.message : String(error),
-                    stack: error instanceof Error ? error.stack : undefined,
-                }
-            );
-            StructuredLogger.error("stream.process_failed", {
-                requestId,
-                error: error instanceof Error ? error.message : String(error),
-                eventCount,
-                stack: error instanceof Error ? error.stack : undefined,
-            });
-
-            const isStreamEndError =
-                !(error instanceof UpstreamStreamError) &&
-                error instanceof Error &&
-                (error.message.includes("Stream ended before [DONE] marker") ||
-                    error.message.includes("stream ended") ||
-                    error.message.includes("unexpected end"));
-
-            // A partial response with its tool calls beats a hard failure, so a
-            // truncated stream that recovers any call completes normally.
-            if (isStreamEndError && hasBufferedToolCalls(streamingState)) {
-                const recoveredCount = recoverBufferedToolCalls("stream_incomplete");
-                if (recoveredCount > 0) {
-                    return;
-                }
-            }
-
-            // Belt-and-suspenders: if a watchdog abort coincided with an actual
-            // stream error, classify it as the retryable inactivity sentinel.
-            if (wasWatchdogAbort) {
-                throw new InactivityTimeoutError(timeoutMs, eventCount);
-            }
-
-            throw error;
         } finally {
-            // The retry loop in provideLanguageModelChatResponse re-enters
-            // this method per attempt on the same token, so the listener must
-            // not outlive this call, or earlier attempts would log duplicate
-            // cancellation events.
-            cancellationListener.dispose();
-            if (watchdog) {
-                clearTimeout(watchdog);
-            }
-            // Every exit path releases the reader, but an early exit (error
-            // frame, reasoning-only retry, recovered tool calls) would otherwise
-            // leave the upstream generating and billing until it finishes.
-            cancelUpstreamBody(responseBody);
+            // Nothing outlives the turn: neither a listed request nor a host listener.
+            activeRequest.dispose();
+            requestCancellation.dispose();
         }
     }
 }

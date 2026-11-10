@@ -1,15 +1,15 @@
 import type * as vscode from "vscode";
-import { convertMessages, convertTools, validateRequest } from "../../utils";
-import { trimMessagesToFitBudget } from "../../adapters/tokenUtils";
+import { convertMessages, convertTools, validateRequest } from "../../utils/messageConversion";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest, OpenAIFunctionToolDef } from "../../types";
 import { DEFAULT_ANTHROPIC_PROMPT_CACHING, resolveAnthropicCacheControl } from "../../utils/promptCaching";
-import { isDeepSeekModel, resolveToolResultImageMode } from "../../utils/modelUtils";
+import { isDeepSeekModel, resolveToolResultImageMode, resolveToolResultTextMode } from "../../utils/modelUtils";
+import { getSupportedReasoningEfforts } from "../../utils/modelCapabilities";
+import type { ToolNameMapping } from "../../utils/toolNameUtils";
 import type { RequestBuilderDeps } from "./types";
 
 export class RequestBuilder {
     private readonly configManager: RequestBuilderDeps["configManager"];
     private readonly getReasoningEffort: RequestBuilderDeps["getReasoningEffort"];
-    private readonly detectQuotaToolRedaction: RequestBuilderDeps["detectQuotaToolRedaction"];
     private readonly stripUnsupportedParametersFromRequest: RequestBuilderDeps["stripUnsupportedParametersFromRequest"];
     private readonly isParameterSupported: RequestBuilderDeps["isParameterSupported"];
     private readonly getUnsupportedParameters: RequestBuilderDeps["getUnsupportedParameters"];
@@ -20,7 +20,6 @@ export class RequestBuilder {
     constructor(deps: RequestBuilderDeps) {
         this.configManager = deps.configManager;
         this.getReasoningEffort = deps.getReasoningEffort;
-        this.detectQuotaToolRedaction = deps.detectQuotaToolRedaction;
         this.stripUnsupportedParametersFromRequest = deps.stripUnsupportedParametersFromRequest;
         this.isParameterSupported = deps.isParameterSupported;
         this.getUnsupportedParameters = deps.getUnsupportedParameters;
@@ -29,49 +28,41 @@ export class RequestBuilder {
         this.extractRawModelName = deps.extractRawModelName;
     }
 
+    /**
+     * Builds the chat-completions body for one request.
+     *
+     * Returns the body with the tool-name mapping it advertised, because the
+     * response path and history replay both need to agree with exactly the tool
+     * list this build sent.
+     */
     public async buildOpenAIChatRequest(
         messages: readonly vscode.LanguageModelChatRequestMessage[],
         model: vscode.LanguageModelChatInformation,
         options: vscode.ProvideLanguageModelChatResponseOptions,
         modelInfo?: LiteLLMModelInfo,
         _caller?: string
-    ): Promise<OpenAIChatCompletionRequest> {
+    ): Promise<{ request: OpenAIChatCompletionRequest; toolNames: ToolNameMapping }> {
         const config = await this.configManager.getConfig();
 
         // `model.id` is the namespaced `<routing>/<raw>` form VS Code hands
-        // us at response time. The LiteLLM request body, the capability
-        // lookup, the parameter-supported probes, and the usage-opt-out
-        // set all need the RAW model name (the part after the first `/`).
+        // us at response time. The LiteLLM request body and the capability
+        // probes need the RAW model name (the part after the first `/`), while
+        // what a proxy taught us about a model is stored under the namespaced id.
         const rawModelId = this.extractRawModelName(model.id);
+        const learnedLimitsKey = model.id;
 
-        const toolRedaction = this.detectQuotaToolRedaction(
-            messages,
-            options.tools ?? [],
-            `build-${Math.random().toString(36).slice(2, 10)}`,
-            rawModelId,
-            config.disableQuotaToolRedaction === true,
-            _caller
-        );
-        // `confidence` is intentionally not threaded into the request body
-        // today. It is consumed by the base for logging/telemetry already;
-        // this call site only needs the (possibly redacted) tool list.
-        const toolConfig = convertTools({ ...options, tools: toolRedaction.tools });
-        // Silently dropping older turns is surprising, so trimming
-        // (`litellm-connector.autoTrimMessages`) stays off by default. The
-        // overflow-recovery retry in the provider base is gated on the same
-        // setting.
-        const messagesToUse =
-            config.autoTrimMessages === true
-                ? trimMessagesToFitBudget(messages, toolConfig.tools, model, modelInfo)
-                : messages;
-        const openaiMessages = convertMessages(messagesToUse, {
+        const toolConfig = convertTools(options);
+        const toolNames = toolConfig.toolNames;
+        const openaiMessages = convertMessages(messages, {
             toolResultImageMode: resolveToolResultImageMode(modelInfo),
+            toolResultTextMode: resolveToolResultTextMode(modelInfo),
+            wireToolNames: toolNames.declaredToWire,
             ensureReasoningContentInActiveTurn:
                 (toolConfig.tools?.length ?? 0) > 0 && isDeepSeekModel(rawModelId, modelInfo),
         });
-        validateRequest(messagesToUse);
+        validateRequest(messages);
 
-        const reasoningEffort = this.getReasoningEffort(options, model, modelInfo);
+        const reasoningEffort = this.getReasoningEffort(options);
         const mo = (options.modelOptions as Record<string, unknown>) ?? {};
 
         const requestBody: OpenAIChatCompletionRequest = {
@@ -82,12 +73,16 @@ export class RequestBuilder {
                 typeof mo.max_tokens === "number"
                     ? Math.min(mo.max_tokens, model.maxOutputTokens)
                     : model.maxOutputTokens,
-            ...(this.isParameterSupported("reasoning_effort", modelInfo, rawModelId) && reasoningEffort
+            // The picker offers exactly `getSupportedReasoningEfforts`, so that list is
+            // the gate. `supported_openai_params` is not consulted: it reports the
+            // provider's own knobs, while a model config that declares effort flags is
+            // stating the levels this deployment accepts.
+            ...(this.modelAcceptsReasoningEffort(model.id, modelInfo, reasoningEffort)
                 ? { reasoning_effort: reasoningEffort }
                 : {}),
         };
 
-        if (!this.usageOptOutModels.has(rawModelId)) {
+        if (!this.usageOptOutModels.has(learnedLimitsKey)) {
             requestBody.stream_options = { include_usage: true } as { include_usage?: boolean };
         }
 
@@ -107,36 +102,23 @@ export class RequestBuilder {
                       : undefined;
             requestBody.temperature = temp;
         }
-        if (this.isParameterSupported("frequency_penalty", modelInfo, rawModelId)) {
-            const fp = mo.frequency_penalty as number | undefined;
-            requestBody.frequency_penalty = fp;
-        }
-        if (this.isParameterSupported("presence_penalty", modelInfo, rawModelId)) {
-            const pp = mo.presence_penalty as number | undefined;
-            requestBody.presence_penalty = pp;
-        }
-        if (this.isParameterSupported("stop", modelInfo, rawModelId) && mo.stop) {
-            requestBody.stop = mo.stop as string | string[];
-        }
         if (this.isParameterSupported("top_p", modelInfo, rawModelId) && typeof mo.top_p === "number") {
             requestBody.top_p = mo.top_p;
         }
 
         // Anthropic prompt caching: LiteLLM forwards a top-level `cache_control`
         // directive to the Claude API for automatic prompt caching. Gated on the
-        // workspace TTL setting, provider support, the per-request opt-out
-        // (commit generation has no reusable prefix worth caching), and what a
-        // previous request learned live about the model's acceptance of the marker.
+        // workspace TTL setting, provider support, and what a previous request
+        // learned live about the model's acceptance of the marker.
         const cacheControl = resolveAnthropicCacheControl({
             mode: config.anthropicPromptCaching ?? DEFAULT_ANTHROPIC_PROMPT_CACHING,
             modelId: rawModelId,
             modelInfo,
-            requestOptOut: mo.promptCaching === false,
         });
         if (
             cacheControl &&
             this.isParameterSupported("cache_control", modelInfo, rawModelId) &&
-            !this.getUnsupportedParameters(rawModelId).has("cache_control")
+            !this.getUnsupportedParameters(learnedLimitsKey).has("cache_control")
         ) {
             requestBody.cache_control = cacheControl;
         }
@@ -149,7 +131,7 @@ export class RequestBuilder {
         // 1. Model supports tool_choice (per isParameterSupported), AND
         // 2. Tools are present, AND
         //    a. Explicitly required by toolMode (toolConfig.tool_choice is set), OR
-        //    b. Model supports it - default to "auto" for backward compatibility
+        //    b. Model supports it, so default to "auto" for backward compatibility
         if (toolConfig.tools && toolConfig.tools.length > 0) {
             if (this.isParameterSupported("tool_choice", modelInfo, rawModelId)) {
                 if (toolConfig.tool_choice) {
@@ -169,6 +151,32 @@ export class RequestBuilder {
             modelInfo,
             rawModelId
         );
-        return requestBody;
+        return { request: requestBody, toolNames };
+    }
+
+    /**
+     * True when the level is one the model is known to offer, or nothing is known about
+     * the model.
+     *
+     * The list is the one the picker builds its control from, resolved under the
+     * namespaced id the picker uses, so a `modelOverrides` entry that matches it affects
+     * both the picker and the request. VS Code stores a level the user picked and merges
+     * it into every later request without re-checking the current schema, and it hides
+     * the control once the list is empty, so a stored value can outlive the declaration
+     * that allowed it. Sending it would fail on a model that refuses the parameter.
+     */
+    private modelAcceptsReasoningEffort(
+        modelId: string,
+        modelInfo: LiteLLMModelInfo | undefined,
+        effort: string | undefined
+    ): boolean {
+        if (!effort) {
+            return false;
+        }
+        if (!modelInfo) {
+            return true;
+        }
+        const offered: readonly string[] = getSupportedReasoningEfforts(modelInfo, modelId);
+        return offered.includes(effort);
     }
 }

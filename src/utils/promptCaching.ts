@@ -8,8 +8,6 @@ export interface AnthropicPromptCachingInput {
     mode: AnthropicPromptCachingMode;
     modelId: string;
     modelInfo?: LiteLLMModelInfo;
-    /** Per-request opt-out (commit generation has no reusable prefix worth caching). */
-    requestOptOut?: boolean;
 }
 
 /**
@@ -33,14 +31,14 @@ export function normalizeAnthropicPromptCachingMode(value: unknown): AnthropicPr
 
 /**
  * Resolves the Anthropic prompt-caching directive for a request. Returns
- * undefined for non-Anthropic models, disabled or opted-out requests, and
- * models whose info explicitly declares `supports_prompt_caching: false`.
- * The 5-minute tier omits `ttl` because it is the API default.
+ * undefined when the mode is `off`, for non-Anthropic models, and for models
+ * whose info explicitly declares `supports_prompt_caching: false`. The
+ * 5-minute tier omits `ttl` because it is the API default.
  */
 export function resolveAnthropicCacheControl(
     input: AnthropicPromptCachingInput
 ): AnthropicCacheControlDirective | undefined {
-    if (input.mode === "off" || input.requestOptOut === true) {
+    if (input.mode === "off") {
         return undefined;
     }
     if (!isAnthropicProvider(input.modelId, input.modelInfo)) {

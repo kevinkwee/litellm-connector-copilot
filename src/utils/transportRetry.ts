@@ -12,17 +12,6 @@ import { Logger } from "./logger";
  * the chat UI.
  */
 
-/** Sentinel thrown to the retry loop when a transport error is retryable. */
-export class TransportErrorBeforeRetry extends Error {
-    public constructor(
-        message: string,
-        public readonly cause: unknown
-    ) {
-        super(message);
-        this.name = "TransportErrorBeforeRetry";
-    }
-}
-
 /** Sentinel for a stream-inactivity watchdog abort (retryable via resume). */
 export class InactivityTimeoutError extends Error {
     public constructor(
@@ -32,6 +21,56 @@ export class InactivityTimeoutError extends Error {
         super(`Stream inactivity timeout after ${timeoutMs}ms (${eventCount} events)`);
         this.name = "InactivityTimeoutError";
     }
+}
+
+/**
+ * Thrown when the provider configuration is incomplete, before a request leaves the
+ * connector.
+ *
+ * No request reaches the proxy, so the attempt is priced at nothing. The message names the
+ * missing configuration field, because it is the only explanation the user gets.
+ */
+export class LiteLLMConfigurationError extends Error {
+    public constructor(message: string) {
+        super(message);
+        this.name = "LiteLLMConfigurationError";
+    }
+}
+
+/**
+ * Sentinel for a request that produced no response headers within its budget.
+ *
+ * The proxy buffers the first streamed chunk before it writes headers, so a slow
+ * upstream spends the whole time to first token in this phase. The body watchdog
+ * starts only after headers and cannot see it. A fresh request is worth trying
+ * because nothing was generated from the connector's point of view.
+ *
+ * `source` says which timer expired: the connector's setting or the HTTP runtime's
+ * own header limit.
+ */
+export class HeadersTimeoutError extends Error {
+    public constructor(
+        public readonly timeoutMs: number,
+        public readonly source: "connector" | "runtime" = "connector",
+        options?: ErrorOptions
+    ) {
+        super(
+            source === "runtime"
+                ? `The HTTP runtime's own header limit expired after ${formatDuration(timeoutMs)}`
+                : `No response headers after ${formatDuration(timeoutMs)} (litellm-connector.headersTimeout)`,
+            options
+        );
+        this.name = "HeadersTimeoutError";
+    }
+}
+
+/** Renders a duration as a compact value, keeping a sub-second one readable. */
+export function formatDuration(durationMs: number): string {
+    if (durationMs < 1_000) {
+        return `${durationMs}ms`;
+    }
+    const seconds = durationMs / 1_000;
+    return Number.isInteger(seconds) ? `${seconds}s` : `${seconds.toFixed(1)}s`;
 }
 
 /** HTTP statuses whose mid-stream failure a fresh request can plausibly survive. */
@@ -114,7 +153,9 @@ function describeUpstreamFailure(
 export class ReasoningOnlyError extends Error {
     public constructor(
         public readonly eventCount: number,
-        public readonly reasoningChars: number
+        public readonly reasoningChars: number,
+        /** True only when a `stop` finish frame proved the model ended its turn. */
+        public readonly normalFinish = false
     ) {
         super(
             `Model returned reasoning-only response with no content or tool calls ` +
@@ -132,11 +173,17 @@ export class ReasoningOnlyError extends Error {
  * identically or produce duplicated content. `UpstreamStreamError` is the
  * upstream failure this function consults directly: it returns its `retriable`
  * flag, so a transient mid-stream death resumes like a dropped socket while a
- * rejected request surfaces its message. `ReasoningOnlyError` is NOT classified
- * here because it has its own, separate retry budget (`emptyResponseRetries`).
+ * rejected request surfaces its message. `InactivityTimeoutError` and
+ * `HeadersTimeoutError` both end an attempt without a completed response, whichever
+ * timer fired, and both are worth a fresh attempt. `ReasoningOnlyError` is NOT
+ * classified here because it has its own, separate retry budget
+ * (`emptyResponseRetries`).
  */
 export function isTransportRetriableError(err: unknown): boolean {
     if (err instanceof InactivityTimeoutError) {
+        return true;
+    }
+    if (err instanceof HeadersTimeoutError) {
         return true;
     }
     if (err instanceof UpstreamStreamError) {
@@ -169,6 +216,89 @@ export function isTransportRetriableError(err: unknown): boolean {
     );
 }
 
+/**
+ * Codes that can only mean no request was ever written.
+ *
+ * The TLS codes belong here because a handshake failure happens before a single byte of
+ * the request is written, so the proxy saw nothing of a request the certificate rejected.
+ */
+const CONNECT_ONLY_CODES: ReadonlySet<string> = new Set([
+    "ECONNREFUSED",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "DEPTH_ZERO_SELF_SIGNED_CERT",
+    "SELF_SIGNED_CERT_IN_CHAIN",
+    "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "UNABLE_TO_GET_ISSUER_CERT",
+    "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+    "CERT_HAS_EXPIRED",
+    "ERR_TLS_CERT_ALTNAME_INVALID",
+]);
+
+/** The transport error code a failure carries. `fetch` puts it on the `cause`. */
+function transportErrorCode(error: unknown): string | undefined {
+    if (!error || typeof error !== "object") {
+        return undefined;
+    }
+    const cause = (error as { cause?: unknown }).cause;
+    if (cause && typeof cause === "object") {
+        const causeCode = (cause as { code?: unknown }).code;
+        if (typeof causeCode === "string") {
+            return causeCode;
+        }
+    }
+    const code = (error as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+}
+
+/**
+ * True when the failure happened while the client was still connecting.
+ *
+ * A failed connect names its call in `syscall`, and Node's multi-address connect reports an
+ * `AggregateError` whose attempts all failed to connect.
+ */
+function failedWhileConnecting(error: unknown): boolean {
+    for (const candidate of [error, (error as { cause?: unknown } | undefined)?.cause]) {
+        if (!candidate || typeof candidate !== "object") {
+            continue;
+        }
+        if (candidate instanceof AggregateError) {
+            return true;
+        }
+        if ((candidate as { syscall?: unknown }).syscall === "connect") {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * True when an error proves the request never reached the proxy.
+ *
+ * A code from the connect-only set proves it on its own: the address refused the connection,
+ * the name did not resolve, the connect timed out, or the TLS handshake failed. Beyond those,
+ * a failure that happened in `connect` proves it whatever its code carries, and so does the
+ * `AggregateError` a multi-address connect raises when no address accepted. A route failure
+ * the kernel reports on an open socket is not a connect failure, and the proxy may already
+ * have billed that prompt, so it counts as reached. An `UpstreamStreamError` came from the
+ * proxy, so it is never a connect-phase failure, whatever its upstream `code` field says.
+ *
+ * One attempt can make several HTTP calls (a connector-parameter strip-and-retry, the
+ * `/responses` fallback, the `include_usage` retry), and only the error that ends the
+ * attempt is classified here.
+ */
+export function failedBeforeReachingProxy(error: unknown): boolean {
+    if (error instanceof UpstreamStreamError) {
+        return false;
+    }
+    const code = transportErrorCode(error);
+    if (code !== undefined && CONNECT_ONLY_CODES.has(code)) {
+        return true;
+    }
+    return failedWhileConnecting(error);
+}
+
 export function sleepWithCancellation(ms: number, token?: vscode.CancellationToken): Promise<void> {
     if (token?.isCancellationRequested) {
         return Promise.resolve();
@@ -184,22 +314,6 @@ export function sleepWithCancellation(ms: number, token?: vscode.CancellationTok
             resolve();
         }, ms);
     });
-}
-
-export interface TransportRetryConfig {
-    /** Maximum number of retry attempts for a single request. */
-    networkRetries: number;
-    /** Base delay in ms; doubles per attempt, capped at 30s. */
-    networkRetryDelayMs: number;
-    /**
-     * Maximum retries for a clean-but-contentless (reasoning-only) stream.
-     * Separate budget from networkRetries because the failure domains differ:
-     * transport deaths are per-connection, contentless responses cluster in
-     * upstream bursts.
-     */
-    emptyResponseRetries: number;
-    /** Base delay in ms for reasoning-only retries; doubles per attempt, capped at 30s. */
-    emptyResponseRetryDelayMs: number;
 }
 
 const MAX_BACKOFF_MS = 30_000;
@@ -245,16 +359,36 @@ export class StreamedTextAccumulator {
     public get sawToolCall(): boolean {
         return this._sawToolCall;
     }
+}
 
-    public get isEmpty(): boolean {
-        return this._text.length === 0 && !this._sawToolCall;
-    }
+/** Content a resume replays as the trailing assistant message. */
+export interface ResumeContent {
+    readonly text: string;
+    readonly thinking: string;
+}
 
-    public reset(): void {
-        this._text = "";
-        this._thinking = "";
-        this._sawToolCall = false;
+/**
+ * The content a resume can replay, or `undefined` when the attempt produced
+ * nothing to continue.
+ *
+ * Whitespace alone does not count: an attempt that produced only blank lines is
+ * resent unchanged instead of being continued.
+ *
+ * Reasoning is replayable only where the endpoint carries it. A `/responses`
+ * request has no field for `reasoning_content`, so the reasoning it streamed
+ * cannot reach the model again, and replaying nothing would turn the resume into
+ * a bare "Continue" nudge that asks the model to continue output no attempt
+ * produced.
+ */
+export function selectResumableContent(
+    accumulator: StreamedTextAccumulator,
+    options: { readonly canReplayReasoning: boolean }
+): ResumeContent | undefined {
+    const thinking = options.canReplayReasoning ? accumulator.thinking : "";
+    if (accumulator.text.trim().length === 0 && thinking.trim().length === 0) {
+        return undefined;
     }
+    return { text: accumulator.text, thinking };
 }
 
 function isThinkingPartInstance(part: vscode.LanguageModelResponsePart): boolean {

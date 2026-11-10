@@ -20,7 +20,7 @@ import { selectFilesForDeletion, type CapsConfig, type FileMeta } from "./copilo
  * ## Never throws
  * Every public method catches its own errors and reports them via
  * `StructuredLogger` / `Logger`. A failed `.copilotmd` export must never
- * break a chat request — the exporter is observability, not on the
+ * break a chat request. The exporter is observability, not on the
  * critical path.
  */
 export class CopilotMdWriter {
@@ -71,7 +71,7 @@ export class CopilotMdWriter {
             });
 
             // Caps enforcement runs after the write so the new file is counted.
-            // Failures here are logged but do not propagate — the write already
+            // Failures here are logged but do not propagate. The write already
             // succeeded, and a failed cleanup shouldn't make the export "fail".
             try {
                 await this.enforceCaps(entry.sessionId);
@@ -141,7 +141,7 @@ export class CopilotMdWriter {
      * flat {@link FileMeta} list the caps selector needs.
      *
      * Two-level walk: list session folders, then list files in each. We
-     * intentionally do NOT recurse deeper — the layout is fixed at
+     * intentionally do NOT recurse deeper, because the layout is fixed at
      * `copilot-debug/{sessionId}/{filename}.copilotmd`.
      */
     private async collectFileMetas(debugRoot: vscode.Uri): Promise<FileMeta[]> {
@@ -150,7 +150,7 @@ export class CopilotMdWriter {
         try {
             sessionEntries = await vscode.workspace.fs.readDirectory(debugRoot);
         } catch {
-            // Root doesn't exist yet — nothing to enforce.
+            // Root does not exist yet, so nothing to enforce.
             return [];
         }
         await Promise.all(
@@ -183,7 +183,7 @@ export class CopilotMdWriter {
                                 sessionId,
                             });
                         } catch {
-                            // Stat failed (race with deletion) — skip.
+                            // Stat failed (race with deletion), so skip it.
                         }
                     })
                 );
@@ -216,7 +216,7 @@ export class CopilotMdWriter {
                         await vscode.workspace.fs.delete(sessionFolder, { recursive: false });
                     }
                 } catch {
-                    // Race or already gone — ignore.
+                    // Race or already gone, so ignore it.
                 }
             })
         );

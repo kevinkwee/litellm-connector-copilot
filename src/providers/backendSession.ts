@@ -3,10 +3,10 @@ import type { LiteLLMClient } from "../adapters/litellmClient";
 /**
  * Represents a resolved per-group connection context.
  * Holds everything needed to make requests to one LiteLLM backend.
- * Populated from VS Code per-group `options.configuration` (VS Code 1.120+).
+ * Populated from VS Code's per-group `options.configuration`.
  */
 export interface BackendSession {
-    /** Human-readable name (group name or backend name) */
+    /** Backend label shown in each model row's detail and tooltip, derived from the URL host. */
     readonly backendName: string;
     /** Base URL of the LiteLLM proxy */
     readonly baseUrl: string;

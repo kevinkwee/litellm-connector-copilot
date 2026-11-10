@@ -1,6 +1,6 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
-import { convertMessages } from "../../utils";
+import { convertMessages } from "../../utils/messageConversion";
 
 suite("Message Normalization", () => {
     suite("convertMessages", () => {

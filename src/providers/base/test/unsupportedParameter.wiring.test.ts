@@ -1,10 +1,12 @@
 import * as assert from "assert";
+import * as sinon from "sinon";
 import * as vscode from "vscode";
 import { Transport } from "../transport";
 import type { TransportDeps } from "../types";
 import type { ConfigManager } from "../../../config/configManager";
 import type { LiteLLMClient } from "../../../adapters/litellmClient";
 import type { OpenAIChatCompletionRequest } from "../../../types";
+import { StructuredLogger } from "../../../observability/structuredLogger";
 
 /**
  * Captures the client factory backend so the transport's threading of the
@@ -40,13 +42,30 @@ suite("onUnsupportedParameter wiring", () => {
             new vscode.CancellationTokenSource().token,
             undefined,
             { mode: "chat" },
-            { baseUrl: "https://x", apiKey: "k" }
+            { baseUrl: "https://x", apiKey: "k" },
+            "req-1",
+            "host.example/wire-model-name"
         );
     }
 
-    test("threads the hook through the factory-injected LiteLLMClient", async () => {
+    function callWithoutLearnedKey(transport: Transport): Promise<unknown> {
+        return transport.sendRequestToLiteLLM(
+            req,
+            { report: () => {} } as unknown as vscode.Progress<vscode.LanguageModelResponsePart>,
+            new vscode.CancellationTokenSource().token,
+            undefined,
+            { mode: "chat" },
+            { baseUrl: "https://x", apiKey: "k" },
+            "req-1"
+        );
+    }
+
+    test("threads the hook through the factory-injected LiteLLMClient under the learned-limits key", async () => {
         lastClientParams = undefined;
-        const onUnsupportedParameter = (_model: string, _param: string) => {};
+        const recorded: { model: string; param: string }[] = [];
+        const onUnsupportedParameter = (model: string, param: string) => {
+            recorded.push({ model, param });
+        };
         const transport = makeTransport({
             configManager: { getConfig: async () => ({}) } as unknown as ConfigManager,
             userAgent: "test-ua",
@@ -60,6 +79,42 @@ suite("onUnsupportedParameter wiring", () => {
 
         await call(transport);
 
-        assert.strictEqual(lastClientParams!.onUnsupportedParameter, onUnsupportedParameter);
+        const hook = lastClientParams!.onUnsupportedParameter;
+        assert.ok(hook, "the transport must pass a hook to the client");
+        hook("wire-model-name", "cache_control");
+        assert.deepStrictEqual(
+            recorded,
+            [{ model: "host.example/wire-model-name", param: "cache_control" }],
+            "the hook records under the namespaced picker id, not the wire name"
+        );
+    });
+
+    test("a missing learned-limits key is reported instead of stored under the wire name", async () => {
+        lastClientParams = undefined;
+        const onUnsupportedParameter = sinon.stub();
+        const warnStub = sinon.stub(StructuredLogger, "warn");
+        try {
+            const transport = makeTransport({
+                configManager: { getConfig: async () => ({}) } as unknown as ConfigManager,
+                userAgent: "test-ua",
+                logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, trace: () => {} },
+                onUnsupportedParameter,
+                liteLLMClientFactory: (backend) => {
+                    lastClientParams = { onUnsupportedParameter: backend.onUnsupportedParameter };
+                    return new HookSpyClient() as unknown as LiteLLMClient;
+                },
+            });
+
+            await callWithoutLearnedKey(transport);
+
+            const hook = lastClientParams!.onUnsupportedParameter;
+            assert.ok(hook);
+            hook("wire-model-name", "cache_control");
+        } finally {
+            warnStub.restore();
+        }
+
+        sinon.assert.notCalled(onUnsupportedParameter);
+        sinon.assert.calledWithMatch(warnStub, "transport.learned_limit_without_key", { param: "cache_control" });
     });
 });

@@ -1,8 +1,8 @@
 /**
  * Type definitions for the observability layer.
  *
- * These types define the structured logging, telemetry, and auditing contracts
- * used throughout the provider request pipeline.
+ * These types define the structured logging contracts used throughout the
+ * provider request pipeline.
  */
 
 /**
@@ -10,7 +10,7 @@
  * - trace: Full payloads, raw SSE frames, detailed parameter maps, hook context snapshots
  * - debug: Detailed flow information, endpoint selection decisions, parameter filtering outcomes
  * - info: High-level lifecycle events, request ingress, completion status, token totals
- * - warn: Recoverable issues, parameter suppression, endpoint fallback, trimming near limits
+ * - warn: Recoverable issues, parameter suppression, endpoint fallback, retried attempts
  * - error: Failures and exceptions, request failures, unhandled errors, quota exhaustion
  */
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error";
@@ -26,10 +26,7 @@ export type EventType =
     | "endpoint.fallback"
     | "param.suppressed"
     | "param.added"
-    | "trim.executed"
-    | "trim.skipped"
     | "tool.called"
-    | "tool.redacted"
     | "hook.invoked"
     | "stream.chunk"
     | "stream.complete"
@@ -57,36 +54,6 @@ export interface LogEvent {
     model?: string;
     /** Endpoint path (if applicable) */
     endpoint?: string;
-    /** Caller context (e.g., "inline-completions", "terminal-chat", "chat") */
+    /** VS Code's `options.requestInitiator`. The Agents window harness sends "core". */
     caller?: string;
-}
-
-/**
- * Audit summary for a completed request.
- */
-export interface AuditSummary {
-    /** Stable request ID */
-    requestId: string;
-    /** Model ID */
-    modelId: string;
-    /** Endpoint used */
-    endpoint: string;
-    /** Caller context */
-    caller: string;
-    /** Total duration in milliseconds */
-    durationMs: number;
-    /** Input token count */
-    tokensIn?: number;
-    /** Output token count */
-    tokensOut?: number;
-    /** Total message count */
-    messageCount: number;
-    /** Tool calls made */
-    toolCalls: string[];
-    /** Errors encountered */
-    errors: string[];
-    /** Warnings encountered */
-    warnings: string[];
-    /** All events for this request */
-    events: LogEvent[];
 }

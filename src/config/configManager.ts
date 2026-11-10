@@ -4,29 +4,32 @@ import { LiteLLMClient } from "../adapters/litellmClient";
 import type { BackendSession } from "../providers/backendSession";
 import { Logger } from "../utils/logger";
 import { normalizeAnthropicPromptCachingMode } from "../utils/promptCaching";
-import { deriveGroupNameFromUrl } from "../utils";
+import { deriveGroupNameFromUrl } from "../utils/groupNameFromUrl";
+import { normalizeProxyBaseUrl } from "../utils/proxyBaseUrl";
+import { DEFAULT_RETRY_BUDGET_MS } from "../utils/retryBudget";
 
 export class ConfigManager {
     private static readonly INACTIVITY_TIMEOUT_KEY = "litellm-connector.inactivityTimeout";
+    private static readonly DEFAULT_INACTIVITY_TIMEOUT_SECONDS = 60;
+    private static readonly MIN_INACTIVITY_TIMEOUT_SECONDS = 1;
+    private static readonly MAX_INACTIVITY_TIMEOUT_SECONDS = 3600;
+    // getConfig() runs several times per request, so warn once per rejected value.
+    private static lastInactivityTimeoutWarning: string | undefined;
     private static readonly DISABLE_CACHING_KEY = "litellm-connector.disableCaching";
     private static readonly ANTHROPIC_PROMPT_CACHING_KEY = "litellm-connector.anthropicPromptCaching";
-    private static readonly DISABLE_QUOTA_TOOL_REDACTION_KEY = "litellm-connector.disableQuotaToolRedaction";
-    private static readonly KEY_MODEL_OVERRIDES_ENABLE = "litellm-connector.enableModelOverrides";
     private static readonly MODEL_CAPABILITIES_OVERRIDES_KEY = "litellm-connector.modelCapabilitiesOverrides";
-    private static readonly SCM_COMMIT_MSG_MODEL_ID_KEY = "litellm-connector.commitModelIdOverride";
     private static readonly FORCE_RESPONSES_ENDPOINT_KEY = "litellm-connector.forceResponsesEndpoint";
     private static readonly ALLOW_CHAT_COMPLETIONS_FALLBACK_KEY = "litellm-connector.allowChatCompletionsFallback";
     private static readonly DISPLAY_PRICING_IN_PICKER_KEY = "litellm-connector.displayPricingInPicker";
     private static readonly DISCOVERY_TIMEOUT_MS_KEY = "litellm-connector.discoveryTimeoutMs";
     private static readonly DISCOVERY_CACHE_TTL_MS_KEY = "litellm-connector.discoveryCacheTtlMs";
-    private static readonly DISCOVERY_FIRE_DEBOUNCE_MS_KEY = "litellm-connector.discoveryFireDebounceMs";
-    private static readonly DISCOVERY_FIRE_MIN_INTERVAL_MS_KEY = "litellm-connector.discoveryFireMinIntervalMs";
     private static readonly NETWORK_RETRIES_KEY = "litellm-connector.networkRetries";
     private static readonly NETWORK_RETRY_DELAY_MS_KEY = "litellm-connector.networkRetryDelayMs";
     private static readonly EMPTY_RESPONSE_RETRIES_KEY = "litellm-connector.emptyResponseRetries";
     private static readonly EMPTY_RESPONSE_RETRY_DELAY_MS_KEY = "litellm-connector.emptyResponseRetryDelayMs";
     private static readonly RATE_LIMIT_MAX_DELAY_SECONDS_KEY = "litellm-connector.rateLimitMaxDelaySeconds";
-    private static readonly AUTO_TRIM_MESSAGES_KEY = "litellm-connector.autoTrimMessages";
+    private static readonly HEADERS_TIMEOUT_KEY = "litellm-connector.headersTimeout";
+    private static readonly RETRY_BUDGET_SECONDS_KEY = "litellm-connector.retryBudgetSeconds";
 
     // Discovery config defaults and bounds
     private static readonly DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
@@ -35,10 +38,6 @@ export class ConfigManager {
     private static readonly DEFAULT_DISCOVERY_CACHE_TTL_MS = 60_000;
     private static readonly MIN_DISCOVERY_CACHE_TTL_MS = 0;
     private static readonly MAX_DISCOVERY_CACHE_TTL_MS = 300_000;
-    private static readonly DEFAULT_DISCOVERY_FIRE_DEBOUNCE_MS = 250;
-    private static readonly MAX_DISCOVERY_FIRE_DEBOUNCE_MS = 5_000;
-    private static readonly DEFAULT_DISCOVERY_FIRE_MIN_INTERVAL_MS = 2_000;
-    private static readonly MAX_DISCOVERY_FIRE_MIN_INTERVAL_MS = 30_000;
 
     // Rate-limit retry ceiling defaults and bounds. The setting is expressed in
     // seconds because Retry-After is a seconds-based header; the internal
@@ -51,57 +50,56 @@ export class ConfigManager {
     private static readonly MAX_RATE_LIMIT_MAX_DELAY_SECONDS = 86_400;
     private static readonly MS_PER_SECOND = 1_000;
 
-    // Last config returned by getConfig(). convertProviderConfiguration is
-    // synchronous but must hand the session client a discovery timeout, so it
-    // reads the most recently loaded workspace config, falling back to the
-    // client default when getConfig() has not run yet.
-    private _lastConfig?: LiteLLMConfig;
-
-    private readonly secrets: vscode.SecretStorage;
-
-    constructor(secrets: vscode.SecretStorage) {
-        this.secrets = ConfigManager.ensureSecretStorage(secrets);
-    }
+    // Time bounds for one chat request. Both are expressed in seconds because
+    // they describe a user-observable wait; the internal pipeline works in
+    // milliseconds. The headers bound is the connector's own guard on the phase
+    // before the body watchdog starts. The retry budget bounds the time spent
+    // retrying a request the host never cancels.
+    //
+    // The headers ceiling matches the 300 s header limit of the runtime's fetch,
+    // which does not consult a custom dispatcher, so a value above 300 s would still
+    // be cut off there. `LiteLLMClient` holds the same limit as
+    // `RUNTIME_HEADERS_TIMEOUT_MS`, to report a request that hits it.
+    private static readonly DEFAULT_HEADERS_TIMEOUT_SECONDS = 300;
+    private static readonly MIN_HEADERS_TIMEOUT_SECONDS = 1;
+    private static readonly MAX_HEADERS_TIMEOUT_SECONDS = 300;
+    private static readonly DEFAULT_RETRY_BUDGET_SECONDS = DEFAULT_RETRY_BUDGET_MS / 1_000;
+    private static readonly MIN_RETRY_BUDGET_SECONDS = 0;
+    private static readonly MAX_RETRY_BUDGET_SECONDS = 3_600;
 
     /**
-     * Ensures a usable SecretStorage implementation even in tests that provide partial stubs.
+     * Clamps the inactivity timeout to the range the manifest declares. A value
+     * of 0 or less would otherwise fire the stream watchdog as soon as a
+     * response starts and abort every response.
      */
-    private static ensureSecretStorage(secrets: vscode.SecretStorage | undefined): vscode.SecretStorage {
-        if (secrets && typeof secrets.get === "function" && typeof secrets.store === "function") {
-            return secrets;
+    private static clampInactivityTimeoutSeconds(value: number | undefined): number {
+        const fallback = ConfigManager.DEFAULT_INACTIVITY_TIMEOUT_SECONDS;
+        if (typeof value !== "number" || !Number.isFinite(value)) {
+            ConfigManager.warnAboutInactivityTimeout(String(value), fallback);
+            return fallback;
         }
-
-        // Provide a minimal stub for testing to avoid empty method warnings
-        const stubStorage: vscode.SecretStorage = {
-            get: async () => undefined,
-            store: async (_key: string): Promise<void> => {
-                /* no-op: stub for testing */
-            },
-            delete: async (_key: string): Promise<void> => {
-                /* no-op: stub for testing */
-            },
-            keys: async () => [],
-            onDidChange: new vscode.EventEmitter<vscode.SecretStorageChangeEvent>().event,
-        };
-        return stubStorage;
+        const clamped = Math.min(
+            ConfigManager.MAX_INACTIVITY_TIMEOUT_SECONDS,
+            Math.max(ConfigManager.MIN_INACTIVITY_TIMEOUT_SECONDS, value)
+        );
+        if (clamped !== value) {
+            ConfigManager.warnAboutInactivityTimeout(String(value), clamped);
+        } else {
+            ConfigManager.lastInactivityTimeoutWarning = undefined;
+        }
+        return clamped;
     }
 
-    /**
-     * Store a secret in the extension's secret storage.
-     */
-    public async store(key: string, value: string): Promise<void> {
-        await this.secrets.store(key, value);
-    }
-
-    /**
-     * Delete a secret from the extension's secret storage.
-     */
-    public async delete(key: string): Promise<void> {
-        await this.secrets.delete(key);
-    }
-
-    public async getSecret(key: string): Promise<string | undefined> {
-        return this.secrets.get(key);
+    private static warnAboutInactivityTimeout(rejected: string, used: number): void {
+        if (ConfigManager.lastInactivityTimeoutWarning === rejected) {
+            return;
+        }
+        ConfigManager.lastInactivityTimeoutWarning = rejected;
+        Logger.warn(
+            `litellm-connector.inactivityTimeout is ${rejected}, which is not a number between ` +
+                `${ConfigManager.MIN_INACTIVITY_TIMEOUT_SECONDS} and ` +
+                `${ConfigManager.MAX_INACTIVITY_TIMEOUT_SECONDS} seconds; using ${used}s`
+        );
     }
 
     /**
@@ -143,28 +141,23 @@ export class ConfigManager {
     /**
      * Retrieves the current LiteLLM workspace-level configuration.
      *
-     * Each call refreshes a cached copy that `convertProviderConfiguration()`
-     * reads synchronously when it builds session clients.
-     *
-     * Backend connection details (baseUrl, apiKey) are NOT read here — they are
-     * delivered by VS Code 1.120 per-group `options.configuration` payloads on
-     * every provider call. This method now only returns workspace-scoped
-     * ergonomic toggles and overrides.
+     * Backend connection details (baseUrl, apiKey) are NOT read here: they arrive in
+     * VS Code's per-group `options.configuration` and are carried by the registry. This
+     * method returns only workspace-scoped ergonomic toggles and overrides.
      */
     async getConfig(): Promise<LiteLLMConfig> {
         const workspaceConfig = vscode.workspace.getConfiguration();
 
-        const inactivityTimeout = workspaceConfig.get<number>(ConfigManager.INACTIVITY_TIMEOUT_KEY, 60);
+        const inactivityTimeout = ConfigManager.clampInactivityTimeoutSeconds(
+            workspaceConfig.get<number>(
+                ConfigManager.INACTIVITY_TIMEOUT_KEY,
+                ConfigManager.DEFAULT_INACTIVITY_TIMEOUT_SECONDS
+            )
+        );
         const disableCaching = workspaceConfig.get<boolean>(ConfigManager.DISABLE_CACHING_KEY, true);
         const anthropicPromptCaching = normalizeAnthropicPromptCachingMode(
             workspaceConfig.get<unknown>(ConfigManager.ANTHROPIC_PROMPT_CACHING_KEY)
         );
-        const disableQuotaToolRedaction = workspaceConfig.get<boolean>(
-            ConfigManager.DISABLE_QUOTA_TOOL_REDACTION_KEY,
-            false
-        );
-        const enableModelOverrides = workspaceConfig.get<boolean>(ConfigManager.KEY_MODEL_OVERRIDES_ENABLE, true);
-
         const modelCapabilitiesOverridesRaw = workspaceConfig.get<Record<string, string | string[]>>(
             ConfigManager.MODEL_CAPABILITIES_OVERRIDES_KEY,
             {}
@@ -202,9 +195,6 @@ export class ConfigManager {
             }
         }
 
-        const scmGitCompletionsModelId = workspaceConfig
-            .get<string>(ConfigManager.SCM_COMMIT_MSG_MODEL_ID_KEY, "")
-            .trim();
         const forceResponsesEndpoint = workspaceConfig.get<boolean>(ConfigManager.FORCE_RESPONSES_ENDPOINT_KEY, false);
         const allowChatCompletionsFallback = workspaceConfig.get<boolean>(
             ConfigManager.ALLOW_CHAT_COMPLETIONS_FALLBACK_KEY,
@@ -217,18 +207,6 @@ export class ConfigManager {
         );
         const discoveryCacheTtlMs = this.clampDiscoveryCacheTtlMs(
             workspaceConfig.get<number>(ConfigManager.DISCOVERY_CACHE_TTL_MS_KEY)
-        );
-        const discoveryFireDebounceMs = this.clampRange(
-            workspaceConfig.get<number>(ConfigManager.DISCOVERY_FIRE_DEBOUNCE_MS_KEY),
-            0,
-            ConfigManager.MAX_DISCOVERY_FIRE_DEBOUNCE_MS,
-            ConfigManager.DEFAULT_DISCOVERY_FIRE_DEBOUNCE_MS
-        );
-        const discoveryFireMinIntervalMs = this.clampRange(
-            workspaceConfig.get<number>(ConfigManager.DISCOVERY_FIRE_MIN_INTERVAL_MS_KEY),
-            0,
-            ConfigManager.MAX_DISCOVERY_FIRE_MIN_INTERVAL_MS,
-            ConfigManager.DEFAULT_DISCOVERY_FIRE_MIN_INTERVAL_MS
         );
 
         const networkRetries = this.clampRange(
@@ -265,32 +243,40 @@ export class ConfigManager {
         );
         const rateLimitMaxDelayMs = Math.round(rateLimitMaxDelaySeconds * ConfigManager.MS_PER_SECOND);
 
-        const autoTrimMessages = workspaceConfig.get<boolean>(ConfigManager.AUTO_TRIM_MESSAGES_KEY, false);
+        const headersTimeoutSeconds = this.clampRange(
+            workspaceConfig.get<number>(ConfigManager.HEADERS_TIMEOUT_KEY),
+            ConfigManager.MIN_HEADERS_TIMEOUT_SECONDS,
+            ConfigManager.MAX_HEADERS_TIMEOUT_SECONDS,
+            ConfigManager.DEFAULT_HEADERS_TIMEOUT_SECONDS
+        );
+        const headersTimeoutMs = Math.round(headersTimeoutSeconds * ConfigManager.MS_PER_SECOND);
+
+        const retryBudgetSeconds = this.clampRange(
+            workspaceConfig.get<number>(ConfigManager.RETRY_BUDGET_SECONDS_KEY),
+            ConfigManager.MIN_RETRY_BUDGET_SECONDS,
+            ConfigManager.MAX_RETRY_BUDGET_SECONDS,
+            ConfigManager.DEFAULT_RETRY_BUDGET_SECONDS
+        );
+        const retryBudgetMs = Math.ceil(retryBudgetSeconds * ConfigManager.MS_PER_SECOND);
 
         const config: LiteLLMConfig = {
             inactivityTimeout,
             disableCaching,
             anthropicPromptCaching,
-            disableQuotaToolRedaction,
-            enableModelOverrides,
             modelCapabilitiesOverrides,
-            commitModelIdOverride: `${scmGitCompletionsModelId}`,
             forceResponsesEndpoint,
             allowChatCompletionsFallback,
             displayPricingInPicker,
             discoveryTimeoutMs,
             discoveryCacheTtlMs,
-            discoveryFireDebounceMs,
-            discoveryFireMinIntervalMs,
             networkRetries,
             networkRetryDelayMs,
             emptyResponseRetries,
             emptyResponseRetryDelayMs,
             rateLimitMaxDelayMs,
-            autoTrimMessages,
+            headersTimeoutMs,
+            retryBudgetMs,
         };
-        this._lastConfig = config;
-        // Shallow copy so callers cannot mutate the cached config in place.
         return { ...config };
     }
 
@@ -298,45 +284,35 @@ export class ConfigManager {
      * Converts VS Code per-group provider configuration into a BackendSession.
      *
      * Required fields (per `package.json` `languageModelChatProviders.configuration`):
-     *   - `baseUrl`  — must start with http:// or https://
-     *   - `apiKey`   — non-empty string (encrypted by VS Code)
-     *
-     * `groupName` is the user-entered group label from VS Code 1.120's group
-     * picker. It is NOT required: when absent, `BackendSession.backendName`
-     * falls back to a hostname derived from `baseUrl`. The discovery layer
-     * uses `baseUrl` as the cache key regardless of the group name, so a
-     * missing or stale groupName has no effect on routing.
+     *   - `baseUrl`: must start with http:// or https://
+     *   - `apiKey`: non-empty string (encrypted by VS Code)
      *
      * `providerName` (if present in the payload) is not part of the schema
      * and is ignored.
      */
     convertProviderConfiguration(
-        groupName: string,
-        configuration: Record<string, unknown>
+        configuration: Record<string, unknown>,
+        clientOptions: { discoveryTimeoutMs: number | undefined; userAgent: string }
     ): BackendSession | undefined {
-        const baseUrl = typeof configuration.baseUrl === "string" ? configuration.baseUrl.trim() : "";
+        const baseUrl = normalizeProxyBaseUrl(typeof configuration.baseUrl === "string" ? configuration.baseUrl : "");
         const apiKey = typeof configuration.apiKey === "string" ? configuration.apiKey.trim() : "";
 
         if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) {
             Logger.warn(
-                "convertProviderConfiguration: rejected — baseUrl must start with http:// or https:// (got a non-http value)"
+                "convertProviderConfiguration: rejected: baseUrl must start with http:// or https:// (got a non-http value)"
             );
             return undefined;
         }
 
         if (!apiKey) {
-            Logger.warn("convertProviderConfiguration: rejected — apiKey is empty in per-group configuration");
+            Logger.warn("convertProviderConfiguration: rejected: apiKey is empty in per-group configuration");
             return undefined;
         }
 
-        // Derive a stable backendName from the canonical group name; fall back to a
-        // hostname+port derived from baseUrl when the user has not entered a group
-        // name. Reuse the same helper the discovery layer uses to compute the
-        // picker's category label, so the two stay in sync.
-        const trimmedGroupName = groupName.trim();
-        const backendName = trimmedGroupName || deriveGroupNameFromUrl(baseUrl) || baseUrl;
+        // Stable label for the model `detail` and `tooltip`, derived from the URL
+        // because VS Code does not pass the user's group name to the provider.
+        const backendName = deriveGroupNameFromUrl(baseUrl) || baseUrl;
 
-        const userAgent = "litellm-vscode-chat/vscode-1.120+";
         return {
             backendName,
             baseUrl,
@@ -345,52 +321,10 @@ export class ConfigManager {
                 {
                     url: baseUrl,
                     key: apiKey,
-                    discoveryTimeoutMs:
-                        this._lastConfig?.discoveryTimeoutMs ?? ConfigManager.DEFAULT_DISCOVERY_TIMEOUT_MS,
+                    discoveryTimeoutMs: clientOptions.discoveryTimeoutMs,
                 },
-                userAgent
+                clientOptions.userAgent
             ),
         };
-    }
-
-    /**
-     * Dispose hook to align with ExtensionContext subscription lifecycle.
-     * Drops the cached workspace config; no disposable resources are held.
-     */
-    async dispose(): Promise<void> {
-        this._lastConfig = undefined;
-    }
-
-    /**
-     * Resets all LiteLLM connector configuration.
-     * Clears SecretStorage keys and triggers a provider refresh.
-     * This is a destructive operation intended for troubleshooting and complete re-configuration.
-     * Note: globalState metadata (migration notices, config flags) and VS Code's native
-     * provider configuration are NOT cleared, as they are extension state, not user configuration.
-     */
-    public async resetConfiguration(): Promise<void> {
-        Logger.info("ConfigManager: Starting configuration reset...");
-
-        // 1. Clear all SecretStorage keys that start with "litellm-connector"
-        try {
-            const allKeys = await this.secrets.keys();
-            const litellmKeys = allKeys.filter((key) => key.startsWith("litellm-connector"));
-
-            for (const key of litellmKeys) {
-                Logger.debug(`Deleting secret key: ${key}`);
-                await this.secrets.delete(key);
-            }
-            Logger.info(`ConfigManager: Cleared ${litellmKeys.length} secret(s)`);
-        } catch (err: unknown) {
-            Logger.error("ConfigManager: Failed to clear secrets", err);
-            // Continue with reset even if secrets clear fails
-        }
-
-        // 2. Trigger a provider refresh to reflect cleaned state
-        // In a full implementation, this would notify the provider to reload models.
-        // However, since ConfigManager doesn't have direct access to the provider,
-        // the command handler should trigger this after reset.
-
-        Logger.info("ConfigManager: Configuration reset complete");
     }
 }

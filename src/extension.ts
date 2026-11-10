@@ -1,21 +1,18 @@
 import * as vscode from "vscode";
 import { LiteLLMChatProvider } from "./providers";
-import { ConfigManager } from "./config/configManager";
+import { ActiveRequestRegistry } from "./providers/activeRequests";
 import {
     registerManageConfigCommand,
     registerReloadModelsCommand,
-    registerResetConfigurationCommand,
     registerShowModelsCommand,
 } from "./commands/manageConfig";
-import { registerGenerateCommitMessageCommand } from "./commands/generateCommitMessage";
-import { LiteLLMCommitMessageProvider } from "./providers/liteLLMCommitProvider";
 import { Logger } from "./utils/logger";
 import { StructuredLogger, CopilotMdManager } from "./observability";
-import { EffortFallbackCache } from "./utils/reasoningEffortFallback";
 import { registerOpenCopilotMdFolderCommand } from "./commands/openCopilotMdFolder";
+import { registerCancelActiveRequestCommand } from "./commands/cancelActiveRequest";
 
-let configManagerInstance: ConfigManager | undefined;
-let activeChatProviderInstance: LiteLLMChatProvider | undefined;
+/** Vendor id this extension registers and lists its models under. */
+export const LITELLM_VENDOR = "litellm-connector";
 
 export function activate(context: vscode.ExtensionContext): void {
     Logger.initialize(context);
@@ -48,28 +45,23 @@ export function activate(context: vscode.ExtensionContext): void {
 
     Logger.info(`UA: ${ua}`);
 
-    configManagerInstance = new ConfigManager(context.secrets);
-    const configManager = configManagerInstance;
+    const activeRequests = new ActiveRequestRegistry();
 
-    const effortFallbackCache = new EffortFallbackCache();
-
-    // VS Code 1.120+ uses the unified chat provider with per-group configuration support.
-
-    const activeProvider = new LiteLLMChatProvider(context.secrets, ua, effortFallbackCache);
-    activeChatProviderInstance = activeProvider; // Store for cleanup on deactivation
-
-    // Commit message provider (version-agnostic)
-    const commitProvider = new LiteLLMCommitMessageProvider(context.secrets, ua, effortFallbackCache);
+    const activeProvider = new LiteLLMChatProvider(ua, activeRequests);
 
     // Register provider immediately (do not await config)
     try {
         Logger.info("Registering LanguageModelChatProvider...");
         const chatProviderRegistration = vscode.lm.registerLanguageModelChatProvider(
-            "litellm-connector",
+            LITELLM_VENDOR,
             activeProvider as unknown as vscode.LanguageModelChatProvider
         );
         if (chatProviderRegistration) {
             context.subscriptions.push(chatProviderRegistration);
+            // Pushed after the registration so VS Code disposes the registration
+            // before the provider that serves it, since subscriptions dispose in
+            // insertion order.
+            context.subscriptions.push(activeProvider);
             Logger.info("Provider registered successfully.");
         } else {
             Logger.error("registerLanguageModelChatProvider returned undefined/null");
@@ -81,15 +73,24 @@ export function activate(context: vscode.ExtensionContext): void {
     // Proactively nudge VS Code to call provideLanguageModelChatInformation immediately after
     // registration.  Without this, model discovery (and reasoning-effort schema population) is
     // deferred until the user first opens the model picker.  Firing the change event right after
-    // registration causes VS Code to eagerly re-query the provider — this time with the correct
+    // registration causes VS Code to eagerly re-query the provider, this time with the correct
     // per-group options.configuration values, so reasoning capabilities populate on first load.
     setImmediate(() => {
         Logger.info("Post-registration: nudging VS Code to refresh model information...");
         activeProvider.refreshModelInformation();
     });
 
-    // Re-query models after settings updates so newly completed Language Models provider
-    // configuration flows are reflected without requiring a reload.
+    // Re-query models when a workspace setting that shapes discovery changes, so the
+    // picker reflects it without the user running Reload Models. Only those settings
+    // are watched. Anything else would clear the response cache and re-fetch every
+    // backend for nothing.
+    const discoveryShapingSettings = [
+        "litellm-connector.modelOverrides",
+        "litellm-connector.enableModelOverrides",
+        "litellm-connector.modelCapabilitiesOverrides",
+        "litellm-connector.displayPricingInPicker",
+        "litellm-connector.forceResponsesEndpoint",
+    ];
     let refreshModelsTimer: NodeJS.Timeout | undefined;
     const refreshModelInformation = () => {
         if (refreshModelsTimer) {
@@ -98,17 +99,12 @@ export function activate(context: vscode.ExtensionContext): void {
         refreshModelsTimer = setTimeout(() => {
             refreshModelsTimer = undefined;
             Logger.info("Configuration changed; refreshing model information...");
-            activeProvider.refreshModelInformation();
+            activeProvider.reloadModelDiscovery();
         }, 250);
     };
     context.subscriptions.push(
         vscode.workspace.onDidChangeConfiguration((e) => {
-            // Only refresh when LiteLM-specific settings change, not generic provider config
-            // (e.affectsConfiguration) returns true for the top-level "litellm-connector.*" path
-            if (
-                e.affectsConfiguration("litellm-connector.modelOverrides") ||
-                e.affectsConfiguration("litellm-connector.backendGroups")
-            ) {
+            if (discoveryShapingSettings.some((setting) => e.affectsConfiguration(setting))) {
                 refreshModelInformation();
             }
         })
@@ -123,12 +119,13 @@ export function activate(context: vscode.ExtensionContext): void {
     });
 
     try {
-        context.subscriptions.push(registerManageConfigCommand(context, configManager, activeProvider));
-        context.subscriptions.push(registerResetConfigurationCommand(context, configManager));
-        context.subscriptions.push(registerShowModelsCommand(activeProvider));
+        context.subscriptions.push(registerManageConfigCommand());
+        context.subscriptions.push(
+            registerShowModelsCommand(() => vscode.lm.selectChatModels({ vendor: LITELLM_VENDOR }))
+        );
         context.subscriptions.push(registerReloadModelsCommand(activeProvider));
-        context.subscriptions.push(registerGenerateCommitMessageCommand(commitProvider));
         context.subscriptions.push(registerOpenCopilotMdFolderCommand());
+        context.subscriptions.push(registerCancelActiveRequestCommand(activeRequests));
         Logger.info("Config command registered.");
     } catch (cmdErr) {
         Logger.error("Failed to register commands", cmdErr);
@@ -136,12 +133,8 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export async function deactivate(): Promise<void> {
-    // Clean up session-scoped caches to free memory
-    if (activeChatProviderInstance) {
-        activeChatProviderInstance.clearSessionCaches();
-    }
-
-    if (configManagerInstance) {
-        await configManagerInstance.dispose();
-    }
+    // Once registration succeeds, the provider and its registration are both on
+    // context.subscriptions, which VS Code disposes in insertion order, so it disposes
+    // the registration before the provider. If registration failed, the provider holds
+    // nothing that outlives the extension host.
 }

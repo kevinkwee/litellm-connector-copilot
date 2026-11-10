@@ -5,9 +5,9 @@ import * as vscode from "vscode";
 import { LiteLLMChatProvider } from "../";
 import { LiteLLMClient, LiteLLMDiscoveryError } from "../../adapters/litellmClient";
 import type { BackendSession } from "../backendSession";
-import type { LiteLLMConfig } from "../../types";
+import type { LiteLLMConfig, LiteLLMModelInfo } from "../../types";
 import { sharedDiscoveryBackoff } from "../base/discoveryBackoff";
-import { createMockChatResponseOptions, createMockSecrets, createMockUserMessage } from "../../test/utils/testMocks";
+import { createMockChatResponseOptions, createMockUserMessage } from "../../test/utils/testMocks";
 import { createMockSSEStream } from "../../test/utils/testStreamUtils";
 
 const USER_AGENT = "GitHubCopilotChat/test VSCode/test";
@@ -17,8 +17,8 @@ interface ProviderAccess {
     _configManager: {
         getConfig: () => Promise<Partial<LiteLLMConfig> & { url?: string }>;
         convertProviderConfiguration: (
-            groupName: string,
-            configuration: Record<string, unknown>
+            configuration: Record<string, unknown>,
+            clientOptions: { discoveryTimeoutMs: number; userAgent: string }
         ) => BackendSession | undefined;
     };
     _registry: {
@@ -26,7 +26,7 @@ interface ProviderAccess {
             info: vscode.LanguageModelChatInformation | undefined
         ) => { baseUrl: string; apiKey: string; rawModelName: string } | undefined;
         lookup: (id: string) => { baseUrl: string; apiKey: string; rawModelName: string } | undefined;
-        clear: () => void;
+        getModelInfo: (id: string) => LiteLLMModelInfo | undefined;
     };
 }
 
@@ -67,8 +67,31 @@ suite("Per-group routing", () => {
         sandbox.restore();
     });
 
+    test("discovery hands the configured timeout and the real user agent to the session client", async () => {
+        const provider = new LiteLLMChatProvider(USER_AGENT);
+        const internals = access(provider);
+        sandbox.stub(internals._configManager, "getConfig").resolves({
+            discoveryTimeoutMs: 30_000,
+            discoveryCacheTtlMs: 0,
+        });
+        const received: { discoveryTimeoutMs: number; userAgent: string }[] = [];
+        sandbox
+            .stub(internals._configManager, "convertProviderConfiguration")
+            .callsFake((_configuration, clientOptions) => {
+                received.push(clientOptions);
+                return createSession(SHARED_HOST, "key-a", "model-a");
+            });
+
+        await provider.discoverModels(
+            { configuration: { baseUrl: SHARED_HOST, apiKey: "key-a" } },
+            new vscode.CancellationTokenSource().token
+        );
+
+        assert.deepStrictEqual(received, [{ discoveryTimeoutMs: 30_000, userAgent: USER_AGENT }]);
+    });
+
     test("two groups on one host route to their own credentials", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const internals = access(provider);
         sandbox.stub(internals._configManager, "getConfig").resolves({
             inactivityTimeout: 60,
@@ -78,7 +101,7 @@ suite("Per-group routing", () => {
         const configB = { baseUrl: SHARED_HOST, apiKey: "key-b" };
         sandbox
             .stub(internals._configManager, "convertProviderConfiguration")
-            .callsFake((_groupName: string, configuration: Record<string, unknown>) => {
+            .callsFake((configuration: Record<string, unknown>) => {
                 if (configuration === configA) {
                     return createSession(SHARED_HOST, "key-a", "shared-model");
                 }
@@ -116,7 +139,7 @@ suite("Per-group routing", () => {
     });
 
     test("lookupInfo resolves a discovered model object to its own entry", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const internals = access(provider);
         sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
         const config = { baseUrl: SHARED_HOST, apiKey: "key-a" };
@@ -134,10 +157,10 @@ suite("Per-group routing", () => {
         assert.strictEqual(internals._registry.lookupInfo({ ...models[0] }), undefined);
     });
 
-    test("clear() stops routing by a model object delivered before the reload", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+    test("a model reload keeps routing so an in-flight request still resolves", async () => {
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const internals = access(provider);
-        sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
+        sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 60_000 });
         sandbox
             .stub(internals._configManager, "convertProviderConfiguration")
             .returns(createSession(SHARED_HOST, "key-a", "shared-model"));
@@ -146,12 +169,151 @@ suite("Per-group routing", () => {
             new vscode.CancellationTokenSource().token
         );
 
-        provider.clearModelCache();
+        provider.reloadModelDiscovery();
+
+        assert.strictEqual(internals._registry.lookupInfo(models[0])?.apiKey, "key-a");
+        assert.strictEqual(internals._registry.lookup(models[0].id)?.apiKey, "key-a");
+    });
+
+    test("a reload during a discovery keeps the superseded result out of the cache", async () => {
+        const provider = new LiteLLMChatProvider(USER_AGENT);
+        const internals = access(provider);
+        sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 60_000 });
+
+        let releaseFetch: (() => void) | undefined;
+        const fetchGate = new Promise<void>((resolve) => {
+            releaseFetch = resolve;
+        });
+        let markFetchStarted: (() => void) | undefined;
+        const fetchStarted = new Promise<void>((resolve) => {
+            markFetchStarted = resolve;
+        });
+        const getModelInfo = sandbox.stub().callsFake(async () => {
+            markFetchStarted?.();
+            await fetchGate;
+            return { data: [{ model_name: "slow-model", model_info: { litellm_provider: "openai" } }] };
+        });
+        const session = {
+            ...createSession(SHARED_HOST, "key-a", "slow-model"),
+            client: { getModelInfo } as unknown as BackendSession["client"],
+        };
+        sandbox.stub(internals._configManager, "convertProviderConfiguration").returns(session);
+        const configuration = { baseUrl: SHARED_HOST, apiKey: "key-a" };
+
+        const inFlight = provider.discoverModels({ configuration }, new vscode.CancellationTokenSource().token);
+        // The reload lands while the fetch is awaited, after this discovery captured
+        // its epoch.
+        await fetchStarted;
+        provider.reloadModelDiscovery();
+        releaseFetch?.();
+        await inFlight;
+
+        // The superseded result never entered the routing table, because the
+        // reload's epoch guard rejected the write.
+        assert.strictEqual(
+            internals._registry.lookup("litellm.example/slow-model"),
+            undefined,
+            "a superseded discovery must not write its model into the routing table"
+        );
+
+        // The next discovery must reach the proxy, because the superseded result was
+        // not cached.
+        const getModelInfoCallsBefore = getModelInfo.callCount;
+        await provider.discoverModels({ configuration }, new vscode.CancellationTokenSource().token);
+
+        assert.strictEqual(getModelInfo.callCount, getModelInfoCallsBefore + 1);
+    });
+
+    test("a superseded discovery does not overwrite the capability cache the newer one wrote", async () => {
+        const provider = new LiteLLMChatProvider(USER_AGENT);
+        const internals = access(provider);
+        sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
+        const configuration = { baseUrl: SHARED_HOST, apiKey: "key-a" };
+        const slowModel = {
+            model_name: "dual-mode",
+            model_info: { litellm_provider: "openai", mode: "chat" as const },
+        };
+        const fastModel = {
+            model_name: "dual-mode",
+            model_info: { litellm_provider: "openai", mode: "responses" as const },
+        };
+
+        let releaseSlowFetch: (() => void) | undefined;
+        const slowFetchGate = new Promise<void>((resolve) => {
+            releaseSlowFetch = resolve;
+        });
+        let markSlowFetchStarted: (() => void) | undefined;
+        const slowFetchStarted = new Promise<void>((resolve) => {
+            markSlowFetchStarted = resolve;
+        });
+        let fetchCount = 0;
+        const getModelInfo = sandbox.stub().callsFake(async () => {
+            fetchCount += 1;
+            if (fetchCount === 1) {
+                markSlowFetchStarted?.();
+                await slowFetchGate;
+                return { data: [slowModel] };
+            }
+            return { data: [fastModel] };
+        });
+        sandbox.stub(internals._configManager, "convertProviderConfiguration").returns({
+            ...createSession(SHARED_HOST, "key-a", "dual-mode"),
+            client: { getModelInfo } as unknown as BackendSession["client"],
+        });
+
+        const superseded = provider.discoverModels({ configuration }, new vscode.CancellationTokenSource().token);
+        await slowFetchStarted;
+        await provider.discoverModels({ configuration }, new vscode.CancellationTokenSource().token);
+        provider.reloadModelDiscovery();
+        releaseSlowFetch?.();
+        await superseded;
 
         assert.strictEqual(
-            internals._registry.lookupInfo(models[0]),
-            undefined,
-            "a user-initiated reload must drop the identity routing table too"
+            internals._registry.getModelInfo("litellm.example/dual-mode")?.mode,
+            "responses",
+            "the newer discovery's capability data must survive the late answer"
+        );
+    });
+
+    test("two keys on one host keep separate lists, and the failing one serves its own last-known models", async () => {
+        const provider = new LiteLLMChatProvider(USER_AGENT);
+        const internals = access(provider);
+        sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
+        const sharedConfig = { baseUrl: SHARED_HOST, apiKey: "shared-key" };
+        const changedConfig = { baseUrl: SHARED_HOST, apiKey: "changed-key" };
+        let failShared = false;
+        sandbox
+            .stub(internals._configManager, "convertProviderConfiguration")
+            .callsFake((configuration: Record<string, unknown>) => {
+                if (configuration === sharedConfig) {
+                    const session = createSession(SHARED_HOST, "shared-key", "shared-model");
+                    if (failShared) {
+                        (session.client as unknown as { getModelInfo: () => Promise<never> }).getModelInfo =
+                            async () => {
+                                throw new LiteLLMDiscoveryError(500, "boom");
+                            };
+                    }
+                    return session;
+                }
+                if (configuration === changedConfig) {
+                    return createSession(SHARED_HOST, "changed-key", "changed-model");
+                }
+                return undefined;
+            });
+        const token = new vscode.CancellationTokenSource().token;
+
+        // The backend identity includes the API-key hash, so the two keys keep
+        // separate lists even though they share a host.
+        await provider.discoverModels({ configuration: sharedConfig }, token);
+        await provider.discoverModels({ configuration: changedConfig }, token);
+
+        failShared = true;
+        const stale = await provider.discoverModels({ configuration: sharedConfig }, token);
+
+        assert.deepStrictEqual(
+            stale.map((model) => model.id),
+            ["litellm.example/shared-model"],
+            "the failing key keeps serving its own last-known models"
         );
     });
 });
@@ -170,14 +332,14 @@ suite("Stale discovery results", () => {
     });
 
     test("refreshing one of two same-host groups does not fire the picker refresh", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const internals = access(provider);
         sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
         const configA = { baseUrl: SHARED_HOST, apiKey: "key-a" };
         const configB = { baseUrl: SHARED_HOST, apiKey: "key-b" };
         sandbox
             .stub(internals._configManager, "convertProviderConfiguration")
-            .callsFake((_groupName: string, configuration: Record<string, unknown>) => {
+            .callsFake((configuration: Record<string, unknown>) => {
                 if (configuration === configA) {
                     return createSession(SHARED_HOST, "key-a", "model-a");
                 }
@@ -227,7 +389,7 @@ suite("Stale discovery results", () => {
     }
 
     test("serves the last known models with a visible warning when a refresh fails", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const { getModelInfo } = configureSession(sandbox, provider);
         const configuration = { baseUrl: SHARED_HOST, apiKey: "key-a" };
         const token = new vscode.CancellationTokenSource().token;
@@ -251,7 +413,7 @@ suite("Stale discovery results", () => {
     });
 
     test("returns an empty list when the group is misconfigured, so the error stays visible", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const { getModelInfo } = configureSession(sandbox, provider);
         const configuration = { baseUrl: SHARED_HOST, apiKey: "key-a" };
         const token = new vscode.CancellationTokenSource().token;
@@ -264,7 +426,7 @@ suite("Stale discovery results", () => {
     });
 
     test("returns an empty list when the first refresh for a group fails", async () => {
-        const provider = new LiteLLMChatProvider(createMockSecrets(), USER_AGENT);
+        const provider = new LiteLLMChatProvider(USER_AGENT);
         const { getModelInfo } = configureSession(sandbox, provider);
         getModelInfo.rejects(new TypeError("fetch failed"));
 
@@ -274,5 +436,50 @@ suite("Stale discovery results", () => {
         );
 
         assert.deepStrictEqual(models, []);
+    });
+
+    test("a cancelled refresh serves the last known models unmarked", async () => {
+        const provider = new LiteLLMChatProvider(USER_AGENT);
+        const internals = access(provider);
+        sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
+        const configuration = { baseUrl: SHARED_HOST, apiKey: "key-a" };
+        const session = createSession(SHARED_HOST, "key-a", "steady-model");
+        sandbox.stub(internals._configManager, "convertProviderConfiguration").returns(session);
+
+        const first = await provider.discoverModels({ configuration }, new vscode.CancellationTokenSource().token);
+        assert.strictEqual(first.length, 1, "the first discovery populates the backend");
+
+        (session.client as unknown as { getModelInfo: () => Promise<never> }).getModelInfo = async () => {
+            throw new DOMException("The operation was aborted.", "AbortError");
+        };
+        const tokenSource = new vscode.CancellationTokenSource();
+        tokenSource.cancel();
+        const second = await provider.discoverModels({ configuration }, tokenSource.token);
+
+        assert.deepStrictEqual(
+            second.map((model) => model.id),
+            ["litellm.example/steady-model"],
+            "a cancellation keeps the working list"
+        );
+        assert.strictEqual(second[0].statusIcon, undefined, "a cancellation is not a stale-list warning");
+    });
+
+    test("a cancelled discovery never records a failure", async () => {
+        const provider = new LiteLLMChatProvider(USER_AGENT);
+        const internals = access(provider);
+        sandbox.stub(internals._configManager, "getConfig").resolves({ discoveryCacheTtlMs: 0 });
+        const configuration = { baseUrl: SHARED_HOST, apiKey: "key-a" };
+        const session = createSession(SHARED_HOST, "key-a", "steady-model");
+        sandbox.stub(internals._configManager, "convertProviderConfiguration").returns(session);
+        const recordFailure = sandbox.spy(sharedDiscoveryBackoff, "recordFailure");
+        const tokenSource = new vscode.CancellationTokenSource();
+        tokenSource.cancel();
+        (session.client as unknown as { getModelInfo: () => Promise<never> }).getModelInfo = async () => {
+            throw new DOMException("The operation was aborted.", "AbortError");
+        };
+
+        await provider.discoverModels({ configuration }, tokenSource.token);
+
+        sinon.assert.notCalled(recordFailure);
     });
 });

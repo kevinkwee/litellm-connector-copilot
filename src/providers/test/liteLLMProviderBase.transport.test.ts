@@ -3,48 +3,19 @@ import * as vscode from "vscode";
 import * as sinon from "sinon";
 import { Transport } from "../base/transport";
 import { ConfigManager } from "../../config/configManager";
+import { LiteLLMApiError } from "../../adapters/litellmClient";
+import { RateLimitWaitLedger } from "../../utils/rateLimitRetryPolicy";
 
 suite("Transport", () => {
     let sandbox: sinon.SinonSandbox;
     let configManager: sinon.SinonStubbedInstance<ConfigManager>;
-    let transport: Transport;
 
     setup(() => {
         sandbox = sinon.createSandbox();
         configManager = sandbox.createStubInstance(ConfigManager);
-        transport = new Transport({
-            configManager,
-            userAgent: "ua",
-            logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, trace: () => {} },
-        });
     });
 
     teardown(() => sandbox.restore());
-
-    test("sendRequestWithRetry retries once on overflow", async () => {
-        const token = new vscode.CancellationTokenSource().token;
-        const progress = { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>;
-        const overflow = new Error("context length exceeded");
-
-        const sendStub = sandbox.stub(transport, "sendRequestToLiteLLM");
-        sendStub.onCall(0).rejects(overflow);
-        sendStub.onCall(1).resolves(new ReadableStream());
-
-        const stream = await transport.sendRequestWithRetry({
-            request: { model: "m", messages: [], stream: true, max_tokens: 100 },
-            messages: [],
-            model: { id: "m", maxInputTokens: 10, maxOutputTokens: 5 } as vscode.LanguageModelChatInformation,
-            options: { modelOptions: {} } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-            progress,
-            token,
-            caller: "test",
-            modelInfo: { mode: "chat", max_input_tokens: 10 },
-        });
-
-        sinon.assert.match(stream, sinon.match.instanceOf(ReadableStream));
-        sinon.assert.calledTwice(sendStub);
-        sinon.assert.match(sendStub.secondCall.args[0].max_tokens, 5);
-    });
 
     test("sendRequestToLiteLLM throws when no baseUrl in call-time configuration", async () => {
         const token = new vscode.CancellationTokenSource().token;
@@ -94,6 +65,51 @@ suite("Transport", () => {
                 ),
             /No apiKey/
         );
+    });
+
+    test("the /responses fallback shares the attempt's rate-limit ledger", async () => {
+        // The fallback resends the same body, so it must keep the allowance the first
+        // call was given rather than starting a fresh one.
+        const token = new vscode.CancellationTokenSource().token;
+        const progress = { report: () => {} } as vscode.Progress<vscode.LanguageModelResponsePart>;
+        const ledgers: unknown[] = [];
+        const localTransport = new Transport({
+            configManager,
+            userAgent: "ua",
+            logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, trace: () => {} },
+            liteLLMClientFactory: (() => ({
+                chat: (_request: unknown, mode: string, _token: unknown, _id: unknown, ledger: unknown) => {
+                    ledgers.push(ledger);
+                    if (mode === "responses") {
+                        return Promise.reject(
+                            new LiteLLMApiError(
+                                502,
+                                "upstream schema mismatch",
+                                "LiteLLM API error: 502 Bad Gateway\nupstream schema mismatch"
+                            )
+                        );
+                    }
+                    return Promise.resolve(new ReadableStream());
+                },
+            })) as never,
+        });
+        const ledger = new RateLimitWaitLedger();
+
+        await localTransport.sendRequestToLiteLLM(
+            { model: "m", messages: [], stream: true, max_tokens: 100 },
+            progress,
+            token,
+            "test",
+            { mode: "responses" } as never,
+            { baseUrl: "https://example.com", apiKey: "sk-test", allowChatCompletionsFallback: true },
+            "request-1",
+            "model-1",
+            ledger
+        );
+
+        assert.strictEqual(ledgers.length, 2, "the 5xx must trigger one fallback");
+        assert.strictEqual(ledgers[0], ledger);
+        assert.strictEqual(ledgers[1], ledger, "the fallback must not get a fresh budget");
     });
 
     test("sendRequestToLiteLLM constructs a client with the call-time configuration", async () => {

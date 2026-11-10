@@ -14,10 +14,9 @@
  *  3. **Change detection**: emits `onDidChange` when a backend's model set
  *     actually differs from the prior delivery, so VS Code only refreshes
  *     the picker when the set has really changed.
- *  4. **Capability caches**: per-model `LiteLLMModelInfo` and derived
- *     capabilities. These are populated as a side effect of discovery and
- *     feed the request hot path. They are NOT a model-list cache: they
- *     cache the capability info for known models.
+ *  4. **Capability cache**: the per-model `LiteLLMModelInfo`, populated as a
+ *     side effect of discovery and read on the request hot path. It is NOT a
+ *     model-list cache: it holds the capability info for known models.
  *
  * Public surface (read + ingress)
  *  - `discoverModels(options, token)`: the only way for VS Code (or any
@@ -26,11 +25,14 @@
  *  - `lookupInfo(info)`: resolve the exact model object VS Code passed back,
  *    which is what distinguishes two groups on the same host.
  *  - `extractRawName(id)`: strip the routing prefix from a namespaced id.
- *  - `getModelInfo(id)` / `getDerivedCapabilities(id)`: read the
- *    capability caches populated during discovery.
- *  - `size()`: number of distinct backends currently registered.
- *  - `clear()`: wipe the routing table (call on user-initiated reload).
- *  - `clearCaches()`: wipe the capability caches + backoff controller.
+ *  - `getModelInfo(id)`: read the model info cache populated during discovery.
+ *  - `clearDiscoveryCaches()`: wipes the discovery response cache and every
+ *    backend's backoff history. Routing and the per-model caches survive.
+ *  - `recordUnsupportedParameter(modelId, param)` /
+ *    `getUnsupportedParameters(modelId)`: the learned-parameter store, keyed by
+ *    the namespaced picker id.
+ *  - `clearUnsupportedParameters()`: forgets that store when the user asks for a
+ *    reload, because the proxy's model config may have changed.
  *  - `onDidChange`: fires when a backend's model set changes.
  *
  * Internal surface (write)
@@ -47,13 +49,13 @@
  *
  * Per-group namespacing
  * The namespaced id format `<routingIdentity>/<rawModelName>` lets the response
- * path look up routing in O(1) by id. The routing identity is the URL hostname
- * (with the user-entered group name as fallback); the raw model name is the
- * part after the first `/` in the id, preserved unchanged from what the backend
- * returned. Ids are unique per host, not per group: two groups on one host
- * produce identical ids, so response-time routing resolves the model object
- * VS Code passed back (`lookupInfo`) first and only falls back to the id for
- * objects this registry did not produce.
+ * path look up routing in O(1) by id. The routing identity is the URL host,
+ * or `LiteLLM` when the URL carries none; the raw model name is the part after
+ * the first `/` in the id, preserved unchanged from what the backend returned.
+ * Ids are unique per host, not per group: two groups on one host produce
+ * identical ids, so response-time routing resolves the model object VS Code
+ * passed back (`lookupInfo`) first and only falls back to the id for objects
+ * this registry did not produce.
  */
 import * as vscode from "vscode";
 import type { LanguageModelChatInformation } from "vscode";
@@ -62,21 +64,21 @@ import { StructuredLogger } from "../observability/structuredLogger";
 import {
     deriveCapabilitiesFromModelInfo,
     capabilitiesToVSCode,
-    getModelTags as getDerivedModelTags,
     buildReasoningEffortConfigurationSchema,
     buildTemperatureConfigurationProperty,
     mergeConfigurationSchemas,
     getSupportedReasoningEfforts,
     derivePickerCategory,
 } from "../utils/modelCapabilities";
-import { deriveGroupNameFromUrl } from "../utils";
-import { sha256HexAsync } from "../utils/discoveryHash";
-import { LiteLLMDiscoveryError } from "../adapters/litellmClient";
-import type { LiteLLMConfig, LiteLLMModelInfo, LiteLLMModelInfoResponse } from "../types";
+import { deriveGroupNameFromUrl } from "../utils/groupNameFromUrl";
+import { sleepWithCancellation } from "../utils/transportRetry";
+import type { LiteLLMConfig, LiteLLMModelInfo } from "../types";
 import type { ConfigManager } from "../config/configManager";
 import type { BackendSession } from "./backendSession";
 import { sharedDiscoveryBackoff } from "./base/discoveryBackoff";
-import { DebouncedEmitter } from "./base/debouncedEmitter";
+import { toBackendIdentityKey } from "./base/backendIdentity";
+import { describeDiscoveryFailure, isTransientDiscoveryFailure } from "./base/discoveryFailure";
+import { toListableDeployments, type LiteLLMModelInfoEntry } from "./base/pausedModelListing";
 import {
     derivePriceCategory,
     extractPricing,
@@ -88,50 +90,8 @@ import {
  * Cached result from a /model/info discovery call.
  */
 interface CachedDiscoveryResult {
-    readonly bodyHash: string;
     readonly models: readonly vscode.LanguageModelChatInformation[];
     readonly fetchedAtMs: number;
-    readonly ttlMs: number;
-}
-
-/**
- * Hashes the API key for use in internal keys. Only the first 8 characters of
- * the SHA-256 digest are used, so the raw key is never logged or persisted.
- */
-async function hashApiKeySuffixAsync(apiKey: string | undefined): Promise<string> {
-    return apiKey ? (await sha256HexAsync(apiKey)).slice(0, 8) : "anonymous";
-}
-
-/**
- * Identity of one configured provider group: its server URL plus a suffix of a
- * hash of its API key.
- *
- * The same value keys the discovery response cache and the per-backend model
- * list, so groups that differ in URL, scheme, or API key never share a cache
- * entry. The scheme is kept as written because `http` and `https` may be
- * different servers.
- */
-async function toBackendIdentityKey(baseUrl: string, apiKey: string | undefined): Promise<string> {
-    return `${baseUrl.replace(/\/+$/, "")}#${await hashApiKeySuffixAsync(apiKey)}`;
-}
-
-/**
- * Returns a short, log-safe reason for a failed discovery refresh.
- */
-function describeDiscoveryFailure(err: unknown): string {
-    const message = err instanceof Error ? err.message : String(err);
-    const singleLine = message.replace(/\s+/g, " ").trim();
-    return singleLine.length > 120 ? `${singleLine.slice(0, 117)}...` : singleLine;
-}
-
-/**
- * Statuses that mean this group is misconfigured rather than the endpoint
- * being unhealthy. Serving the last known list for one of them would hide the
- * problem behind a warning icon, so discovery returns an empty list instead.
- */
-const NON_TRANSIENT_DISCOVERY_STATUS = new Set([400, 401, 403, 404]);
-function isTransientDiscoveryFailure(err: unknown): boolean {
-    return !(err instanceof LiteLLMDiscoveryError && NON_TRANSIENT_DISCOVERY_STATUS.has(err.status));
 }
 
 /**
@@ -187,63 +147,6 @@ function setsEqual(a: Set<string>, b: Set<string>): boolean {
     return true;
 }
 
-/**
- * A single deployment row from a `/model/info` response. The same public
- * `model_name` can be served by multiple deployments with different
- * credentials or providers.
- */
-type LiteLLMModelInfoEntry = LiteLLMModelInfoResponse["data"][number];
-
-/**
- * Applies LiteLLM's paused-model listing rule to a `/model/info` payload,
- * matching `Router.get_fully_blocked_model_names` on the proxy: a
- * deployment whose `model_info.blocked` is `true` is admin-paused and is
- * dropped. A public name is hidden only when every deployment carrying it
- * is paused; with at least one non-paused deployment the name stays
- * listable and is represented by its first non-paused deployment, so
- * multi-deployment names appear once. Entries without a `model_name` are
- * passed through unless paused, so the unknown-name skip in
- * `toVSCodeInfo` keeps reporting them. Strict `=== true` leaves older
- * proxies that do not send the flag untouched.
- */
-export function toListableDeployments(data: readonly LiteLLMModelInfoEntry[]): LiteLLMModelInfoEntry[] {
-    const namesWithPausedDeployment = new Set<string>();
-    const namesWithLiveDeployment = new Set<string>();
-    for (const entry of data) {
-        if (!entry.model_name) {
-            continue;
-        }
-        if (entry.model_info?.blocked === true) {
-            namesWithPausedDeployment.add(entry.model_name);
-        } else {
-            namesWithLiveDeployment.add(entry.model_name);
-        }
-    }
-    const hiddenNames = [...namesWithPausedDeployment].filter((name) => !namesWithLiveDeployment.has(name));
-    if (hiddenNames.length > 0) {
-        StructuredLogger.debug("discovery.paused_deployments_filtered", {
-            hiddenModelNames: hiddenNames.sort(),
-            hiddenCount: hiddenNames.length,
-        });
-    }
-
-    const listedNames = new Set<string>();
-    const listable: LiteLLMModelInfoEntry[] = [];
-    for (const entry of data) {
-        if (entry.model_info?.blocked === true) {
-            continue;
-        }
-        if (entry.model_name && listedNames.has(entry.model_name)) {
-            continue;
-        }
-        if (entry.model_name) {
-            listedNames.add(entry.model_name);
-        }
-        listable.push(entry);
-    }
-    return listable;
-}
-
 export class LiteLLMProviderRegistry implements vscode.Disposable {
     private readonly configManager: RegistryDeps["configManager"];
     private readonly _userAgent: string;
@@ -271,25 +174,24 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     private readonly unsupportedParamsByModel = new Map<string, Set<string>>();
 
     /**
-     * Per-model capability caches. These are populated as a side effect of
-     * discovery and feed the request hot path (`buildOpenAIChatRequest`,
-     * token utilities, capability derivation). They are NOT a model list
-     * cache: they cache the capability info for known models.
+     * Per-model capability cache. It is populated as a side effect of discovery and
+     * read on the request hot path (`buildOpenAIChatRequest`, the token utilities and
+     * the provider's request-time lookup). It is NOT a model list cache: it holds the
+     * `LiteLLMModelInfo` of the models the proxy currently lists.
      */
     private readonly modelInfoCache = new Map<string, LiteLLMModelInfo | undefined>();
-    private readonly derivedCapabilitiesCache = new Map<string, ReturnType<typeof deriveCapabilitiesFromModelInfo>>();
 
     private readonly _onDidChangeEmitter = new vscode.EventEmitter<void>();
 
     // Discovery response cache for /model/info responses
     private readonly discoveryResponseCache = new Map<string, CachedDiscoveryResult>();
-
-    // Debounced change event emitter (initialized lazily on first use)
-    private _debouncedOnDidChange: DebouncedEmitter | undefined;
-
-    // Discovery debounce defaults
-    private static readonly DEFAULT_DISCOVERY_FIRE_DEBOUNCE_MS = 250;
-    private static readonly DEFAULT_DISCOVERY_FIRE_MIN_INTERVAL_MS = 2_000;
+    /**
+     * Bumped whenever the discovery caches are cleared. A discovery that was
+     * already awaiting the proxy when the clear happened carries the older
+     * epoch, so it must not write its pre-change result back into the fresh
+     * cache or the per-backend list.
+     */
+    private discoveryEpoch = 0;
 
     /**
      * Emits when a backend's discovered model set has actually changed
@@ -301,37 +203,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     constructor(deps: RegistryDeps) {
         this.configManager = deps.configManager;
         this._userAgent = deps.userAgent;
-    }
-
-    /**
-     * Builds the debounced emitter used by `onDidChange` coalescing. Nothing on
-     * the discovery path calls it: `discoverModels` fires the raw emitter so the
-     * picker reflects a model-set change immediately.
-     */
-    private async getDebouncedEmitter(): Promise<DebouncedEmitter> {
-        if (!this._debouncedOnDidChange) {
-            const config = await this.configManager.getConfig();
-            const debounceMs =
-                config.discoveryFireDebounceMs ?? LiteLLMProviderRegistry.DEFAULT_DISCOVERY_FIRE_DEBOUNCE_MS;
-            const minIntervalMs =
-                config.discoveryFireMinIntervalMs ?? LiteLLMProviderRegistry.DEFAULT_DISCOVERY_FIRE_MIN_INTERVAL_MS;
-
-            this._debouncedOnDidChange = new DebouncedEmitter(
-                () => this._onDidChangeEmitter.fire(),
-                debounceMs,
-                minIntervalMs,
-                (reasons) => {
-                    if (reasons.length > 1) {
-                        StructuredLogger.debug("discovery.fire_debounced", {
-                            baseUrl: reasons[0] ?? "unknown",
-                            coalescedFires: reasons.length,
-                            windowMs: debounceMs,
-                        });
-                    }
-                }
-            );
-        }
-        return this._debouncedOnDidChange;
     }
 
     // Public ingress
@@ -353,17 +224,14 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         options: {
             silent?: boolean;
             configuration?: Record<string, unknown>;
-            groupName?: string;
         },
         token: vscode.CancellationToken
     ): Promise<LanguageModelChatInformation[]> {
         const outcome = await this.discoverInternal(options, token);
         if (outcome.changed) {
             const baseUrl = outcome.session?.baseUrl ?? "unknown";
-            // Fire immediately when model set changes. The debounce logic was
-            // intended to rate-limit rapid discoveries but caused test failures
-            // because tests expect immediate change notifications. In production,
-            // VS Code's own UI has natural debouncing from user interaction.
+            // Fires as soon as the id set differs. A delayed notification would
+            // only postpone the picker refresh the change is meant to trigger.
             Logger.debug("discovery.fire", { baseUrl, reason: "model_change" });
             this._onDidChangeEmitter.fire();
         }
@@ -419,26 +287,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     /**
-     * Aggregated, deduplicated model list across all registered backends. Intended
-     * for read-only access (e.g., commit provider) without introducing secondary
-     * caches.
-     */
-    public getAllModels(): LanguageModelChatInformation[] {
-        const seen = new Set<string>();
-        const out: LanguageModelChatInformation[] = [];
-        for (const models of this.modelsByBackend.values()) {
-            for (const model of models) {
-                if (seen.has(model.id)) {
-                    continue;
-                }
-                seen.add(model.id);
-                out.push(model);
-            }
-        }
-        return out;
-    }
-
-    /**
      * Splits a namespaced id into its routing identity and raw model name
      * parts. The split is on the FIRST `/` because raw model names from
      * LiteLLM commonly contain slashes (e.g. `azure_ai/gpt-5.4-mini`).
@@ -464,50 +312,29 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     /**
-     * Returns the derived capabilities cached during the most recent
-     * discovery for this id, or `undefined` if the id has not been seen.
+     * Wipes the discovery response cache and every backend's backoff history, the
+     * two pieces a model reload must refresh. The routing table and the per-model
+     * capability cache survive, so an in-flight request keeps resolving while VS
+     * Code re-queries each group.
      */
-    public getDerivedCapabilities(id: string): ReturnType<typeof deriveCapabilitiesFromModelInfo> | undefined {
-        return this.derivedCapabilitiesCache.get(id);
-    }
-
-    /**
-     * Number of distinct backends currently registered. Used by tests and
-     * by telemetry; not a routing primitive.
-     */
-    public size(): number {
-        return this.modelsByBackend.size;
-    }
-
-    /**
-     * Wipes every routing entry, the identity map, every per-backend model list,
-     * and the discovery response cache. Call on user-initiated model reload so
-     * the next discovery pass starts from a clean slate. Does NOT touch the
-     * per-model capability caches; call `clearCaches()` for that.
-     */
-    public clear(): void {
-        this.entries.clear();
-        this.modelsByBackend.clear();
-        this.entriesByInfo = new WeakMap();
-        this.discoveryResponseCache.clear();
-    }
-
-    /**
-     * Wipes the per-model capability caches and the shared backoff
-     * controller. Does NOT touch the routing table.
-     */
-    public clearCaches(): void {
-        this.modelInfoCache.clear();
-        this.derivedCapabilitiesCache.clear();
-        this.unsupportedParamsByModel.clear();
+    public clearDiscoveryCaches(): void {
+        this.discoveryEpoch += 1;
         this.discoveryResponseCache.clear();
         sharedDiscoveryBackoff.reset();
     }
 
     /**
-     * Records an auto-stripped parameter for a model so future requests can
-     * proactively omit it. Only to be called when the transport detected a failed
-     * request and removed the parameter before retrying.
+     * Forgets every parameter a live rejection taught this session. Used when the
+     * user asks for a reload, because the proxy's model config may have changed.
+     */
+    public clearUnsupportedParameters(): void {
+        this.unsupportedParamsByModel.clear();
+    }
+
+    /**
+     * Records a parameter the client stripped after a rejection, so later
+     * requests omit it. `modelId` is the namespaced picker id the transport
+     * supplies, not the wire model name.
      */
     public recordUnsupportedParameter(modelId: string, param: string): void {
         const trimmed = param.trim();
@@ -527,7 +354,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     }
 
     public dispose(): void {
-        this._debouncedOnDidChange?.dispose();
         this._onDidChangeEmitter.dispose();
     }
 
@@ -613,13 +439,16 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
     // Discovery implementation
 
     private async discoverInternal(
-        options: { silent?: boolean; configuration?: Record<string, unknown>; groupName?: string },
+        options: { silent?: boolean; configuration?: Record<string, unknown> },
         token: vscode.CancellationToken
     ): Promise<DiscoveryOutcome> {
         // Set once the backend identity is known, so a transient failure can
         // fall back to the models this group last delivered.
         let backendKey: string | undefined;
         let failureBaseUrl: string | undefined;
+        // A reload during the fetch makes this call's result stale, so it must
+        // not overwrite the list the re-query wrote.
+        const epochAtStart = this.discoveryEpoch;
         try {
             if (!options.configuration) {
                 // Vendor-level call: nothing to discover. Return an empty list
@@ -632,9 +461,12 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
                 typeof options.configuration.baseUrl === "string" ? options.configuration.baseUrl.trim() : "";
             failureBaseUrl = configuredBaseUrl;
             const urlHostname = deriveGroupNameFromUrl(configuredBaseUrl).trim();
-            const displayLabel = options.groupName ?? (urlHostname.length > 0 ? urlHostname : undefined) ?? "LiteLLM";
+            const displayLabel = urlHostname.length > 0 ? urlHostname : "LiteLLM";
 
-            const session = this.resolveBackendForCall(options.configuration, urlHostname || displayLabel);
+            // Read once per discovery so the session client, the response cache
+            // and the capability cache all see the same workspace settings.
+            const config = await this.configManager.getConfig();
+            const session = this.resolveBackendForCall(options.configuration, config);
             if (!session) {
                 const baseUrlMissing =
                     typeof options.configuration.baseUrl !== "string" || options.configuration.baseUrl.trim() === "";
@@ -653,11 +485,14 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
                         `Open the LiteLLM provider settings and confirm both Server URL and API key are set.`
                 );
             }
-            const routingIdentity = (urlHostname.length > 0 ? urlHostname : displayLabel).replace(/\//g, "_");
+            const routingIdentity = displayLabel;
             // Identity is known before the fetch, so a failed refresh can still
             // find the models this group delivered last time.
             backendKey = await toBackendIdentityKey(session.baseUrl, session.apiKey);
-            const models = await this.discoverFromSession(session, token, displayLabel, routingIdentity);
+            const models = await this.discoverFromSession(session, config, token, displayLabel, routingIdentity);
+            // A successful discovery clears the failure history, so the next
+            // transient failure starts from a clean slate.
+            sharedDiscoveryBackoff.reset(backendKey);
             Logger.trace(
                 `LiteLLMProviderRegistry.discoverModels: fetched ${models.length} models for baseUrl="${session.baseUrl}"`
             );
@@ -672,8 +507,12 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
                 `LiteLLMProviderRegistry.discoverModels: baseUrl="${session.baseUrl}" routingIdentity="${routingIdentity}" ` +
                     `modelCount=${models.length} sampleIds=[${[...newIds].slice(0, 3).join(", ")}] changed=${changed}`
             );
-            if (session.apiKey) {
+            if (session.apiKey && this.discoveryEpoch === epochAtStart) {
                 this.setModelsForBackend(backendKey, session.baseUrl, session.apiKey, routingIdentity, models);
+            } else if (session.apiKey) {
+                Logger.trace(
+                    `LiteLLMProviderRegistry.discoverModels: skipping registry write for a result a reload superseded baseUrl="${session.baseUrl}"`
+                );
             } else {
                 Logger.trace(
                     `LiteLLMProviderRegistry.discoverModels: skipping registry write (no session/apiKey) baseUrl="${session.baseUrl}" modelCount=${models.length}`
@@ -688,16 +527,24 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             if (err instanceof vscode.LanguageModelError) {
                 throw err;
             }
-            const decision = sharedDiscoveryBackoff.recordFailure(Date.now());
-            if (decision.delayMs > 0) {
-                await this.sleep(decision.delayMs, token);
-            }
-            if (decision.shouldBlock) {
-                throw vscode.LanguageModelError.Blocked(
-                    `Discovery blocked after ${decision.attempt} consecutive failures. ` +
-                        `The LiteLLM endpoint appears to be unhealthy. ` +
-                        `Please check your configuration and retry later.`
+            // A cancelled discovery says nothing about the backend's health, so
+            // it must not advance the backoff, delay the next refresh, or mark a
+            // working group's models as stale.
+            if (token.isCancellationRequested) {
+                const lastKnown = backendKey ? this.getModelsForBackend(backendKey) : undefined;
+                Logger.debug(
+                    `LiteLLMProviderRegistry.discoverModels: discovery cancelled for baseUrl="${failureBaseUrl ?? "unknown"}"; serving ${lastKnown?.length ?? 0} model(s) unchanged`
                 );
+                StructuredLogger.debug("discovery.cancelled", {
+                    baseUrl: failureBaseUrl,
+                    modelCount: lastKnown?.length ?? 0,
+                });
+                return { models: lastKnown ? [...lastKnown] : [], changed: false, routingIdentity: "" };
+            }
+            const backoffKey = backendKey ?? failureBaseUrl ?? "unknown";
+            const decision = sharedDiscoveryBackoff.recordFailure(backoffKey, Date.now());
+            if (decision.delayMs > 0) {
+                await sleepWithCancellation(decision.delayMs, token);
             }
 
             // A refresh that fails must not empty a working group: an in-flight
@@ -720,33 +567,65 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
                 });
                 return { models: this.toStaleModels(lastKnown, reason), changed: false, routingIdentity: "" };
             }
+
+            // Blocking only matters when there is nothing to serve, so the
+            // stale-while-error contract above always wins.
+            if (decision.shouldBlock) {
+                // The throw is the last thing this failure does, so this is the layer that
+                // has to record it; nothing above logs a blocked group's cause.
+                const blockedReason = describeDiscoveryFailure(err);
+                Logger.warn(
+                    `LiteLLMProviderRegistry.discoverModels: blocking baseUrl="${failureBaseUrl ?? "unknown"}" after ${decision.attempt} consecutive failures (${blockedReason})`
+                );
+                StructuredLogger.warn("discovery.blocked", {
+                    baseUrl: failureBaseUrl,
+                    reason: blockedReason,
+                    attempt: decision.attempt,
+                });
+                throw vscode.LanguageModelError.Blocked(
+                    `Discovery blocked after ${decision.attempt} consecutive failures. ` +
+                        `The LiteLLM endpoint appears to be unhealthy. ` +
+                        `Please check your configuration and retry later.`
+                );
+            }
+            Logger.warn(
+                `LiteLLMProviderRegistry.discoverModels: discovery failed with no last-known models for baseUrl="${failureBaseUrl ?? "unknown"}"`
+            );
+            StructuredLogger.warn("discovery.failed_without_last_known", {
+                baseUrl: failureBaseUrl,
+                reason: describeDiscoveryFailure(err),
+                attempt: decision.attempt,
+            });
             return { models: [], changed: false, routingIdentity: "" };
         }
     }
 
     /**
-     * Resolves the active backend session for a request by honoring the
-     * per-group configuration passed on the call.
+     * Resolves the backend session for one discovery call from its per-group
+     * configuration.
      */
     private resolveBackendForCall(
-        configuration: Record<string, unknown> | undefined,
-        groupName?: string
+        configuration: Record<string, unknown>,
+        config: LiteLLMConfig
     ): BackendSession | undefined {
-        if (!configuration) {
-            return undefined;
-        }
-        Logger.trace(`LiteLLMProviderRegistry.resolveBackendForCall: groupName="${groupName ?? ""}"`);
-        return this.configManager.convertProviderConfiguration(groupName ?? "", configuration);
+        // The client falls back to its own default when the setting is absent.
+        return this.configManager.convertProviderConfiguration(configuration, {
+            discoveryTimeoutMs: config.discoveryTimeoutMs,
+            userAgent: this._userAgent,
+        });
     }
 
     private async discoverFromSession(
         session: BackendSession,
+        config: LiteLLMConfig,
         token: vscode.CancellationToken,
         displayLabel: string,
         routingIdentity: string
     ): Promise<vscode.LanguageModelChatInformation[]> {
-        const config = await this.configManager.getConfig();
         const ttlMs = config.discoveryCacheTtlMs ?? 60_000;
+        // Captured before the fetch: a reload that lands while the request is in
+        // flight bumps the epoch, and this call must then skip its cache writes.
+        const epochAtFetchStart = this.discoveryEpoch;
 
         // Check cache first
         const cacheKey = await toBackendIdentityKey(session.baseUrl, session.apiKey);
@@ -758,7 +637,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
                     ageMs: Date.now() - cached.fetchedAtMs,
                     ttlMs,
                     modelCount: cached.models.length,
-                    bodyHash: cached.bodyHash.slice(0, 8),
                 });
                 return [...cached.models];
             }
@@ -786,44 +664,51 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             return [];
         }
 
-        const infos = toListableDeployments(models.data)
-            .map((entry) =>
-                this.toVSCodeInfo(
-                    entry,
-                    session.backendName,
-                    { url: session.baseUrl, apiKey: session.apiKey },
-                    displayLabel,
-                    routingIdentity,
-                    config.forceResponsesEndpoint,
-                    config.modelCapabilitiesOverrides,
-                    config.displayPricingInPicker !== false
-                )
+        const mapped = toListableDeployments(models.data).map((entry) =>
+            this.toVSCodeInfo(
+                entry,
+                session.backendName,
+                { url: session.baseUrl, apiKey: session.apiKey },
+                displayLabel,
+                routingIdentity,
+                config.forceResponsesEndpoint,
+                config.modelCapabilitiesOverrides,
+                config.displayPricingInPicker !== false
             )
-            .filter((info) => info.isUserSelectable !== false);
+        );
+        const selectable = mapped.filter((item) => item.info.isUserSelectable !== false);
+        const infos = selectable.map((item) => item.info);
 
-        // Cache the response if TTL > 0
-        if (ttlMs > 0) {
-            // Create a deterministic hash of the response body
-            const bodyHash = await sha256HexAsync(JSON.stringify(models.data ?? []));
-            this.discoveryResponseCache.set(cacheKey, {
-                bodyHash,
-                models: infos,
-                fetchedAtMs: Date.now(),
-                ttlMs,
-            });
-            StructuredLogger.debug("discovery.cached", {
-                baseUrl: session.baseUrl,
-                bodyHash: bodyHash.slice(0, 8),
-                modelCount: infos.length,
-                ttlMs,
-            });
+        // A reload during the fetch invalidates everything this call derived, so
+        // both the response cache and the per-model capability cache are skipped:
+        // writing them would let a pre-reload answer overwrite the newer one.
+        if (this.discoveryEpoch === epochAtFetchStart) {
+            for (const item of selectable) {
+                this.modelInfoCache.set(item.info.id, item.modelInfo);
+            }
+            if (ttlMs > 0) {
+                this.discoveryResponseCache.set(cacheKey, {
+                    models: infos,
+                    fetchedAtMs: Date.now(),
+                });
+                StructuredLogger.debug("discovery.cached", {
+                    baseUrl: session.baseUrl,
+                    modelCount: infos.length,
+                    ttlMs,
+                });
+            }
         }
 
         return infos;
     }
 
+    /**
+     * Maps one discovered deployment to the VS Code model object plus the model info
+     * the request path reads. Nothing is written here: the caller commits `modelInfo`
+     * under the discovery epoch guard.
+     */
     private toVSCodeInfo(
-        entry: LiteLLMModelInfoResponse["data"][number],
+        entry: LiteLLMModelInfoEntry,
         backendName: string,
         backend: { url?: string; apiKey?: string } | undefined,
         displayLabel: string,
@@ -831,14 +716,17 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         forceResponsesEndpoint?: boolean,
         modelCapabilitiesOverrides?: LiteLLMConfig["modelCapabilitiesOverrides"],
         displayPricingInPicker = true
-    ): vscode.LanguageModelChatInformation {
+    ): {
+        info: vscode.LanguageModelChatInformation;
+        modelInfo: LiteLLMModelInfo | undefined;
+    } {
         if (!entry.model_name) {
             Logger.warn(
                 `Skipping model entry without model_name from backend "${backendName}". Entry keys: ${Object.keys(
                     entry
                 ).join(",")}`
             );
-            return {
+            const info = {
                 id: "unknown",
                 name: "unknown",
                 vendor: entry.model_info?.litellm_provider ?? "litellm",
@@ -851,6 +739,10 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
                 category: displayLabel,
                 configurationSchema: undefined,
             } as unknown as vscode.LanguageModelChatInformation & { isUserSelectable: boolean };
+            return {
+                info,
+                modelInfo: entry.model_info,
+            };
         }
 
         const modelName = entry.model_name;
@@ -866,13 +758,10 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             modelInfo = { ...modelInfo, mode: "responses" as const };
         }
 
-        this.modelInfoCache.set(modelId, modelInfo);
         const derived = deriveCapabilitiesFromModelInfo(modelId, modelInfo);
-        this.derivedCapabilitiesCache.set(modelId, derived);
 
         const capabilityOverrides = modelCapabilitiesOverrides?.[modelId] ?? modelCapabilitiesOverrides?.[modelName];
         const capabilities = capabilitiesToVSCode(derived, capabilityOverrides);
-        const tags = getDerivedModelTags(modelId, derived, {}, capabilityOverrides);
         const supportedEfforts = getSupportedReasoningEfforts(modelInfo, modelId);
         const reasoningSchema = buildReasoningEffortConfigurationSchema(supportedEfforts, modelId, modelInfo);
         // The temperature knob is advertised only for models that accept the
@@ -900,7 +789,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
         const info: vscode.LanguageModelChatInformation & {
             vendor?: string;
             backendName?: string;
-            tags?: string[];
             detail?: string;
             tooltip?: string;
             pricing?: string;
@@ -925,7 +813,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             maxInputTokens: derived.maxInputTokens,
             maxOutputTokens: derived.maxOutputTokens,
             capabilities,
-            tags,
             isUserSelectable: true,
             // The picker reads this field via `getCategoryLabel(category)` and
             // crashes with `TypeError: a.charAt is not a function` when the
@@ -972,30 +859,6 @@ export class LiteLLMProviderRegistry implements vscode.Disposable {
             }
         }
 
-        return info;
+        return { info, modelInfo };
     }
-
-    private sleep(ms: number, _token?: vscode.CancellationToken): Promise<void> {
-        return new Promise((resolve) => setTimeout(resolve, ms));
-    }
-}
-
-let sharedRegistry: LiteLLMProviderRegistry | undefined;
-
-export function getOrCreateBackendRegistry(deps: RegistryDeps): LiteLLMProviderRegistry {
-    if (!sharedRegistry) {
-        sharedRegistry = new LiteLLMProviderRegistry(deps);
-        return sharedRegistry;
-    }
-
-    return sharedRegistry;
-}
-
-/**
- * Test-only helper to reset the singleton instance. Do not call in production
- * paths.
- */
-export function resetBackendRegistry(): void {
-    sharedRegistry?.dispose();
-    sharedRegistry = undefined;
 }

@@ -1,10 +1,12 @@
 import * as vscode from "vscode";
-import type { ConfigManager } from "../config/configManager";
 import type { LiteLLMChatProvider } from "../providers";
-import { Logger } from "../utils/logger";
 
-function createConfigHandler(_configManager: ConfigManager, _provider?: LiteLLMChatProvider) {
-    return async (): Promise<void> => {
+/**
+ * Registers the command that points users at VS Code's Language Models view,
+ * where LiteLLM provider groups are configured.
+ */
+export function registerManageConfigCommand(): vscode.Disposable {
+    return vscode.commands.registerCommand("litellm-connector.manage", async () => {
         const openLanguageModels = "Open Language Models";
         const choice = await vscode.window.showInformationMessage(
             "LiteLLM Connector is now configured through VS Code's Language Models view. " +
@@ -22,89 +24,39 @@ function createConfigHandler(_configManager: ConfigManager, _provider?: LiteLLMC
             // Fallback for builds where the chat management command is unavailable.
             await vscode.commands.executeCommand("workbench.action.openSettings", "@tag:language-model");
         }
-    };
+    });
 }
 
 /**
- * Creates the handler for the reset configuration command.
- * Shows a confirmation dialog before wiping all configuration.
+ * Registers the command that lists the models VS Code holds for this vendor and
+ * copies the id of the one the user picks.
  */
-function createResetConfigurationHandler(configManager: ConfigManager): () => Promise<void> {
-    return async (): Promise<void> => {
-        // Show confirmation dialog
-        const reset = "Reset Configuration";
-        const cancel = "Cancel";
-
-        const choice = await vscode.window.showWarningMessage(
-            "This will remove all LiteLLM provider groups, API keys, and settings. " +
-                "You will need to re-configure the extension from scratch.",
-            { modal: true },
-            reset,
-            cancel
-        );
-
-        if (choice !== reset) {
-            Logger.info("Reset configuration cancelled by user");
-            return;
-        }
-
-        Logger.info("User confirmed reset configuration");
-
-        try {
-            await configManager.resetConfiguration();
-
-            await vscode.window.showInformationMessage(
-                "LiteLLM configuration has been reset. " +
-                    "Use 'LiteLLM: Manage Configuration' to re-configure providers."
-            );
-
-            Logger.info("Configuration reset completed successfully");
-        } catch (err: unknown) {
-            Logger.error("Configuration reset failed", err);
-
-            await vscode.window.showErrorMessage(
-                `Failed to reset configuration: ${err instanceof Error ? err.message : String(err)}`
-            );
-        }
-    };
-}
-
-export function registerManageConfigCommand(
-    context: vscode.ExtensionContext,
-    configManager: ConfigManager,
-    provider?: LiteLLMChatProvider
+export function registerShowModelsCommand(
+    listModels: () => Thenable<readonly vscode.LanguageModelChat[]>
 ): vscode.Disposable {
-    return vscode.commands.registerCommand("litellm-connector.manage", createConfigHandler(configManager, provider));
-}
-
-export function registerShowModelsCommand(provider: LiteLLMChatProvider): vscode.Disposable {
     return vscode.commands.registerCommand("litellm-connector.showModels", async () => {
-        const models = provider.getLastKnownModels();
+        const models = await listModels();
         if (!models.length) {
             vscode.window.showInformationMessage(
-                "No cached models yet. Run 'LiteLLM: Reload Models' (or open the provider settings) to fetch models from LiteLLM."
+                "No LiteLLM models are available. Add a LiteLLM provider in the Language Models view, or run 'LiteLLM: Reload Models'."
             );
             return;
         }
 
         type ModelQuickPickItem = vscode.QuickPickItem & { modelId: string };
 
-        // Show a quick pick list with user-facing backend:model label.
-        // Copy the internal routable model id to the clipboard.
         const picked = await vscode.window.showQuickPick(
             models
                 .slice()
-                .sort((a: vscode.LanguageModelChatInformation, b: vscode.LanguageModelChatInformation) =>
-                    a.id.localeCompare(b.id)
-                )
+                .sort((a: vscode.LanguageModelChat, b: vscode.LanguageModelChat) => a.id.localeCompare(b.id))
                 .map((m) => ({
                     label: m.name,
-                    description: m.name !== m.id ? m.name : undefined,
-                    detail: m.tooltip,
+                    description: m.id,
+                    detail: m.family,
                     modelId: m.id,
                 })) as ModelQuickPickItem[],
             {
-                title: "LiteLLM: Available Models (cached)",
+                title: "LiteLLM: Available Models",
                 placeHolder: "Select a model to copy its id to clipboard",
                 matchOnDescription: true,
                 matchOnDetail: true,
@@ -122,39 +74,7 @@ export function registerShowModelsCommand(provider: LiteLLMChatProvider): vscode
 
 export function registerReloadModelsCommand(provider: LiteLLMChatProvider): vscode.Disposable {
     return vscode.commands.registerCommand("litellm-connector.reloadModels", async () => {
-        provider.clearModelCache();
-        try {
-            await vscode.window.withProgress(
-                {
-                    location: vscode.ProgressLocation.Notification,
-                    title: "LiteLLM: Reloading models",
-                    cancellable: false,
-                },
-                async () => {
-                    // Trigger a fresh discovery request. VS Code will call discovery when it needs it,
-                    // but we do it proactively so completions pick up new models immediately.
-                    await provider.provideLanguageModelChatInformation(
-                        { silent: true },
-                        new vscode.CancellationTokenSource().token
-                    );
-                }
-            );
-
-            const count = provider.getLastKnownModels().length;
-            vscode.window.showInformationMessage(`LiteLLM: Reloaded ${count} models.`);
-        } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            vscode.window.showWarningMessage(`LiteLLM: Model reload failed: ${msg}`);
-        }
+        provider.reloadModels();
+        vscode.window.showInformationMessage("LiteLLM: Reloading models...");
     });
-}
-
-export function registerResetConfigurationCommand(
-    context: vscode.ExtensionContext,
-    configManager: ConfigManager
-): vscode.Disposable {
-    return vscode.commands.registerCommand(
-        "litellm-connector.resetConfiguration",
-        createResetConfigurationHandler(configManager)
-    );
 }

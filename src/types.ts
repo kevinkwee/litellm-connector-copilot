@@ -12,7 +12,7 @@ export interface OpenAIToolCall {
  */
 export interface OpenAIFunctionToolDef {
     type: "function";
-    function: { name: string; description?: string; parameters?: object };
+    function: { name: string; description?: string; parameters: object };
 }
 
 /**
@@ -37,6 +37,17 @@ export interface OpenAIChatMessageContentItem {
  *   whose transforms keep only the text of a list and would drop the image.
  */
 export type ToolResultImageMode = "native" | "hoist";
+
+/**
+ * Wire shape used to carry the separate text parts a tool result contains.
+ *
+ * - `separate`: one text item per part, so boundaries survive. Correct for
+ *   provider families whose LiteLLM transform keeps list items apart
+ *   (Anthropic, Bedrock).
+ * - `joined`: the parts joined with a blank line and sent as one string, for
+ *   providers whose transform concatenates list items with no separator.
+ */
+export type ToolResultTextMode = "separate" | "joined";
 
 /**
  * Anthropic thinking block carried on assistant messages. Only signed or
@@ -67,7 +78,7 @@ export interface OpenAIChatMessage {
      * Reasoning/thinking content from the model's internal reasoning process.
      * LiteLLM passes this through to upstream providers that support it
      * (GLM-5.2, DeepSeek, Qwen, etc.) and also accepts it on assistant
-     * messages sent back as conversation history — so the model can see
+     * messages sent back as conversation history, so the model can see
      * its own prior reasoning on subsequent turns. This is separate from
      * `content` (the model's visible response text) to match the
      * `reasoning_content` field that LiteLLM and reasoning-native providers
@@ -92,6 +103,15 @@ export interface OpenAIChatMessage {
 export interface OpenAIUsagePromptTokenDetails {
     cached_tokens?: number;
     cache_creation_input_tokens?: number;
+    /**
+     * Anthropic's split of the cache-write tokens by cache tier. The proxy
+     * charges the one-hour tier at its own rate, so the cost estimate needs both
+     * counts rather than their sum.
+     */
+    cache_creation_token_details?: {
+        ephemeral_5m_input_tokens?: number;
+        ephemeral_1h_input_tokens?: number;
+    };
 }
 
 /**
@@ -136,10 +156,6 @@ export interface ModelCapabilityOverride {
     toolCalling?: boolean;
     /** Override the imageInput (vision) capability reported to VS Code. */
     imageInput?: boolean;
-    /** Override the reasoning capability (surfaced as tag). */
-    reasoning?: boolean;
-    /** Override the pdf input capability (surfaced as tag). */
-    pdfInput?: boolean;
 }
 
 export type SupportedReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -153,40 +169,17 @@ export interface ModelOverride {
     reasoningEfforts?: SupportedReasoningEffort[];
     /** Default reasoning effort when reasoning is supported */
     defaultEffort?: SupportedReasoningEffort;
-    /** Force this override to be mandatory (ignore remote LiteLLM values) */
+    /** Use this override's list in place of the levels the proxy reports; see `getEffectiveEfforts` for when the proxy still wins. */
     forceMandatory?: boolean;
-    /** Custom tags to add to model */
-    tags?: string[];
-    /** Override for supported_openai_params */
-    supportedOpenaiParams?: string[];
     /** Additional notes about this override */
     notes?: string;
 }
 
 /**
- * LiteLLM model configuration parameters.
- */
-export interface LiteLLMParams {
-    custom_llm_provider?: string;
-    litellm_credential_name?: string;
-    use_in_pass_through?: boolean;
-    use_litellm_proxy?: boolean;
-    /**
-     * When true, merge OpenAI chat `delta.reasoning_content` into `delta.content` so the
-     * reasoning text is surfaced inline with the assistant response instead of as a
-     * separate thinking part. Defaults to `false` (emit as thinking).
-     */
-    merge_reasoning_content_in_choices?: boolean;
-    model?: string;
-    tags?: string[];
-}
-
-/**
- * LiteLLM workspace-level configuration. Backend connection details
- * (baseUrl, apiKey) are delivered by VS Code 1.120 per-group
- * `options.configuration` payloads on every provider call; they are NOT
- * stored in workspace settings. This type only carries workspace-scoped
- * ergonomic toggles and overrides.
+ * LiteLLM workspace-level configuration. Backend connection details (baseUrl, apiKey)
+ * arrive in VS Code's per-group `options.configuration` at discovery time and are
+ * carried by the registry afterwards. They are NOT stored in workspace settings. This
+ * type only carries workspace-scoped ergonomic toggles and overrides.
  */
 export interface LiteLLMConfig {
     inactivityTimeout?: number;
@@ -198,14 +191,7 @@ export interface LiteLLMConfig {
      * Default: "5m".
      */
     anthropicPromptCaching?: AnthropicPromptCachingMode;
-    disableQuotaToolRedaction?: boolean;
-    /**
-     * Enable/disable the model override system.
-     * When enabled, merged user and bundled model override rules are applied.
-     * When disabled, only LiteLLM /model/info derived capabilities are used.
-     * Default: true (backwards compatible).
-     */
-    enableModelOverrides?: boolean;
+
     /**
      * Per-model capability overrides exposed to VS Code.
      * Key is the Model ID (e.g. 'gpt-4o').
@@ -213,47 +199,29 @@ export interface LiteLLMConfig {
      */
     modelCapabilitiesOverrides?: Record<string, ModelCapabilityOverride>;
 
-    /** Model id to use for LiteLLM commit message generation. */
-    commitModelIdOverride?: string;
-
     /**
-     * When true, forces all models to use the `/responses` endpoint instead of per-model mode selection.
-     * This ensures consistent behavior across models, especially for those that require reasoning support.
-     * Default: false (opt-in, JSON-only, not in Settings UI).
+     * When true, models whose proxy mode is `chat` are sent to the `/responses`
+     * endpoint instead. Changing it reloads the model list.
+     * Default: false.
      */
     forceResponsesEndpoint?: boolean;
 
     /**
-     * When true and forceResponsesEndpoint is true, falls back to `/chat/completions` if `/responses` fails.
+     * When true and the model's mode is `responses`, a 5xx from `/responses`
+     * retries once on `/chat/completions`.
      * This is an escape hatch for models that cannot use /responses.
-     * Default: false (JSON-only, not in Settings UI).
+     * Default: false.
      */
     allowChatCompletionsFallback?: boolean;
 
     /** When true, show pricing data in the model picker hover (if available from /model/info). Default: true. */
     displayPricingInPicker?: boolean;
 
-    /**
-     * When true, trims chat history to fit the model's input token budget:
-     * proactively before each request and again when the upstream rejects
-     * a request for exceeding the context window.
-     * When false (default), the full history is always sent and context
-     * overflow failures surface as errors. Opt-in because trimming
-     * silently drops older turns, which can surprise users.
-     */
-    autoTrimMessages?: boolean;
-
     /** Timeout in milliseconds for /model/info discovery requests. Default: 5000. */
     discoveryTimeoutMs?: number;
 
     /** TTL in milliseconds for cached /model/info discovery responses. Default: 60000. Set to 0 to disable caching. */
     discoveryCacheTtlMs?: number;
-
-    /** Trailing-edge debounce window in milliseconds for outward model-discovery change notifications. Default: 250. */
-    discoveryFireDebounceMs?: number;
-
-    /** Minimum interval in milliseconds between outward model-discovery change notifications. Default: 2000. */
-    discoveryFireMinIntervalMs?: number;
 
     /**
      * Maximum transport-level retry attempts for a chat request when the
@@ -288,15 +256,26 @@ export interface LiteLLMConfig {
      */
     rateLimitMaxDelayMs?: number;
 
-    // sendDefaultParameters was removed in v2.2.0 (deprecated v1.5.0). Use individual modelOptions instead.
+    /**
+     * Most time in milliseconds a chat request may wait for response headers.
+     * Default: 300000.
+     */
+    headersTimeoutMs?: number;
+
+    /**
+     * Time budget in milliseconds for retrying one chat request, counted from its
+     * first failure. Once it has elapsed no further attempt starts. Default:
+     * 300000. Set to 0 to disable the budget.
+     */
+    retryBudgetMs?: number;
 }
 
 /**
  * Connection-level configuration for a single LiteLLM proxy. Each
  * `LiteLLMClient` is bound to exactly one proxy and carries its baseUrl
  * and API key. The `disableCaching` flag is duplicated here so the client
- * can opt the connection itself out of `Cache-Control` headers without
- * needing access to the workspace-level `LiteLLMConfig`.
+ * can add the proxy cache directive without needing access to the
+ * workspace-level `LiteLLMConfig`.
  */
 export interface LiteLLMClientConfig {
     url: string;
@@ -311,12 +290,21 @@ export interface LiteLLMClientConfig {
      */
     rateLimitMaxDelayMs?: number;
     /**
-     * Observability hook: invoked when a 400 response forces a parameter to
-     * be stripped and the request retried. Lets callers persist the learned
-     * incompatibility so later requests proactively omit the parameter.
+     * Most time in milliseconds to wait for response headers. Default: 300000.
+     */
+    headersTimeoutMs?: number;
+    /**
+     * Invoked when a 400 or 403 response rejects a parameter this connector adds,
+     * so the provider can remember the incompatibility and later requests omit
+     * it. The client retries without the parameter itself; whoever supplies the
+     * hook only records it. `model` is the wire model name the request carried;
+     * the transport replaces it with the namespaced learned-limits key.
      */
     onUnsupportedParameter?: (model: string, param: string) => void;
 }
+
+/** A per-token rate as the proxy reports it: a number, or a decimal string. */
+export type PricedRate = number | string | null | undefined;
 
 /**
  * Detailed model information from LiteLLM proxy including capabilities and token constraints.
@@ -355,10 +343,10 @@ export interface LiteLLMModelInfo {
     supports_reasoning?: boolean | null;
     supports_computer_use?: boolean | null;
     // Pricing fields (per-token costs, USD). Optional; absent when backend does not return pricing.
-    input_cost_per_token?: number | null;
-    output_cost_per_token?: number | null;
-    cache_read_input_token_cost?: number | null;
-    cache_creation_input_token_cost?: number | null;
+    input_cost_per_token?: PricedRate;
+    output_cost_per_token?: PricedRate;
+    cache_read_input_token_cost?: PricedRate;
+    cache_creation_input_token_cost?: PricedRate;
     // Extended reasoning effort support fields from LiteLLM
     supports_none_reasoning_effort?: boolean | null;
     supports_minimal_reasoning_effort?: boolean | null;
@@ -367,21 +355,12 @@ export interface LiteLLMModelInfo {
     supports_high_reasoning_effort?: boolean | null;
     supports_xhigh_reasoning_effort?: boolean | null;
     supports_max_reasoning_effort?: boolean | null;
-    // Supported parameters array - must be validated before API calls
+    // Supported parameters array, validated before API calls
     supported_openai_params?: string[] | null;
     // Modalities for advanced capability detection
     modalities?: string[];
     tags?: string[];
     [key: string]: unknown; // Allow additional fields for extensibility
-}
-
-/**
- * Single model entry from /model/info endpoint.
- */
-export interface LiteLLMModelEntry {
-    model_name: string;
-    litellm_params?: LiteLLMParams;
-    model_info?: LiteLLMModelInfo;
 }
 
 /**
@@ -395,27 +374,23 @@ export interface LiteLLMModelInfoResponse {
 }
 
 /**
- * Request for LiteLLM token counter endpoint.
- */
-export interface LiteLLMTokenCounterRequest {
-    model: string;
-    prompt?: string;
-    messages?: OpenAIChatMessage[];
-    contents?: Record<string, unknown>[];
-}
-
-/**
- * Response from LiteLLM token counter endpoint.
- */
-export interface LiteLLMTokenCounterResponse {
-    token_count: number;
-}
-
-/**
  * Anthropic prompt-caching setting. "5m" and "1h" map to the CachePoint TTL
  * the Claude API charges for cache writes; "off" disables the directive.
  */
 export type AnthropicPromptCachingMode = "off" | "5m" | "1h";
+
+/**
+ * Tool-selection mode shared by both endpoints. `required` asks for at least
+ * one tool call without naming it: LiteLLM forwards it unchanged to OpenAI and
+ * maps it onto Anthropic's `any`.
+ */
+export type OpenAIToolChoiceMode = "auto" | "required";
+
+/** Tool selection on `/chat/completions`, where a named tool nests under `function`. */
+export type OpenAIChatToolChoice = OpenAIToolChoiceMode | { type: "function"; function: { name: string } };
+
+/** Tool selection on `/responses`, where a named tool carries `name` at the top level. */
+export type LiteLLMResponsesToolChoice = OpenAIToolChoiceMode | { type: "function"; name: string };
 
 /**
  * Anthropic CachePoint directive. `ttl` is omitted for the 5-minute tier
@@ -436,11 +411,8 @@ export interface OpenAIChatCompletionRequest {
     max_tokens?: number;
     temperature?: number;
     top_p?: number;
-    frequency_penalty?: number;
-    presence_penalty?: number;
-    stop?: string | string[];
     tools?: OpenAIFunctionToolDef[];
-    tool_choice?: string | object;
+    tool_choice?: OpenAIChatToolChoice;
     stream_options?: { include_usage?: boolean };
     /**
      * Anthropic prompt-caching directive forwarded by LiteLLM to the Claude
@@ -483,17 +455,15 @@ export interface OpenAIChatCompletionRequest {
      */
     reasoning_effort?: string | { effort: string; summary?: string };
     /**
-     * LiteLLM passthrough body.
-     * Used for features like caching controls.
+     * LiteLLM cache directive. The proxy reads `cache["no-cache"]` at the top
+     * level and lists `cache` in `all_litellm_params`, so it is never forwarded
+     * to a provider.
      *
      * Docs: https://docs.litellm.ai/docs/proxy/caching#no-cache
      */
-    extra_body?: {
-        cache?: {
-            /** Skip cache check, get fresh response */
-            "no-cache"?: boolean;
-        };
-        [key: string]: unknown;
+    cache?: {
+        /** Skip the cache lookup and get a fresh response */
+        "no-cache"?: boolean;
     };
 }
 
@@ -505,25 +475,23 @@ export interface LiteLLMResponsesRequest {
     input: (OpenAIChatMessageContentItem | LiteLLMResponseInputItem)[];
     instructions?: string;
     stream?: boolean;
-    max_tokens?: number;
+    /** Output-token cap. The Responses API has no `max_tokens` parameter. */
+    max_output_tokens?: number;
     temperature?: number;
     top_p?: number;
-    frequency_penalty?: number;
-    presence_penalty?: number;
-    stop?: string | string[];
     tools?: LiteLLMResponseTool[];
-    tool_choice?: string | object;
+    tool_choice?: LiteLLMResponsesToolChoice;
     /**
-     * Mirror of `OpenAIChatCompletionRequest.reasoning_effort` — LiteLLM accepts the
+     * Mirror of `OpenAIChatCompletionRequest.reasoning_effort`. LiteLLM accepts the
      * same flat snake_case key on `/responses`, so we propagate it unchanged from
      * the canonical chat-shaped request body during transformation. Accepts the
-     * same string-or-object shape as the chat-shaped request — see that field for
+     * same string-or-object shape as the chat-shaped request. See that field for
      * details.
      */
     reasoning_effort?: string | { effort: string; summary?: string };
     stream_options?: { include_usage?: boolean };
     /**
-     * LiteLLM proxy metadata — same shape and purpose as
+     * LiteLLM proxy metadata, the same shape and purpose as
      * `OpenAIChatCompletionRequest.metadata`. The responses adapter
      * propagates it from the chat-shaped request body during transformation.
      */
@@ -532,14 +500,10 @@ export interface LiteLLMResponsesRequest {
         [key: string]: unknown;
     };
     /**
-     * LiteLLM passthrough body.
-     * Used for features like caching controls.
+     * LiteLLM cache directive, read at the top level by the proxy.
      */
-    extra_body?: {
-        cache?: {
-            "no-cache"?: boolean;
-        };
-        [key: string]: unknown;
+    cache?: {
+        "no-cache"?: boolean;
     };
 }
 
@@ -553,20 +517,7 @@ export type LiteLLMResponseInputItem =
           content: string | OpenAIChatMessageContentItem[];
       }
     | { type: "function_call"; id: string; call_id?: string; name: string; arguments: string }
-    | { type: "function_call_output"; id?: string; call_id: string; output: string }
-    | {
-          /**
-           * Carries an Anthropic `thinking` or `redacted_thinking` block back
-           * to the model. `encrypted_content` is the signature (or the opaque
-           * redacted data) that the API uses to verify reasoning continuity
-           * across turns. `summary` carries the human-readable thinking text
-           * (empty for redacted blocks).
-           */
-          type: "reasoning";
-          id: string;
-          summary: { type: "summary_text"; text: string }[];
-          encrypted_content: string;
-      };
+    | { type: "function_call_output"; id?: string; call_id: string; output: string };
 
 /**
  * Tool definition for LiteLLM /responses endpoint.
@@ -576,28 +527,18 @@ export interface LiteLLMResponseTool {
     name: string;
     description: string;
     parameters: object;
+    /**
+     * The Responses request schema requires this field and documents true as its
+     * default. The connector forwards the caller's schema unchanged, so it states
+     * false explicitly rather than letting the endpoint enforce a stricter schema.
+     */
+    strict: boolean;
 }
 
-/**
- * Transformed model item for internal use.
- */
-export interface TransformedModelItem {
-    id: string;
-    object: string;
-    created: number;
-    owned_by: string;
-    model_name: string;
-    litellm_params?: LiteLLMParams;
-    model_info?: LiteLLMModelInfo;
-}
-
-/**
- * Buffer used to accumulate streamed tool call parts until arguments are valid JSON.
- */
-export interface ToolCallBuffer {
-    id?: string;
-    name?: string;
-    args: string;
+/** A tool call the connector dropped because its arguments were not a JSON object. */
+export interface DroppedToolCall {
+    readonly id: string;
+    readonly name: string;
 }
 
 /** OpenAI-style chat roles. */

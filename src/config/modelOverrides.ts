@@ -1,69 +1,18 @@
 import * as vscode from "vscode";
 import type { LiteLLMModelInfo, ModelOverride, SupportedReasoningEffort } from "../types";
 import { Logger } from "../utils/logger";
-import { getDefaultReasoningEffort } from "../utils/modelCapabilities";
+import { CANONICAL_REASONING_EFFORTS, highestReasoningEffort, readDeclaredReasoningEfforts } from "./reasoningEfforts";
 import bundledOverridesSource from "./modelOverrides.json";
 
 const bundledOverridesData: unknown = bundledOverridesSource;
-
-/**
- * Local copy of LiteLLM reasoning effort field mapping.
- * Kept in sync with src/utils/modelCapabilities.ts.
- */
-const LITELLM_REASONING_EFFORT_MAPPING: Record<string, SupportedReasoningEffort> = {
-    supports_none_reasoning_effort: "none",
-    supports_minimal_reasoning_effort: "minimal",
-    supports_low_reasoning_effort: "low",
-    supports_xlow_reasoning_effort: "low",
-    supports_medium_reasoning_effort: "medium",
-    supports_high_reasoning_effort: "high",
-    supports_xhigh_reasoning_effort: "xhigh",
-    supports_max_reasoning_effort: "max",
-} as const satisfies Record<string, SupportedReasoningEffort>;
-
-const CANONICAL_REASONING_EFFORTS: readonly SupportedReasoningEffort[] = [
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-];
-
-const CANONICAL_DEFAULT_EFFORT: SupportedReasoningEffort = "medium";
 
 const MODEL_OVERRIDES_SETTING_KEY = "litellm-connector.modelOverrides";
 
 let bundledOverridesCache: ModelOverride[] | undefined;
 
+/** True for a level the connector's single effort table knows. */
 function isSupportedReasoningEffort(value: unknown): value is SupportedReasoningEffort {
-    return (
-        value === "none" ||
-        value === "minimal" ||
-        value === "low" ||
-        value === "medium" ||
-        value === "high" ||
-        value === "xhigh" ||
-        value === "max"
-    );
-}
-
-/**
- * Coerce an unknown value to a `string[]` of trimmed, non-empty entries.
- * Returns `undefined` when the input is not an array or contains no strings.
- *
- * Used to safely validate user-supplied override fields (`tags`,
- * `supportedOpenaiParams`) without tripping `no-unsafe-*` lints. `Array.isArray`
- * on its own narrows `unknown` to `any[]`, which is why the runtime check is
- * paired here with an explicit `unknown[]` filter.
- */
-export function toStringArray(value: unknown): string[] | undefined {
-    if (!Array.isArray(value)) {
-        return undefined;
-    }
-    const items = (value as unknown[]).filter((v): v is string => typeof v === "string");
-    return items.length > 0 ? items : undefined;
+    return typeof value === "string" && (CANONICAL_REASONING_EFFORTS as readonly string[]).includes(value);
 }
 
 function normalizeEfforts(efforts: unknown): SupportedReasoningEffort[] | undefined {
@@ -72,7 +21,13 @@ function normalizeEfforts(efforts: unknown): SupportedReasoningEffort[] | undefi
     }
 
     const normalized = efforts.filter(isSupportedReasoningEffort);
-    return normalized.length > 0 ? normalized : undefined;
+    if (normalized.length === 0) {
+        return undefined;
+    }
+    // The default is the last entry, so a hand-written override such as
+    // `["high", "low"]` is ordered by the canonical ranking rather than left in
+    // its declared order.
+    return CANONICAL_REASONING_EFFORTS.filter((effort) => normalized.includes(effort));
 }
 
 function validateOverride(entry: unknown, source: string): ModelOverride | undefined {
@@ -114,8 +69,6 @@ function validateOverride(entry: unknown, source: string): ModelOverride | undef
         reasoningEfforts,
         defaultEffort,
         forceMandatory: candidate.forceMandatory === true,
-        tags: toStringArray(candidate.tags),
-        supportedOpenaiParams: toStringArray(candidate.supportedOpenaiParams),
         notes: candidate.notes,
     };
 }
@@ -180,40 +133,23 @@ export function findOverride(modelId: string, config?: vscode.WorkspaceConfigura
     return undefined;
 }
 
-function getExplicitReasoningEfforts(modelInfo?: LiteLLMModelInfo): SupportedReasoningEffort[] | undefined {
-    if (!modelInfo) {
-        return undefined;
-    }
-    const explicitEfforts: SupportedReasoningEffort[] = [];
-    let hasAnyExplicitField = false;
-    for (const [key, value] of Object.entries(LITELLM_REASONING_EFFORT_MAPPING)) {
-        const fieldValue = modelInfo[key as keyof LiteLLMModelInfo];
-        if (fieldValue === true) {
-            explicitEfforts.push(value as SupportedReasoningEffort);
-        }
-        if (fieldValue !== undefined && fieldValue !== null) {
-            hasAnyExplicitField = true;
-        }
-    }
-    return hasAnyExplicitField ? explicitEfforts : undefined;
-}
-
+/**
+ * Resolves a model's reasoning effort levels from its override and the proxy's
+ * reasoning data.
+ *
+ * A proxy that reports `supports_reasoning: false`, or an override that sets
+ * `supportsReasoning: false`, gets no levels. A `forceMandatory` override supplies
+ * its own list, or the canonical list when it declares none. Otherwise the proxy's
+ * explicit effort fields decide, then its `supports_reasoning` flag, and an override
+ * with `supportsReasoning: true` supplies its list only when the proxy reports neither.
+ */
 export function getEffectiveEfforts(
     modelId: string,
     modelInfo?: LiteLLMModelInfo,
-    config?: vscode.WorkspaceConfiguration,
-    forceMandatory?: boolean
+    config?: vscode.WorkspaceConfiguration
 ): readonly SupportedReasoningEffort[] {
     const override = findOverride(modelId, config);
     const overrideEfforts = override?.reasoningEfforts;
-
-    // Force-mandatory request parameter should win regardless of LiteLLM data
-    if (forceMandatory && override) {
-        if (override.supportsReasoning === false) {
-            return [];
-        }
-        return overrideEfforts ?? [...CANONICAL_REASONING_EFFORTS];
-    }
 
     if (modelInfo?.supports_reasoning === false) {
         return [];
@@ -228,28 +164,15 @@ export function getEffectiveEfforts(
             return overrideEfforts ?? [...CANONICAL_REASONING_EFFORTS];
         }
 
-        // When the proxy exposes explicit effort flags, prefer those over non-mandatory overrides.
-        // explicitEfforts is undefined when no effort fields are present (fall back to defaults),
-        // or an array (possibly empty) when fields are present — respect explicit false values.
-        const explicitEfforts = getExplicitReasoningEfforts(modelInfo)
-            ?.filter(isSupportedReasoningEffort)
-            .filter((effort, index, arr) => arr.indexOf(effort) === index);
+        const explicitEfforts = readDeclaredReasoningEfforts(modelInfo);
         if (explicitEfforts !== undefined) {
             return explicitEfforts;
         }
 
-        // Non-mandatory overrides do not apply when LiteLLM has valid capability data.
-        // Models with supports_reasoning: true but no explicit effort flags fall back to
-        // canonical efforts, allowing the caller to use DEFAULT_REASONING_EFFORTS or
-        // enforce explicit flags based on their own logic.
-
-        // Next priority: Generic reasoning support flag.
         if (modelInfo?.supports_reasoning) {
             return [...CANONICAL_REASONING_EFFORTS];
         }
 
-        // If there is no model info but override explicitly marks reasoning support,
-        // allow the override to provide canonical efforts.
         if (override.supportsReasoning === true) {
             return overrideEfforts ?? [...CANONICAL_REASONING_EFFORTS];
         }
@@ -258,9 +181,7 @@ export function getEffectiveEfforts(
     }
 
     // No override: check explicit effort fields first, then fall back to canonical.
-    const explicitEfforts = getExplicitReasoningEfforts(modelInfo)
-        ?.filter(isSupportedReasoningEffort)
-        .filter((effort, index, arr) => arr.indexOf(effort) === index);
+    const explicitEfforts = readDeclaredReasoningEfforts(modelInfo);
     if (explicitEfforts !== undefined) {
         return explicitEfforts;
     }
@@ -272,6 +193,18 @@ export function getEffectiveEfforts(
     return [];
 }
 
+/**
+ * Resolves the default effort for a model.
+ *
+ * An override's `defaultEffort` wins when the list the override declares (or the
+ * canonical list, when it declares none) contains it. Otherwise the default is that
+ * list's highest level, its last entry, because both lists follow the canonical
+ * order.
+ *
+ * The result can sit outside the list the model advertises, because this function
+ * checks membership against the override's list only. Callers check it against the
+ * model's list before showing it.
+ */
 export function getDefaultEffort(
     modelId: string,
     modelInfo?: LiteLLMModelInfo,
@@ -288,26 +221,22 @@ export function getDefaultEffort(
             return undefined;
         }
 
-        if (override.defaultEffort) {
+        const efforts = override.reasoningEfforts ?? CANONICAL_REASONING_EFFORTS;
+        if (override.defaultEffort && efforts.includes(override.defaultEffort)) {
             return override.defaultEffort;
         }
 
-        const efforts = override.reasoningEfforts ?? CANONICAL_REASONING_EFFORTS;
         if (override.supportsReasoning === true || modelInfo?.supports_reasoning) {
-            if (efforts.includes(CANONICAL_DEFAULT_EFFORT)) {
-                return CANONICAL_DEFAULT_EFFORT;
-            }
-            return getDefaultReasoningEffort(efforts) ?? CANONICAL_DEFAULT_EFFORT;
+            return highestReasoningEffort(efforts);
         }
         return undefined;
     }
 
     if (modelInfo?.supports_reasoning) {
-        return CANONICAL_DEFAULT_EFFORT;
+        return highestReasoningEffort(CANONICAL_REASONING_EFFORTS);
     }
 
     return undefined;
 }
 
-export { CANONICAL_REASONING_EFFORTS, CANONICAL_DEFAULT_EFFORT };
 export type { ModelOverride } from "../types";

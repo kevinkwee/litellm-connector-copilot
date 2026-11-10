@@ -3,14 +3,8 @@ import * as vscode from "vscode";
 import { LiteLLMChatProvider } from "../../providers";
 import { LiteLLMApiError } from "../../adapters/litellmClient";
 import * as sinon from "sinon";
-import { createMockSecrets } from "../../test/utils/testMocks";
 
 suite("LiteLLM Error Handling Unit Tests", function () {
-    const mockSecrets = createMockSecrets({
-        "litellm-connector.baseUrl": "http://localhost:4000",
-        "litellm-connector.apiKey": "test-api-key",
-    });
-
     const userAgent = "GitHubCopilotChat/test VSCode/test";
     let sandbox: sinon.SinonSandbox;
 
@@ -23,7 +17,7 @@ suite("LiteLLM Error Handling Unit Tests", function () {
     });
 
     test("provideLanguageModelChatResponse reports a rejected model parameter without resending the request", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfig {
             _configManager: {
@@ -102,7 +96,7 @@ suite("LiteLLM Error Handling Unit Tests", function () {
     });
 
     test("provideLanguageModelChatResponse explains how to fix an unsupported model parameter", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfig {
             _configManager: {
@@ -184,7 +178,7 @@ suite("LiteLLM Error Handling Unit Tests", function () {
     });
 
     test("provideLanguageModelChatResponse handles generic 400 error", async () => {
-        const provider = new LiteLLMChatProvider(mockSecrets, userAgent);
+        const provider = new LiteLLMChatProvider(userAgent);
 
         interface ProviderWithConfig {
             _configManager: {

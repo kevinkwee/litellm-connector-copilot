@@ -33,22 +33,20 @@
 	"license": "Apache-2.0",
 	"publisher": "GethNet",
 	"main": "./dist/extension.js",
-	"browser": "./dist/web/extension.js",
 	"scripts": {
 		"bump-version": "node scripts/bump-version.js",
-		"clean": "find ./dist ./out ./coverage ./test-results -delete || true",
-		"clean:build": "find ./dist ./out -delete || true",
-		"clean:tests": "find ./coverage ./test-results -delete || true",
+		"clean": "node scripts/clean.mjs dist out coverage test-results",
+		"clean:build": "node scripts/clean.mjs dist out",
+		"clean:tests": "node scripts/clean.mjs coverage test-results",
 		"precompile": "npm run clean",
 		"compile": "tsc -p ./",
 		"coverage:serve": "npx serve coverage -p 8080",
-		"download-api": "yes | dts main && mv vscode.d.ts src/ && yes | dts dev && mv vscode.proposed.*.d.ts src/",
+		"download-api": "node scripts/download-api.mjs",
 		"format": "prettier --check .",
 		"format:fix": "prettier --write .",
 		"postinstall": "npm run download-api",
 		"lint": "eslint",
 		"lint:fix": "eslint --fix",
-		"memory-profile": "npm run compile && node scripts/run-memory-profile.mjs",
 		"pretest:coverage": "npm run compile",
 		"test:coverage": "node scripts/test-coverage.mjs",
 		"test:scripts": "node --test scripts/versionUtils.test.mjs scripts/bump-version.test.mjs",
@@ -71,42 +69,21 @@
 				"title": "LiteLLM: Manage Configuration"
 			},
 			{
-				"command": "litellm-connector.resetConfiguration",
-				"title": "LiteLLM: Reset All Configuration"
-			},
-			{
-				"command": "litellm-connector.generateCommitMessage",
-				"title": "Generate Commit Message",
-				"icon": "$(sparkle)"
-			},
-			{
 				"command": "litellm-connector.openCopilotMdFolder",
 				"title": "LiteLLM: Open .copilotmd Export Folder"
+			},
+			{
+				"command": "litellm-connector.cancelActiveRequest",
+				"title": "LiteLLM: Cancel Active Request"
 			}
 		],
 		"configuration": {
 			"title": "LiteLLM Connector",
 			"properties": {
-				"litellm-connector.commitModelIdOverride": {
-					"type": "string",
-					"default": "",
-					"description": "Override the model ID for git commit message generation. If empty, the feature is disabled.",
-					"markdownDescription": "Override the model ID for git commit message generation. If empty, the feature is disabled."
-				},
-				"litellm-connector.disableQuotaToolRedaction": {
-					"type": "boolean",
-					"default": false,
-					"description": "Disable per-turn tool redaction when a quota error is detected in chat history. Leave off to keep redaction enabled."
-				},
-				"litellm-connector.autoTrimMessages": {
-					"type": "boolean",
-					"default": false,
-					"description": "Trim older chat messages to fit the model's input token budget, both proactively before each request and as a recovery retry when the upstream rejects a request for exceeding the context window. When off, the full history is sent and context overflow failures surface as errors instead of being silently trimmed."
-				},
 				"litellm-connector.modelOverrides": {
 					"type": "array",
 					"default": [],
-					"description": "User-supplied model overrides for reasoning capabilities. Merged on top of bundled overrides (user entries take precedence on regex match). Each entry: { match: string (regex), supportsReasoning?: boolean|null, reasoningEfforts?: string[], defaultEffort?: string, notes?: string }.",
+					"description": "User-supplied model overrides for reasoning capabilities. Merged on top of bundled overrides (user entries take precedence on regex match). Each entry: { match: string (regex), supportsReasoning?: boolean|null, reasoningEfforts?: string[], defaultEffort?: string, forceMandatory?: boolean, notes?: string }.",
 					"items": {
 						"type": "object",
 						"properties": {
@@ -131,7 +108,8 @@
 										"low",
 										"medium",
 										"high",
-										"xhigh"
+										"xhigh",
+										"max"
 									]
 								}
 							},
@@ -143,8 +121,13 @@
 									"low",
 									"medium",
 									"high",
-									"xhigh"
+									"xhigh",
+									"max"
 								]
+							},
+							"forceMandatory": {
+								"type": "boolean",
+								"description": "Use this override's reasoningEfforts, or every level when it lists none, in place of the effort levels the proxy reports. The proxy still wins when it reports supports_reasoning false, or when it lists supported_openai_params without reasoning_effort and reports none of the level fields."
 							},
 							"notes": {
 								"type": "string"
@@ -166,6 +149,8 @@
 				"litellm-connector.inactivityTimeout": {
 					"type": "number",
 					"default": 60,
+					"minimum": 1,
+					"maximum": 3600,
 					"description": "Timeout in seconds of inactivity before the LiteLLM proxy connection is considered idle."
 				},
 				"litellm-connector.networkRetries": {
@@ -186,7 +171,7 @@
 					"default": 2,
 					"minimum": 0,
 					"maximum": 10,
-					"description": "Maximum retries for a cleanly-completed stream that produced only reasoning (no text, no tool calls). The retry appends the partial reasoning to the request so the model continues its thought. Separate budget from networkRetries because reasoning-only responses cluster in upstream bursts. Set to 0 to disable."
+					"description": "Maximum retries for a cleanly-completed stream that produced only reasoning (no text, no tool calls). The retry appends the partial reasoning to the request so the model continues its thought; a /responses model cannot carry that reasoning back, so its request is resent unchanged. A model that declares it has nothing to say is resent at most once whatever this setting allows. Separate budget from networkRetries because reasoning-only responses cluster in upstream bursts. Set to 0 to disable."
 				},
 				"litellm-connector.emptyResponseRetryDelayMs": {
 					"type": "number",
@@ -200,12 +185,26 @@
 					"default": 120,
 					"minimum": 0,
 					"maximum": 86400,
-					"description": "Most time in seconds one call to the proxy spends waiting between 429 rate-limit retries. Without Retry-After, waits start at 0.5s and double, each at most 60s. A Retry-After longer than the time left fails that call at once. Default: 120 (2 minutes). Set to 0 to disable rate-limit retries."
+					"description": "Most time in seconds one provider attempt spends waiting between 429 rate-limit retries, shared by every resend that attempt makes. Without Retry-After, waits start at 0.5s and double, each at most 60s. A Retry-After longer than the time left fails that attempt at once. Default: 120 (2 minutes). Set to 0 to disable rate-limit retries."
+				},
+				"litellm-connector.headersTimeout": {
+					"type": "number",
+					"default": 300,
+					"minimum": 1,
+					"maximum": 300,
+					"description": "Most time in seconds to wait for the proxy's response headers before aborting the attempt. The proxy buffers the first streamed chunk before it writes headers, so this bounds the wait the stream inactivity timeout cannot see. A headers timeout is retried at most once per request. Capped at 300s because the runtime's fetch keeps its own 300s header limit. Default: 300 (5 minutes)."
+				},
+				"litellm-connector.retryBudgetSeconds": {
+					"type": "number",
+					"default": 300,
+					"minimum": 0,
+					"maximum": 3600,
+					"description": "Most time in seconds one request may spend retrying, counted from its first failure, so the time before that failure, which includes the first attempt however long it runs, is not charged. An attempt that delivered new text or reasoning restarts the clock. Once the budget has elapsed no further attempt starts. Default: 300 (5 minutes). Set to 0 to disable the budget."
 				},
 				"litellm-connector.disableCaching": {
 					"type": "boolean",
 					"default": true,
-					"description": "When enabled, LiteLLM caching will be bypassed by sending 'no-cache: true' and 'Cache-Control: no-cache' headers.",
+					"description": "Ask the LiteLLM proxy to skip its response cache for every request (sends cache: {\"no-cache\": true}). A key that is not allowed to set it is detected once per model and the directive is dropped.",
 					"tags": [
 						"experimental"
 					]
@@ -218,7 +217,7 @@
 						"1h"
 					],
 					"default": "5m",
-					"description": "Anthropic prompt-caching TTL for Claude requests sent through LiteLLM. Unrelated to disableCaching, which bypasses the proxy response cache. 5m marks requests with a 5 minute CachePoint (cache writes cost 1.25x input tokens). 1h uses a 1 hour CachePoint (cache writes cost 2x input tokens). off never marks. Only applied to Anthropic Claude models; commit message generation never marks."
+					"description": "Anthropic prompt-caching TTL for Claude requests sent through LiteLLM. Unrelated to disableCaching, which bypasses the proxy response cache. 5m marks requests with a 5 minute CachePoint (cache writes cost 1.25x input tokens). 1h uses a 1 hour CachePoint (cache writes cost 2x input tokens). off never marks. Only applied to Anthropic Claude models."
 				},
 				"litellm-connector.enableModelOverrides": {
 					"type": "boolean",
@@ -229,6 +228,16 @@
 					"type": "boolean",
 					"default": true,
 					"description": "Show model pricing in the model picker when available."
+				},
+				"litellm-connector.forceResponsesEndpoint": {
+					"type": "boolean",
+					"default": false,
+					"description": "Send models whose proxy mode is chat to the /responses endpoint. Changing it reloads the model list."
+				},
+				"litellm-connector.allowChatCompletionsFallback": {
+					"type": "boolean",
+					"default": false,
+					"description": "When a request routed to /responses fails with a 5xx status, retry it once on /chat/completions."
 				},
 				"litellm-connector.discoveryTimeoutMs": {
 					"type": "number",
@@ -249,26 +258,6 @@
 						"advanced"
 					],
 					"description": "TTL in milliseconds for cached /model/info discovery responses. Set to 0 to disable caching. Default: 60000."
-				},
-				"litellm-connector.discoveryFireDebounceMs": {
-					"type": "number",
-					"default": 250,
-					"minimum": 0,
-					"maximum": 5000,
-					"tags": [
-						"advanced"
-					],
-					"description": "Trailing-edge debounce window in milliseconds for outward model-discovery change notifications. Set to 0 to disable debouncing. Default: 250."
-				},
-				"litellm-connector.discoveryFireMinIntervalMs": {
-					"type": "number",
-					"default": 2000,
-					"minimum": 0,
-					"maximum": 30000,
-					"tags": [
-						"advanced"
-					],
-					"description": "Minimum interval in milliseconds between outward model-discovery change notifications. Set to 0 to disable rate limiting. Default: 2000."
 				},
 				"litellm-connector.debug.copilotMdExport.enabled": {
 					"type": "boolean",
@@ -342,16 +331,7 @@
 					]
 				}
 			}
-		],
-		"menus": {
-			"scm/title": [
-				{
-					"command": "litellm-connector.generateCommitMessage",
-					"group": "navigation",
-					"when": "config.litellm-connector.commitModelIdOverride != ''"
-				}
-			]
-		}
+		]
 	},
 	"activationEvents": [
 		"onLanguageModelChatProvider:litellm-connector",
@@ -396,10 +376,7 @@
 		"chatProvider",
 		"languageModelCapabilities",
 		"languageModelPricing",
-		"languageModelProxy",
 		"languageModelSystem",
-		"languageModelThinkingPart",
-		"languageModelToolResultAudience",
-		"languageModelToolSupportsModel"
+		"languageModelThinkingPart"
 	]
 }

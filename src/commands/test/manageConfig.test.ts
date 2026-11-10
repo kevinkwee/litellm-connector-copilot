@@ -4,21 +4,15 @@ import * as sinon from "sinon";
 import {
     registerManageConfigCommand,
     registerReloadModelsCommand,
-    registerResetConfigurationCommand,
     registerShowModelsCommand,
 } from "../../commands/manageConfig";
-import { ConfigManager } from "../../config/configManager";
 import type { LiteLLMChatProvider } from "../../providers";
 
 suite("ManageConfig Command Unit Tests", () => {
     let sandbox: sinon.SinonSandbox;
-    let mockConfigManager: sinon.SinonStubbedInstance<ConfigManager>;
-    let mockContext: vscode.ExtensionContext;
 
     setup(() => {
         sandbox = sinon.createSandbox();
-        mockConfigManager = sandbox.createStubInstance(ConfigManager);
-        mockContext = { subscriptions: [] } as unknown as vscode.ExtensionContext;
     });
 
     teardown(() => {
@@ -27,7 +21,7 @@ suite("ManageConfig Command Unit Tests", () => {
 
     test("registers command correctly", () => {
         const registerStub = sandbox.stub(vscode.commands, "registerCommand");
-        registerManageConfigCommand(mockContext, mockConfigManager as unknown as ConfigManager);
+        registerManageConfigCommand();
         assert.strictEqual(registerStub.calledWith("litellm-connector.manage"), true);
     });
 
@@ -46,19 +40,18 @@ suite("ManageConfig Command Unit Tests", () => {
             return { dispose: sandbox.stub() } as vscode.Disposable;
         });
 
-        registerManageConfigCommand(mockContext, mockConfigManager as unknown as ConfigManager);
+        registerManageConfigCommand();
         await commandHandler?.();
 
         assert.strictEqual(executeCommandStub.called, true);
     });
 
-    test("reloadModels triggers provider discovery and shows info", async () => {
+    test("calls reloadModels and reports that a reload started", async () => {
         const infoStub = sandbox.stub(vscode.window, "showInformationMessage");
+        const reloadStub = sandbox.stub();
 
         const provider = {
-            clearModelCache: sandbox.stub(),
-            getLastKnownModels: () => [],
-            provideLanguageModelChatInformation: sandbox.stub().resolves([]),
+            reloadModels: reloadStub,
         } as unknown as LiteLLMChatProvider;
 
         let handler: (() => Promise<void>) | undefined;
@@ -72,64 +65,9 @@ suite("ManageConfig Command Unit Tests", () => {
         registerReloadModelsCommand(provider);
         await handler?.();
 
+        assert.strictEqual(reloadStub.calledOnce, true);
         assert.ok(infoStub.calledOnce);
-    });
-
-    test("resetConfiguration command shows confirmation dialog and resets on confirmation", async () => {
-        const warningStub = sandbox
-            .stub(vscode.window, "showWarningMessage")
-            .resolves("Reset Configuration" as unknown as vscode.MessageItem);
-        const infoStub = sandbox.stub(vscode.window, "showInformationMessage");
-
-        mockConfigManager.resetConfiguration.resolves(undefined);
-
-        let handler: (() => Promise<void>) | undefined;
-        sandbox.stub(vscode.commands, "registerCommand").callsFake((id, cb) => {
-            if (id === "litellm-connector.resetConfiguration") {
-                handler = cb as () => Promise<void>;
-            }
-            return { dispose: sandbox.stub() } as vscode.Disposable;
-        });
-
-        registerResetConfigurationCommand(
-            mockContext as unknown as vscode.ExtensionContext,
-            mockConfigManager as unknown as ConfigManager
-        );
-
-        await handler?.();
-
-        sinon.assert.calledOnce(warningStub);
-        sinon.assert.calledOnceWithExactly(mockConfigManager.resetConfiguration);
-        assert.strictEqual(infoStub.callCount, 1);
-        assert.ok(
-            infoStub.calledWith(
-                "LiteLLM configuration has been reset. Use 'LiteLLM: Manage Configuration' to re-configure providers."
-            )
-        );
-    });
-
-    test("resetConfiguration command cancels when user declines confirmation", async () => {
-        const warningStub = sandbox
-            .stub(vscode.window, "showWarningMessage")
-            .resolves("Cancel" as unknown as vscode.MessageItem);
-
-        let handler: (() => Promise<void>) | undefined;
-        sandbox.stub(vscode.commands, "registerCommand").callsFake((id, cb) => {
-            if (id === "litellm-connector.resetConfiguration") {
-                handler = cb as () => Promise<void>;
-            }
-            return { dispose: sandbox.stub() } as vscode.Disposable;
-        });
-
-        registerResetConfigurationCommand(
-            mockContext as unknown as vscode.ExtensionContext,
-            mockConfigManager as unknown as ConfigManager
-        );
-
-        await handler?.();
-
-        sinon.assert.notCalled(mockConfigManager.resetConfiguration);
-        assert.strictEqual(warningStub.callCount, 1);
+        assert.strictEqual(infoStub.firstCall.args[0], "LiteLLM: Reloading models...");
     });
 });
 
@@ -144,10 +82,30 @@ suite("Model Commands Unit Tests", () => {
         sandbox.restore();
     });
 
-    test("showModels: prompts to reload when cache is empty", async () => {
-        const provider = {
-            getLastKnownModels: () => [],
-        } as unknown as LiteLLMChatProvider;
+    test("showModels: describes each row with the routable id", async () => {
+        const model = { id: "litellm.example/model", name: "model", family: "litellm" } as vscode.LanguageModelChat;
+        const listModels = () => Promise.resolve([model]);
+        let items: readonly vscode.QuickPickItem[] | undefined;
+        sandbox.stub(vscode.window, "showQuickPick").callsFake(async (candidate) => {
+            items = candidate as readonly vscode.QuickPickItem[];
+            return undefined;
+        });
+
+        let handler: (() => Promise<void>) | undefined;
+        sandbox.stub(vscode.commands, "registerCommand").callsFake((id, cb) => {
+            if (id === "litellm-connector.showModels") {
+                handler = cb as () => Promise<void>;
+            }
+            return { dispose: sandbox.stub() } as vscode.Disposable;
+        });
+
+        registerShowModelsCommand(listModels);
+        await handler?.();
+
+        assert.strictEqual(items?.[0].description, "litellm.example/model");
+    });
+    test("showModels: prompts to reload when no models are available", async () => {
+        const listModels = () => Promise.resolve([]);
 
         const infoStub = sandbox.stub(vscode.window, "showInformationMessage");
 
@@ -159,11 +117,11 @@ suite("Model Commands Unit Tests", () => {
             return { dispose: sandbox.stub() } as vscode.Disposable;
         });
 
-        registerShowModelsCommand(provider);
+        registerShowModelsCommand(listModels);
         await handler?.();
 
         assert.strictEqual(infoStub.calledOnce, true);
-        assert.ok(String(infoStub.firstCall.args[0]).includes("No cached models"));
+        assert.ok(String(infoStub.firstCall.args[0]).includes("No LiteLLM models are available"));
     });
 
     test("showModels: quick pick copies model id", async () => {
@@ -172,16 +130,14 @@ suite("Model Commands Unit Tests", () => {
         // assert the user-visible side-effect: the "Copied model id:" information
         // message includes the model id the user selected. The clipboard write itself
         // is exercised manually in development.
-        const provider = {
-            getLastKnownModels: () => [
+        const listModels = () =>
+            Promise.resolve([
                 {
                     id: "backend/model",
                     name: "backend/model",
-                    tooltip: "t",
-                    isUserSelectable: true,
-                },
-            ],
-        } as unknown as LiteLLMChatProvider;
+                    family: "litellm",
+                } as vscode.LanguageModelChat,
+            ]);
 
         const infoStub = sandbox.stub(vscode.window, "showInformationMessage");
         const quickPickStub = sandbox.stub(vscode.window, "showQuickPick");
@@ -195,13 +151,43 @@ suite("Model Commands Unit Tests", () => {
             return { dispose: sandbox.stub() } as vscode.Disposable;
         });
 
-        registerShowModelsCommand(provider);
+        registerShowModelsCommand(listModels);
         await handler?.();
 
         assert.strictEqual(infoStub.calledOnce, true);
         assert.ok(
             String(infoStub.firstCall.args[0]).includes("Copied model id: backend/model"),
             "Information message should announce the copied model id"
+        );
+    });
+
+    test("showModels: lists exactly the models VS Code reports", async () => {
+        const listModels = () =>
+            Promise.resolve([
+                { id: "host-a/model-1", name: "model-1", family: "openai" },
+                { id: "host-b/model-2", name: "model-2", family: "anthropic" },
+            ] as vscode.LanguageModelChat[]);
+        let items: readonly vscode.QuickPickItem[] | undefined;
+        sandbox.stub(vscode.window, "showQuickPick").callsFake(async (candidate) => {
+            items = candidate as readonly vscode.QuickPickItem[];
+            return undefined;
+        });
+
+        let handler: (() => Promise<void>) | undefined;
+        sandbox.stub(vscode.commands, "registerCommand").callsFake((id, cb) => {
+            if (id === "litellm-connector.showModels") {
+                handler = cb as () => Promise<void>;
+            }
+            return { dispose: sandbox.stub() } as vscode.Disposable;
+        });
+
+        registerShowModelsCommand(listModels);
+        await handler?.();
+
+        assert.deepStrictEqual(
+            items?.map((item) => `${item.label}|${item.description}|${item.detail}`),
+            ["model-1|host-a/model-1|openai", "model-2|host-b/model-2|anthropic"],
+            "each row shows the model name, the routable id, and the family"
         );
     });
 });

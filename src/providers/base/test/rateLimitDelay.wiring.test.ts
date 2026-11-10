@@ -4,7 +4,7 @@ import { Transport } from "../transport";
 import type { TransportDeps } from "../types";
 import type { ConfigManager } from "../../../config/configManager";
 import type { LiteLLMClient } from "../../../adapters/litellmClient";
-import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../../types";
+import type { OpenAIChatCompletionRequest } from "../../../types";
 
 /**
  * Captures the most recent backend params passed to the factory, so the
@@ -23,7 +23,6 @@ class RateLimitSpyClient {
         _request: OpenAIChatCompletionRequest,
         _mode: string | undefined,
         _token?: vscode.CancellationToken,
-        _modelInfo?: LiteLLMModelInfo,
         requestId?: string
     ): Promise<ReadableStream<Uint8Array>> {
         lastChatRequestId = requestId;
@@ -91,18 +90,15 @@ suite("rateLimitMaxDelayMs wiring", () => {
     test("hands the request id to the client so its retry logs match the provider's", async () => {
         const transport = makeTransport();
 
-        await transport.sendRequestWithRetry({
-            request: req,
-            messages: [],
-            model: { maxOutputTokens: 100 } as vscode.LanguageModelChatInformation,
-            options: {} as vscode.ProvideLanguageModelChatResponseOptions,
-            progress: { report: () => {} },
-            token: new vscode.CancellationTokenSource().token,
-            caller: "chat",
-            modelInfo: { mode: "chat" },
-            configuration: { baseUrl: "https://x", apiKey: "k" },
-            requestId: "req-42",
-        });
+        await transport.sendRequestToLiteLLM(
+            req,
+            { report: () => {} } as unknown as vscode.Progress<vscode.LanguageModelResponsePart>,
+            new vscode.CancellationTokenSource().token,
+            "chat",
+            { mode: "chat" },
+            { baseUrl: "https://x", apiKey: "k" },
+            "req-42"
+        );
 
         assert.strictEqual(lastChatRequestId, "req-42");
     });

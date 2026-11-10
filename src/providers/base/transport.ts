@@ -1,17 +1,17 @@
 import type * as vscode from "vscode";
 import { LiteLLMClient } from "../../adapters/litellmClient";
-import { isContextOverflowError } from "../../adapters/tokenUtils";
 import { StructuredLogger } from "../../observability/structuredLogger";
 import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types";
-import type { SendRequestArgs, TransportDeps } from "./types";
+import type { TransportDeps } from "./types";
+import { describeFailureForLog, toErrorLogFields } from "./errorLogFields";
+import type { RateLimitWaitLedger } from "../../utils/rateLimitRetryPolicy";
+import { LiteLLMConfigurationError } from "../../utils/transportRetry";
 
 /**
  * Sends a LiteLLM request to the configured endpoint.
  *
- * The single-provider design means routing is direct: the
- * `LiteLLMClient` is constructed from the baseUrl/apiKey passed on the
- * originating VS Code call (via `options.configuration`). There is no
- * global state consulted for routing and no model-id parsing.
+ * The caller resolves which backend a request belongs to and passes its baseUrl and
+ * apiKey in, so this layer holds no routing state.
  */
 export class Transport {
     private readonly configManager: TransportDeps["configManager"];
@@ -23,6 +23,7 @@ export class Transport {
         key?: string;
         disableCaching?: boolean;
         rateLimitMaxDelayMs?: number;
+        headersTimeoutMs?: number;
         onUnsupportedParameter?: (model: string, param: string) => void;
     }) => LiteLLMClient;
 
@@ -40,33 +41,11 @@ export class Transport {
                         key: backend.key,
                         disableCaching: backend.disableCaching,
                         rateLimitMaxDelayMs: backend.rateLimitMaxDelayMs,
+                        headersTimeoutMs: backend.headersTimeoutMs,
                         onUnsupportedParameter: backend.onUnsupportedParameter,
                     },
                     this.userAgent
                 ));
-    }
-
-    public async sendRequestWithRetry(args: SendRequestArgs): Promise<ReadableStream<Uint8Array>> {
-        const { request, progress, token, caller, modelInfo, model, configuration, requestId } = args;
-        try {
-            return await this.sendRequestToLiteLLM(
-                request,
-                progress,
-                token,
-                caller,
-                modelInfo,
-                configuration,
-                requestId
-            );
-        } catch (err) {
-            if (isContextOverflowError(err) && modelInfo?.max_input_tokens) {
-                this.logger.warn("Retrying after context overflow", err);
-                const trimmed: OpenAIChatCompletionRequest = { ...request };
-                trimmed.max_tokens = Math.min(trimmed.max_tokens ?? model.maxOutputTokens, model.maxOutputTokens);
-                return this.sendRequestToLiteLLM(trimmed, progress, token, caller, modelInfo, configuration, requestId);
-            }
-            throw err;
-        }
     }
 
     public async sendRequestToLiteLLM(
@@ -76,7 +55,9 @@ export class Transport {
         caller?: string,
         modelInfo?: LiteLLMModelInfo,
         configuration?: Record<string, unknown>,
-        requestId?: string
+        requestId?: string,
+        learnedLimitsKey?: string,
+        rateLimitLedger?: RateLimitWaitLedger
     ): Promise<ReadableStream<Uint8Array>> {
         this.logger.debug(
             `[transport.sendRequestToLiteLLM] Preparing LiteLLM request for model: ${request.model} (caller: ${caller})`
@@ -93,48 +74,59 @@ export class Transport {
         const baseUrl = typeof configuration?.baseUrl === "string" ? configuration.baseUrl.trim() : "";
         const apiKey = typeof configuration?.apiKey === "string" ? configuration.apiKey.trim() : "";
 
+        // The provider terminates a rejected configuration and logs it with the request
+        // id, so the transport only throws. The error type is the connector's own, which
+        // is what tells the provider that no request reached the proxy.
         if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) {
-            const errMsg = `No baseUrl provided in call-time configuration for model "${request.model}". Configure the LiteLLM provider group in VS Code's Language Models view.`;
-            this.logger.error(`[transport.sendRequestToLiteLLM] Configuration validation failed: ${errMsg}`);
-            StructuredLogger.error("transport.config_validation_failed", {
-                model: request.model,
-                reason: "missing_or_invalid_baseUrl",
-                caller,
-            });
-            throw new Error(errMsg);
+            throw new LiteLLMConfigurationError(
+                `No baseUrl provided in call-time configuration for model "${request.model}". Configure the LiteLLM provider group in VS Code's Language Models view.`
+            );
         }
         if (!apiKey) {
-            const errMsg = `No apiKey provided in call-time configuration for model "${request.model}". Configure the LiteLLM provider group in VS Code's Language Models view.`;
-            this.logger.error(`[transport.sendRequestToLiteLLM] Configuration validation failed: ${errMsg}`);
-            StructuredLogger.error("transport.config_validation_failed", {
-                model: request.model,
-                reason: "missing_apiKey",
-                caller,
-            });
-            throw new Error(errMsg);
+            throw new LiteLLMConfigurationError(
+                `No apiKey provided in call-time configuration for model "${request.model}". Configure the LiteLLM provider group in VS Code's Language Models view.`
+            );
         }
 
         // Thread disableCaching from the per-call configuration through to the
-        // LiteLLMClient so Cache-Control headers are set on the HTTP connection.
+        // LiteLLMClient, which then adds the proxy cache directive to the body.
         const disableCaching =
             typeof configuration?.disableCaching === "boolean" ? configuration.disableCaching : undefined;
         // The configuration merge does not guarantee clamped values, so the
-        // guard below must stay self-contained.
+        // guards below must stay self-contained.
         const rateLimitMaxDelayMs =
             typeof configuration?.rateLimitMaxDelayMs === "number" &&
             Number.isFinite(configuration.rateLimitMaxDelayMs) &&
             configuration.rateLimitMaxDelayMs >= 0
                 ? configuration.rateLimitMaxDelayMs
                 : undefined;
+        const headersTimeoutMs =
+            typeof configuration?.headersTimeoutMs === "number" &&
+            Number.isFinite(configuration.headersTimeoutMs) &&
+            configuration.headersTimeoutMs > 0
+                ? configuration.headersTimeoutMs
+                : undefined;
         this.logger.trace(
-            `[transport.sendRequestToLiteLLM] Creating client: baseUrl=${baseUrl}, timeout=${modelInfo?.timeout ?? "default"}ms, disableCaching=${disableCaching}`
+            `[transport.sendRequestToLiteLLM] Creating client: baseUrl=${baseUrl}, timeout=${modelInfo?.timeout ?? "default"}ms, disableCaching=${disableCaching}, headersTimeoutMs=${headersTimeoutMs ?? "default"}`
         );
         const client = this.liteLLMClientFactory({
             url: baseUrl,
             key: apiKey,
             disableCaching,
             rateLimitMaxDelayMs,
-            onUnsupportedParameter: this.onUnsupportedParameter,
+            headersTimeoutMs,
+            // A learned rejection belongs to one proxy's model config, so it is
+            // recorded under the namespaced picker id, not the wire model name.
+            // The provider always supplies that id, so a missing one means a
+            // caller bypassed it: the rejection is reported instead of stored
+            // under a key nothing reads.
+            onUnsupportedParameter: (wireModel: string, param: string) => {
+                if (!learnedLimitsKey) {
+                    StructuredLogger.warn("transport.learned_limit_without_key", { param, model: wireModel });
+                    return;
+                }
+                this.onUnsupportedParameter?.(learnedLimitsKey, param);
+            },
         });
 
         this.logger.info(
@@ -152,16 +144,16 @@ export class Transport {
         });
 
         // Read the per-call fallback flag from the per-group configuration.
-        // VS Code 1.120 delivers workspace settings via options.configuration on
-        // every call; the chat provider merges LiteLLMConfig into this object
-        // before invoking the transport, so allowChatCompletionsFallback lives
-        // here rather than on a globally-cached config.
+        // The base provider merges the per-group configuration with the workspace
+        // settings it reads itself, then passes the result here, so
+        // allowChatCompletionsFallback lives on that object rather than on a
+        // globally-cached config.
         const allowFallback =
             typeof configuration?.allowChatCompletionsFallback === "boolean" &&
             configuration.allowChatCompletionsFallback === true;
 
         try {
-            const stream = await client.chat(request, modelInfo?.mode, token, modelInfo, requestId);
+            const stream = await client.chat(request, modelInfo?.mode, token, requestId, rateLimitLedger);
             this.logger.debug(`[transport.sendRequestToLiteLLM] HTTP stream established for model: ${request.model}`);
             StructuredLogger.debug("transport.http_response_stream_open", {
                 model: request.model,
@@ -173,8 +165,8 @@ export class Transport {
             // backend-advertised mode) routes a model to /responses and the
             // proxy returns a 5xx (e.g. Azure AI returning a chat-completions
             // schema that LiteLLM cannot parse into ResponsesAPIResponse),
-            // retry exactly once on /chat/completions. Only /responses 5xx
-            // triggers the fallback — 4xx and chat-mode failures propagate as
+            // retry exactly once on /chat/completions. Only a /responses 5xx
+            // triggers the fallback. A 4xx and a chat-mode failure propagate as
             // hard failures. This is the behavior README.md advertises for
             // `litellm-connector.allowChatCompletionsFallback`.
             const isResponsesMode = modelInfo?.mode === "responses";
@@ -182,25 +174,18 @@ export class Transport {
             if (allowFallback && isResponsesMode && is500) {
                 this.logger.warn(
                     `[transport.sendRequestToLiteLLM] /responses failed with 5xx for model ${request.model}; falling back to /chat/completions (allowChatCompletionsFallback=true)`,
-                    err
+                    describeFailureForLog(err)
                 );
                 StructuredLogger.warn("transport.responses_fallback_to_chat", {
                     model: request.model,
                     caller,
-                    error: err instanceof Error ? err.message : String(err),
+                    ...toErrorLogFields(err),
                 });
-                const chatModelInfo: LiteLLMModelInfo | undefined = modelInfo
-                    ? { ...modelInfo, mode: "chat" }
-                    : modelInfo;
-                return client.chat(request, "chat", token, chatModelInfo, requestId);
+                return client.chat(request, "chat", token, requestId, rateLimitLedger);
             }
 
-            this.logger.error(`[transport.sendRequestToLiteLLM] HTTP request failed for model ${request.model}`, err);
-            StructuredLogger.error("transport.http_request_failed", {
-                model: request.model,
-                caller,
-                error: err instanceof Error ? err.message : String(err),
-            });
+            // The provider owns the single log for a request failure, so this
+            // layer rethrows without logging.
             throw err;
         }
     }

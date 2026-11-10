@@ -23,23 +23,3 @@ export function lmcr_toString(role: LanguageModelChatMessageRole): string {
     // Default to system for everything else
     return "system";
 }
-
-/**
- * Converts a string representation of a chat role to a LanguageModelChatMessageRole.
- */
-export function lmcr_fromString(role: string): LanguageModelChatMessageRole {
-    // Safety check: ensure role is a valid string and normalize
-    const normalizedRole = (role || "").toLowerCase();
-
-    switch (normalizedRole) {
-        case "user":
-            return LanguageModelChatMessageRole.User;
-        case "assistant":
-            return LanguageModelChatMessageRole.Assistant;
-        case "system":
-            return 3 as number as LanguageModelChatMessageRole.System;
-        default:
-            // Default should be the user role, we may change this down the road
-            return LanguageModelChatMessageRole.User;
-    }
-}

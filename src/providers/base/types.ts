@@ -1,26 +1,11 @@
 import type * as vscode from "vscode";
-import type { LiteLLMModelInfo, OpenAIChatCompletionRequest } from "../../types";
+import type { LiteLLMModelInfo } from "../../types";
 import type { LiteLLMClient } from "../../adapters/litellmClient";
 import type { ConfigManager as configMgr } from "../../config/configManager";
 
 export interface RequestBuilderDeps {
     configManager: configMgr;
-    getReasoningEffort: (
-        options: vscode.ProvideLanguageModelChatResponseOptions,
-        model: vscode.LanguageModelChatInformation,
-        modelInfo?: LiteLLMModelInfo
-    ) => string | undefined;
-    detectQuotaToolRedaction: (
-        messages: readonly vscode.LanguageModelChatRequestMessage[],
-        tools: readonly vscode.LanguageModelChatTool[],
-        requestId: string,
-        modelId: string,
-        disableRedaction: boolean,
-        caller?: string
-    ) => {
-        tools: readonly vscode.LanguageModelChatTool[];
-        confidence: "none" | "low" | "high";
-    };
+    getReasoningEffort: (options: vscode.ProvideLanguageModelChatResponseOptions) => string | undefined;
     stripUnsupportedParametersFromRequest: (
         requestBody: Record<string, unknown>,
         modelInfo: LiteLLMModelInfo | undefined,
@@ -28,14 +13,13 @@ export interface RequestBuilderDeps {
     ) => void;
     isParameterSupported: (param: string, modelInfo: LiteLLMModelInfo | undefined, modelId?: string) => boolean;
     /**
-     * Parameters a live 400 taught us to omit for this raw model id. Fed by
-     * the registry's learned-unsupported store so a single failed request
+     * Parameters a live rejection taught us to omit for this namespaced model id.
+     * Fed by the registry's learned-unsupported store so a single failed request
      * short-circuits later ones.
      */
     getUnsupportedParameters: (modelId: string) => ReadonlySet<string>;
     getTelemetryOptions: (options: vscode.ProvideLanguageModelChatResponseOptions) => {
-        caller?: string;
-        justification?: string;
+        caller: string;
         modelConfiguration?: Record<string, unknown>;
     };
     usageOptOutModels: Set<string>;
@@ -64,32 +48,15 @@ export interface TransportDeps {
         key?: string;
         disableCaching?: boolean;
         rateLimitMaxDelayMs?: number;
+        headersTimeoutMs?: number;
         onUnsupportedParameter?: (model: string, param: string) => void;
     }) => LiteLLMClient;
     /**
-     * Forwarded into every per-request LiteLLMClient. Called by the client's
-     * 400 strip-and-retry path so the owning provider can persist learned
-     * parameter incompatibilities (registry `recordUnsupportedParameter`).
+     * Invoked when a 400 or 403 response rejects a parameter this connector
+     * adds, so the provider can remember the incompatibility and later requests
+     * omit it. The client retries without the parameter itself; the provider
+     * only records it. The model id it receives is the namespaced learned-limits
+     * key, not the wire model name.
      */
     onUnsupportedParameter?: (model: string, param: string) => void;
-}
-
-export interface SendRequestArgs {
-    request: OpenAIChatCompletionRequest;
-    messages: readonly vscode.LanguageModelChatRequestMessage[];
-    model: vscode.LanguageModelChatInformation;
-    options: vscode.ProvideLanguageModelChatResponseOptions;
-    progress: vscode.Progress<vscode.LanguageModelResponsePart>;
-    token: vscode.CancellationToken;
-    caller?: string;
-    modelInfo?: LiteLLMModelInfo;
-    /**
-     * Per-group provider configuration passed by VS Code on the originating
-     * call. When present, the transport uses its `baseUrl` / `apiKey` directly
-     * to construct the LiteLLM client. When absent, the request cannot be
-     * routed and the transport throws a configuration error.
-     */
-    configuration?: Record<string, unknown>;
-    /** Ties the client's retry logs to the provider's request logs. */
-    requestId?: string;
 }

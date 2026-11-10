@@ -14,7 +14,7 @@ import type { ChatSessionIdSource } from "../utils/chatSessionId";
  * Users who already work with Copilot's `.copilotmd` exports (e.g. for
  * sharing, archiving, or diffing prompts) get identical-looking files for
  * LiteLLM-backed requests: same header banner, same `## Metadata`
- * `<pre><code>` block, same `tools` `<details>`, same `~~~md` fenced
+ * `<pre><code>` block, same `tools` `<details>`, same fenced `md`
  * `## Request Messages`, same `🛠️ {name} ({callId}) {args}` tool-call
  * lines, same `<style>` footer. The files render the same way in any
  * markdown preview and the in-file anchors (`#request-messages`,
@@ -45,6 +45,14 @@ import type { ChatSessionIdSource } from "../utils/chatSessionId";
  *   request messages and for tool results. We write a `<mime, size>` placeholder
  *   instead, so an exported transcript stays readable and never carries raw
  *   binary bytes.
+ * - Escaping and fences: every free-text value interpolated into the Metadata
+ *   `<pre><code>` block is HTML-escaped, headings collapse to one escaped line,
+ *   and each fenced block is widened past the longest `~` run in its content.
+ *   Copilot's renderer interpolates those values raw and uses a fixed fence,
+ *   which lets a tool description or a file excerpt break the preview.
+ * - Failed requests: Copilot writes only the failure heading. We render the
+ *   response parts the request streamed before that heading, so a failed turn's
+ *   partial answer is not lost.
  *
  * Everything else is line-for-line compatible.
  */
@@ -53,11 +61,11 @@ import type { ChatSessionIdSource } from "../utils/chatSessionId";
  * Input bundle for one request log entry.
  *
  * Every field is something the `LiteLLMChatProvider` already has in hand
- * at the point it calls `logFinalUsageEnvelope` / `LiteLLMTelemetry.reportMetric`
- * — no new instrumentation is required upstream.
+ * at the point it calls `logFinalUsageEnvelope` / `LiteLLMTelemetry.reportMetric`,
+ * so no new instrumentation is required upstream.
  */
 export interface CopilotMdEntry {
-    /** Short request label, e.g. "chat", "panel/editAgent". Becomes the H1 suffix and filename stem. */
+    /** Short request label, e.g. "core". Becomes the H1 suffix and filename stem. */
     debugName: string;
     /** 8-char hex id (matches Copilot's `generateUuid().substring(0, 8)`). */
     id: string;
@@ -71,7 +79,7 @@ export interface CopilotMdEntry {
     maxResponseTokens: number | undefined;
     /** Chat-location enum value VS Code passed in (`options.modelOptions.location`); undefined if not surfaced. */
     location: number | undefined;
-    /** Request body as built by `buildOpenAIChatRequest` — feeds `tools`, `temperature`, `reasoning_effort`, etc. */
+    /** Request body as built by `buildOpenAIChatRequest`, feeding `tools`, `temperature`, `reasoning_effort`, etc. */
     body: OpenAIChatCompletionRequest;
     /** The `messages: readonly LanguageModelChatRequestMessage[]` arg, for the `## Request Messages` section. */
     requestMessages: readonly vscode.LanguageModelChatRequestMessage[];
@@ -83,13 +91,13 @@ export interface CopilotMdEntry {
     durationMs: number;
     /** The per-request UUID already generated for `Logger.info("Chat request started | RequestID: ...")`. */
     ourRequestId: string;
-    /** Time-to-first-token in ms (first text/tool part timestamp − startTime), if observed. */
+    /** Time-to-first-token in ms (first text/tool part timestamp - startTime), if observed. */
     timeToFirstTokenMs: number | undefined;
     /** The model id actually used (post-override). Usually equals `model`; emitted as `resolved model`. */
     resolvedModel: string;
-    /** Token snapshot from `StreamTokenCapture.getSnapshot()`. Drives the `usage` line. */
+    /** Request token totals from `StreamTokenCapture.getSpendSnapshot()`. Drives the `usage` line. */
     usage: TokenSnapshot;
-    /** Response parts emitted to VS Code via `progress.report(...)` — text, tool calls, thinking. */
+    /** Response parts emitted to VS Code through `progress.report(...)`, namely text, tool calls, and thinking. */
     responseParts: readonly vscode.LanguageModelResponsePart[];
     /** Status: "success" | "failure" | "canceled". Affects the `## Response` heading. */
     status: "success" | "failure" | "canceled";
@@ -101,12 +109,37 @@ export interface CopilotMdEntry {
     sessionIdSource: ChatSessionIdSource;
 }
 
-const MARKDOWN_FENCE = "~~~";
+const MIN_FENCE_LENGTH = 3;
+
+/**
+ * Escapes text the renderer emits into HTML and markdown: the Metadata
+ * `<pre><code>` block, the tool-list `<summary>`, and headings. An unescaped
+ * `<` opens markup the parser never closes, so a tool description containing
+ * `<select>`, `<script>`, `<textarea>`, or `<!--` would hide the rest of the
+ * preview.
+ */
+function escapeHtml(value: string): string {
+    return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Flattens text into one escaped heading line, so a multi-line error cannot break the heading. */
+function toHeadingText(value: string): string {
+    return escapeHtml(value.replace(/\s+/g, " ").trim());
+}
+
+/**
+ * Picks a fence the content cannot close early: the longest run of `~` in the
+ * content plus one, never shorter than three.
+ */
+function fenceFor(content: string): string {
+    const longestRun = (content.match(/~+/g) ?? []).reduce((longest, run) => Math.max(longest, run.length), 0);
+    return "~".repeat(Math.max(MIN_FENCE_LENGTH, longestRun + 1));
+}
 
 /**
  * Renders a single request entry to a `.copilotmd`-formatted markdown string.
  *
- * Pure function — no I/O, no logging, no telemetry. Safe to call from any
+ * Pure function with no I/O, no logging, and no telemetry. Safe to call from any
  * context. The caller is responsible for writing the returned string to disk.
  */
 export function renderCopilotMd(entry: CopilotMdEntry): string {
@@ -115,10 +148,10 @@ export function renderCopilotMd(entry: CopilotMdEntry): string {
     out.push(
         "> 🚨 Note: This log may contain personal information such as the contents of your files or terminal output. Please review the contents carefully before sharing."
     );
-    out.push(`# ${entry.debugName} - ${entry.id}`);
+    out.push(`# ${toHeadingText(entry.debugName)} - ${toHeadingText(entry.id)}`);
     out.push("");
 
-    // Table of contents — matches Copilot's `_renderRequestToMarkdown` ordering.
+    // Table of contents, matching Copilot's `_renderRequestToMarkdown` ordering.
     const toc: string[] = [];
     toc.push("- [Request Messages](#request-messages)");
     toc.push("  - [System](#system)");
@@ -132,13 +165,13 @@ export function renderCopilotMd(entry: CopilotMdEntry): string {
     // Metadata
     out.push("## Metadata");
     out.push("<pre><code>");
-    out.push(`url              : ${entry.url}`);
-    out.push(`model            : ${entry.model}`);
+    out.push(`url              : ${escapeHtml(entry.url)}`);
+    out.push(`model            : ${escapeHtml(entry.model)}`);
     out.push(`maxPromptTokens  : ${fmtOptNum(entry.maxPromptTokens)}`);
     out.push(`maxResponseTokens: ${fmtOptNum(entry.maxResponseTokens)}`);
-    out.push(`location         : ${fmtOpt(entry.location)}`);
+    out.push(`location         : ${escapeHtml(fmtOpt(entry.location))}`);
 
-    // otherOptions — the four known optional body knobs Copilot extracts.
+    // The four known optional body knobs Copilot extracts into otherOptions.
     const otherOptions: Record<string, string | number | boolean> = {};
     if (entry.body.temperature !== undefined) {
         otherOptions.temperature = entry.body.temperature;
@@ -148,10 +181,10 @@ export function renderCopilotMd(entry: CopilotMdEntry): string {
     }
     // `store` and `reasoning_effort` are not part of OpenAIChatCompletionRequest;
     // include reasoning_effort under its own line below to match Copilot's split.
-    out.push(`otherOptions     : ${JSON.stringify(otherOptions)}`);
+    out.push(`otherOptions     : ${escapeHtml(JSON.stringify(otherOptions))}`);
 
     if (entry.body.reasoning_effort !== undefined) {
-        out.push(`reasoning        : ${JSON.stringify(entry.body.reasoning_effort)}`);
+        out.push(`reasoning        : ${escapeHtml(JSON.stringify(entry.body.reasoning_effort))}`);
     }
     out.push(`intent           : undefined`);
     out.push(`startTime        : ${entry.startTimeIso}`);
@@ -165,8 +198,8 @@ export function renderCopilotMd(entry: CopilotMdEntry): string {
         out.push(`requestId        : ${entry.ourRequestId}`);
         out.push(`serverRequestId  : ${entry.ourRequestId}`);
         out.push(`timeToFirstToken : ${fmtOptNum(entry.timeToFirstTokenMs)}ms`);
-        out.push(`resolved model   : ${entry.resolvedModel}`);
-        out.push(`usage            : ${JSON.stringify(snapshotToUsagePayload(entry.usage))}`);
+        out.push(`resolved model   : ${escapeHtml(entry.resolvedModel)}`);
+        out.push(`usage            : ${escapeHtml(JSON.stringify(snapshotToUsagePayload(entry.usage)))}`);
         if (typeof entry.usage.estimatedTotalCost === "number") {
             out.push(
                 `estimatedCost    : $${entry.usage.estimatedTotalCost.toFixed(6)} (input $${fmtOptNum(
@@ -187,10 +220,8 @@ export function renderCopilotMd(entry: CopilotMdEntry): string {
         const pad = " ".repeat(Math.max(0, 9 - numToolsString.length));
         out.push(
             `<details>`,
-            `<summary>tools ${numToolsString}${pad}: ${toolNames.join(", ")}</summary>${JSON.stringify(
-                entry.body.tools,
-                undefined,
-                4
+            `<summary>tools ${numToolsString}${pad}: ${escapeHtml(toolNames.join(", "))}</summary>${escapeHtml(
+                JSON.stringify(entry.body.tools, undefined, 4)
             )}`,
             `</details>`
         );
@@ -211,7 +242,14 @@ export function renderCopilotMd(entry: CopilotMdEntry): string {
         out.push(`## Response`);
         out.push(responsePartsToMarkdown("assistant", entry.responseParts));
     } else if (entry.status === "failure") {
-        out.push(`## FAILED: ${entry.statusReason ?? "unknown error"}`);
+        // A failed request can still have streamed part of an answer, so the
+        // partial response is rendered before the failure heading.
+        if (entry.responseParts.length > 0) {
+            out.push(`## Response`);
+            out.push(responsePartsToMarkdown("assistant", entry.responseParts));
+            out.push("");
+        }
+        out.push(`## FAILED: ${toHeadingText(entry.statusReason ?? "unknown error")}`);
     } else {
         out.push(`## CANCELED`);
     }
@@ -222,8 +260,9 @@ export function renderCopilotMd(entry: CopilotMdEntry): string {
 }
 
 /**
- * Renders one `LanguageModelChatRequestMessage` as `### {Role}\n~~~md\n{content}\n~~~\n`,
- * matching Copilot's `messageToMarkdown` for `@vscode/prompt-tsx` `Raw.ChatMessage`.
+ * Renders one `LanguageModelChatRequestMessage` as a `### {Role}` heading and a
+ * fenced `md` block, matching Copilot's `messageToMarkdown` for
+ * `@vscode/prompt-tsx` `Raw.ChatMessage`.
  *
  * Differences from Copilot's helper, forced by the different input shape:
  * - Tool calls in an Assistant message arrive as `LanguageModelToolCallPart`
@@ -247,8 +286,6 @@ function requestMessageToMarkdown(message: vscode.LanguageModelChatRequestMessag
     const roleLabel = isToolResultMessage ? "Tool" : roleToString(message.role);
     const capitalizedRole = roleLabel.charAt(0).toUpperCase() + roleLabel.slice(1);
 
-    let str = `### ${capitalizedRole}\n${MARKDOWN_FENCE}md\n`;
-
     // Separate reasoning from non-reasoning parts so we can insert a visible
     // separator between them. Each SSE delta creates a separate
     // LanguageModelThinkingPart, so we buffer and concatenate them into one
@@ -269,16 +306,19 @@ function requestMessageToMarkdown(message: vscode.LanguageModelChatRequestMessag
         }
     }
 
+    let content = "";
     if (reasoningChunks.length > 0) {
-        str += `reasoning: ${reasoningChunks.join("")}\n`;
+        content += `reasoning: ${reasoningChunks.join("")}\n`;
         if (otherParts.length > 0) {
-            str += `\n---\n\n`;
+            content += `\n---\n\n`;
         }
     }
-    str += otherParts.join("\n");
+    content += otherParts.join("\n");
 
-    str += `\n${MARKDOWN_FENCE}\n`;
-    return str;
+    // The fence is chosen from the content, so a `~~~` line inside a file
+    // excerpt cannot close the block early.
+    const fence = fenceFor(content);
+    return `### ${capitalizedRole}\n${fence}md\n${content}\n${fence}\n`;
 }
 
 /**
@@ -286,28 +326,27 @@ function requestMessageToMarkdown(message: vscode.LanguageModelChatRequestMessag
  * its `.copilotmd` text representation.
  */
 function requestPartToMarkdown(part: vscode.LanguageModelInputPart | unknown): string {
-    // LanguageModelToolCallPart — assistant's request to call a tool.
+    // LanguageModelToolCallPart: the assistant's request to call a tool.
     if (part instanceof vscode.LanguageModelToolCallPart) {
         const callPart = part as vscode.LanguageModelToolCallPart;
         const argsStr = prettyToolArgs(callPart.input);
         return `🛠️ ${callPart.name} (${callPart.callId}) ${argsStr}`;
     }
-    // LanguageModelToolResultPart — user-side tool result back to the assistant.
+    // LanguageModelToolResultPart: a user-side tool result returned to the assistant.
     if (part instanceof vscode.LanguageModelToolResultPart) {
         const resultPart = part as vscode.LanguageModelToolResultPart;
         const resultText = renderToolResultContent(resultPart.content);
         return `🛠️ ${resultPart.callId}\n${resultText}`;
     }
-    // LanguageModelTextPart — plain text content.
+    // LanguageModelTextPart: plain text content.
     if (part instanceof vscode.LanguageModelTextPart) {
         return (part as vscode.LanguageModelTextPart).value;
     }
-    // LanguageModelThinkingPart — model's internal reasoning/thinking content.
-    // Rendered as `reasoning: {text}` to match Copilot's opaque-content branch
-    // for thinking data (see messageStringify.ts → rawPartAsThinkingData). The
-    // `{"$mid":22,"value":"..."}` garbage in the first export was this part
-    // falling through to the JSON.stringify fallback — the $mid is VS Code's
-    // internal marshalling ID, not meaningful content.
+    // LanguageModelThinkingPart: the model's internal reasoning. Rendered as
+    // `reasoning: {text}` to match Copilot's opaque-content branch for thinking
+    // data (see messageStringify.ts -> rawPartAsThinkingData). Stringifying it
+    // would write VS Code's internal `$mid` marshalling field into the
+    // transcript instead of the reasoning text.
     const ThinkingPart = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart as
         (new (value: string | string[], id?: string, metadata?: Record<string, unknown>) => unknown) | undefined;
     if (ThinkingPart && part instanceof ThinkingPart) {
@@ -330,8 +369,9 @@ function requestPartToMarkdown(part: vscode.LanguageModelInputPart | unknown): s
 }
 
 /**
- * Renders the `## Response` section's `### Assistant\n~~~md\n{...}\n~~~\n` block
- * from the response parts the provider emitted to VS Code's `progress.report()`.
+ * Renders the `## Response` section: one `### Assistant` heading and a fenced
+ * `md` block built from the parts the provider emitted through
+ * `progress.report()`.
  *
  * Mirrors Copilot's `_renderDeltasToMarkdown` → `processDeltasToMessage`:
  * - **Text parts are concatenated** (not newline-joined), because each SSE
@@ -344,12 +384,11 @@ function requestPartToMarkdown(part: vscode.LanguageModelInputPart | unknown): s
  *   original streamed text.
  * - **Tool-call parts** render as `🛠️ {name} ({callId}) {args}` lines, each
  *   on its own line so multiple parallel tool calls stay readable.
- * - **Thinking parts** would contribute their text (currently dropped —
- *   the renderer doesn't model `LanguageModelThinkingPart` yet; if the
- *   proposed API is available, the part falls through to the default
- *   `JSON.stringify` branch below).
- * - **Data parts** (usage, cache-control) are dropped from the response
- *   body — they're metadata, already surfaced in the `usage` metadata line.
+ * - **Thinking parts** contribute their text to a `reasoning:` line,
+ *   concatenated like the answer text. A `---` rule separates the reasoning
+ *   from answer text when no tool call falls between them.
+ * - **Data parts** (usage) are dropped from the response body. They are
+ *   metadata, already surfaced in the `usage` metadata line.
  *
  * Boundaries between part types get a newline so a text stream followed
  * by a tool call doesn't run together (`...text🛠️ tool...`).
@@ -374,8 +413,8 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
 
     /**
      * Flushes any accumulated reasoning as a single `reasoning: {text}` line,
-     * then resets the buffer. Same concatenation logic as `flushText` — each
-     * SSE `delta.reasoning_content` chunk creates a separate
+     * then resets the buffer. It concatenates the same way `flushText` does,
+     * because each SSE `delta.reasoning_content` chunk creates a separate
      * `LanguageModelThinkingPart`, and concatenating them (not newline-joining)
      * restores the original reasoning prose. Without this, the reasoning
      * would be split across dozens of `reasoning: {one word}` lines.
@@ -389,16 +428,14 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
 
     /**
      * Flushes both buffers in the correct order (reasoning before text).
-     * Inserts a visible `---` separator between reasoning and text/tool-calls
-     * so the boundary between "what the model thought" and "what the model
-     * said/did" is immediately obvious when scanning the rendered markdown.
+     * Inserts a visible `---` separator between reasoning and the answer text
+     * when both are buffered, so the boundary between "what the model thought"
+     * and "what the model said" is obvious when scanning the rendered markdown.
      */
     const flushAll = (): void => {
         const hadReasoning = reasoningBuffer.length > 0;
         const hadText = textBuffer.length > 0;
         flushReasoning();
-        // Insert a visible separator between reasoning and the content that
-        // follows (text or tool calls) so they don't run together visually.
         if (hadReasoning && hadText) {
             lines.push("");
             lines.push("---");
@@ -420,8 +457,6 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
             const callPart = part as vscode.LanguageModelToolCallPart;
             lines.push(`🛠️ ${callPart.name} (${callPart.callId}) ${prettyToolArgs(callPart.input)}`);
         } else if (part instanceof vscode.LanguageModelDataPart) {
-            // Usage / cache-control data parts don't belong in the rendered
-            // response body — they're metadata. Skip silently.
             continue;
         } else {
             // Check for LanguageModelThinkingPart (proposed API). The class
@@ -433,16 +468,15 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
             if (ThinkingPart && part instanceof ThinkingPart) {
                 // Accumulate reasoning fragments into one continuous string,
                 // same as text. Each SSE delta.reasoning_content chunk is a
-                // fragment of the same reasoning stream — concatenating
+                // fragment of the same reasoning stream, so concatenating them
                 // restores the original prose instead of splitting it across
                 // dozens of `reasoning: {one word}` lines.
                 const thinkingPart = part as unknown as { value: string | string[]; id?: string };
                 const text = Array.isArray(thinkingPart.value) ? thinkingPart.value.join("\n") : thinkingPart.value;
                 reasoningBuffer += text;
             } else {
-                // Unknown part type — skip rather than emitting a confusing
-                // JSON.stringify line (which produced the `{"$mid":22,...}`
-                // garbage in the first export).
+                // Unknown part type: stringifying it would write VS Code's
+                // internal marshalling fields into the transcript, so skip it.
                 continue;
             }
         }
@@ -452,7 +486,8 @@ function responsePartsToMarkdown(role: string, parts: readonly vscode.LanguageMo
     flushAll();
 
     const body = lines.length > 0 ? lines.join("\n") : "";
-    return `### ${capitalizedRole}\n${MARKDOWN_FENCE}md\n${body}\n${MARKDOWN_FENCE}\n`;
+    const fence = fenceFor(body);
+    return `### ${capitalizedRole}\n${fence}md\n${body}\n${fence}\n`;
 }
 
 /**
@@ -500,7 +535,7 @@ function formatBinaryPartPlaceholder(mimeType: string, byteLength: number): stri
  * Pretty-prints tool-call arguments the way Copilot does in
  * `processDeltasToMessage` / `messageToMarkdown`: parse the JSON, re-stringify
  * with 2-space indent, then un-escape `\n` and `\t` so multi-line args render
- * readably inside the `~~~md` fence.
+ * readably inside its fenced `md` block.
  */
 function prettyToolArgs(input: object): string {
     let argsStr: string;
@@ -527,7 +562,7 @@ function roleToString(role: vscode.LanguageModelChatMessageRole): string {
             return "Assistant";
         // System role is part of the proposed API surface (`LanguageModelChatMessageRole.System = 3`)
         // and is used by some upstream callers. Handle it defensively even though
-        // the stable 1.120 enum only declares User/Assistant.
+        // the stable role enum only declares User/Assistant.
         default:
             return "System";
     }
@@ -553,8 +588,8 @@ function snapshotToUsagePayload(snapshot: TokenSnapshot): OpenAIUsagePayload {
     };
     return {
         prompt_tokens: snapshot.promptTokens,
-        completion_tokens: snapshot.completionTokens,
-        total_tokens: snapshot.promptTokens + snapshot.completionTokens,
+        completion_tokens: snapshot.outputTokens,
+        total_tokens: snapshot.promptTokens + snapshot.outputTokens,
         ...(Object.keys(promptDetails).length > 0 ? { prompt_tokens_details: promptDetails } : {}),
         ...(Object.keys(completionDetails).length > 0 ? { completion_tokens_details: completionDetails } : {}),
         ...(snapshot.systemPromptTokens ? { system_prompt_tokens: snapshot.systemPromptTokens } : {}),
@@ -597,7 +632,7 @@ function fmtOptNum(value: number | undefined): string {
  * - `debugName` is sanitized to filename-safe characters (matches Copilot's
  *   `debugName.replace(/\W/g, '_')`).
  * - `ISOtimestamp` is the start time with `:` removed (Windows-safe) and
- *   milliseconds dropped — sortable in a file explorer at a glance, and
+ *   milliseconds dropped, so it sorts in a file explorer at a glance, and
  *   conflicts only on >1 request with the same id in the same second,
  *   which the 8-char `id` already disambiguates.
  * - `id` is the 8-char hex already used in the H1.

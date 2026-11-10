@@ -1,7 +1,6 @@
 .env
 
 # IDEs and editors
-package-lock.json
 .idea/
 
 # Worktrees
@@ -29,7 +28,6 @@ lerna-debug.log*
 
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
-memory-profile-results.json
 
 # Block rogue markdowns in root
 *.md

@@ -1,195 +1,109 @@
 import * as assert from "assert";
-import type * as vscode from "vscode";
 
 import { ConfigManager } from "../config/configManager";
 
+const CLIENT_OPTIONS = { discoveryTimeoutMs: 5_000, userAgent: "test-ua" };
+
 suite("ConfigManager", () => {
-    test("convertProviderConfiguration returns a backend session when provider config is complete", async () => {
-        const secrets = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            keys: async () => [],
-            onDidChange: () => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
+    test("convertProviderConfiguration returns a backend session when provider config is complete", () => {
+        const manager = new ConfigManager();
 
-        const manager = new ConfigManager(secrets);
-        const session = manager.convertProviderConfiguration("group-a", {
-            providerName: "group-a",
-            baseUrl: "http://localhost:4000",
-            apiKey: "secret",
-        });
+        const session = manager.convertProviderConfiguration(
+            { providerName: "group-a", baseUrl: "http://localhost:4000", apiKey: "secret" },
+            CLIENT_OPTIONS
+        );
 
         assert.ok(session);
-        assert.strictEqual(session?.backendName, "group-a");
-        assert.strictEqual(session?.baseUrl, "http://localhost:4000");
-        assert.strictEqual(session?.apiKey, "secret");
+        assert.strictEqual(session.baseUrl, "http://localhost:4000");
+        assert.strictEqual(session.apiKey, "secret");
     });
 
-    test("uses groupName directly as backendName (ignores providerName in config)", async () => {
-        const secrets = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            keys: async () => [],
-            onDidChange: () => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
+    test("derives backendName from the URL hostname", () => {
+        const manager = new ConfigManager();
 
-        const manager = new ConfigManager(secrets);
-        const session = manager.convertProviderConfiguration("llmapi.wolfram.com", {
-            baseUrl: "https://llmapi.wolfram.com",
-            apiKey: "sk-test",
-            providerName: "should-be-ignored",
-        });
+        const session = manager.convertProviderConfiguration(
+            { baseUrl: "https://llmapi.wolfram.com/v1", apiKey: "sk-test" },
+            CLIENT_OPTIONS
+        );
 
         assert.ok(session);
-        assert.strictEqual(session?.backendName, "llmapi.wolfram.com");
+        assert.strictEqual(session.backendName, "llmapi.wolfram.com");
     });
 
-    test("getConfig no longer exposes legacy url/key/backends", async () => {
-        const secrets = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            keys: async () => [],
-            onDidChange: () => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
+    test("passes the supplied discovery timeout and user agent to the session client", () => {
+        const manager = new ConfigManager();
 
-        const manager = new ConfigManager(secrets);
+        const session = manager.convertProviderConfiguration(
+            { baseUrl: "http://localhost:4000", apiKey: "secret" },
+            { discoveryTimeoutMs: 30_000, userAgent: "GitHubCopilotChat/test VSCode/test" }
+        );
+
+        assert.ok(session);
+        const clientInternals = session.client as unknown as {
+            config: { discoveryTimeoutMs?: number };
+            userAgent?: string;
+        };
+        assert.strictEqual(clientInternals.config.discoveryTimeoutMs, 30_000);
+        assert.strictEqual(
+            clientInternals.userAgent,
+            "GitHubCopilotChat/test VSCode/test",
+            "the session client must send the caller's user agent, not a hardcoded one"
+        );
+    });
+
+    test("getConfig returns only supported keys", async () => {
+        const manager = new ConfigManager();
+
         const config = await manager.getConfig();
 
         // url, key, and backends are not part of LiteLLMConfig; backends are
         // configured per provider group in VS Code's Language Models settings.
-        assert.strictEqual(config.commitModelIdOverride, "");
+        const legacyKeys = Object.keys(config).filter((key) => ["url", "key", "backends", "apiKey"].includes(key));
+        assert.deepStrictEqual(legacyKeys, []);
     });
 
-    // resolveBackends test removed - method no longer exists (VS Code 1.120+ per-group configuration)
+    test("ignores a stale providerName in the configuration payload", () => {
+        const manager = new ConfigManager();
 
-    test("convertProviderConfiguration accepts an empty groupName when baseUrl is set", async () => {
-        const secrets = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            keys: async () => [],
-            onDidChange: () => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
-
-        const manager = new ConfigManager(secrets);
-        // VS Code 1.120 supplies options.groupName separately; convertProviderConfiguration
-        // must not require it. The session's backendName may be empty in this case and the
-        // picker will fall back to a URL-derived display label.
-        const session = manager.convertProviderConfiguration("", {
-            baseUrl: "http://localhost:4000",
-            apiKey: "secret",
-        });
+        const session = manager.convertProviderConfiguration(
+            { baseUrl: "http://localhost:4000", apiKey: "secret", providerName: "stale-payload-value" },
+            CLIENT_OPTIONS
+        );
 
         assert.ok(session);
-        assert.strictEqual(session?.baseUrl, "http://localhost:4000");
-        assert.strictEqual(session?.apiKey, "secret");
+        assert.strictEqual(session.backendName, "localhost:4000");
     });
 
-    test("convertProviderConfiguration ignores stale providerName in the configuration payload", async () => {
-        const secrets = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            keys: async () => [],
-            onDidChange: () => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
+    test("returns undefined without a baseUrl", () => {
+        const manager = new ConfigManager();
 
-        const manager = new ConfigManager(secrets);
-        // providerName is no longer part of the schema; if VS Code ever passes one, the
-        // canonical groupName argument still wins.
-        const session = manager.convertProviderConfiguration("canonical-group", {
-            baseUrl: "http://localhost:4000",
-            apiKey: "secret",
-            providerName: "stale-payload-value",
-        });
-
-        assert.ok(session);
-        assert.strictEqual(session?.backendName, "canonical-group");
-    });
-
-    test("convertProviderConfiguration returns undefined without a baseUrl", async () => {
-        const secrets = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            keys: async () => [],
-            onDidChange: () => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
-
-        const manager = new ConfigManager(secrets);
         assert.strictEqual(
-            manager.convertProviderConfiguration("group-a", { providerName: "group-a", apiKey: "secret" }),
+            manager.convertProviderConfiguration({ providerName: "group-a", apiKey: "secret" }, CLIENT_OPTIONS),
             undefined
         );
     });
 
-    test("convertProviderConfiguration returns undefined when baseUrl is not http(s)", async () => {
-        const secrets = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            keys: async () => [],
-            onDidChange: () => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
+    test("returns undefined when baseUrl is not http(s)", () => {
+        const manager = new ConfigManager();
 
-        const manager = new ConfigManager(secrets);
         assert.strictEqual(
-            manager.convertProviderConfiguration("group-a", {
-                providerName: "group-a",
-                baseUrl: "localhost:4000",
-                apiKey: "secret",
-            }),
+            manager.convertProviderConfiguration(
+                { providerName: "group-a", baseUrl: "localhost:4000", apiKey: "secret" },
+                CLIENT_OPTIONS
+            ),
             undefined
         );
     });
 
-    test("convertProviderConfiguration returns undefined without apiKey", async () => {
-        const secrets = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            keys: async () => [],
-            onDidChange: () => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
+    test("returns undefined without apiKey", () => {
+        const manager = new ConfigManager();
 
-        const manager = new ConfigManager(secrets);
         assert.strictEqual(
-            manager.convertProviderConfiguration("group-a", {
-                providerName: "group-a",
-                baseUrl: "http://localhost:4000",
-            }),
+            manager.convertProviderConfiguration(
+                { providerName: "group-a", baseUrl: "http://localhost:4000" },
+                CLIENT_OPTIONS
+            ),
             undefined
         );
-    });
-
-    test("dispose resolves cleanly", async () => {
-        const secrets = {
-            get: async () => undefined,
-            store: async () => {},
-            delete: async () => {},
-            keys: async () => [],
-            onDidChange: () => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
-
-        const manager = new ConfigManager(secrets);
-        await assert.doesNotReject(async () => manager.dispose());
-        await assert.doesNotReject(async () => manager.dispose());
-    });
-
-    test("getSecret exposes stored values", async () => {
-        const secrets = {
-            get: async (key: string) => (key === "litellm-connector.apiKey.default" ? "abc" : undefined),
-            store: async () => {},
-            delete: async () => {},
-            keys: async () => [],
-            onDidChange: () => ({ dispose() {} }),
-        } as unknown as vscode.SecretStorage;
-
-        const manager = new ConfigManager(secrets);
-        const secret = await manager.getSecret("litellm-connector.apiKey.default");
-        assert.strictEqual(secret, "abc");
     });
 });

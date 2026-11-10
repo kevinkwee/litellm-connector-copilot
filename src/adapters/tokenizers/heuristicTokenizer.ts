@@ -108,7 +108,7 @@ export class HeuristicTokenizer implements Tokenizer {
                 }
                 // Count text and JSON data
                 if (mimeType.startsWith("text/") || mimeType.includes("json") || mimeType === "usage") {
-                    const textContent = Buffer.from(data).toString("utf-8");
+                    const textContent = new TextDecoder().decode(data);
                     const tokens = this.countTokens(textContent).tokens;
                     StructuredLogger.trace("Counting text/json data part tokens", {
                         mimeType,

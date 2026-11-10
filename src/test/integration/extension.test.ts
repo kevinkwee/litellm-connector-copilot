@@ -8,12 +8,6 @@ import { Logger } from "../../utils/logger";
 import { createMockSecrets, createMockOutputChannel, createMockMemento } from "../utils/testMocks";
 
 /**
- * Helper that wires up the common stubs every activation test needs so the
- * individual tests can stay focused on the behavior under test instead of
- * boilerplate. Returns a teardown function that restores sinon state and the
- * captured `vscode.commands.executeCommand` stub for direct assertions.
- */
-/**
  * Wires up the common stubs every activation test needs.  Each test must
  * call this exactly once: a second `sandbox.stub` on the same property
  * throws because sinon sees the prior wrap.
@@ -158,8 +152,8 @@ suite("Extension Activation Unit Tests", () => {
         // Commands registration.
         sandbox.stub(vscode.commands, "registerCommand").returns({ dispose() {} } as vscode.Disposable);
 
-        // Ensure chat provider can be constructed without side effects.
-        sandbox.stub(providers.LiteLLMChatProvider.prototype, "getLastKnownModels").returns([]);
+        // Silence the post-registration refresh that activate() schedules on a setImmediate.
+        sandbox.stub(providers.LiteLLMChatProvider.prototype, "refreshModelInformation");
 
         extension.activate(context);
 
@@ -167,7 +161,7 @@ suite("Extension Activation Unit Tests", () => {
         assert.ok(context.subscriptions.length >= 2);
     });
 
-    test("activate constructs chat provider with secrets and UA", async () => {
+    test("activate registers exactly one chat provider", async () => {
         const mockSecrets = createMockSecrets();
         const context = {
             subscriptions: [],
@@ -201,7 +195,7 @@ suite("Extension Activation Unit Tests", () => {
         sandbox.stub(vscode.lm, "registerLanguageModelChatProvider").returns({ dispose() {} } as vscode.Disposable);
         sandbox.stub(vscode.commands, "registerCommand").returns({ dispose() {} } as vscode.Disposable);
 
-        const clearModelCacheStub = sandbox.stub(providers.LiteLLMChatProvider.prototype, "clearModelCache");
+        const reloadStub = sandbox.stub(providers.LiteLLMChatProvider.prototype, "reloadModelDiscovery");
 
         let configChangeHandler: ((e: vscode.ConfigurationChangeEvent) => void) | undefined;
         sandbox.stub(vscode.workspace, "onDidChangeConfiguration").callsFake((listener) => {
@@ -221,7 +215,46 @@ suite("Extension Activation Unit Tests", () => {
         configChangeHandler(mockEvent);
         await new Promise((resolve) => setTimeout(resolve, 300));
 
-        assert.strictEqual(clearModelCacheStub.calledOnce, false);
+        assert.strictEqual(reloadStub.calledOnce, false);
+    });
+
+    test("activate reloads discovery when a setting that shapes the model list changes", async () => {
+        const mockSecrets = createMockSecrets();
+        const context = {
+            subscriptions: [],
+            secrets: mockSecrets,
+        } as unknown as vscode.ExtensionContext;
+
+        sandbox.stub(vscode.window, "createOutputChannel").returns(createMockOutputChannel());
+        sandbox.stub(vscode.extensions, "getExtension").returns({ packageJSON: { version: "1.2.3" } } as never);
+        sandbox.stub(vscode.window, "showInformationMessage");
+        sandbox.stub(vscode.lm, "registerLanguageModelChatProvider").returns({ dispose() {} } as vscode.Disposable);
+        sandbox.stub(vscode.commands, "registerCommand").returns({ dispose() {} } as vscode.Disposable);
+
+        const reloadStub = sandbox.stub(providers.LiteLLMChatProvider.prototype, "reloadModelDiscovery");
+
+        let configChangeHandler: ((e: vscode.ConfigurationChangeEvent) => void) | undefined;
+        sandbox.stub(vscode.workspace, "onDidChangeConfiguration").callsFake((listener) => {
+            configChangeHandler = listener as (e: vscode.ConfigurationChangeEvent) => void;
+            return { dispose() {} } as vscode.Disposable;
+        });
+
+        extension.activate(context);
+        assert.ok(configChangeHandler);
+
+        const changedSettings = [
+            "litellm-connector.modelOverrides",
+            "litellm-connector.enableModelOverrides",
+            "litellm-connector.modelCapabilitiesOverrides",
+            "litellm-connector.displayPricingInPicker",
+            "litellm-connector.forceResponsesEndpoint",
+        ];
+        for (const setting of changedSettings) {
+            configChangeHandler({ affectsConfiguration: (section: string) => section === setting });
+            await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+
+        assert.strictEqual(reloadStub.callCount, changedSettings.length);
     });
 
     test("deactivate does not clear configuration", async () => {
@@ -357,10 +390,6 @@ suite("Extension Activation Unit Tests", () => {
         // modelOverrides changed -> should debounce and then refresh.
         handler({
             affectsConfiguration: (section: string): boolean => section === "litellm-connector.modelOverrides",
-        });
-        // backendGroups changed -> should also trigger.
-        handler({
-            affectsConfiguration: (section: string): boolean => section === "litellm-connector.backendGroups",
         });
         // Unrelated change -> must NOT trigger.
         const before = env.refreshStub.callCount;

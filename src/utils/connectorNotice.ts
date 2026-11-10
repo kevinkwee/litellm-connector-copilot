@@ -1,45 +1,66 @@
+import type { DroppedToolCall } from "../types";
+
 /**
  * Prefix that marks text the connector writes into a response itself, such as a
  * failure explanation or a stop notice. It keeps those messages distinguishable
- * from model output, so a consumer that treats response text as data (commit
- * message generation) never mistakes a notice for generated content.
- *
- * A notice that follows model output must start a new block: append it as
- * `"\n\n" + formatConnectorNotice(...)`. `splitConnectorNotice` recognises the
- * prefix only at the start of the response or after a blank line, because model
- * text may legitimately mention the prefix mid-sentence.
+ * from model output.
  */
 export const CONNECTOR_NOTICE_PREFIX = "[litellm-connector]";
 
+/**
+ * Returns the prefixed notice without a leading blank line. A caller that appends
+ * it to streamed text prepends `"\n\n"` so the notice starts its own block instead
+ * of reading as part of the model's sentence.
+ */
 export function formatConnectorNotice(message: string): string {
     return `${CONNECTOR_NOTICE_PREFIX} ${message}`;
 }
 
-export interface SplitConnectorNotice {
-    /** Response text before the first notice. */
-    readonly modelText: string;
-    /** Notice text after the prefix, or undefined when the response has none. */
-    readonly notice?: string;
+/**
+ * Returns the notice that explains tool calls the connector dropped because their
+ * arguments were not a JSON object. The notice already starts with the blank line that
+ * puts it in its own block, so a caller must not prepend another.
+ */
+export function describeDroppedToolCalls(calls: readonly DroppedToolCall[]): string {
+    const names = [...new Set(calls.map((call) => call.name))];
+    const subject =
+        names.length === 1 ? `the "${names[0]}" tool` : `the ${names.map((name) => `"${name}"`).join(", ")} tools`;
+    const outcome = names.length === 1 ? "was not run" : "were not run";
+    const count = calls.length === 1 ? "a tool call" : `${calls.length} tool calls`;
+    return (
+        "\n\n" +
+        formatConnectorNotice(
+            `The model returned ${count} whose arguments could not be read, so ${subject} ${outcome}.`
+        )
+    );
 }
 
 /**
- * Splits response text at the first connector notice. A notice can follow model
- * output (a failure or a stop reason after a partial answer), so callers that
- * treat the text as data must scan the whole value, not just its start.
- *
- * A notice always begins the response or a new block, so the prefix only counts
- * at the start or after a blank line; text that merely mentions the prefix
- * mid-sentence stays model output.
+ * Returns the finish reason and the notice that explains an incomplete answer, or
+ * `undefined` for a reason that needs none. The notice already starts with the
+ * blank line that puts it in its own block, so a caller must not prepend another.
  */
-export function splitConnectorNotice(text: string): SplitConnectorNotice {
-    const afterBlankLine = text.indexOf(`\n\n${CONNECTOR_NOTICE_PREFIX}`);
-    const atStart = text.startsWith(CONNECTOR_NOTICE_PREFIX);
-    if (!atStart && afterBlankLine < 0) {
-        return { modelText: text };
+export function describeStoppedEarly(reason: string | undefined): { reason: string; notice: string } | undefined {
+    if (reason === "length") {
+        return {
+            reason,
+            notice:
+                "\n\n" +
+                formatConnectorNotice(
+                    "The response stopped at the model's output token limit, so it is incomplete. " +
+                        "Raise the model's max output tokens, or ask it to continue."
+                ),
+        };
     }
-    const index = atStart ? 0 : afterBlankLine + 2;
-    return {
-        modelText: text.slice(0, index).trimEnd(),
-        notice: text.slice(index + CONNECTOR_NOTICE_PREFIX.length).trim(),
-    };
+    if (reason === "content_filter") {
+        return {
+            reason,
+            notice:
+                "\n\n" +
+                formatConnectorNotice(
+                    "The provider's content filter ended the response early; part of the answer was withheld."
+                ),
+        };
+    }
+    return undefined;
 }

@@ -1,8 +1,8 @@
 import * as assert from "assert";
+import * as sinon from "sinon";
+import * as vscode from "vscode";
 import {
     capabilitiesToVSCode,
-    getModelTags,
-    formatModelDisplayLabel,
     getSupportedReasoningEfforts,
     getDefaultReasoningEffort,
     buildReasoningEffortConfigurationSchema,
@@ -10,9 +10,23 @@ import {
     mergeConfigurationSchemas,
     derivePickerCategory,
     type DerivedModelCapabilities,
-    type ExtendedModelInformation,
 } from "../modelCapabilities";
 import type { LiteLLMModelInfo, ModelCapabilityOverride, SupportedReasoningEffort } from "../../types";
+
+/** Points `vscode.workspace.getConfiguration` at an override list. Callers restore the stub in a `finally`. */
+function stubWorkspaceConfiguration(overrides: unknown): void {
+    sinon.stub(vscode.workspace, "getConfiguration").returns({
+        get: (key: string, defaultValue?: unknown) => {
+            if (key === "litellm-connector.modelOverrides") {
+                return overrides;
+            }
+            if (key === "litellm-connector.enableModelOverrides") {
+                return true;
+            }
+            return defaultValue;
+        },
+    } as unknown as vscode.WorkspaceConfiguration);
+}
 
 suite("modelCapabilities", () => {
     suite("capabilitiesToVSCode", () => {
@@ -20,9 +34,7 @@ suite("modelCapabilities", () => {
             const derived = {
                 supportsTools: false,
                 supportsVision: false,
-                supportsStreaming: true,
                 supportsReasoning: false,
-                supportsPdf: false,
                 supportsAudioInput: false,
                 supportsAudioOutput: false,
                 supportsComputerUse: false,
@@ -49,9 +61,7 @@ suite("modelCapabilities", () => {
             const derived = {
                 supportsTools: false,
                 supportsVision: false,
-                supportsStreaming: true,
                 supportsReasoning: false,
-                supportsPdf: false,
                 supportsAudioInput: false,
                 supportsAudioOutput: false,
                 supportsComputerUse: false,
@@ -79,9 +89,7 @@ suite("modelCapabilities", () => {
             const derived = {
                 supportsTools: false,
                 supportsVision: false,
-                supportsStreaming: true,
                 supportsReasoning: false,
-                supportsPdf: false,
                 supportsAudioInput: false,
                 supportsAudioOutput: false,
                 supportsComputerUse: false,
@@ -109,9 +117,7 @@ suite("modelCapabilities", () => {
             const derived = {
                 supportsTools: true,
                 supportsVision: true,
-                supportsStreaming: true,
                 supportsReasoning: false,
-                supportsPdf: false,
                 supportsAudioInput: false,
                 supportsAudioOutput: false,
                 supportsComputerUse: false,
@@ -139,9 +145,7 @@ suite("modelCapabilities", () => {
             const derived = {
                 supportsTools: false,
                 supportsVision: false,
-                supportsStreaming: true,
                 supportsReasoning: false,
-                supportsPdf: false,
                 supportsAudioInput: false,
                 supportsAudioOutput: false,
                 supportsComputerUse: false,
@@ -163,203 +167,6 @@ suite("modelCapabilities", () => {
             const caps = capabilitiesToVSCode(derived, overrides);
             assert.strictEqual(caps.toolCalling, true);
             assert.strictEqual(caps.imageInput, true);
-        });
-    });
-
-    suite("getModelTags with capability overrides", () => {
-        test("adds tools tag when toolCalling is overridden to true", () => {
-            const derived = {
-                supportsTools: false,
-                supportsVision: false,
-                supportsStreaming: true,
-                supportsReasoning: false,
-                supportsPdf: false,
-                supportsAudioInput: false,
-                supportsAudioOutput: false,
-                supportsComputerUse: false,
-                supportsFunctionCalling: false,
-                supportsToolChoice: false,
-                supportsSystemMessages: false,
-                supportsResponseSchema: false,
-                supportsPromptCaching: false,
-                supportsWebSearch: false,
-                supportsUrlContext: false,
-                supportsReasoningEffort: false,
-                supportsThinking: false,
-                endpointMode: "chat" as const,
-                maxInputTokens: 100000,
-                maxOutputTokens: 16000,
-                rawContextWindow: 128000,
-            };
-            const capabilityOverrides: ModelCapabilityOverride = { toolCalling: true };
-            const tags = getModelTags("gpt-4o", derived, {}, capabilityOverrides);
-            assert.ok(tags.includes("tools"), "Should include tools tag from capability override");
-            assert.ok(!tags.includes("vision"), "Should not include vision tag");
-        });
-
-        test("adds vision tag when imageInput is overridden to true", () => {
-            const derived = {
-                supportsTools: false,
-                supportsVision: false,
-                supportsStreaming: true,
-                supportsReasoning: false,
-                supportsPdf: false,
-                supportsAudioInput: false,
-                supportsAudioOutput: false,
-                supportsComputerUse: false,
-                supportsFunctionCalling: false,
-                supportsToolChoice: false,
-                supportsSystemMessages: false,
-                supportsResponseSchema: false,
-                supportsPromptCaching: false,
-                supportsWebSearch: false,
-                supportsUrlContext: false,
-                supportsReasoningEffort: false,
-                supportsThinking: false,
-                endpointMode: "chat" as const,
-                maxInputTokens: 100000,
-                maxOutputTokens: 16000,
-                rawContextWindow: 128000,
-            };
-            const capabilityOverrides: ModelCapabilityOverride = { imageInput: true };
-            const tags = getModelTags("gpt-4o", derived, {}, capabilityOverrides);
-            assert.ok(tags.includes("vision"), "Should include vision tag from capability override");
-            assert.ok(!tags.includes("tools"), "Should not include tools tag");
-        });
-
-        test("removes tools tag when toolCalling is overridden to false", () => {
-            const derived = {
-                supportsTools: true,
-                supportsVision: true,
-                supportsStreaming: true,
-                supportsReasoning: false,
-                supportsPdf: false,
-                supportsAudioInput: false,
-                supportsAudioOutput: false,
-                supportsComputerUse: false,
-                supportsFunctionCalling: false,
-                supportsToolChoice: false,
-                supportsSystemMessages: false,
-                supportsResponseSchema: false,
-                supportsPromptCaching: false,
-                supportsWebSearch: false,
-                supportsUrlContext: false,
-                supportsReasoningEffort: false,
-                supportsThinking: false,
-                endpointMode: "chat" as const,
-                maxInputTokens: 100000,
-                maxOutputTokens: 16000,
-                rawContextWindow: 128000,
-            };
-            const capabilityOverrides: ModelCapabilityOverride = { toolCalling: false };
-            const tags = getModelTags("gpt-4o", derived, {}, capabilityOverrides);
-            assert.ok(!tags.includes("tools"), "Should not include tools tag when overridden to false");
-            assert.ok(tags.includes("vision"), "Should still include vision tag");
-        });
-
-        test("adds reasoning and pdf tags based on capabilities", () => {
-            const tags = getModelTags("test", {
-                supportsTools: false,
-                supportsVision: false,
-                supportsStreaming: false,
-                supportsReasoning: true,
-                supportsPdf: true,
-                supportsAudioInput: false,
-                supportsAudioOutput: false,
-                supportsComputerUse: false,
-                supportsFunctionCalling: false,
-                supportsToolChoice: false,
-                supportsSystemMessages: false,
-                supportsResponseSchema: false,
-                supportsPromptCaching: false,
-                supportsWebSearch: false,
-                supportsUrlContext: false,
-                supportsReasoningEffort: false,
-                supportsThinking: false,
-                endpointMode: "chat" as const,
-                maxInputTokens: 100,
-                maxOutputTokens: 100,
-                rawContextWindow: 200,
-            });
-            assert.ok(tags.includes("reasoning"), "should have reasoning tag");
-            assert.ok(tags.includes("pdf"), "should have pdf tag");
-        });
-
-        test("adds reasoning and pdf tags based on overrides", () => {
-            const derived = {
-                supportsTools: false,
-                supportsVision: false,
-                supportsStreaming: false,
-                supportsReasoning: false,
-                supportsPdf: false,
-                supportsAudioInput: false,
-                supportsAudioOutput: false,
-                supportsComputerUse: false,
-                supportsFunctionCalling: false,
-                supportsToolChoice: false,
-                supportsSystemMessages: false,
-                supportsResponseSchema: false,
-                supportsPromptCaching: false,
-                supportsWebSearch: false,
-                supportsUrlContext: false,
-                supportsReasoningEffort: false,
-                supportsThinking: false,
-                endpointMode: "chat" as const,
-                maxInputTokens: 100,
-                maxOutputTokens: 100,
-                rawContextWindow: 200,
-            };
-            const capabilityOverrides: ModelCapabilityOverride = { reasoning: true, pdfInput: true };
-            const tags = getModelTags("test", derived, {}, capabilityOverrides);
-            assert.ok(tags.includes("reasoning"), "should have reasoning tag from override");
-            assert.ok(tags.includes("pdf"), "should have pdf tag from override");
-        });
-
-        test("override merges tag overrides and capability overrides together", () => {
-            const derived = {
-                supportsTools: false,
-                supportsVision: false,
-                supportsStreaming: true,
-                supportsReasoning: false,
-                supportsPdf: false,
-                supportsAudioInput: false,
-                supportsAudioOutput: false,
-                supportsComputerUse: false,
-                supportsFunctionCalling: false,
-                supportsToolChoice: false,
-                supportsSystemMessages: false,
-                supportsResponseSchema: false,
-                supportsPromptCaching: false,
-                supportsWebSearch: false,
-                supportsUrlContext: false,
-                supportsReasoningEffort: false,
-                supportsThinking: false,
-                endpointMode: "chat" as const,
-                maxInputTokens: 100000,
-                maxOutputTokens: 16000,
-                rawContextWindow: 128000,
-            };
-            const tagOverrides = { "gpt-4o": ["custom-tag"] };
-            const capabilityOverrides: ModelCapabilityOverride = { toolCalling: true };
-            const tags = getModelTags("gpt-4o", derived, tagOverrides, capabilityOverrides);
-            assert.ok(tags.includes("tools"), "Should include tools tag from capability override");
-            assert.ok(tags.includes("custom-tag"), "Should include custom tag from tag overrides");
-        });
-    });
-
-    suite("formatModelDisplayLabel", () => {
-        test("formats strings correctly", () => {
-            assert.strictEqual(formatModelDisplayLabel("gpt-4o", "openai"), "[openai] gpt-4o");
-            assert.strictEqual(formatModelDisplayLabel("gpt-4o"), "gpt-4o");
-            assert.strictEqual(formatModelDisplayLabel("gpt-4o", ""), "gpt-4o");
-        });
-
-        test("formats model objects correctly", () => {
-            const mockModel = { name: "gpt-4o", vendor: "openai" } as unknown as ExtendedModelInformation;
-            assert.strictEqual(formatModelDisplayLabel(mockModel), "[openai] gpt-4o");
-
-            const mockModelNoVendor = { name: "gpt-4o" } as unknown as ExtendedModelInformation;
-            assert.strictEqual(formatModelDisplayLabel(mockModelNoVendor), "gpt-4o");
         });
     });
 
@@ -420,6 +227,66 @@ suite("modelCapabilities", () => {
             assert.ok(result.includes("high"), "should include high");
         });
 
+        test("a forced override leaves an excluded reasoning_effort parameter without a picker", () => {
+            try {
+                stubWorkspaceConfiguration([
+                    { match: "^gpt-5", reasoningEfforts: ["low", "high"], forceMandatory: true },
+                ]);
+                const modelInfo: LiteLLMModelInfo = {
+                    supports_reasoning: true,
+                    supported_openai_params: ["stream"],
+                };
+
+                const result = getSupportedReasoningEfforts(modelInfo, "gpt-5-model");
+
+                assert.deepStrictEqual(result, [], "an excluded parameter has no effort list to replace");
+            } finally {
+                sinon.restore();
+            }
+        });
+
+        test("a forced override replaces the levels the proxy reports", () => {
+            try {
+                stubWorkspaceConfiguration([
+                    { match: "^gpt-5", reasoningEfforts: ["low", "high"], forceMandatory: true },
+                ]);
+                const modelInfo: LiteLLMModelInfo = {
+                    supports_reasoning: true,
+                    supports_medium_reasoning_effort: true,
+                };
+
+                const result = getSupportedReasoningEfforts(modelInfo, "gpt-5-model");
+
+                assert.deepStrictEqual(result, ["low", "high"], "the forced list wins over the proxy's levels");
+            } finally {
+                sinon.restore();
+            }
+        });
+
+        test("keeps the model's own effort flags when supports_reasoning is false, ignoring a forced override", () => {
+            try {
+                stubWorkspaceConfiguration([
+                    { match: "^gpt-5", reasoningEfforts: ["low", "high"], forceMandatory: true },
+                ]);
+                const modelInfo: LiteLLMModelInfo = {
+                    id: "gpt-5-mini",
+                    name: "GPT-5 Mini",
+                    supports_reasoning: false,
+                    supports_medium_reasoning_effort: true,
+                };
+
+                const result = getSupportedReasoningEfforts(modelInfo, "gpt-5-mini");
+
+                assert.deepStrictEqual(
+                    result,
+                    ["medium"],
+                    "the model's own flags decide when supports_reasoning is false, so the override has no effect"
+                );
+            } finally {
+                sinon.restore();
+            }
+        });
+
         test("returns the canonical GPT-5 effort ladder for gpt-5-mini", () => {
             const modelInfo: LiteLLMModelInfo = {
                 id: "gpt-5-mini",
@@ -474,35 +341,6 @@ suite("modelCapabilities", () => {
             const result = getSupportedReasoningEfforts(undefined, "unknown-model");
             assert.deepStrictEqual(result, []);
         });
-
-        test("returns empty array when reasoning support is disabled even for catch-all ids", () => {
-            test("returns empty array when model has supports_reasoning=true but no reasoning_effort parameter specified in supported_openai_params", () => {
-                const modelInfo: LiteLLMModelInfo = {
-                    id: "minimax-large",
-                    name: "MiniMax Large",
-                    supports_reasoning: true,
-                    supports_openai_params: ["temperature", "top_p", "stream"],
-                };
-
-                const result = getSupportedReasoningEfforts(modelInfo, "minimax-large");
-
-                // Model supports reasoning capability but does not explicitly support the reasoning_effort parameter
-                // Therefore it should get an empty array instead of defaulting to all efforts
-                assert.deepStrictEqual(result, []);
-            });
-
-            test("returns empty array when reasoning support is disabled even for catch-all ids", () => {
-                const modelInfo: LiteLLMModelInfo = {
-                    id: "gpt-5-mini",
-                    name: "GPT-5 Mini",
-                    supports_reasoning: false,
-                };
-
-                const result = getSupportedReasoningEfforts(modelInfo, "gpt-5-mini");
-
-                assert.deepStrictEqual(result, []);
-            });
-        });
     });
 
     suite("buildReasoningEffortConfigurationSchema", () => {
@@ -515,7 +353,7 @@ suite("modelCapabilities", () => {
             const schema = buildReasoningEffortConfigurationSchema(["none", "low", "medium", "high"]);
             assert.ok(schema, "Expected schema for non-empty efforts");
             const prop = schema?.properties.reasoningEffort;
-            // Without `group: "navigation"` VS Code 1.120 hides the configuration property behind
+            // Without `group: "navigation"` VS Code hides the configuration property behind
             // the secondary settings UI and the reasoning effort picker is not visible from the
             // chat model selector. This guards against regressions where the field is dropped.
             assert.strictEqual(prop?.group, "navigation");
@@ -546,7 +384,7 @@ suite("modelCapabilities", () => {
             // enumDescriptions is the field VS Code uses to render the per-item description text
             // that appears alongside each option in the model picker hover popup (e.g.
             // "Balanced reasoning and speed" for "medium"). Without this, the picker shows only
-            // labels with no guidance — exactly what Copilot's own models provide.
+            // labels with no guidance, exactly what Copilot's own models provide.
             const schema = buildReasoningEffortConfigurationSchema(["none", "low", "medium", "high"]);
             const descs = schema?.properties.reasoningEffort.enumDescriptions;
             assert.ok(Array.isArray(descs), "Expected enumDescriptions to be an array");
@@ -557,26 +395,87 @@ suite("modelCapabilities", () => {
             assert.strictEqual(descs?.[3], "Greater reasoning depth but slower");
         });
 
-        test("defaults to medium for canonical reasoning configuration", () => {
+        test("defaults to the highest listed effort for a canonical reasoning configuration", () => {
             const canonicalEfforts: SupportedReasoningEffort[] = ["none", "minimal", "low", "medium", "high"];
 
             const defaultEffort = getDefaultReasoningEffort(canonicalEfforts, "any-other-model");
             const schema = buildReasoningEffortConfigurationSchema(canonicalEfforts, "any-other-model");
 
-            assert.strictEqual(defaultEffort, "medium");
+            assert.strictEqual(defaultEffort, "high");
             // `default` is present so VS Code renders the effort label next to the model name
-            // (e.g. "model-name · Medium") before the user makes an explicit selection.
-            assert.strictEqual(schema?.properties.reasoningEffort.default, "medium");
+            // (e.g. "model-name · High") before the user makes an explicit selection.
+            assert.strictEqual(schema?.properties.reasoningEffort.default, "high");
         });
 
-        test("defaults to medium for Claude reasoning configuration", () => {
+        test("defaults to the highest listed effort for a Claude reasoning configuration", () => {
             const claudeEfforts: SupportedReasoningEffort[] = ["none", "low", "medium", "high"];
 
             const defaultEffort = getDefaultReasoningEffort(claudeEfforts, "claude-haiku-4-5");
             const schema = buildReasoningEffortConfigurationSchema(claudeEfforts, "claude-haiku-4-5");
 
-            assert.strictEqual(defaultEffort, "medium");
-            assert.strictEqual(schema?.properties.reasoningEffort.default, "medium");
+            assert.strictEqual(defaultEffort, "high");
+            assert.strictEqual(schema?.properties.reasoningEffort.default, "high");
+        });
+
+        test("defaults to the highest listed effort for a single-level ladder and a ladder that skips levels", () => {
+            const minimalOnly: SupportedReasoningEffort[] = ["minimal"];
+
+            assert.strictEqual(getDefaultReasoningEffort(minimalOnly), "minimal");
+            assert.strictEqual(getDefaultReasoningEffort(["none", "xhigh"]), "xhigh");
+        });
+
+        test("returns undefined for an empty effort list", () => {
+            assert.strictEqual(getDefaultReasoningEffort([]), undefined);
+        });
+
+        test("keeps an override default inside the model's list", () => {
+            stubWorkspaceConfiguration([
+                { match: "^test-.*", supportsReasoning: true, reasoningEfforts: ["low", "high"], defaultEffort: "low" },
+            ]);
+            try {
+                assert.strictEqual(
+                    getDefaultReasoningEffort(["low", "high"], "test-model", { supports_reasoning: true }),
+                    "low"
+                );
+            } finally {
+                sinon.restore();
+            }
+        });
+
+        test("falls back to the model's highest effort when the override default is outside its list", () => {
+            stubWorkspaceConfiguration([
+                { match: "^test-.*", supportsReasoning: true, reasoningEfforts: ["low", "high"], defaultEffort: "max" },
+            ]);
+            try {
+                assert.strictEqual(
+                    getDefaultReasoningEffort(["low", "high"], "test-model", { supports_reasoning: true }),
+                    "high"
+                );
+            } finally {
+                sinon.restore();
+            }
+        });
+
+        test("ignores a canonical override default the model does not offer", () => {
+            // The override default passes `getDefaultEffort` because the canonical list
+            // contains it, so only `getDefaultReasoningEffort`'s membership check keeps
+            // the schema default inside the model's narrower ladder.
+            stubWorkspaceConfiguration([{ match: "^test-.*", supportsReasoning: true, defaultEffort: "max" }]);
+            const supportedEfforts: SupportedReasoningEffort[] = ["none", "low", "high", "xhigh"];
+            try {
+                assert.strictEqual(
+                    getDefaultReasoningEffort(supportedEfforts, "test-model", { supports_reasoning: true }),
+                    "xhigh"
+                );
+                assert.strictEqual(
+                    buildReasoningEffortConfigurationSchema(supportedEfforts, "test-model", {
+                        supports_reasoning: true,
+                    })?.properties.reasoningEffort.default,
+                    "xhigh"
+                );
+            } finally {
+                sinon.restore();
+            }
         });
     });
 
@@ -647,9 +546,7 @@ suite("modelCapabilities", () => {
         const baseDerived: DerivedModelCapabilities = {
             supportsTools: false,
             supportsVision: false,
-            supportsStreaming: true,
             supportsReasoning: false,
-            supportsPdf: false,
             supportsAudioInput: false,
             supportsAudioOutput: false,
             supportsComputerUse: false,
@@ -701,7 +598,7 @@ suite("modelCapabilities", () => {
             assert.strictEqual(derivePickerCategory({ ...baseDerived, rawContextWindow: 64000 }), undefined);
         });
 
-        test("returns a string literal — never null or an object (regression guard for VS Code picker crash)", () => {
+        test("returns a string literal, never null or an object (regression guard for VS Code picker crash)", () => {
             const result = derivePickerCategory(baseDerived);
             // Guard against the exact bug class: a non-string value reaching the
             // picker's getCategoryLabel switch default branch.

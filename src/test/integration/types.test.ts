@@ -1,7 +1,6 @@
 import * as assert from "assert";
 
 import type {
-    LiteLLMConfig,
     LiteLLMModelInfo,
     LiteLLMResponseInputItem,
     OpenAIChatCompletionRequest,
@@ -10,27 +9,19 @@ import type {
 } from "../../types";
 
 suite("Types Unit Tests", () => {
-    test("LiteLLMConfig supports commit model id override", () => {
-        const cfg: LiteLLMConfig = {
-            commitModelIdOverride: "gpt-4",
-        };
-
-        assert.strictEqual(cfg.commitModelIdOverride, "gpt-4");
-    });
-
     test("OpenAIChatCompletionRequest shape is assignable", () => {
         const msg: OpenAIChatMessage = { role: "user", content: "hi" };
         const req: OpenAIChatCompletionRequest = {
             model: "m",
             messages: [msg],
             stream: true,
-            extra_body: { cache: { "no-cache": true } },
+            cache: { "no-cache": true },
         };
 
         assert.strictEqual(req.model, "m");
         assert.strictEqual(req.messages[0].role, "user");
         assert.strictEqual(req.stream, true);
-        assert.strictEqual(req.extra_body?.cache?.["no-cache"], true);
+        assert.strictEqual(req.cache?.["no-cache"], true);
     });
 
     test("LiteLLMResponseInputItem union accepts message and tool items", () => {
